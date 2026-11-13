@@ -562,15 +562,15 @@ async def test_new_suspension_blocks_backlog_delivery(tmp_path) -> None:
             "conversation-1", task_id="task-1", status="succeeded"
         )
         # The accepted message releases suspension, but delivery creates a new one.
-        original = runtime.reconcile_versions
+        original = runtime._replay_external_observations
 
-        async def suspend_mid_delivery(conversation_id, context=None):
+        async def suspend_mid_delivery(conversation_id, task_id=None):
             await runtime._user_input.suspend(
                 store, conversation_id, "test_new_suspension"
             )
-            return await original(conversation_id, context)
+            return await original(conversation_id, task_id)
 
-        runtime.reconcile_versions = suspend_mid_delivery
+        runtime._replay_external_observations = suspend_mid_delivery
         await _continue_message(runtime, context, command_id="msg-lift")
         await asyncio.sleep(0.05)
         assert adapter.external_task_notifications == []

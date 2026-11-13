@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Literal
@@ -32,7 +33,8 @@ from openhands.agent_server.pyromind_auth import (
     parse_auth_token_from_cookie_header,
 )
 from pyromind_agent_server.api.router import (
-    _profile_matches,
+    _require_profile,
+    configure_session,
     context_for_profile,
     get_conversation_service,
     get_product_runtime,
@@ -100,18 +102,6 @@ def _build_dataset_start_context(project: ProjectInfo, node_id: str) -> str:
         "server identifiers, and do not start Inference, Evaluator, or Train. "
         "Those stages are outside this Dataset development action."
     )
-
-
-def _require_echomind_conversation(request: Request, conversation_id: str) -> None:
-    if not _profile_matches(
-        get_conversation_service(request),
-        conversation_id,
-        ECHOMIND_PRODUCT_PROFILE,
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="EchoMind conversation not found.",
-        )
 
 
 def _require_sandbox_credentials(request: Request) -> None:
@@ -219,11 +209,14 @@ async def start_echomind_project_node(
         )
 
     conversation_id = project.project.conversation_id
-    _require_echomind_conversation(request, conversation_id)
+    await asyncio.to_thread(
+        _require_profile, request, conversation_id, ECHOMIND_PRODUCT_PROFILE
+    )
     command = UserMessageCommand(
         command_id=uuid4().hex,
         content=(TextContent(text=_build_dataset_start_context(project, node_id)),),
     )
+    await configure_session(request, conversation_id, ECHOMIND_PRODUCT_PROFILE)
     receipt = await get_product_runtime(request).submit_command(
         conversation_id,
         command,

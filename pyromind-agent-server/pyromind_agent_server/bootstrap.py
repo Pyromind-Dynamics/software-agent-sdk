@@ -21,6 +21,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIndex
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -110,6 +111,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     versions = Versions(
         SQLiteVersionStore(version_path),
         PlatformArtifactSnapshots(version_path.parent / "snapshot-staging"),
+        archive_runs=os.getenv("PYROMIND_RUN_ARCHIVES_ENABLED", "0") == "1",
     )
 
     async def version_call(
@@ -180,6 +182,11 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow_call=workflow_call if workflow_enabled else None,
     )
     pi_adapter.set_version_handler(version_call, execution_call)
+
+    async def record_training_artifacts(scope, task_id, nodes, context):
+        return await runtime.record_training_artifacts(scope, task_id, nodes, context)
+
+    pi_adapter.set_training_artifact_hook(record_training_artifacts)
     adapters["pi"] = pi_adapter
     if workflow_enabled and backend == "pi":
 
@@ -230,6 +237,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         adapters,
         default_harness_id=backend,
         preparation_store=preparation_store,
+        experiment_index=SQLExperimentIndex(preparation_store.engine)
+        if preparation_store is not None
+        else None,
         experiment_plan_project_binder=EchoMindExperimentPlanProjectBinder(
             service.conversations_dir
         )

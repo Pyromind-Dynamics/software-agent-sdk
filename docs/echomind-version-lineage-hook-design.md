@@ -1,8 +1,96 @@
 # EchoMind 实验版本血缘自动登记技术方案
 
 > 日期：2026-11-12  
-> 状态：设计建议，尚未实现。代码事实来自当前工作区，不代表线上部署已验证。  
+> 状态：已实现运行归档与实验聚合/查询切片；后文完整实验版本方案尚未全部实现。代码事实来自当前工作区，不代表线上部署已验证。
 > 参考：《EchoMind 版本血缘登记技术方案（Hook 实现）》。
+
+## 本轮实现：非侵入式运行归档
+
+为减少对已测通主链路的影响，第一步只把**已有版本账本和执行事实**自动汇成不可变归档，不改变训练/评测输入、Agent 提示、Profile 白名单或选模行为。
+
+启动服务前设置 `PYROMIND_RUN_ARCHIVES_ENABLED=1` 开启；默认关闭。开关位于 Server 依赖装配层，对使用同一 Runtime 的执行入口采用相同语义，不在共享层判断 Agent 或场景。无需数据库迁移，也不新增 Agent 工具、Pi 插件或后台轮询。
+
+启用后，工作流提交成功、提交结果 uncertain，以及现有版本对账时尝试归档：
+
+```text
+/workspace/.pyromind-agent/{conversation_id}/lineage/
+└── {version_run_id}/{content_digest}/
+    ├── content/lineage.json
+    ├── files.json
+    └── manifest.json
+```
+
+`lineage.json` 包含执行 RunSpec、实际提交配置、taskId/任务状态、输入/产物版本与祖先关系，以及从已校验快照读取的配置/DSL 文本。Pipeline 已持久化的 result 原样记录，不重新评分或选模。`artifact_project_id` 明确指现有版本库 Project，不冒充业务 Project。
+
+同一内容重复对账使用相同路径，状态变化产生新归档，旧记录不覆盖。各目录是一次独立观察，不设置可能被旧回调覆盖的“latest”指针；不要仅凭目录名排序推断最新业务状态，当前状态仍从 Product Runtime 获取。归档不注册成新产物版本，不改变原编号与血缘。
+
+归档通过现有 `ArtifactSnapshotPort` 写入：失败只记录待补写日志，不改变提交成功/uncertain 或任务终态；后续带有效凭据的对账会重试。无 RequestContext 时不访问远端 Storage，不持久化请求凭据。已有版本快照和账本仍是恢复依据，不能把它们作为归档缓存删除。
+
+开启后，归档跟随现有对账执行，会增加配置/代码快照的读取与归档上传耗时，尚未优化大型历史项目的增量导出；默认关闭时不产生这些 I/O。建议先在测试环境开启验证，不直接全量启用。
+
+**第一步不等于完整 P0**：其范围仅为运行归档，不包含组合实验、冻结输入或主动产物发现。数据/模型仍保留现有 `reference_only` 语义；归档不会把路径引用升级为可恢复快照。没有接入平台的手工任务或未登记产物不会被自动补造。
+
+## 第二步实现：实验聚合与查询
+
+在第一步归档基础上补充以下能力，仍不改动 Agent 委派、平台提交和选模规则：
+
+- `domain/experiments.py` 定义与 Harness 无关的实验版本、评测和指标 DTO。
+- 按账本中的数据飞轮轮次（`iteration_id`）编号。新一轮由现有 `new_iteration` 操作开启，有 workflow 后才生成该轮清单。同一轮提交和重试共享一个 vN 目录，`attempts` 记录每次执行，`execution` 和 `inputs` 展示最近一次执行及输入。第一条 workflow 的 Run ID 作为实验 ID，旧的其他 Run ID 仍可查询同一轮详情。
+- 评分批次只有 source_manifest.task_id 精确指向该 workflow 时才自动挂接；独立推理仅凭唯一模型产物路径，或明确的 selection_run_id 关联。来源不明、路径有歧义的评测保留在 `unassigned_evaluations`，不默认挂到最近训练。
+- 后续训练的模型输入可追溯到先前实验时建立 parent。选模运行产生的模型也追溯到原训练；不按时间邻接推断“上一版”，不自动读取 Agent notes 推导 parent。
+- 业务 Project 从现有 PreparationStore 的授权绑定读取，保留与 artifact_project_id 的区别。无业务绑定时 project_id 为 null，不伪造业务 Project。
+- `PipelineRun.evaluations` 保存通过原有批次来源校验的 StepEvaluation；历史文件默认空且不额外序列化该字段。不改变 result 中的 CheckpointSelection。
+- 指标查询只使用任务 succeeded 且 eligible、有 comparison_group 的逐步结果。保留 baseline、dataset_role 和组标识，test/baseline 不标为 selected，不重算 best，不把旧 inference 指标猜成同口径结果。
+
+启用原归档开关后，现有对账还会导出：
+
+```text
+/.pyromind-agent/{conversation_id}/projects/{business_project_id或artifact_project_id}/
+  experiments/vN/{content_digest}/content/experiment.json
+```
+
+`experiment.json` 聚合 task、输入/输出引用、已知父实验和评测摘要，并引用已有运行归档。它不复制模型/原图，不把 `reference_only` 升级为已冻结；不设置可覆盖的 latest 指针。
+
+新增只读路由，在两套产品路由前缀下共用：
+
+```text
+GET /{conversation_id}/experiments
+GET /{conversation_id}/experiments/{experiment_id}
+GET /{conversation_id}/experiment-metrics?metric=pass_rate&comparison_group=...
+```
+
+查询进入 ConversationRuntime 授权，只读现有账本，不附着 Harness、不唤醒 Agent、不访问平台 Storage。新增 DTO 不塞进旧 snapshot/SSE，旧客户端不需升级。
+
+只读 CLI 同样走 API，例如：
+
+```bash
+uv run pyromind-lineage CONVERSATION_ID \
+  --api-prefix /api/v2/echomind/conversations --user-id USER_ID --cluster CLUSTER
+uv run pyromind-lineage CONVERSATION_ID \
+  --api-prefix /api/v2/echomind/conversations --metrics --metric pass_rate
+```
+
+`--user-id` 仅用于服务允许的调试身份，不绕过生产鉴权；SESSION_API_KEY、PYROMIND_COOKIE、PYROMIND_AUTHORIZATION 从环境读取，不写入文件或命令行参数。
+
+**剩余能力**：用户可编辑实验草稿与分叉目录、提交前数据冻结、主动 checkpoint 发现、v0/基线推理缓存、前端趋势图和交付闸门尚未接入。当前指标 API 按账本投影查询，归档后同步写 SQL 派生索引；没有逐步评测摘要的历史运行不会凭空出现指标，需要原有可信结果对账补齐。
+
+已知的同步归档耗时和历史 DSL 明文密钥复制问题按用户要求暂缓处理，本轮未修复，也不将其视为已通过验收。
+
+### 第二步验证与兼容影响
+
+- `uv run pytest tests/pyromind_runtime -q -o addopts=''`：758 passed、6 skipped；pre-commit 全部通过，CLI 入口可正常调用。
+- 使用真实 p19/p20/p21 账本做无远程请求的只读投影，重复结果一致；原账本未改变。历史未关联推理保留未关联，没有逐步证据的旧运行不生成趋势值。
+- 跨包变更遵循 Server → Runtime，聚合与指标逻辑仅依赖 Runtime domain；无 Harness/场景条件分支，查询不执行 Agent 或读取平台 Storage。
+- 公开接口只新增路由与独立 DTO，不改变旧命令、事件或 snapshot。持久化仅增加可选 evaluations，旧数据读取默认为空，空字段不写回；未要求数据库迁移，不保证新增字段后的文件可直接交给不支持该字段的旧服务降级读取。
+- 实验导出跟随原对账，失败不改变平台任务结果；测试覆盖重复导出不新增产物版本、查询鉴权与 Profile/cluster 隔离、test/baseline 不选模和旧数据兼容读取。
+
+## 第三步实现：Train 和 Eval 交付登记
+
+- 对应 H4，`training_analysis(operation="artifacts")` 返回后由 Adapter 转交结构化发现结果。Runtime 核对已成功的训练任务，按运行、节点、step 登记完整 checkpoint 及对应预测摘要。重复观察相同产物复用既有记录。
+- 对应 H6/H7，本地 CPU 评分交付 `public_data/eval_result-<批次>.json`。Skill 脚本和 Runtime 共享校验实现。子 Agent 完成事件和已有对账入口触发验收，Runtime 核对所属训练任务、节点、checkpoint、预测摘要和报告文件，再保存不可变的 `eval_result.json`。验收失败保留阶段结果，修正文件后可对账补写。
+- 实验接口把通过验收的交付归入来源训练所在的飞轮版本，保留批次、报告、选模和逐步指标。现有平台评分路径继续使用 `PipelineRun`。本地交付的可比组依据数据摘要和包含生成参数的评分指纹，指标数值来自子 Agent 的评分脚本。
+
+普通 checkpoint 推理复用 H5/H6：评估提交时校验并冻结原 checkpoint 版本 ID，LoRA 由现有评估工作流合并。完成回调核对运行清单、报告和指标，保存结构化结果和产物路径，再由实验查询投影到训练所在轮次。平台失败状态和报告有效性分开表达，已验证报告里的零分照常进入指标。历史上仅传入合并模型路径且没有可靠父引用的运行保留未关联状态。
 
 ## 1. 结论与范围
 

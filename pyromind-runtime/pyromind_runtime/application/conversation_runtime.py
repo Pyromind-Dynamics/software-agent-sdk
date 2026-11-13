@@ -26,6 +26,15 @@ from pyromind_runtime.application.evaluation_cases import (
     EvaluationMedia,
 )
 from pyromind_runtime.application.event_projection import ProductEventProjector
+from pyromind_runtime.application.experiments import (
+    experiment_catalog,
+    experiment_metrics,
+)
+from pyromind_runtime.application.inference_results import finalize_inference
+from pyromind_runtime.application.lineage_deliveries import (
+    register_eval_deliveries,
+    register_training_artifacts,
+)
 from pyromind_runtime.application.preparation import (
     Preparations,
 )
@@ -67,6 +76,7 @@ from pyromind_runtime.domain.experiment_execution import (
 from pyromind_runtime.domain.experiment_plans import (
     PlanOwner,
 )
+from pyromind_runtime.domain.experiments import ExperimentCatalog, ExperimentMetric
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import (
     PREPARATION_TOOLS,
@@ -77,11 +87,13 @@ from pyromind_runtime.domain.preparation import (
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
+    ConversationSummary,
     ExternalTaskState,
     TimelineOperation,
     WorkflowState,
 )
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
+from pyromind_runtime.domain.training_evaluation import CheckpointArtifact
 from pyromind_runtime.domain.versions import (
     RunSource,
     SaveVersion,
@@ -94,6 +106,7 @@ from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
 )
+from pyromind_runtime.ports.experiment_index import ExperimentIndex
 from pyromind_runtime.ports.experiment_plans import (
     ExperimentPlanProjectBinder,
 )
@@ -211,6 +224,7 @@ class ConversationRuntime:
         workflows: WorkflowBackend | None = None,
         workflow_submission: WorkflowSubmissionPort | None = None,
         versions: Versions | None = None,
+        experiment_index: ExperimentIndex | None = None,
         evaluation_storage_factory: Callable[[RequestContext], EvaluationStorage]
         | None = None,
     ) -> None:
@@ -235,6 +249,7 @@ class ConversationRuntime:
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
         self.versions = versions
+        self._experiment_index = experiment_index
         self._evaluation_storage_factory = evaluation_storage_factory
         self._projector = ProductEventProjector()
         self._user_input = UserInputCoordinator(publish=self._publish)
@@ -276,19 +291,23 @@ class ConversationRuntime:
         self._pending_task_registrations: dict[str, asyncio.Event] = {}
         self._observation_replays: set[asyncio.Task[None]] = set()
         self._notification_retries: dict[str, asyncio.Task[None]] = {}
+        self._read_recoveries: dict[str, asyncio.Task[None]] = {}
+        self._version_recovery_completed: set[str] = set()
 
     async def apply_session_configuration(
         self, conversation_id: str, policy: SessionPolicy, context: RequestContext
     ) -> bool:
         """Apply trusted router configuration only at an idle boundary."""
-        store = await self._read_store(conversation_id, context)
+        store = await self._authorized_store(conversation_id, context)
         prepared = store.preparation_policy() is not None
         if policy.preparation_policy is not None and not prepared:
             return True
         if policy.configuration_version <= store.configuration_version():
             return True
         async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
-            snapshot = store.load_snapshot()
+            if policy.configuration_version <= store.configuration_version():
+                return True
+            snapshot = await asyncio.to_thread(store.load_snapshot)
             if snapshot.status == "running" or _has_active_subagents(snapshot):
                 return False
             if prepared:
@@ -551,8 +570,9 @@ class ConversationRuntime:
     async def get_preparation(
         self, conversation_id: str, context: RequestContext
     ) -> PreparationView:
-        await self._read_store(conversation_id, context)
-        owner = self._preparation_owner(conversation_id, context)
+        owner = await asyncio.to_thread(
+            self._preparation_owner, conversation_id, context
+        )
         assert self._preparations is not None
         state = await self._plan_io(self._preparations.store.get, owner)
         policy = self._store(conversation_id).preparation_policy()
@@ -562,8 +582,9 @@ class ConversationRuntime:
     async def get_project(
         self, conversation_id: str, context: RequestContext
     ) -> ProjectView | None:
-        await self._read_store(conversation_id, context)
-        owner = self._preparation_owner(conversation_id, context)
+        owner = await asyncio.to_thread(
+            self._preparation_owner, conversation_id, context
+        )
         assert self._preparations is not None
         return await self._plan_io(self._preparations.store.project, owner)
 
@@ -695,6 +716,165 @@ class ConversationRuntime:
             self.versions.call, conversation_id, request, command_id, context
         )
 
+    async def get_experiments(
+        self, conversation_id: str, context: RequestContext
+    ) -> ExperimentCatalog:
+        return await asyncio.to_thread(
+            self._experiment_catalog, conversation_id, context
+        )
+
+    async def record_training_artifacts(
+        self,
+        conversation_id: str,
+        task_id: str,
+        nodes: list[JsonObject],
+        context: RequestContext,
+    ) -> int:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        versions = self.versions
+        if versions is None:
+            return 0
+
+        def register() -> int:
+            project = versions.project(conversation_id, context, create=False)
+            if project is None:
+                return 0
+            task = next(
+                (
+                    task
+                    for task in store.load_snapshot().external_tasks
+                    if task.task_id == task_id
+                ),
+                None,
+            )
+            if (
+                task is None
+                or task.kind != "workflow_run"
+                or task.status != "succeeded"
+            ):
+                return 0
+            if (
+                context.task_origin
+                and context.task_origin.type == "subagent"
+                and (
+                    task.correlation is None
+                    or task.correlation.origin != context.task_origin
+                )
+            ):
+                return 0
+            run = next(
+                (
+                    run
+                    for run in versions.store.list_runs(project.id)
+                    if run.source.kind == "workflow" and run.source.task_id == task_id
+                ),
+                None,
+            )
+            if run is None:
+                return 0
+            return register_training_artifacts(versions, project, run, nodes, context)
+
+        count = await asyncio.to_thread(register)
+        if count:
+            await self._archive_version_runs(conversation_id, context)
+        return count
+
+    async def _reconcile_eval_deliveries(
+        self, conversation_id: str, context: RequestContext
+    ) -> bool:
+        versions = self.versions
+        storage_factory = self._evaluation_storage_factory
+        if versions is None or storage_factory is None:
+            return False
+
+        def register() -> bool:
+            store = self._store(conversation_id)
+            store.authorize(context.user_id, context.profile_id)
+            project = versions.project(conversation_id, context, create=False)
+            if project is None:
+                return False
+            completed = {
+                task.task_id
+                for task in store.load_snapshot().external_tasks
+                if task.kind == "workflow_run" and task.status == "succeeded"
+            }
+            runs = {
+                run.source.task_id: run
+                for run in versions.store.list_runs(project.id)
+                if run.source.kind == "workflow" and run.source.task_id in completed
+            }
+            return bool(runs) and register_eval_deliveries(
+                versions, project, runs, storage_factory(context), context
+            )
+
+        try:
+            return await asyncio.to_thread(register)
+        except Exception as exc:
+            logger.warning(
+                "Evaluation delivery scan pending: conversation=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            return False
+
+    async def get_experiment_metrics(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        metric: str | None = None,
+        comparison_group: str | None = None,
+    ) -> tuple[ExperimentMetric, ...]:
+        catalog = await self.get_experiments(conversation_id, context)
+        return tuple(
+            row
+            for row in experiment_metrics(catalog)
+            if (metric is None or row.metric == metric)
+            and (comparison_group is None or row.comparison_group == comparison_group)
+        )
+
+    def _experiment_catalog(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        archives: dict[str, str] | None = None,
+    ) -> ExperimentCatalog:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        business_project = None
+        if self._preparations is not None and store.preparation_policy() is not None:
+            business_project = self._preparations.store.project(
+                self._preparation_owner(conversation_id, context)
+            )
+        if (
+            business_project is not None
+            and context.x_cluster
+            and business_project.cluster
+            and context.x_cluster != business_project.cluster
+        ):
+            raise PermissionError("Project belongs to another cluster")
+        project_id = business_project.project_id if business_project else None
+        project = (
+            self.versions.project(conversation_id, context, create=False)
+            if self.versions is not None
+            else None
+        )
+        if project is None or self.versions is None:
+            return ExperimentCatalog(
+                conversation_id=conversation_id, project_id=project_id
+            )
+        return experiment_catalog(
+            project,
+            self.versions.store.list_runs(project.id),
+            self.versions.store.list_versions(project.id),
+            store.load_workflow_execution_requests(),
+            store.load_pipeline_runs(),
+            store.load_snapshot().external_tasks,
+            project_id=project_id,
+            archives=archives,
+        )
+
     async def submit_versioned_workflow(
         self,
         conversation_id: str,
@@ -780,6 +960,7 @@ class ConversationRuntime:
                 ),
                 expected_revision=request.revision,
             )
+            await self._archive_version_runs(conversation_id, context)
             raise ValueError(
                 f"submission outcome uncertain; reconcile before retrying ({detail})"
             ) from exc
@@ -819,34 +1000,96 @@ class ConversationRuntime:
 
     async def reconcile_training_evaluations(
         self, conversation_id: str, context: RequestContext | None
-    ) -> None:
-        if context is None or self._evaluation_storage_factory is None:
-            return
+    ) -> bool:
+        storage_factory = self._evaluation_storage_factory
+        if context is None or storage_factory is None:
+            return True
+        complete = True
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         completed = {
-            task.task_id
-            for task in store.load_snapshot().external_tasks
-            if task.status == "succeeded"
+            task.task_id: task.status
+            for task in (await asyncio.to_thread(store.load_snapshot)).external_tasks
+            if task.status in _TERMINAL_EXTERNAL_TASK_STATUSES
         }
-        for run in store.load_pipeline_runs().values():
-            if (
-                run.definition.get("kind") != "prediction_evaluation"
-                or run.task_id not in completed
-            ):
+        runs = await asyncio.to_thread(store.load_pipeline_runs)
+        for run in runs.values():
+            if run.task_id is None or run.task_id not in completed:
                 continue
+            succeeded = completed[run.task_id] == "succeeded"
+            inference = run.definition.get("inference")
             try:
-                await asyncio.to_thread(
-                    self.finalize_training_evaluation,
-                    conversation_id,
-                    str(run.run_id),
-                    context,
-                    self._evaluation_storage_factory(context),
-                )
+                if run.definition.get("kind") == "prediction_evaluation":
+                    if not succeeded:
+                        continue
+                    await asyncio.to_thread(
+                        self.finalize_training_evaluation,
+                        conversation_id,
+                        str(run.run_id),
+                        context,
+                        storage_factory(context),
+                    )
+                elif isinstance(inference, dict) and not run.result.get(
+                    "inference_delivery"
+                ):
+                    inference_definition = inference
+
+                    def register_inference() -> None:
+                        checkpoint = None
+                        if isinstance(
+                            identity := inference_definition.get("selection_run_id"),
+                            str,
+                        ):
+                            selection = runs.get(identity)
+                            model = (
+                                selection.result.get("model")
+                                if selection and isinstance(selection.result, dict)
+                                else None
+                            )
+                            if model:
+                                checkpoint = CheckpointArtifact.model_validate(model)
+                        if checkpoint is None and isinstance(
+                            identity := inference_definition.get(
+                                "source_checkpoint_version_id"
+                            ),
+                            str,
+                        ):
+                            versions = self.versions
+                            project = (
+                                versions.project(conversation_id, context, create=False)
+                                if versions
+                                else None
+                            )
+                            if versions is not None and project is not None:
+                                artifact = versions.store.get_version(
+                                    project.id, identity
+                                )
+                                summary = artifact.manifest.summary
+                                checkpoint = CheckpointArtifact.model_validate(
+                                    {
+                                        "step": summary["step"],
+                                        "path": artifact.manifest.storage_ref,
+                                        "kind": summary["kind"],
+                                        "base_model": summary.get("base_model"),
+                                        "complete": True,
+                                    }
+                                )
+                        if checkpoint is not None:
+                            finalize_inference(
+                                store,
+                                storage_factory(context),
+                                run,
+                                checkpoint,
+                                succeeded=succeeded,
+                            )
+
+                    await asyncio.to_thread(register_inference)
             except Exception:
+                complete = False
                 logger.exception(
                     "Training evaluation reconciliation pending for %s", run.run_id
                 )
+        return complete
 
     def finalize_training_evaluation(
         self,
@@ -904,19 +1147,19 @@ class ConversationRuntime:
         self,
         conversation_id: str,
         context: RequestContext | None = None,
-    ) -> None:
-        await self.reconcile_training_evaluations(conversation_id, context)
+    ) -> bool:
+        complete = await self.reconcile_training_evaluations(conversation_id, context)
         if self.versions is None:
-            return
+            return complete
         store = self._store(conversation_id)
         if context is not None:
             store.authorize(context.user_id, context.profile_id)
         versions = self.versions
 
-        def reconcile() -> None:
+        def reconcile() -> bool:
             project = versions.store.bound_project(conversation_id)
             if project is None:
-                return
+                return True
             requests = store.load_workflow_execution_requests()
             pipelines = store.load_pipeline_runs()
             tasks = store.load_snapshot().external_tasks
@@ -1027,17 +1270,142 @@ class ConversationRuntime:
                         )
                 if outputs:
                     versions.register_outputs(project, run, outputs, context)
-            if context is not None:
-                versions.recover(project, context)
+            return context is None or all(
+                item["state"] == "ready" for item in versions.recover(project, context)
+            )
 
         try:
-            await asyncio.to_thread(reconcile)
+            complete = await asyncio.to_thread(reconcile) and complete
         except Exception as exc:
+            complete = False
             logger.warning(
                 "Version reconciliation pending: conversation=%s error=%s",
                 conversation_id,
                 type(exc).__name__,
             )
+        if context is not None:
+            await self._reconcile_eval_deliveries(conversation_id, context)
+        return await self._archive_version_runs(conversation_id, context) and complete
+
+    async def _archive_version_runs(
+        self, conversation_id: str, context: RequestContext | None
+    ) -> bool:
+        versions = self.versions
+        if versions is None or not versions.archive_runs or context is None:
+            return True
+
+        def archive() -> bool:
+            store = self._store(conversation_id)
+            store.authorize(context.user_id, context.profile_id)
+            project = versions.project(conversation_id, context, create=False)
+            if project is None:
+                return True
+            complete = True
+            requests = store.load_workflow_execution_requests()
+            pipelines = store.load_pipeline_runs()
+            tasks = {
+                task.task_id: task for task in store.load_snapshot().external_tasks
+            }
+            archives: dict[str, str] = {}
+            for run in versions.store.list_runs(project.id):
+                request = (
+                    requests.get(run.source.source_id)
+                    if run.source.kind == "workflow"
+                    else pipelines.get(run.source.source_id)
+                )
+                if (
+                    isinstance(request, PipelineRun)
+                    and request.execution_revision != run.source.execution_revision
+                ):
+                    continue
+                task_id = run.source.task_id or (
+                    request.task_id if request is not None else None
+                )
+                task = tasks.get(task_id) if task_id else None
+                execution: JsonObject = {
+                    "task_id": task_id,
+                    "task_status": task.status if task else None,
+                    "output_dir": task.output_dir if task else None,
+                    "submission_status": (
+                        request.submission_status
+                        if isinstance(request, PipelineRun)
+                        else request.status
+                        if request is not None
+                        else None
+                    ),
+                    "result": request.result
+                    if isinstance(request, PipelineRun)
+                    else {},
+                }
+                try:
+                    result = versions.archive_run(project, run, execution, context)
+                    if result is not None:
+                        archives[run.id] = result.storage_ref
+                except Exception as exc:
+                    complete = False
+                    logger.warning(
+                        "Run archive pending: conversation=%s run=%s error=%s",
+                        conversation_id,
+                        run.id,
+                        type(exc).__name__,
+                    )
+            observed_at = time.time_ns()
+            source_sequence = store.load_snapshot().through_seq
+            catalog = self._experiment_catalog(conversation_id, context, archives)
+            for experiment in catalog.versions:
+                try:
+                    digest = fingerprint(experiment.model_dump(mode="json"))
+                    receipt = versions.snapshots.save(
+                        SnapshotSource(
+                            text=experiment.model_dump_json(),
+                            filename="experiment.json",
+                        ),
+                        experiment.directory_ref + "/" + digest,
+                        context,
+                    )
+                except Exception as exc:
+                    complete = False
+                    logger.warning(
+                        "Experiment archive pending: conversation=%s run=%s error=%s",
+                        conversation_id,
+                        experiment.experiment_id,
+                        type(exc).__name__,
+                    )
+                    continue
+                if self._experiment_index is not None:
+                    try:
+                        self._experiment_index.save(
+                            PlanOwner(
+                                user_id=context.user_id,
+                                profile_id=context.profile_id,
+                                conversation_id=conversation_id,
+                            ),
+                            experiment,
+                            archive_ref=receipt.storage_ref,
+                            manifest_digest=digest,
+                            source_sequence=source_sequence,
+                            observed_at=observed_at,
+                        )
+                    except Exception as exc:
+                        complete = False
+                        logger.warning(
+                            "Experiment index pending: conversation=%s run=%s error=%s",
+                            conversation_id,
+                            experiment.experiment_id,
+                            type(exc).__name__,
+                        )
+
+            return complete
+
+        try:
+            return await asyncio.to_thread(archive)
+        except Exception as exc:
+            logger.warning(
+                "Run archives pending: conversation=%s error=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            return False
 
     async def workflow_call(
         self,
@@ -1670,8 +2038,146 @@ class ConversationRuntime:
         conversation_id: str,
         context: RequestContext,
     ) -> ConversationSnapshot:
-        store = await self._read_store(conversation_id, context)
-        snapshot = store.load_snapshot()
+        started = time.perf_counter()
+        result = "error"
+        try:
+            store = await self._authorized_store(conversation_id, context)
+            snapshot = await self._load_saved_snapshot(conversation_id, store, context)
+            if snapshot.project:
+                if snapshot.project.cluster:
+                    context = replace(context, x_cluster=snapshot.project.cluster)
+                policy = snapshot.preparation.policy if snapshot.preparation else None
+                tools = await asyncio.to_thread(store.development_policy)
+                if policy is not None and "subagent" in (tools.tool_allowlist or ()):
+                    snapshot = project_stage_activity(snapshot, policy)
+            await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
+            self._schedule_read_recovery(conversation_id, store, context)
+            result = "ok"
+            return snapshot
+        finally:
+            self._log_timing(
+                "snapshot_ms", started, profile_id=context.profile_id, result=result
+            )
+
+    async def _load_saved_snapshot(
+        self, conversation_id: str, store: FileProductStore, context: RequestContext
+    ) -> ConversationSnapshot:
+        if conversation_id not in self._active:
+            await self._user_input.coordinate_recovery(store, conversation_id)
+        snapshot = await asyncio.to_thread(store.load_snapshot)
+        policy = await asyncio.to_thread(store.preparation_policy)
+        if policy is None or self._preparations is None:
+            return snapshot
+        owner = PlanOwner(
+            user_id=context.user_id,
+            conversation_id=conversation_id,
+            profile_id=context.profile_id,
+        )
+        preparation, project = await asyncio.gather(
+            self._plan_io(self._preparations.store.get, owner),
+            self._plan_io(self._preparations.store.project, owner),
+        )
+        return snapshot.model_copy(
+            update={
+                "preparation": PreparationView.from_state(preparation, policy),
+                "project": project,
+            }
+        )
+
+    def _schedule_read_recovery(
+        self,
+        conversation_id: str,
+        store: FileProductStore,
+        context: RequestContext,
+        *,
+        recover_execution: bool = True,
+    ) -> None:
+        if self._closing:
+            return
+        active = self._active.get(conversation_id)
+        if recover_execution and active is not None and not active.stopping:
+            active.touch()
+            if context.cookie or context.authorization:
+                active.context = replace(
+                    context, x_cluster=context.x_cluster or active.context.x_cluster
+                )
+        if conversation_id in self._read_recoveries:
+            return
+
+        async def recover() -> None:
+            started = time.perf_counter()
+            result = "error"
+            try:
+                snapshot = await asyncio.to_thread(store.load_snapshot)
+                recovery_context = context
+                if not context.x_cluster:
+                    recovery_context = replace(
+                        context, x_cluster=await asyncio.to_thread(store.load_x_cluster)
+                    )
+                active = self._active.get(conversation_id)
+                if recover_execution and self._has_pending_external_work(
+                    snapshot, context
+                ):
+                    try:
+                        if active is None:
+                            await self._ensure_active(conversation_id, recovery_context)
+                        elif (
+                            not active.stopping
+                            and active.ready.is_set()
+                            and any(
+                                task.resume_pending
+                                or task.kind == "historical_experience"
+                                for task in snapshot.external_tasks
+                            )
+                        ):
+                            await self._resume_pending_external_tasks(active, store)
+                    except Exception as exc:
+                        logger.warning(
+                            "Execution recovery failed: error=%s", type(exc).__name__
+                        )
+                if recover_execution:
+                    try:
+                        await self._recover_operation_activity(
+                            conversation_id, store, snapshot, context
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Activity recovery failed: error=%s", type(exc).__name__
+                        )
+                if (
+                    (
+                        self.versions is not None
+                        or self._evaluation_storage_factory is not None
+                    )
+                    and (context.cookie or context.authorization)
+                    and conversation_id not in self._version_recovery_completed
+                ):
+                    if not await self.reconcile_versions(
+                        conversation_id, recovery_context
+                    ):
+                        return
+                    self._version_recovery_completed.add(conversation_id)
+                result = "ok"
+            except Exception as exc:
+                logger.warning("Read recovery failed: error=%s", type(exc).__name__)
+            finally:
+                self._read_recoveries.pop(conversation_id, None)
+                self._log_timing(
+                    "read_recovery_ms",
+                    started,
+                    profile_id=context.profile_id,
+                    result=result,
+                )
+
+        self._read_recoveries[conversation_id] = asyncio.create_task(recover())
+
+    async def _recover_operation_activity(
+        self,
+        conversation_id: str,
+        store: FileProductStore,
+        snapshot: ConversationSnapshot,
+        context: RequestContext,
+    ) -> None:
         missing_activity = tuple(
             item.item_id
             for item in snapshot.timeline
@@ -1680,64 +2186,39 @@ class ConversationRuntime:
             and item.status != "running"
             and item.activity is None
         )[-32:]
-        adapter = self._adapter(store.harness_id())
-        if missing_activity and isinstance(adapter, OperationActivityReader):
-            try:
-                activities = await adapter.read_operation_activities(
-                    SessionHandle(
-                        session_id=conversation_id,
-                        adapter_session_ref=conversation_id,
-                        harness_id=store.harness_id(),
-                        capabilities=snapshot.capabilities,
-                    ),
-                    missing_activity,
-                    context,
-                )
-                for operation_id, activity in activities.items():
-                    if operation_id not in missing_activity:
-                        continue
-                    # Existing operation identity/state remains authoritative.
-                    event, _ = store.append(
-                        ProductEvent(
-                            conversation_id=conversation_id,
-                            event_id="activity:"
-                            + fingerprint(
-                                {
-                                    "operation_id": operation_id,
-                                    "activity": activity.model_dump(mode="json"),
-                                }
-                            ),
-                            type="operation.progress",
-                            payload={
-                                "operation_id": operation_id,
-                                "activity": activity.model_dump(mode="json"),
-                            },
-                        )
-                    )
-                    self._publish(event)
-                snapshot = store.load_snapshot()
-            except Exception:
-                logger.warning(
-                    "Retained activity unavailable for %s",
-                    conversation_id,
-                    exc_info=True,
-                )
-        if store.preparation_policy() is not None:
-            preparation = await self.get_preparation(conversation_id, context)
-            project = await self.get_project(conversation_id, context)
-            if project and (
-                store.access_policy()["tool_allowlist"]
-                != store.development_policy().tool_allowlist
-            ):
-                await self._activate_development_policy(conversation_id, store, context)
-            snapshot = snapshot.model_copy(
-                update={"preparation": preparation, "project": project}
+        if not missing_activity:
+            return
+        harness_id = await asyncio.to_thread(store.harness_id)
+        adapter = self._adapter(harness_id)
+        if not isinstance(adapter, OperationActivityReader):
+            return
+        activities = await adapter.read_operation_activities(
+            SessionHandle(
+                session_id=conversation_id,
+                adapter_session_ref=conversation_id,
+                harness_id=harness_id,
+                capabilities=snapshot.capabilities,
+            ),
+            missing_activity,
+            context,
+        )
+        for operation_id, activity in activities.items():
+            if operation_id not in missing_activity:
+                continue
+            payload = {
+                "operation_id": operation_id,
+                "activity": activity.model_dump(mode="json"),
+            }
+            event, _ = await asyncio.to_thread(
+                store.append,
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    event_id="activity:" + fingerprint(payload),
+                    type="operation.progress",
+                    payload=payload,
+                ),
             )
-        if snapshot.project and store.permits_tool("subagent"):
-            policy = store.preparation_policy()
-            if policy is not None:
-                snapshot = project_stage_activity(snapshot, policy)
-        return snapshot
+            self._publish(event)
 
     async def read_workspace_text(
         self,
@@ -1788,9 +2269,20 @@ class ConversationRuntime:
         command: ProductCommand,
         context: RequestContext,
     ) -> CommandReceipt:
-        store = await self._read_store(conversation_id, context)
+        store = await self._authorized_store(conversation_id, context)
         store.require_command(command.type)
+        if store.preparation_policy() is not None:
+            current = store.access_policy()
+            development = store.development_policy()
+            if (
+                current["tool_allowlist"] != development.tool_allowlist
+                or current["skill_allowlist"] != development.skill_allowlist
+            ) and await self.get_project(conversation_id, context) is not None:
+                await self._activate_development_policy(conversation_id, store, context)
         if isinstance(command, CreateProjectCommand):
+            if conversation_id not in self._active:
+                await self._user_input.coordinate_recovery(store, conversation_id)
+            await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
             return await self._create_project(conversation_id, command, context)
         store = await self._ensure_active(conversation_id, context)
         store.save_x_cluster(context.x_cluster)
@@ -2190,6 +2682,7 @@ class ConversationRuntime:
             store.save_workflow_execution_request(
                 uncertain, expected_revision=request.revision
             )
+            await self._archive_version_runs(conversation_id, context)
             message = "提交结果未确认，请先在平台核对是否已产生任务，避免重复运行。"
             self._emit_workflow_execution_message(store, request, "uncertain", message)
             return {
@@ -2638,8 +3131,11 @@ class ConversationRuntime:
         self, conversation_id: str, task_id: str | None = None
     ) -> None:
         store = self._store(conversation_id)
-        known = {task.task_id: task for task in store.load_snapshot().external_tasks}
-        for event in store.replay():
+        snapshot = await asyncio.to_thread(store.load_snapshot)
+        known = {task.task_id: task for task in snapshot.external_tasks}
+        if not any(task.correlation is not None for task in known.values()):
+            return
+        for event in await asyncio.to_thread(store.replay):
             if event.type != "external_task.observed":
                 continue
             identity = str(event.payload["task_id"])
@@ -2731,18 +3227,24 @@ class ConversationRuntime:
             registration.set()
         return persisted
 
+    async def authorize_event_stream(
+        self, conversation_id: str, context: RequestContext
+    ) -> None:
+        await self._authorized_store(conversation_id, context)
+
     async def stream_events(
         self,
         conversation_id: str,
         after_seq: int,
         context: RequestContext,
     ) -> AsyncGenerator[ProductEvent]:
-        store = await self._read_store(conversation_id, context)
+        store = await self._authorized_store(conversation_id, context)
         queue: asyncio.Queue[ProductEvent] = asyncio.Queue(_SUBSCRIBER_QUEUE_MAX)
         self._subscribers.setdefault(conversation_id, set()).add(queue)
         cursor = after_seq
         try:
-            for event in store.replay(after_seq):
+            self._schedule_read_recovery(conversation_id, store, context)
+            for event in await asyncio.to_thread(store.replay, after_seq):
                 cursor = event.seq
                 yield event
             while True:
@@ -2771,6 +3273,11 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        recoveries = tuple(self._read_recoveries.values())
+        for task in recoveries:
+            task.cancel()
+        await asyncio.gather(*recoveries, return_exceptions=True)
+        self._read_recoveries.clear()
         if self._execution_event_task is not None:
             self._execution_event_task.cancel()
             await asyncio.gather(self._execution_event_task, return_exceptions=True)
@@ -2812,12 +3319,20 @@ class ConversationRuntime:
                 logger.exception("Execution observation close failed")
 
     async def list_snapshots(
-        self, context: RequestContext
+        self,
+        context: RequestContext,
+        *,
+        conversation_ids: tuple[str, ...] | None = None,
     ) -> tuple[ConversationSnapshot, ...]:
         snapshots: list[ConversationSnapshot] = []
         if not self.conversation_root.is_dir():
             return ()
-        for conversation_dir in self.conversation_root.iterdir():
+        directories = (
+            (self._store(identity).conversation_dir for identity in conversation_ids)
+            if conversation_ids is not None
+            else self.conversation_root.iterdir()
+        )
+        for conversation_dir in directories:
             if not conversation_dir.is_dir():
                 continue
             store = FileProductStore(conversation_dir)
@@ -2826,44 +3341,17 @@ class ConversationRuntime:
             try:
                 # Authorize before coordinating writes so another user's conversation
                 # is neither listed nor modified.
-                store.authorize(context.user_id, context.profile_id)
+                await asyncio.to_thread(
+                    store.authorize, context.user_id, context.profile_id
+                )
             except (PermissionError, OSError, ProductStoreError):
                 continue
             try:
-                if conversation_dir.name not in self._active:
-                    # Use the same recovery logic as the detail endpoint: mark inputs
-                    # from dead runs interrupted, preserve live pending inputs, and
-                    # update product storage without starting a harness session.
-                    await self._user_input.coordinate_recovery(
-                        store, conversation_dir.name
+                snapshots.append(
+                    await self._load_saved_snapshot(
+                        conversation_dir.name, store, context
                     )
-                snapshot = store.load_snapshot()
-                if (
-                    store.preparation_policy() is not None
-                    and self._preparations is not None
-                ):
-                    owner = PlanOwner(
-                        user_id=context.user_id,
-                        conversation_id=conversation_dir.name,
-                        profile_id=context.profile_id,
-                    )
-                    preparation = await self._plan_io(
-                        self._preparations.store.get, owner
-                    )
-                    policy = store.preparation_policy()
-                    assert policy is not None
-                    project = await self._plan_io(
-                        self._preparations.store.project, owner
-                    )
-                    snapshot = snapshot.model_copy(
-                        update={
-                            "preparation": PreparationView.from_state(
-                                preparation, policy
-                            ),
-                            "project": project,
-                        }
-                    )
-                snapshots.append(snapshot)
+                )
             except Exception:
                 # A single unreadable conversation must not take down the
                 # whole listing: callers only ever see the healthy subset.
@@ -2881,6 +3369,38 @@ class ConversationRuntime:
         )
         return tuple(snapshots)
 
+    async def list_summaries(
+        self,
+        context: RequestContext,
+        *,
+        conversation_ids: tuple[str, ...] | None = None,
+    ) -> tuple[ConversationSummary, ...]:
+        started = time.perf_counter()
+        result = "error"
+        try:
+            summaries = tuple(
+                ConversationSummary.from_snapshot(snapshot)
+                for snapshot in await self.list_snapshots(
+                    context, conversation_ids=conversation_ids
+                )
+            )
+            result = "ok"
+            return summaries
+        finally:
+            self._log_timing(
+                "conversation_summaries_ms",
+                started,
+                profile_id=context.profile_id,
+                result=result,
+            )
+
+    async def _authorized_store(
+        self, conversation_id: str, context: RequestContext
+    ) -> FileProductStore:
+        store = self._store(conversation_id)
+        await asyncio.to_thread(store.authorize, context.user_id, context.profile_id)
+        return store
+
     async def _read_store(
         self,
         conversation_id: str,
@@ -2896,7 +3416,7 @@ class ConversationRuntime:
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         if conversation_id in self._active or self._has_pending_external_work(
-            store, context
+            await asyncio.to_thread(store.load_snapshot), context
         ):
             store = await self._ensure_active(conversation_id, context)
         else:
@@ -2907,17 +3427,13 @@ class ConversationRuntime:
         return store
 
     def _has_pending_external_work(
-        self, store: FileProductStore, context: RequestContext
+        self, snapshot: ConversationSnapshot, context: RequestContext
     ) -> bool:
-        try:
-            snapshot = store.load_snapshot()
-        except (OSError, ProductStoreError):
-            return False
         can_poll = self._external_task_query is not None and bool(
             context.cookie or context.authorization
         )
         return any(
-            task.resume_pending
+            (task.resume_pending and not snapshot.automatic_turns_suspended)
             or (can_poll and _pollable_external_task(task))
             or (
                 task.kind == "historical_experience"
@@ -3076,7 +3592,12 @@ class ConversationRuntime:
     ) -> None:
         self._schedule_notification_retry(active.handle.session_id)
         await self._replay_external_observations(active.handle.session_id)
-        await self.reconcile_versions(active.handle.session_id, active.context)
+        if (
+            active.context.cookie or active.context.authorization
+        ) and active.handle.session_id not in self._version_recovery_completed:
+            self._schedule_read_recovery(
+                active.handle.session_id, store, active.context, recover_execution=False
+            )
         async with self._notification_resume_lock:
             await self._repair_parked_await_bindings(active.handle.session_id)
             await self._sync_workflow_task_context(active, store)
@@ -3353,6 +3874,17 @@ class ConversationRuntime:
                             handle.session_id,
                         )
                 self._publish(persisted)
+                if (
+                    product_event.type == "operation.completed"
+                    and product_event.payload.get("category") == "subagent"
+                    and (active := self._active.get(handle.session_id)) is not None
+                ):
+                    if await self._reconcile_eval_deliveries(
+                        handle.session_id, active.context
+                    ):
+                        await self._archive_version_runs(
+                            handle.session_id, active.context
+                        )
                 if product_event.type == "external_task.submitted":
                     self._schedule_observation_replay(
                         handle.session_id, str(product_event.payload["task_id"])
@@ -3797,7 +4329,7 @@ class ConversationRuntime:
     def _log_timing(
         metric: str,
         started_at: float,
-        **dimensions: str,
+        **dimensions: str | None,
     ) -> None:
         elapsed_ms = (time.perf_counter() - started_at) * 1000
         suffix = " ".join(f"{key}={value}" for key, value in dimensions.items())

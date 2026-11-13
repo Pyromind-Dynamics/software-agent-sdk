@@ -349,15 +349,15 @@ class UserInputCoordinator:
         """
         if conversation_id in self._coordinated:
             return
-        snapshot = store.load_snapshot()
-        receipts = store.load_input_command_receipts()
+        snapshot = await asyncio.to_thread(store.load_snapshot)
+        receipts = await asyncio.to_thread(store.load_input_command_receipts)
         if not snapshot.pending_inputs and not receipts:
             self._coordinated.add(conversation_id)
             self._attach_records.setdefault(conversation_id, ())
             return
         # Persist suspension before any resolution so recovery itself cannot expose
         # an interrupted-but-unsuspended window.
-        _resolved, history = _scan_input_history(store)
+        _resolved, history = await asyncio.to_thread(_scan_input_history, store)
         if snapshot.foreground_inputs or _has_unconsumed_answers(history, snapshot):
             await self._suspend(store, conversation_id, "input_recovery")
         interrupted_requests: dict[str, str | None] = {}
@@ -375,8 +375,12 @@ class UserInputCoordinator:
             self._publish(persisted)
             if pending.task_run_id is None:
                 interrupted_requests[pending.request_id] = pending.operation_id
-        resolved_commands, requests = _scan_input_history(store)
-        self._reconcile_receipts(store, receipts, resolved_commands)
+        resolved_commands, requests = await asyncio.to_thread(
+            _scan_input_history, store
+        )
+        await asyncio.to_thread(
+            self._reconcile_receipts, store, receipts, resolved_commands
+        )
         records = [
             InterruptedInputRecord(
                 request_id=request_id,

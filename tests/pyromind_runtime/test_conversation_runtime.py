@@ -228,7 +228,16 @@ async def test_cached_session_reattaches_to_survive_harness_eviction(
     await runtime.get_snapshot("conversation-evicted", context)
     await runtime.get_snapshot("conversation-evicted", context)
 
-    assert adapter.attached == ["conversation-evicted", "conversation-evicted"]
+    assert adapter.attached == []
+    await runtime.submit_command(
+        "conversation-evicted",
+        UserMessageCommand(
+            command_id="after-eviction", content=(TextContent(text="continue"),)
+        ),
+        context,
+    )
+    assert adapter.attached
+    assert all(session == "conversation-evicted" for session in adapter.attached)
     await runtime.close()
 
 
@@ -439,7 +448,9 @@ async def test_runtime_resumes_callback_through_owning_adapter(tmp_path) -> None
         "callback-conversation", RequestContext(user_id="42")
     )
 
-    assert snapshot.external_tasks[0].resume_pending is False
+    assert snapshot.external_tasks[0].resume_pending is True
+    await asyncio.wait_for(runtime._read_recoveries["callback-conversation"], timeout=3)
+    assert not store.load_snapshot().external_tasks[0].resume_pending
     assert adapter.external_task_notifications[0][1].status == "succeeded"
     await runtime.close()
 
@@ -990,6 +1001,7 @@ async def test_parked_history_run_survives_without_a_live_conversation(
     assert not adapter.external_task_notifications
     assert store.load_snapshot().external_tasks[0].resume_pending
     await runtime.get_snapshot("parked-idle", RequestContext(user_id="42"))
+    await asyncio.wait_for(runtime._read_recoveries["parked-idle"], timeout=3)
     notice = adapter.external_task_notifications[0][1]
     assert notice.trigger_turn is True
     assert "review.out" in notice.hidden_text
@@ -1612,10 +1624,12 @@ async def test_history_result_recovers_once_without_reexecuting(
 
     monkeypatch.setattr(adapter, "notify_external_task", flaky_notify)
     context = RequestContext(user_id="42")
-    with pytest.raises(RuntimeError, match="notification unavailable"):
-        await runtime.get_snapshot("history", context)
+    snapshot = await runtime.get_snapshot("history", context)
+    assert snapshot.external_tasks[0].resume_pending
+    await asyncio.wait_for(runtime._read_recoveries["history"], timeout=3)
     assert store.load_snapshot().external_tasks[0].resume_pending
     await runtime.get_snapshot("history", context)
+    await asyncio.wait_for(runtime._read_recoveries["history"], timeout=3)
     await runtime.get_snapshot("history", context)
     assert len(adapter.external_task_notifications) == 1
     notice = adapter.external_task_notifications[0][1]

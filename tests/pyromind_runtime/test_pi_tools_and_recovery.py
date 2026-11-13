@@ -2571,3 +2571,46 @@ async def test_terminal_permission_recovery_survives_missing_parent_run(
     assert event.run_id == "previous"
     assert event.payload == {"permission_id": "recover-me", "decision": "deny"}
     assert files.load_pending_permission() is None
+
+
+@pytest.mark.parametrize("register_fails", [False, True])
+async def test_training_analysis_artifact_hook_is_best_effort(tmp_path, register_fails):
+    from openhands.tools.training_analysis import (
+        TrainingAnalysisAction,
+        TrainingAnalysisObservation,
+    )
+
+    host = _business_tool_host()
+    nodes = [{"training_node_id": "training"}]
+
+    # The adapter must consume the structured observation, before output clipping.
+    class Tool:
+        action_type = TrainingAnalysisAction
+        meta = None
+        executor = None
+
+        def __call__(self, action, _facade):
+            return TrainingAnalysisObservation.from_text(
+                "training inspection",
+                operation=action.operation,
+                result={"task_id": action.task_id, "training_nodes": nodes},
+            )
+
+    host._factories["training_analysis"] = lambda _: Tool()
+
+    async def register(scope, task_id, result, _context):
+        assert (scope, task_id, result) == ("c", "10348", nodes)
+        if register_fails:
+            raise OSError("storage unavailable")
+        return 1
+
+    host.training_artifact_hook = register
+    result = await host.execute(
+        "training_analysis",
+        {"operation": "artifacts", "task_id": "10348"},
+        _tool_context(tmp_path, "c"),
+    )
+    assert not result["is_error"]
+    assert result["details"]["lineage"]["status"] == (
+        "pending" if register_fails else "registered"
+    )

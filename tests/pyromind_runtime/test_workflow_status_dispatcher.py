@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
@@ -241,6 +242,7 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
     assert adapter.external_task_notifications == []
 
     await runtime.get_snapshot("conversation-2", RequestContext(user_id="42"))
+    await asyncio.wait_for(runtime._read_recoveries["conversation-2"], 3)
 
     assert store.load_snapshot().external_tasks[0].resume_pending is False
     assert adapter.external_task_notifications[0][0] == "conversation-2"

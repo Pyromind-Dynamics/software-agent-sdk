@@ -90,6 +90,11 @@ class InferenceOptions(BaseModel):
             "namespace), or a repository name for download."
         ),
     )
+    source_checkpoint_version_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Version ID of the checkpoint used as model_path.",
+    )
     selection_run_id: str | None = Field(
         default=None,
         description="Validation selection batch authorizing this independent test run.",
@@ -575,6 +580,8 @@ class InferencePipelineHandler:
                     "report_spec_path",
                 }
             )
+            if inference["source_checkpoint_version_id"] is None:
+                inference.pop("source_checkpoint_version_id")
             inference["model_path"] = model_reference(
                 options.model_path, evaluation_options.model_source
             )

@@ -54,6 +54,8 @@ def assert_compact_schema(engine):
     assert set(inspector.get_table_names()) == {
         "experiment_projects",
         "experiment_preparations",
+        "experiment_version_index",
+        "experiment_metric_index",
         "experiment_plan_schema_version",
     }
     assert not set(RETIRED.RETIRED_COLUMNS) & {
@@ -158,3 +160,81 @@ def test_retirement_preserves_projects_preparation_and_supports_retry(
         with Operations.context(context):
             RETIRED.upgrade()
     assert_compact_schema(engine)
+
+
+def test_archive_index_keeps_zero_metrics_and_rejects_stale_replay(migration_database):
+    from pyromind_runtime.domain.experiments import (
+        ExperimentEvaluation,
+        ExperimentExecution,
+        ExperimentVersion,
+    )
+    from pyromind_runtime.domain.training_evaluation import StepEvaluation
+    from pyromind_runtime.domain.versions import fingerprint
+    from pyromind_runtime.infrastructure.sql_experiment_index import (
+        SQLExperimentIndex,
+        experiment_metric_rows,
+        experiment_versions,
+    )
+
+    engine, config = migration_database
+    command.upgrade(config, "head")
+    index = SQLExperimentIndex(engine)
+    owner = PlanOwner(user_id="42", profile_id="a", conversation_id="chat")
+    experiment = ExperimentVersion(
+        experiment_id="r1",
+        version="v1",
+        project_id="project",
+        artifact_project_id="p1",
+        conversation_id="chat",
+        iteration_id="i1",
+        created_at=1,
+        directory_ref="/experiment/v1",
+        execution=ExperimentExecution(run_id="r1", status="succeeded"),
+        evaluations=(
+            ExperimentEvaluation(
+                run_id="eval",
+                operation="score",
+                task_id="10361",
+                status="succeeded",
+                steps=(
+                    StepEvaluation(
+                        step=12,
+                        run_id="eval:12",
+                        output_dir="/eval",
+                        eligible=True,
+                        comparison_group="protocol",
+                        metrics={"accuracy": 0.0},
+                    ),
+                ),
+            ),
+        ),
+    )
+    for seq, observed, row in (
+        (2, 20, experiment),
+        (2, 21, experiment),
+        (1, 30, experiment.model_copy(update={"evaluations": ()})),
+        (2, 19, experiment.model_copy(update={"evaluations": ()})),
+    ):
+        index.save(
+            owner,
+            row,
+            archive_ref="/archive/experiment.json",
+            manifest_digest=fingerprint(row.model_dump(mode="json")),
+            source_sequence=seq,
+            observed_at=observed,
+        )
+    with engine.connect() as conn:
+        version = conn.execute(sa.select(experiment_versions)).one()
+        metric = conn.execute(sa.select(experiment_metric_rows)).one()
+        assert version.owner_key == owner_key(owner)
+        assert version.observed_at == 21
+        assert version.document["evaluations"][0]["run_id"] == "eval"
+        assert (metric.index_id, metric.task_id, metric.metric, metric.value) == (
+            version.index_id,
+            "10361",
+            "accuracy",
+            0.0,
+        )
+    command.downgrade(config, "0008_retire_experiment_state")
+    assert "experiment_projects" in sa.inspect(engine).get_table_names()
+    assert "experiment_version_index" not in sa.inspect(engine).get_table_names()

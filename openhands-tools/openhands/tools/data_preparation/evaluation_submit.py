@@ -63,6 +63,7 @@ Choose operation and pass its fields directly at the top level:
 - inference: model_path, dataset_config_path, evaluation_config_path. Generates
   optional model preparation -> VLLMInference -> CPU scoring. Set gpu_product and
   gpu_count for the chosen model. Model source is in evaluation_config JSON.
+  source_checkpoint_version_id binds the registered checkpoint used as model_path.
   selection_run_id binds an independent test to its validation-selected checkpoint.
 - score: source_manifest_path, scoring_spec_path, scoring_script_path. Scores
   existing predictions on CPU; does not run a model or initialize annotations.
@@ -113,6 +114,11 @@ class DfSubmitEvaluationAction(Action):
         default=None,
         min_length=1,
         description="inference: workspace rubric, generation and model_source JSON.",
+    )
+    source_checkpoint_version_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Version ID of the checkpoint used as model_path.",
     )
     selection_run_id: str | None = Field(
         default=None,

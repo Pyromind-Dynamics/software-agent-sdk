@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -312,6 +312,14 @@ class PiAdapter:
             resource_roots.append((f".agents/skills/{root.name}", root))
         if self._knowledge_root is not None:
             resource_roots.append(("knowledge", self._knowledge_root))
+        from pyromind_runtime.domain import eval_delivery
+
+        resource_roots.append(
+            (
+                ".agents/skills/inference-evaluation/scripts/validate_eval_result.py",
+                Path(eval_delivery.__file__),
+            )
+        )
         self._sandbox = SandboxExecutionManager(resource_roots=resource_roots)
 
     def execution_request(
@@ -350,6 +358,11 @@ class PiAdapter:
     ) -> None:
         self._business_tools.version_call = callback
         self._business_tools.execution_call = execution
+
+    def set_training_artifact_hook(
+        self, callback: Callable[..., Awaitable[int]]
+    ) -> None:
+        self._business_tools.training_artifact_hook = callback
 
     def set_preparation_handler(self, callback: Any, revision: Any) -> None:
         self._preparation_call = callback

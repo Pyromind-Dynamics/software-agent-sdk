@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -391,10 +392,13 @@ async def test_read_recovers_activity_once_without_attaching_or_starting_work(
             await runtime.get_snapshot("chat", denied)
     assert adapter.reads == 0
     first = await runtime.get_snapshot("chat", context)
+    assert first.timeline[0].kind == "operation" and first.timeline[0].activity is None
+    await asyncio.wait_for(runtime._read_recoveries["chat"], timeout=3)
     second = await runtime.get_snapshot("chat", context)
-    assert first == second
+    assert second.through_seq == first.through_seq + 1
     assert adapter.reads == 1 and adapter.attached == []
     assert len(first.timeline) == 1
-    operation = first.timeline[0]
+    operation = second.timeline[0]
     assert isinstance(operation, TimelineOperation)
     assert operation.status == "completed" and operation.activity is not None
+    await runtime.close()

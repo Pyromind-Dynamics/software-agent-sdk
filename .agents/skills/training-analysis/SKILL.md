@@ -18,6 +18,8 @@ checkpoint-n 与 eval_step_n.jsonl；不依赖 W&B。多个训练节点时用
 `training_node_id` 明确目标。返回文件指纹、样例、字段和模型完整性；不能将
 不同 step 的 eval 与 checkpoint 配对。路径未解析或文件不可访问时按缺口处理。
 
+训练任务交付时保留工具返回的 `task_id`、`training_node_id`、checkpoint 和逐步预测摘要。成功返回后 Hook 用已核验的 step 登记血缘，工具回执 `lineage.status=registered` 表示完成。若返回 `pending`，可用同一任务 ID 重新发现补写，并在交付中说明仍缺的证据。
+
 已有 eval 交给 [inference-evaluation](../inference-evaluation/SKILL.md) 的
 已有预测评分入口：读取真实样例后生成一份评分脚本，计算所有 step，并复用基线预测。
 结合实际训练 step 的 W&B 序列解释选择；log_step 不等于 checkpoint step，未记录值不等于 NaN。

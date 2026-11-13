@@ -37,9 +37,74 @@ def snapshot_result(version: ArtifactVersion) -> SnapshotResult:
 
 
 class Versions:
-    def __init__(self, store: VersionStore, snapshots: ArtifactSnapshotPort) -> None:
+    def __init__(
+        self,
+        store: VersionStore,
+        snapshots: ArtifactSnapshotPort,
+        *,
+        archive_runs: bool = False,
+    ) -> None:
         self.store = store
         self.snapshots = snapshots
+        self.archive_runs = archive_runs
+
+    def archive_run(
+        self,
+        project: VersionProject,
+        run: VersionRun,
+        execution: JsonObject,
+        context: RequestContext,
+    ) -> SnapshotResult | None:
+        """Export an immutable ledger view without registering new versions."""
+        if not self.archive_runs:
+            return None
+        if project.owner_user_id != context.user_id or run.project_id != project.id:
+            raise PermissionError("run archive belongs to another project or user")
+        check_persistable(execution)
+        versions = {
+            version.id: version for version in self.store.list_versions(project.id)
+        }
+        identities = set(run.spec.inputs.values()) | {
+            version.id
+            for version in versions.values()
+            if version.producer_run_id == run.id
+        }
+        pending = list(identities)
+        while pending:
+            version = versions[pending.pop()]
+            for parent in version.manifest.parents:
+                if parent.version_id not in identities:
+                    identities.add(parent.version_id)
+                    pending.append(parent.version_id)
+        artifacts = [versions[identity] for identity in sorted(identities)]
+        payload = {
+            "schema_version": 1,
+            "artifact_project_id": project.id,
+            "conversation_id": project.conversation_id,
+            "profile_id": context.profile_id,
+            "input_snapshot_guarantee": "per_artifact_state_only",
+            "run": run.model_dump(mode="json"),
+            "execution": execution,
+            "artifacts": [self.describe(version) for version in artifacts],
+            "documents": {
+                version.id: {
+                    "filename": version.manifest.source.filename,
+                    "text": self.snapshots.read_text(snapshot_result(version), context),
+                }
+                for version in artifacts
+                if version.state == "ready"
+                and version.kind in {"code", "workflow", "config"}
+            },
+        }
+        target = (
+            f"/.pyromind-agent/{project.conversation_id}/lineage/"
+            f"{run.id}/{fingerprint(payload)}"
+        )
+        return self.snapshots.save(
+            SnapshotSource(text=canonical(payload), filename="lineage.json"),
+            target,
+            context,
+        )
 
     def project(
         self, conversation_id: str, context: RequestContext, *, create: bool = True

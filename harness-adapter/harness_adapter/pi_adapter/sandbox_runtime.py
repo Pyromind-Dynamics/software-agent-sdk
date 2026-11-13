@@ -1225,6 +1225,9 @@ class SandboxExecutionManager:
         files: list[tuple[str, str]] = []
         for destination_root, source_root in self._resource_roots:
             source = os.fspath(source_root)
+            if os.path.isfile(source) and not os.path.islink(source):
+                files.append((f"{workspace_path}/{destination_root}", source))
+                continue
             if not os.path.isdir(source):
                 continue
             for directory, directories, names in os.walk(source):

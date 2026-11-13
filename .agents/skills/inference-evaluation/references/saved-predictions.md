@@ -125,3 +125,32 @@ LoRA 写 `{"type":"checkpoint","kind":"lora","base_model":"/models/实际基模"
 清单 datasets.test.path，model_path 与 model_source 精确对应选中 checkpoint。
 测试集文件必须与 train/validation 不同且指纹不同；应由数据来源确认独立划分，路径和指纹
 检查不能证明无近重复或业务泄漏。test 不参与选模，不把 test 的表现用于重新挑选 checkpoint。
+
+## 本地 CPU 评分交付
+
+任务允许在沙箱本地复用训练预测评分时，让评分脚本直接写 JSON。完成报告后，先在任务目录写临时文件并校验，再用同一挂载内的 rename 发布到当前会话 `public_data/eval_result-<唯一评分批次标识>.json`，同一次评分重试沿用标识，不同评分批次分别写。报告可保留在子 Agent 工作目录下。
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "<来源训练任务 ID>",
+  "training_node_id": "<实际训练节点 ID>",
+  "dataset_role": "validation",
+  "dataset_sha256": "<验证集原始字节 SHA256>",
+  "scoring_sha256": "<评分脚本、判分配置和实际生成参数的稳定指纹>",
+  "report_path": "<当前会话 public_data 内的绝对 Storage 路径>",
+  "steps": [
+    {
+      "step": 3,
+      "checkpoint_path": "<已登记的 checkpoint Storage 路径>",
+      "prediction_sha256": "<该步 eval_step JSONL 原始字节 SHA256>",
+      "metrics": {"accuracy": 0.0}
+    }
+  ],
+  "selected_step": 3
+}
+```
+
+指标填实际有限数值。未选模时填 `null`，test 和 train 只能填 `null`。同一文件记录同一训练节点、数据集和评分口径。报告可附基线及判断依据，交付 JSON 仅记录可对应到训练 checkpoint 的评分。
+
+发布前执行 `python3 .agents/skills/inference-evaluation/scripts/validate_eval_result.py <文件>`。修复报出的字段错误后再发布。Runtime 复验 task、node、step 和预测摘要，验收通过后归入训练所在的飞轮轮次。

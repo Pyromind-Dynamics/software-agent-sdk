@@ -150,6 +150,31 @@ def test_runtime_has_no_server_or_harness_dependencies() -> None:
     assert not any(name.startswith(forbidden) for name in imports)
 
 
+def test_conversation_read_routes_use_shared_runtime() -> None:
+    source = (
+        ROOT / "pyromind-agent-server/pyromind_agent_server/api/router.py"
+    ).read_text()
+    tree = ast.parse(source)
+    for route_name, runtime_method in (
+        ("get_snapshot", "get_snapshot"),
+        ("list_summaries", "list_summaries"),
+        ("stream_events", "authorize_event_stream"),
+    ):
+        route = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == route_name
+        )
+        calls = {
+            node.func.attr
+            for node in ast.walk(route)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert runtime_method in calls
+        if route_name == "stream_events":
+            assert "get_snapshot" not in calls
+
+
 def test_adapter_does_not_depend_on_pyromind_server() -> None:
     imports = _imports(ROOT / "harness-adapter" / "harness_adapter")
     assert not any(name.startswith("pyromind_agent_server") for name in imports)
@@ -609,6 +634,7 @@ def test_shared_execution_rules_do_not_dispatch_on_agent_or_role_names():
     names = {"echomind", "pyromind", "avi", "pcb", "init", "dataset", "train", "eval"}
     for filename in (
         "application/conversation_runtime.py",
+        "application/experiments.py",
         "application/snapshot_projector.py",
         "infrastructure/sql_preparation.py",
         "infrastructure/file_product_store.py",

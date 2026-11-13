@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 pyromind-agent-server = "pyromind_agent_server.__main__:main"
+pyromind-lineage = "pyromind_agent_server.lineage:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

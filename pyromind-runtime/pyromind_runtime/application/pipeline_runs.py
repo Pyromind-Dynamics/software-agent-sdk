@@ -10,6 +10,7 @@ from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
     RunSource,
@@ -150,6 +151,10 @@ class PipelineRuns:
                 project, input_definition, inputs, self._context, key
             )
         )
+        if isinstance(
+            checkpoint_id := original_inference.get("source_checkpoint_version_id"), str
+        ):
+            inputs["source_checkpoint"] = checkpoint_id
         if selected_checkpoint:
             effective_definition["evaluation_config"] = evaluation
         effective_inference = effective_definition.get("inference", {})
@@ -316,6 +321,69 @@ class PipelineRuns:
         definition = final_test_definition(
             self._store, self.conversation_id, definition
         )
+        inference = definition.get("inference") or {}
+        checkpoint_id = inference.get("source_checkpoint_version_id")
+        source = (definition.get("evaluation_config") or {}).get("model_source", {})
+        if (
+            checkpoint_id is None
+            and resume_run_id is None
+            and source.get("type") == "checkpoint"
+            and not inference.get("selection_run_id")
+            and self._versions is not None
+            and self._context is not None
+        ):
+            project = self._versions.project(
+                self.conversation_id, self._context, create=False
+            )
+            if project is not None:
+                path = to_storage_api_path(inference["model_path"])
+                matches = [
+                    artifact
+                    for artifact in self._versions.store.list_versions(project.id)
+                    if artifact.registration_key.startswith("training-artifact:")
+                    and artifact.state in {"ready", "reference_only"}
+                    and artifact.manifest.storage_ref == path
+                ]
+                if len(matches) == 1:
+                    checkpoint_id = matches[0].id
+        if checkpoint_id is not None:
+            if self._versions is None or self._context is None:
+                raise ValueError("checkpoint lineage requires a versioned conversation")
+            project = self._versions.project(
+                self.conversation_id, self._context, create=False
+            )
+            if project is None:
+                raise ValueError("checkpoint lineage requires a project")
+            checkpoint = self._versions.store.get_version(project.id, checkpoint_id)
+            if (
+                not checkpoint.registration_key.startswith("training-artifact:")
+                or checkpoint.kind != "model"
+                or checkpoint.state not in {"ready", "reference_only"}
+                or source.get("type") != "checkpoint"
+                or source.get("kind") != checkpoint.manifest.summary.get("kind")
+                or to_storage_api_path(inference["model_path"])
+                != checkpoint.manifest.storage_ref
+            ):
+                raise ValueError(
+                    "checkpoint version must match the actual inference input"
+                )
+            if source["kind"] == "lora":
+                base = checkpoint.manifest.summary.get("base_model")
+                if not isinstance(base, str) or to_storage_api_path(
+                    base
+                ) != to_storage_api_path(source["base_model"]):
+                    raise ValueError(
+                        "LoRA base model does not match the registered checkpoint"
+                    )
+            if resume_run_id is None:
+                definition = {
+                    **definition,
+                    "inference": {
+                        **inference,
+                        "source_checkpoint_version_id": checkpoint_id,
+                    },
+                }
+                definition.setdefault("dataset_role", "validation")
         if definition.get("kind") == "prediction_evaluation":
             from pyromind_runtime.domain.training_evaluation import (
                 CheckpointSelectionPolicy,
@@ -378,6 +446,11 @@ class PipelineRuns:
                     "execution_revision": prior.execution_revision + 1,
                     "task_id": None,
                     "submission_status": "preparing",
+                    **(
+                        {"result": {}, "evaluations": ()}
+                        if isinstance(definition.get("inference"), dict)
+                        else {}
+                    ),
                 }
             )
         else:

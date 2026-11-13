@@ -387,6 +387,7 @@ class PyromindBusinessToolHost:
         )
         self._pipeline_runs = pipeline_runs
         self.version_call: VersionCall | None = None
+        self.training_artifact_hook: Callable[..., Awaitable[int]] | None = None
         self.execution_call: ExecutionCall | None = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
         for path in (
@@ -802,6 +803,42 @@ class PyromindBusinessToolHost:
             details = observation.model_dump(
                 mode="json", exclude={"content", "is_error"}
             )
+            if (
+                name == TrainingAnalysisTool.name
+                and arguments.get("operation") == "artifacts"
+                and not observation.is_error
+                and self.training_artifact_hook is not None
+            ):
+                artifacts = details.get("result") or {}
+                nodes = artifacts.get("training_nodes")
+                if isinstance(nodes, list) and artifacts.get(
+                    "task_id"
+                ) == arguments.get("task_id"):
+                    try:
+                        count = await self.training_artifact_hook(
+                            context.conversation_id,
+                            artifacts["task_id"],
+                            nodes,
+                            context.request_context,
+                        )
+                        receipt = {
+                            "status": "registered" if count else "unavailable",
+                            "checkpoints": count,
+                        }
+                    except Exception as exc:
+                        logger.warning(
+                            "Training artifact registration pending: %s",
+                            type(exc).__name__,
+                        )
+                        receipt = {"status": "pending"}
+                    details["lineage"] = receipt
+                    content.insert(
+                        0,
+                        {
+                            "type": "text",
+                            "text": json.dumps({"lineage": receipt}) + "\n",
+                        },
+                    )
             if len(submissions.submissions) == 1:
                 details["correlation"] = next(
                     iter(submissions.submissions.values())

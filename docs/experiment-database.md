@@ -37,12 +37,17 @@ EXPERIMENT_DB_BACKEND=sqlite uv run python -m pyromind_agent_server.plan_migrati
 迁移前备份并停止使用该数据库的服务。SQLite 使用本地文件、WAL、外键检查和
 5 秒忙等待；短写事务先执行 `BEGIN IMMEDIATE`。MariaDB 使用事务和行锁。
 
-## 两张业务表
+## 业务表与派生索引
 
 | 表 | 数据 |
 |---|---|
 | experiment_projects | 项目归属、cluster、创建命令 ID、workflow_plan_path |
 | experiment_preparations | 准备计划、入口任务、审阅状态、revision、Project 关联 |
+
+启用 `PYROMIND_RUN_ARCHIVES_ENABLED=1` 后，Runtime 在实验清单归档成功后写入
+`experiment_version_index` 和 `experiment_metric_index`。两张表由迁移 `0009` 创建，
+同一实验的清单和指标在一个事务内更新。SQL 写入失败时，后续归档对账会重试。
+在线实验 API 仍使用现有账本，历史归档不会在启动时自动全量导入。
 
 另外保留 `experiment_plan_schema_version` 迁移版本表。
 `workflow_plan_path` 相对于所属会话工作区，新项目写入
@@ -55,7 +60,7 @@ EXPERIMENT_DB_BACKEND=sqlite uv run python -m pyromind_agent_server.plan_migrati
 agent_role_sessions、runtime_work_items、external_task_submissions、runtime_messages。
 Project 和 preparation 行保留；被删的旧执行数据不再恢复，必须事先备份。
 MariaDB DDL 可独立提交，迁移支持中断后重试。历史迁移不改写，
-新库和旧库使用同一条迁移链，最终只留下两张业务表。
+新库和旧库使用同一条迁移链。
 
 ## 验证
 

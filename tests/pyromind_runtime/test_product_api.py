@@ -17,6 +17,7 @@ from pyromind_agent_server.profiles import (
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 
@@ -100,6 +101,7 @@ async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
         assert created.status_code == 201
         conversation_id = created.json()["conversation_id"]
         listed = await client.get("/api/v2/pyromind/conversations")
+        summaries = await client.get("/api/v2/pyromind/conversations/summaries")
         snapshot = await client.get(
             f"/api/v2/pyromind/conversations/{conversation_id}/snapshot"
         )
@@ -122,6 +124,10 @@ async def test_http_create_list_snapshot_and_command(tmp_path) -> None:
 
     assert [item["conversation_id"] for item in listed.json()] == [conversation_id]
     assert snapshot.json()["timeline"][0]["kind"] == "message"
+    assert summaries.status_code == 200
+    assert summaries.json()[0]["conversation_id"] == conversation_id
+    assert summaries.json()[0]["title"] == "hello"
+    assert "timeline" not in summaries.json()[0]
     assert command.status_code == 202
     assert command.json() == retry.json()
     assert adapter.created_specs[0].workspace_root == str(
@@ -172,6 +178,9 @@ async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
             metadata["profile_id"] = None
             metadata_path.write_text(json.dumps(metadata))
 
+        assert (
+            await client.get("/api/v2/pyromind/conversations/summaries")
+        ).json() == []
         assert [
             item["conversation_id"]
             for item in (await client.get("/api/first/conversations")).json()
@@ -180,7 +189,17 @@ async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
             item["conversation_id"]
             for item in (await client.get("/api/second/conversations")).json()
         ] == [second_id]
+        for prefix, expected in (("first", first_id), ("second", second_id)):
+            response = await client.get(f"/api/{prefix}/conversations/summaries")
+            assert response.status_code == 200
+            assert [item["conversation_id"] for item in response.json()] == [expected]
+        assert (
+            await client.get(f"/api/first/conversations/{second_id}/events")
+        ).status_code == 404
         assert (await client.get("/api/v2/pyromind/conversations")).json() == []
+        assert (
+            await client.get("/api/v2/pyromind/conversations/summaries")
+        ).json() == []
         assert (
             await client.get(f"/api/first/conversations/{second_id}/snapshot")
         ).status_code == 404
@@ -303,6 +322,87 @@ async def test_sse_uses_persisted_sequence_as_event_id(tmp_path) -> None:
     assert '"seq":1' in event_frame
     await stream.aclose()
     await runtime.close()
+
+
+async def test_live_stream_delivers_events_appended_during_replay_once(
+    tmp_path, monkeypatch
+) -> None:
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42")
+    snapshot = await runtime.create_conversation(
+        SessionSpec(conversation_id="race", user_id="42", workspace_root=str(tmp_path)),
+        context,
+    )
+    store = FileProductStore(tmp_path / snapshot.conversation_id)
+    original_replay = FileProductStore.replay
+
+    def replay_and_append(self, after_seq=0):
+        events = original_replay(self, after_seq)
+        loop.call_soon_threadsafe(runtime._publish, events[-1])
+        event, _ = store.append(
+            ProductEvent(
+                conversation_id=snapshot.conversation_id,
+                type="status.changed",
+                payload={"status": "running"},
+            )
+        )
+        loop.call_soon_threadsafe(runtime._publish, event)
+        return events
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(FileProductStore, "replay", replay_and_append)
+    stream = runtime.stream_events(snapshot.conversation_id, 0, context)
+    try:
+        for seq in (1, 2):
+            assert (await asyncio.wait_for(anext(stream), 1)).seq == seq
+    finally:
+        await stream.aclose()
+        await runtime.close()
+
+
+async def test_snapshot_and_event_replay_return_while_archive_is_pending(
+    tmp_path, monkeypatch
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    runtime = ConversationRuntime(conversations, FakeAdapter())
+    context = RequestContext(user_id="42", cookie="test-cookie")
+    archive_started = asyncio.Event()
+    unblock_archive = asyncio.Event()
+
+    async def archive(conversation_id, request_context):
+        assert request_context == context
+        archive_started.set()
+        await unblock_archive.wait()
+        return True
+
+    monkeypatch.setattr(runtime, "_evaluation_storage_factory", object())
+    monkeypatch.setattr(runtime, "reconcile_versions", archive)
+    snapshot = await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="archive-pending",
+            user_id="42",
+            workspace_root=str(conversations),
+        ),
+        context,
+    )
+    stream = runtime.stream_events(snapshot.conversation_id, 0, context)
+    try:
+        await asyncio.wait_for(
+            runtime.get_snapshot(snapshot.conversation_id, context), 1
+        )
+        await asyncio.wait_for(archive_started.wait(), 1)
+        recovery = runtime._read_recoveries[snapshot.conversation_id]
+        await asyncio.wait_for(
+            runtime.authorize_event_stream(snapshot.conversation_id, context), 1
+        )
+        assert (await asyncio.wait_for(anext(stream), 1)).seq == 1
+        assert runtime._read_recoveries[snapshot.conversation_id] is recovery
+        assert not recovery.done()
+    finally:
+        unblock_archive.set()
+        await stream.aclose()
+        await runtime.close()
 
 
 def test_sse_cursor_prefers_after_seq_and_validates_last_event_id() -> None:

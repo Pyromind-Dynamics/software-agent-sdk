@@ -17,6 +17,7 @@ description: 模型效果评测的统一入口，包括基模 Benchmark、训后
 有 eval_step_n.jsonl 或已有基线 prediction 时，先读真实样例并明确业务判分含义，
 按 [已有预测评分契约](references/saved-predictions.md) 生成本轮解析、评分脚本和说明，
 通过 `df_submit_evaluation(operation="score", ...)` 在 CPU 评分所有 step。此入口计算评分，可生成报告，不初始化人工标注，也不调用模型。评分规则变化时复用原始预测，新建评分运行。
+任务允许本地 CPU 评分时，按同一参考中的「本地 CPU 评分交付」直接生成、校验并发布结构化 JSON，再回报 JSON 和报告路径。
 训练集与验证集标签分布随报告展示；优先查看所选 checkpoint 的 badcase。
 `iteration_context.json` 汇总目标、数据、step 对比、选模和人工反馈，供下一轮判断；
 原因假设由 Agent 结合证据提出，不套用固定的补数据或重训规则。
@@ -107,3 +108,5 @@ Storage 模型使用不可变版本；clone/download 恢复仍执行同一准备
 profile 统计数据分布，report 渲染已有结果，均使用 CPU，不调用模型。
 评测报告内的独立复核运行仅用于用户明确选择该报告界面的场景，不能替代 Label Studio 打标。
 rubric 变化后新建评分版本，保留旧结果和人工标注。
+
+评估已登记的训练 checkpoint 时，提交原 checkpoint 路径与 `model_source.type="checkpoint"`。LoRA 同时填写实际基模，已有执行链会在评估工作流内完成合并。Runtime 按原路径的唯一登记绑定来源，已知产物版本 ID 时可传 `source_checkpoint_version_id` 消除歧义。带来源的推理报告和指标在完成回调入库。
