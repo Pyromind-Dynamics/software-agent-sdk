@@ -28,6 +28,7 @@ import math
 import os
 import re
 import ssl
+import statistics
 import sys
 import tempfile
 import urllib.error
@@ -322,43 +323,68 @@ def _history_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _validation_loss_rebound(points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    finite = [point for point in points if point.get("value") is not None]
+    if len(finite) < 7:
+        return None
+    best_index = min(range(len(finite)), key=lambda index: finite[index]["value"])
+    if len(finite) - best_index - 1 < 3:
+        return None
+    best = finite[best_index]
+    baseline = finite[max(0, best_index - 1) : best_index + 2]
+    baseline_top = max(point["value"] for point in baseline)
+    baseline_spread = baseline_top - min(point["value"] for point in baseline)
+    threshold = baseline_top + max(abs(baseline_top) * 0.2, baseline_spread, 1e-6)
+    if not all(point["value"] > threshold for point in finite[-3:]):
+        return None
+    earlier = finite[best_index + 1 : -3]
+    first_high = next(
+        (index for index, point in enumerate(earlier) if point["value"] > threshold),
+        None,
+    )
+    if first_high is not None and any(
+        point["value"] <= threshold for point in earlier[first_high + 1 :]
+    ):
+        return None
+    return {
+        "best_value": best["value"],
+        "best_step": best.get("step"),
+        "final_value": finite[-1]["value"],
+        "final_step": finite[-1].get("step"),
+    }
+
+
 def _loss_metric_key(summary: dict[str, Any]) -> str:
     """从 summary 选默认 loss 键。"""
     return next((k for k in summary if "loss" in k), "")
 
 
-def _probe_suggestions(
-    config: dict[str, Any], stats: dict[str, Any]
-) -> list[dict[str, str]]:
-    """基于单 run 统计生成单变量探针实验建议(保守启发式)。"""
-    suggestions: list[dict[str, str]] = []
-    lr = config.get("learning_rate")
-    if isinstance(lr, (int, float)) and lr > 0:
-        suggestions.append(
+def _probe_suggestions(stats: dict[str, Any]) -> list[dict[str, str]]:
+    """只为已观测到的指标信号生成下一步验证建议。"""
+    rebound = stats.get("validation_loss_rebound")
+    if isinstance(rebound, dict):
+        return [
             {
-                "parameter": "learning_rate",
-                "change": f"{lr} → {lr / 2}",
-                "rationale": "loss 抖动/发散时降低学习率是首选单变量探针",
+                "parameter": "checkpoint_validation",
+                "change": (
+                    "用更大的独立验证集比较 step "
+                    f"{rebound.get('best_step')} 与 step {rebound.get('final_step')}"
+                ),
+                "rationale": (
+                    "当前验证 loss 后段呈回升迹象；先验证 checkpoint 差异，"
+                    "不据此直接调整超参数"
+                ),
             }
-        )
-    if stats.get("nan", 0) > 0:
-        suggestions.append(
+        ]
+    if stats.get("has_nan") or stats.get("has_inf") or stats.get("spikes", 0) > 0:
+        return [
             {
-                "parameter": "batch_size",
-                "change": "减半并同步增大 grad_accumulation_steps 保持有效 batch",
-                "rationale": "NaN 常与过大梯度相关,减小 batch 可降低单步方差",
+                "parameter": "numerical_stability_check",
+                "change": "定位异常 step 并核对对应的 learning_rate、grad_norm 和样本",
+                "rationale": "先确认异常来源,再选择是否调整训练参数",
             }
-        )
-    epochs = config.get("num_epochs")
-    if isinstance(epochs, (int, float)) and stats.get("count", 0) > 0:
-        suggestions.append(
-            {
-                "parameter": "num_epochs",
-                "change": f"{epochs} → {int(epochs) + 1}",
-                "rationale": "loss 仍在下降(未平台期)时延长训练",
-            }
-        )
-    return suggestions
+        ]
+    return []
 
 
 def _redact_report(output: str, creds: dict[str, str]) -> str:
@@ -710,7 +736,12 @@ class TrainingAnalysisService:
         )
         selected_metric = str(analysis.get("metric") or "")
         diagnostics = analysis.get("diagnostics") or {}
-        config = analysis.get("config") or {}
+        metric_points = (analysis.get("metric_series") or {}).get(selected_metric, [])
+        rebound = (
+            _validation_loss_rebound(metric_points)
+            if selected_metric in {"eval/loss", "eval_loss", "val_loss"}
+            else None
+        )
         stats = {
             "total_steps": diagnostics.get("total_steps"),
             "final_value": diagnostics.get("final_value"),
@@ -721,55 +752,126 @@ class TrainingAnalysisService:
             "train_val_gap": diagnostics.get("train_val_gap"),
             "error": diagnostics.get("error"),
         }
-        suggestions = _probe_suggestions(config, stats)
-        lines = [
-            f"# 训练分析报告:{entity_project}/{run_id}",
-            "",
-            "## 1. 先验假设",
-            "- 训练类型:由 config 推断(SFT/DPO/GRPO,见 config 摘要)",
-            f"- 关注指标: {selected_metric or '未知'}",
-            "- 基线预期: loss 单调下降或收敛至平台期",
-            "",
-            "## 2. 数据惊奇",
-            f"- run state: {analysis.get('state', '')}, display_name: "
-            f"{analysis.get('display_name', '')}",
-            f"- 诊断: {json.dumps(stats, ensure_ascii=False)}",
-            "",
-            "## 3. 候选机制",
-        ]
-        if diagnostics.get("has_nan"):
-            lines.append("- NaN 出现 → 数值不稳定(梯度爆炸/学习率过大/数据含异常样本)")
-            lines.append("  - 同时建议检查训练数据集质量(重复样本/异常值/格式问题)")
-        if diagnostics.get("likely_overfit"):
-            lines.append("- 疑似过拟合 → train/val gap 扩大,考虑早停/正则化/增大数据量")
-            lines.append(
-                "  - 数据集质量检查:重复样本/标签噪声可能导致过拟合, "
-                "建议检查并清洗训练数据"
+        if rebound:
+            stats["validation_loss_rebound"] = rebound
+        metric_stats = analysis.get("metric_stats") or {}
+        stats["spikes"] = metric_stats.get("spikes", 0)
+        stats["has_inf"] = diagnostics.get("has_inf", False)
+        suggestions = _probe_suggestions(stats)
+        state = str(analysis.get("state") or "未知")
+        if state != "finished":
+            conclusion = f"run 状态为 {state}，当前不能判定训练已完成。"
+        elif stats["has_nan"] or stats["has_inf"]:
+            conclusion = "训练已结束，但指标存在 NaN 或 Inf，需要先定位数值异常。"
+        elif rebound:
+            conclusion = (
+                "训练已完成；当前验证损失后段有回升迹象，"
+                "不能仅凭这条曲线选定 checkpoint。"
             )
-        if diagnostics.get("converged") is False:
-            lines.append("- 未收敛 → 训练不足,考虑延长 epoch 或调整学习率")
-        if not diagnostics.get("has_nan") and not diagnostics.get("likely_overfit"):
-            lines.append("- 未发现明显异常,可能与基线/相邻 run 的指标对比确认")
-            lines.append(
-                "  - 数据集质量基线检查:若后续调优效果不达预期,"
-                " 建议检查训练数据集质量(重复样本/标签噪声/分布)"
-            )
-        lines += ["", "## 4. 可证伪探针实验"]
-        if suggestions:
-            for suggestion in suggestions:
-                lines.append(
-                    f"- **{suggestion['parameter']}**: {suggestion['change']}"
-                    f" — {suggestion['rationale']}"
-                )
+        elif diagnostics.get("likely_overfit"):
+            conclusion = "训练已完成；训练与验证指标出现差距，需结合验证数据复核。"
+        elif metric_points:
+            conclusion = "训练已完成；当前指标未显示明确数值异常，模型效果仍需评测。"
         else:
-            lines.append("- 无自动建议,请人工检查 config 或对比其他 run")
+            conclusion = "训练已完成，但缺少所选指标的曲线，暂时无法判断指标走势。"
+
+        finite_points = [
+            point
+            for point in metric_points
+            if isinstance(point.get("value"), (int, float))
+            and not isinstance(point["value"], bool)
+            and math.isfinite(point["value"])
+        ]
+        changes = [
+            current["value"] - previous["value"]
+            for previous, current in zip(finite_points, finite_points[1:])
+        ]
+        if (
+            state == "finished"
+            and selected_metric in {"eval/loss", "eval_loss", "val_loss"}
+            and not rebound
+            and not diagnostics.get("likely_overfit")
+            and not stats["has_nan"]
+            and not stats["has_inf"]
+            and any(change > 0 for change in changes)
+            and any(change < 0 for change in changes)
+        ):
+            first_window = statistics.median(
+                point["value"] for point in finite_points[:3]
+            )
+            last_window = statistics.median(
+                point["value"] for point in finite_points[-3:]
+            )
+            if last_window < first_window - max(abs(first_window) * 0.2, 0.05):
+                conclusion = (
+                    "训练已完成；验证损失有波动但整体下降，"
+                    "未见明确持续回升，模型效果仍需评测。"
+                )
+            else:
+                conclusion = (
+                    "训练已完成；验证损失有波动，未见明确持续回升，模型效果仍需评测。"
+                )
+        lines = [
+            f"# 训练分析报告：{entity_project}/{run_id}",
+            "",
+            "## 结论",
+            conclusion,
+            "",
+            "## 关键证据",
+            f"- run 状态：{state}；名称：{analysis.get('display_name', '')}。",
+            f"- 关注指标：{selected_metric or '未知'}。",
+        ]
+        if rebound:
+            lines.append(
+                f"- 有效记录 {len(finite_points)} 个点；"
+                "验证损失后段有回升迹象："
+                f"{rebound['best_value']:.4g}（step {rebound['best_step']}）→ "
+                f"{rebound['final_value']:.4g}（step {rebound['final_step']}）。"
+            )
+        elif finite_points:
+            lowest = min(finite_points, key=lambda point: point["value"])
+            final = finite_points[-1]
+            lines.append(
+                f"- 有效记录 {len(finite_points)} 个点；最低值 "
+                f"{lowest['value']:.4g}（step {lowest.get('step')}），末值 "
+                f"{final['value']:.4g}（step {final.get('step')}）。"
+            )
+        else:
+            lines.append("- 当前没有可用的指标历史点。")
+        if stats["has_nan"] or stats["has_inf"] or stats["spikes"]:
+            lines.append(
+                "- 数值异常："
+                f"NaN={bool(stats['has_nan'])}，Inf={bool(stats['has_inf'])}，"
+                f"尖峰={stats['spikes']}。"
+            )
+        lines += [
+            "",
+            "## 判断限制",
+            (
+                "- 当前报告未核对验证样本数与业务评测结果；"
+                "loss 不能单独证明模型效果或最佳 checkpoint。"
+            ),
+        ]
+        if rebound:
+            lines.append(
+                "- 曲线回升迹象需要用更多验证数据复核；"
+                "仅凭该指标不能确认泛化能力变化或具体原因。"
+            )
+        if diagnostics.get("error"):
+            lines.append(f"- 诊断缺口：{diagnostics['error']}")
+        lines += ["", "## 下一步"]
+        if suggestions:
+            suggestion = suggestions[0]
+            lines.append(f"- {suggestion['change']}。{suggestion['rationale']}。")
+        else:
+            lines.append("- 先核对同口径基线与已有评测结果，再决定是否调整训练参数。")
         lines += [
             "",
             "## 审计线索",
             f"- entity/project: `{entity_project}`",
             f"- run id: `{run_id}`",
             f"- 指标键: `{selected_metric or 'N/A'}`",
-            f"- 数据来源: {source_name} 数据源,凭证来自平台节点 config/输出",
+            f"- 数据来源：{source_name}；凭证由平台管理。",
         ]
         output = _redact_report("\n".join(lines) + "\n", creds)
         if output_path:

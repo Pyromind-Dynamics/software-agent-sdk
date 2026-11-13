@@ -142,6 +142,7 @@ export class SandboxFileClient {
     init.searchParams.set("total_size", String(body.byteLength));
     init.searchParams.set("total_chunks", String(totalChunks));
     const initialized = await this.json(
+      "POST", init,
       await this.fetch(endpoint, init, { method: "POST", signal }),
     );
     const uploadId = readString(initialized, "upload_id");
@@ -216,7 +217,10 @@ export class SandboxFileClient {
   private async bytes(method: string, url: URL, response: Response, limit: number): Promise<Buffer> {
     try {
       const reader = response.body?.getReader();
-      if (!reader) return Buffer.alloc(0);
+      if (!reader) {
+        this.portalProven = true;
+        return Buffer.alloc(0);
+      }
       const chunks: Buffer[] = [];
       let total = 0;
       try {
@@ -227,6 +231,7 @@ export class SandboxFileClient {
           if (total > limit) throw new Error("file exceeds size limit");
           chunks.push(Buffer.from(value));
         }
+        this.portalProven = true;
         return Buffer.concat(chunks);
       } finally { await reader.cancel(); }
     } catch (error) {
@@ -264,10 +269,9 @@ export class SandboxFileClient {
     } catch (error) {
       throw transportError(init.method ?? "GET", url, error);
     }
-    // Any HTTP answer proves the portal is reachable, even an error status.
-    this.portalProven = true;
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
+      this.portalProven = true;
       throw new SandboxFileError(
         `sandbox file request failed: ${init.method ?? "GET"} ${url.pathname} ` +
           `-> ${response.status}${detail ? ` ${detail.slice(0, 300)}` : ""}`,
@@ -277,8 +281,15 @@ export class SandboxFileClient {
     return response;
   }
 
-  private async json(response: Response): Promise<Record<string, unknown>> {
-    const payload: unknown = await response.json();
+  private async json(method: string, url: URL, response: Response): Promise<Record<string, unknown>> {
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      throw transportError(method, url, error);
+    }
+    this.portalProven = true;
+    const payload: unknown = JSON.parse(text);
     if (!isRecord(payload)) throw new SandboxFileError("sandbox file response is not an object");
     const data = isRecord(payload.data) ? payload.data : payload;
     return data;

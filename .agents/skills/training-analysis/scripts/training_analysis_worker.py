@@ -26,6 +26,39 @@ _INLINE_SECRET = re.compile(
     re.IGNORECASE,
 )
 _MAX_ERROR_LENGTH = 2000
+_CONFIG_SUMMARY_KEYS = {
+    "_name_or_path",
+    "model_type",
+    "learning_rate",
+    "lr_scheduler_type",
+    "warmup_steps",
+    "warmup_ratio",
+    "weight_decay",
+    "optim",
+    "eval_strategy",
+    "logging_steps",
+    "num_train_epochs",
+    "max_steps",
+    "per_device_train_batch_size",
+    "per_device_eval_batch_size",
+    "gradient_accumulation_steps",
+    "max_grad_norm",
+    "max_length",
+    "eval_steps",
+    "save_steps",
+    "save_total_limit",
+    "seed",
+    "bf16",
+    "fp16",
+}
+_PEFT_SUMMARY_KEYS = {
+    "peft_type",
+    "r",
+    "lora_alpha",
+    "lora_dropout",
+    "target_modules",
+    "modules_to_save",
+}
 
 
 def _sanitized(
@@ -100,6 +133,121 @@ def _redact_text(value: str, secrets: tuple[str, ...]) -> str:
     return _INLINE_SECRET.sub(r"\1[REDACTED]", value)
 
 
+def _error_description(exc: Exception) -> str:
+    parts = [f"{type(exc).__name__}: {exc}"]
+    cause = exc.__cause__
+    for _ in range(2):
+        if cause is None:
+            break
+        parts.append(f"caused by {type(cause).__name__}: {cause}")
+        cause = cause.__cause__
+    return "; ".join(parts)[:_MAX_ERROR_LENGTH]
+
+
+def _wandb_api_access_forbidden(exc: Exception) -> bool:
+    from wandb.errors import AuthenticationError
+    from wandb.sdk.lib.service.service_connection import WandbApiFailedError
+
+    cause = exc.__cause__
+    if not isinstance(exc, AuthenticationError) or not isinstance(
+        cause, WandbApiFailedError
+    ):
+        return False
+    response = cause.response
+    return (
+        response is not None
+        and response.http_status == 403
+        and "<!doctype html>" in str(cause).lower()
+    )
+
+
+def _compact_analysis_result(
+    result: dict[str, Any], metric: str, keys: list[str]
+) -> dict[str, Any]:
+    compact = dict(result)
+    config = result.get("config")
+    if isinstance(config, dict):
+        config_summary = {
+            key: value for key, value in config.items() if key in _CONFIG_SUMMARY_KEYS
+        }
+        peft_config = config.get("peft_config")
+        if isinstance(peft_config, dict):
+            default_peft = peft_config.get("default")
+            if isinstance(default_peft, dict):
+                selected_peft = {
+                    key: value
+                    for key, value in default_peft.items()
+                    if key in _PEFT_SUMMARY_KEYS
+                }
+                if selected_peft:
+                    config_summary["peft_config"] = selected_peft
+        compact["config"] = config_summary
+        compact["omitted_config_key_count"] = len(config) - len(config_summary)
+
+    requested_metrics = set(keys) | {metric}
+    if "train/loss" in requested_metrics:
+        requested_metrics.add("train_loss")
+    summary = result.get("summary")
+    if isinstance(summary, dict):
+        compact["summary"] = {
+            key: value for key, value in summary.items() if key in requested_metrics
+        }
+
+    metric_series = result.get("metric_series")
+    if isinstance(metric_series, dict):
+        summaries: dict[str, Any] = {}
+        for name, points in metric_series.items():
+            if not isinstance(points, list):
+                continue
+            finite = [
+                point
+                for point in points
+                if isinstance(point, dict)
+                and isinstance(point.get("value"), (int, float))
+                and not isinstance(point.get("value"), bool)
+                and math.isfinite(point["value"])
+            ]
+            curve: dict[str, Any] = {
+                "count": len(points),
+                "nonfinite_count": len(points) - len(finite),
+            }
+            if finite:
+                best = min(finite, key=lambda point: point["value"])
+                final = finite[-1]
+                curve.update(
+                    {
+                        "first": {
+                            "step": finite[0].get("step"),
+                            "value": finite[0]["value"],
+                        },
+                        "minimum": {
+                            "step": best.get("step"),
+                            "value": best["value"],
+                        },
+                        "maximum": {
+                            "step": max(finite, key=lambda point: point["value"]).get(
+                                "step"
+                            ),
+                            "value": max(point["value"] for point in finite),
+                        },
+                        "final": {
+                            "step": final.get("step"),
+                            "value": final["value"],
+                        },
+                    }
+                )
+            if name in {"eval/loss", "eval_loss", "val_loss"}:
+                rebound = train_analysis._validation_loss_rebound(points)
+                if rebound:
+                    curve["sustained_rebound"] = rebound
+            summaries[name] = curve
+        compact["metric_summaries"] = summaries
+        compact.pop("metric_series", None)
+    compact.pop("multi_metrics", None)
+    compact["detail_level"] = "summary"
+    return compact
+
+
 def _validate_payload(payload: dict[str, Any]) -> None:
     operation = payload.get("operation")
     if operation not in {"probe", "analyze", "report", "artifacts"}:
@@ -114,6 +262,11 @@ def _validate_payload(payload: dict[str, Any]) -> None:
         or any(not isinstance(key, str) for key in keys)
     ):
         raise ValueError("keys must be a list of at most 20 strings")
+    include_history = payload.get("include_history", False)
+    if not isinstance(include_history, bool):
+        raise ValueError("include_history must be a boolean")
+    if operation != "analyze" and include_history:
+        raise ValueError("include_history is only valid for operation=analyze")
     if operation != "report" and payload.get("output_path") is not None:
         raise ValueError("output_path is only valid for operation=report")
     if operation == "report" and payload.get("output_path") == "":
@@ -206,12 +359,20 @@ def _operation(
     if operation == "analyze":
         service = train_analysis.TrainingAnalysisService()
         analyze = getattr(service, "analyze", None) or getattr(service, "analyze_run")
-        return analyze(
+        result = analyze(
             **common,
             entity_project=entity_project,
             run_id=run_id,
             metric=str(payload.get("metric") or ""),
             keys=[str(key) for key in payload.get("keys") or []],
+        )
+        if payload.get("include_history") is True:
+            result["detail_level"] = "full"
+            return result
+        return _compact_analysis_result(
+            result,
+            str(payload.get("metric") or ""),
+            [str(key) for key in payload.get("keys") or []],
         )
     if operation == "report":
         output = str(payload.get("output_path") or "")
@@ -360,12 +521,24 @@ def main() -> int:
             "error_message": str(exc)[:_MAX_ERROR_LENGTH],
         }
     except Exception as exc:
-        response = {
-            "ok": False,
-            "failure_stage": "analysis_execution",
-            "error_code": "training_analysis_failed",
-            "error_message": f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_LENGTH],
-        }
+        if _wandb_api_access_forbidden(exc):
+            response = {
+                "ok": False,
+                "failure_stage": "external_service",
+                "error_code": "wandb_api_access_forbidden",
+                "error_message": (
+                    "W&B API returned HTTP 403 Forbidden HTML while verifying "
+                    "credentials. This does not establish whether the API key is "
+                    "valid. Check W&B API access from the local backend host."
+                ),
+            }
+        else:
+            response = {
+                "ok": False,
+                "failure_stage": "analysis_execution",
+                "error_code": "training_analysis_failed",
+                "error_message": _error_description(exc),
+            }
     print(
         json.dumps(
             _sanitized(

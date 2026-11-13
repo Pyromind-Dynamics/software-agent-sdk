@@ -162,6 +162,13 @@ class TrainingAnalysisAction(Action):
         max_length=20,
         description="Optional metric keys to inspect; at most 20.",
     )
+    include_history: bool = Field(
+        default=False,
+        description=(
+            "Return every metric point and the full run config. Defaults to a "
+            "compact summary; enable only when individual points are needed."
+        ),
+    )
     output_path: str | None = Field(
         default=None,
         description=(
@@ -173,6 +180,8 @@ class TrainingAnalysisAction(Action):
     def validate_target(self) -> Self:
         if not self.task_id.strip():
             raise ValueError("task_id is required")
+        if self.operation != "analyze" and self.include_history:
+            raise ValueError("include_history is only valid for operation=analyze")
         if self.operation != "report" and self.output_path is not None:
             raise ValueError("output_path is only valid for operation=report")
         if self.output_path is not None and not self.output_path.strip():
@@ -198,9 +207,11 @@ multiple training nodes exist. Inspect returned samples before writing scoring c
 Use this tool for W&B metric discovery, loss/NaN/divergence/overfitting analysis,
 four-stage reports, and run comparisons. Call operation=probe to discover keys,
 operation=analyze for structured diagnostics, and operation=report to write a
-Markdown report. Compare runs by analyzing each task separately. Credentials are
-resolved from the platform and never returned. Do not run the skill's Python
-scripts or access W&B through terminal.
+Markdown report. Analyze returns compact curve/config summaries by default; set
+include_history=true only when individual points or the full config are needed.
+Compare runs by analyzing each task separately. Credentials are resolved from
+the platform and never returned. Do not run the skill's Python scripts or access
+W&B through terminal.
 """
 
 
@@ -560,6 +571,7 @@ class TrainingAnalysisExecutor(
             "data_source": action.data_source,
             "metric": action.metric,
             "keys": action.keys,
+            "include_history": action.include_history,
             "output_path": str(output_path) if output_path else None,
             "output_relative": (
                 output_path.relative_to(host_root).as_posix() if output_path else None
