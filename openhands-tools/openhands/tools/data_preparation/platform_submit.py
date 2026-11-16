@@ -66,6 +66,7 @@ from openhands.tools.utils.storage_paths import (
     to_tool_storage_path,
 )
 from openhands.tools.workflow.task_submission import (
+    WorkflowResourceValidationError,
     submit_workflow_task,
 )
 
@@ -819,12 +820,17 @@ class DfSubmitPipelineExecutor(
             return DfSubmitPipelineObservation.from_text(
                 text=(
                     "Submission outcome uncertain; reconcile before retrying. "
-                    if self._submission_guard is not None and submit_started
+                    if self._submission_guard is not None
+                    and submit_started
+                    and not isinstance(exc, WorkflowResourceValidationError)
                     else ""
                 )
                 + f"Failed to submit Python pipeline: {exc}",
                 status="Failed",
                 is_error=True,
+                failure_stage="resources"
+                if isinstance(exc, WorkflowResourceValidationError)
+                else None,
             )
 
         agent_output_dir = to_agent_storage_path(output_dir)

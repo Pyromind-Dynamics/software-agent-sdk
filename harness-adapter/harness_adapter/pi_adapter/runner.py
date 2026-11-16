@@ -362,6 +362,7 @@ def _runner_environment() -> dict[str, str]:
         "PYROMIND_OBSERVABILITY_API_BASE",
         "PYROMIND_OBSERVABILITY_RUN_KIND",
         "PYROMIND_PI_MODEL_IDLE_TIMEOUT_MS",
+        "PYROMIND_PI_MAX_OUTPUT_TOKENS",
     )
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
     ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS") or _node_ca_bundle()

@@ -16,10 +16,12 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
   modelRuntime: ModelRuntime;
   model: Model<Api>;
 }> {
+  const outputLimit = maxOutputTokens();
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(config.provider, async () => ({ type: "api_key", key: config.apiKey }));
   const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false });
   let model = resolveModel(modelRuntime, config);
+  model = { ...model, maxTokens: Math.min(model.maxTokens, outputLimit) };
 
   if (config.baseUrl && !isOfficialOpenAIBaseUrl(config.baseUrl)) {
     const idleTimeoutMs = modelIdleTimeoutMs();
@@ -35,7 +37,7 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
           const reasoning = guardedOptions.reasoning
             ? clampThinkingLevel(requestModel, guardedOptions.reasoning)
             : undefined;
-          // Keep explicit output limits without deriving max_tokens from context usage.
+          // 保留单次输出上限，不从上下文使用量推导输出预算。
           return streamModel(requestModel, context, {
             ...guardedOptions,
             reasoningEffort: reasoning === "off" ? undefined : reasoning,
@@ -49,7 +51,22 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
     model = modelRuntime.getModel(config.provider, config.modelId) ?? model;
   }
   await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
+  const stream = modelRuntime.streamSimple.bind(modelRuntime);
+  modelRuntime.streamSimple = (requestModel, context, options) =>
+    stream(requestModel, context, {
+      ...options,
+      maxTokens: Math.min(outputLimit, requestModel.maxTokens, options?.maxTokens ?? outputLimit),
+    });
   return { modelRuntime, model };
+}
+
+function maxOutputTokens(): number {
+  const raw = process.env.PYROMIND_PI_MAX_OUTPUT_TOKENS?.trim();
+  const value = raw ? Number(raw) : 4096;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("PYROMIND_PI_MAX_OUTPUT_TOKENS must be a positive safe integer");
+  }
+  return value;
 }
 
 export function resolveModel(

@@ -1,10 +1,4 @@
-"""Pyromind workflow debug/test tool.
-
-Always submits via :mod:`openhands.tools.workflow.run_workflow` with
-``test_mode=True``. Prefer this tool over calling ``run_workflow`` with
-``test_mode=true`` directly. Successful submissions return
-``keep_ui_lock=True`` (production ``run_workflow`` does not).
-"""
+"""Pyromind 工作流调试工具，使用仅供调试的平台提交能力。"""
 
 from openhands.tools.workflow_debug.definition import (
     WorkflowDebugAction,

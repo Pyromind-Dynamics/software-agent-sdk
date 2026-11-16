@@ -922,14 +922,22 @@ class ConversationRuntime:
             raise ValueError(
                 "submission is in progress or uncertain; reconcile before retrying"
             )
+        effective, resolved_inputs = await asyncio.to_thread(
+            self.versions.resolve_run_definition,
+            conversation_id,
+            context,
+            workflow,
+        )
+        await self._workflow_submission.validate_resources(effective, context)
         record = await asyncio.to_thread(
             self.versions.prepare_run,
             conversation_id,
             context,
             identity,
             RunSource(kind="workflow", source_id=identity),
-            workflow,
+            effective,
             code=code,
+            resolved_inputs=resolved_inputs,
         )
         effective = record.spec.parameters["definition"]
         assert isinstance(effective, dict)
@@ -2577,15 +2585,18 @@ class ConversationRuntime:
             task_kind="workflow_run",
             **(origin or context.task_origin or TaskOrigin()).model_dump(),
         )
-        identity = request_id or uuid4().hex
-        previous = store.load_workflow_execution_requests().get(identity)
+        previous = (
+            store.load_workflow_execution_requests().get(request_id)
+            if request_id is not None
+            else None
+        )
         if previous is not None:
             if previous.correlation is not None and previous.correlation != correlation:
                 raise PermissionError("request belongs to another task origin")
             if previous.workflow_path != workflow_path:
                 raise ValueError("request id already belongs to another workflow")
             return {
-                "request_id": identity,
+                "request_id": previous.request_id,
                 "status": previous.status,
                 "summary": previous.summary,
                 **({"task_id": previous.task_id} if previous.task_id else {}),
@@ -2603,6 +2614,17 @@ class ConversationRuntime:
         ):
             raise ValueError("workflow preparation returned an invalid definition")
         summary = {**summary, "workflow_path": workflow_path}
+        resolved_inputs: dict[str, str] | None = None
+        if self.versions is not None:
+            workflow, resolved_inputs = await asyncio.to_thread(
+                self.versions.resolve_run_definition,
+                conversation_id,
+                context,
+                workflow,
+            )
+        # 资源通过后才创建正式请求并冻结版本，拒绝不应占用重试标识。
+        await self._workflow_submission.validate_resources(workflow, context)
+        identity = request_id or uuid4().hex
         if self.versions is not None:
             source_text = prepared.get("source")
             version_run = await asyncio.to_thread(
@@ -2613,6 +2635,7 @@ class ConversationRuntime:
                 RunSource(kind="workflow", source_id=identity),
                 workflow,
                 code=source_text if isinstance(source_text, str) else None,
+                resolved_inputs=resolved_inputs,
             )
             effective = version_run.spec.parameters["definition"]
             assert isinstance(effective, dict)

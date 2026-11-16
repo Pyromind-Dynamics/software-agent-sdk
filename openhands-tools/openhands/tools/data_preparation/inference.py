@@ -19,6 +19,7 @@ from openhands.tools.utils.workspace_staging import publish_workspace_path
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
+    WorkflowResourceValidationError,
     submit_workflow_task,
 )
 from openhands.tools.workflow.validate_workflow_dsl import (
@@ -778,6 +779,8 @@ class InferencePipelineHandler:
             self.runs.finish_submission(run_id, revision, task_id, "submitted")
         except Exception as exc:
             if task_id is None:
+                if isinstance(exc, WorkflowResourceValidationError):
+                    submitting = False
                 self.runs.finish_submission(
                     run_id, revision, None, "uncertain" if submitting else "failed"
                 )
@@ -804,6 +807,11 @@ class InferencePipelineHandler:
                             "validation_warnings": exc.validation.warnings,
                         }
                         if isinstance(exc, _WorkflowValidationError)
+                        else {}
+                    ),
+                    **(
+                        {"failure_stage": "resources"}
+                        if isinstance(exc, WorkflowResourceValidationError)
                         else {}
                     ),
                 }

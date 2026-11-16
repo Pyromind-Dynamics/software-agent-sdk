@@ -224,6 +224,9 @@ async def test_http_workflow_execution_submits_without_confirmation(
                 "summary": {"name": "sft", "node_count": 0},
             }
 
+        async def validate_resources(self, workflow, context):
+            pass
+
         async def submit(self, workflow, conversation_id, context, *, correlation=None):
             self.submitted = True
             return "task-1"

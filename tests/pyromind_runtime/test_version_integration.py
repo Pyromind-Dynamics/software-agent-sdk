@@ -2,9 +2,13 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
-from harness_adapter import artifact_snapshots as platform
+from harness_adapter import (
+    artifact_snapshots as platform,
+    workflow_submission as platform_submission,
+)
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
@@ -21,6 +25,7 @@ from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import (
     SaveVersion,
     SnapshotSource,
@@ -32,6 +37,11 @@ from pyromind_runtime.infrastructure.file_artifact_snapshots import (
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import SessionSpec
+
+from openhands.tools.workflow.task_submission import (
+    submit_workflow_task,
+    workflow_submission_scope,
+)
 
 from .fake_adapter import FakeAdapter
 from .test_workflow_execution import FakeSubmission
@@ -414,6 +424,93 @@ async def test_direct_tool_submission_is_durable_and_idempotent(version_runtime)
         await runtime.submit_versioned_workflow(
             "c", "call-1", {"name": "changed"}, None, context
         )
+
+
+@pytest.mark.parametrize(
+    "error", ["WORKFLOW_RESOURCES_INSUFFICIENT", "RESOURCE_CHECK_FAILED"]
+)
+async def test_versioned_submission_checks_resources_before_freezing(
+    version_runtime, monkeypatch, error
+):
+    runtime, submission, context = version_runtime
+    checked = []
+
+    async def reject(workflow, ctx):
+        checked.append(workflow)
+        raise ValueError(error)
+
+    monkeypatch.setattr(submission, "validate_resources", reject)
+    with pytest.raises(ValueError, match=error):
+        await runtime.submit_versioned_workflow(
+            "c", "admission", submission.workflow, None, context
+        )
+    project = runtime.versions.store.bound_project("c")
+    assert runtime.versions.store.list_runs(project.id) == []
+    assert not runtime._store("c").load_workflow_execution_requests()
+    assert submission.submissions == []
+    assert len(checked) == 1
+
+    async def allow(workflow, ctx):
+        checked.append(workflow)
+
+    monkeypatch.setattr(submission, "validate_resources", allow)
+    retry = {**submission.workflow, "id": "reconverted"}
+    result = await runtime.submit_versioned_workflow(
+        "c", "admission", retry, None, context
+    )
+    assert result["task_id"] == "task-123"
+    assert submission.submissions[0][0] == checked[-1]
+    assert len(checked) == 2
+    assert (
+        await runtime.submit_versioned_workflow("c", "admission", retry, None, context)
+        == result
+    )
+    assert len(checked) == 2 and len(submission.submissions) == 1
+
+
+async def test_delegated_submission_checks_once_before_receipt(
+    version_runtime, monkeypatch
+):
+    runtime, submission, context = version_runtime
+    client = MagicMock()
+    client.studio.create.return_value.task_id = "platform-task"
+    client.studio.create.return_value.status = "Pending"
+    port = platform_submission.PlatformWorkflowSubmission()
+    checked = []
+
+    async def admit(workflow, ctx):
+        assert not runtime._store("c").load_workflow_execution_requests()
+        checked.append(workflow)
+
+    monkeypatch.setattr(port, "validate_resources", admit)
+    monkeypatch.setattr(
+        platform_submission, "create_workflow_api_client", lambda **kwargs: client
+    )
+    runtime._workflow_submission = port
+
+    def duplicate_check(workflow):
+        pytest.fail("版本化提交由 Runtime 检查，不应在写回执后再次检查")
+
+    bridge = submission_bridge(
+        runtime.submit_versioned_workflow,
+        "c",
+        lambda: "delegated",
+        context,
+        asyncio.get_running_loop(),
+    )
+    with workflow_submission_scope(TaskOrigin(), resource_validator=duplicate_check):
+        response = await asyncio.to_thread(
+            submit_workflow_task,
+            client=client,
+            workflow=submission.workflow,
+            name="admitted",
+            conversation_id="c",
+            submission_handler=bridge,
+        )
+    assert response.task_id == "platform-task"
+    assert len(checked) == 1
+    assert client.studio.create.call_count == 1
+    assert client.studio.create.call_args.args[0].workflow == checked[0]
 
 
 async def test_graph_submission_registers_the_await_owner_immediately(
@@ -977,3 +1074,76 @@ async def test_inference_callback_registers_result_under_source_checkpoint(
         0.0,
         False,
     )
+
+
+async def test_resources_recheck_the_version_effective_definition_before_receipt(
+    version_runtime, monkeypatch
+):
+    runtime, submission, context = version_runtime
+    resolve_definition = runtime.versions.resolve_run_definition
+    checked = []
+
+    def transformed(*args, **kwargs):
+        workflow, inputs = resolve_definition(*args, **kwargs)
+        workflow["resource_marker"] = "version-effective"
+        return workflow, inputs
+
+    async def reject(workflow, ctx):
+        checked.append(workflow)
+        raise ValueError("resource check rejected effective definition")
+
+    monkeypatch.setattr(runtime.versions, "resolve_run_definition", transformed)
+    monkeypatch.setattr(submission, "validate_resources", reject)
+    with pytest.raises(ValueError, match="resource check rejected"):
+        await runtime.prepare_workflow_execution(
+            "c", "/train.py", context, request_id="resources"
+        )
+    assert checked[0]["resource_marker"] == "version-effective"
+    assert not FileProductStore(
+        runtime.conversation_root / "c"
+    ).load_workflow_execution_requests()
+    assert not submission.submissions
+
+
+@pytest.mark.parametrize("change", ["generated_id", "resources"])
+async def test_resource_rejection_does_not_freeze_request_before_retry(
+    version_runtime, monkeypatch, change
+):
+    runtime, submission, context = version_runtime
+    submission.workflow["id"] = "generated-A"
+
+    async def reject(workflow, ctx):
+        raise ValueError("WORKFLOW_RESOURCES_INSUFFICIENT")
+
+    monkeypatch.setattr(submission, "validate_resources", reject)
+    with pytest.raises(ValueError, match="WORKFLOW_RESOURCES_INSUFFICIENT"):
+        await runtime.prepare_workflow_execution(
+            "c", "/train.py", context, request_id="retry"
+        )
+    project = runtime.versions.store.bound_project("c")
+    assert runtime.versions.store.list_runs(project.id) == []
+    assert not FileProductStore(
+        runtime.conversation_root / "c"
+    ).load_workflow_execution_requests()
+
+    if change == "generated_id":
+        submission.workflow["id"] = "generated-B"
+    else:
+        submission.workflow["nodes"][0]["data"]["config"] = {"gpu_count": 1}
+    checked = []
+
+    async def allow(workflow, ctx):
+        checked.append(workflow)
+        assert runtime.versions.store.list_runs(project.id) == []
+
+    monkeypatch.setattr(submission, "validate_resources", allow)
+    result = await runtime.prepare_workflow_execution(
+        "c", "/train.py", context, request_id="retry"
+    )
+    assert result["request_id"] == "retry"
+    assert result["status"] == "submitted"
+    assert len(submission.submissions) == 1
+    assert submission.submissions[0][0] == checked[0]
+    runs = runtime.versions.store.list_runs(project.id)
+    assert len(runs) == 1
+    assert runs[0].spec.parameters["definition"] == checked[0]

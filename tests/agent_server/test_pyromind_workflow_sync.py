@@ -1,10 +1,4 @@
-"""Tests for the workflow<->canvas sync helper and the debug callback route.
-
-Covers the "工作流同步链路" cases from the debug-loop plan: from-scratch
-(empty reminder), canvas edited (overwrite + reminder), canvas cleared (remove
-file + reminder), already-in-sync, and no canvas attached. Every case reports the
-resulting workflow state, so the agent never has to probe the filesystem for it.
-"""
+"""验证 Pi 复用的平台调试与工作流状态回调。"""
 
 from __future__ import annotations
 
@@ -14,97 +8,11 @@ from fastapi import HTTPException
 from openhands.agent_server.pyromind_router import (
     PyromindDebugCallbackRequest,
     PyromindWorkflowCallbackRequest,
-    _sync_workflow_with_canvas,
     pyromind_debug_callback,
     pyromind_workflow_callback,
 )
-from openhands.agent_server.run_workflow_callback import RunWorkflowCallbackResult
+from openhands.agent_server.workflow_status import WorkflowCallbackResult
 from openhands.tools.pyromind_debug.broker import get_debug_result_broker
-
-
-def test_no_workflow_dsl_reports_missing_workflow(tmp_path):
-    reminder = _sync_workflow_with_canvas(tmp_path, None)
-
-    assert "workflow.py does not exist" in reminder.text
-    assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
-
-
-def test_no_workflow_dsl_reports_existing_workflow(tmp_path):
-    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
-    wf.parent.mkdir(parents=True, exist_ok=True)
-    wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
-
-    reminder = _sync_workflow_with_canvas(tmp_path, None)
-
-    assert "A workflow already exists" in reminder.text
-    assert wf.read_text(encoding="utf-8") == "# workflow: demo\nx = 1\n"
-
-
-def test_from_scratch_both_empty_returns_authoritative_reminder(tmp_path):
-    reminder = _sync_workflow_with_canvas(tmp_path, "")
-
-    assert reminder is not None
-    assert "current canvas is empty" in reminder.text
-    assert "invoke the matching skill immediately" in reminder.text
-    assert "do not inspect state.json" in reminder.text
-    assert not (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").exists()
-
-
-def test_already_in_sync_reports_existing_workflow(tmp_path):
-    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
-    wf.parent.mkdir(parents=True, exist_ok=True)
-    wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
-
-    reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: demo\nx = 1\n")
-
-    assert "A workflow already exists" in reminder.text
-    assert wf.read_text(encoding="utf-8") == ("# workflow: demo\nx = 1\n")
-
-
-def test_canvas_edited_overwrites_and_reminds(tmp_path):
-    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
-    wf.parent.mkdir(parents=True, exist_ok=True)
-    wf.write_text("# workflow: old\nx = 1\n", encoding="utf-8")
-
-    reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: new\nx = 2\n")
-
-    assert reminder is not None
-    assert "system_reminder" in reminder.text
-    assert "modified the workflow on the canvas" in reminder.text
-    assert wf.read_text(encoding="utf-8") == ("# workflow: new\nx = 2\n")
-
-
-def test_canvas_seeds_missing_workflow_file(tmp_path):
-    reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: from-canvas\n")
-
-    assert reminder is not None
-    assert "already had a workflow on the canvas" in reminder.text
-    assert (tmp_path / "public_data" / "workflow_canvas" / "workflow.py").read_text(
-        encoding="utf-8"
-    ) == ("# workflow: from-canvas\n")
-
-
-def test_canvas_cleared_removes_file_and_reminds(tmp_path):
-    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
-    wf.parent.mkdir(parents=True, exist_ok=True)
-    wf.write_text("# workflow: old\nx = 1\n", encoding="utf-8")
-
-    reminder = _sync_workflow_with_canvas(tmp_path, "")
-
-    assert reminder is not None
-    assert "cleared the workflow on the canvas" in reminder.text
-    assert not wf.exists()
-
-
-def test_whitespace_only_diff_does_not_rewrite_file(tmp_path):
-    wf = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
-    wf.parent.mkdir(parents=True, exist_ok=True)
-    wf.write_text("# workflow: demo\nx = 1\n", encoding="utf-8")
-
-    reminder = _sync_workflow_with_canvas(tmp_path, "# workflow: demo\nx = 1\n\n\n  ")
-
-    assert "A workflow already exists" in reminder.text
-    assert wf.read_text(encoding="utf-8") == "# workflow: demo\nx = 1\n"
 
 
 @pytest.mark.asyncio
@@ -151,9 +59,9 @@ async def test_workflow_callback_delegates_to_deliver(
 ) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_deliver(**kwargs: object) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: object) -> WorkflowCallbackResult:
         captured.update(kwargs)
-        return RunWorkflowCallbackResult(
+        return WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="task-1",
             normalized_status="Succeeded",
@@ -161,7 +69,7 @@ async def test_workflow_callback_delegates_to_deliver(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 
@@ -192,9 +100,9 @@ async def test_workflow_callback_passes_from_workflow_debug(
 ) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_deliver(**kwargs: object) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: object) -> WorkflowCallbackResult:
         captured.update(kwargs)
-        return RunWorkflowCallbackResult(
+        return WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="task-debug-1",
             normalized_status="Succeeded",
@@ -202,7 +110,7 @@ async def test_workflow_callback_passes_from_workflow_debug(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 
@@ -227,9 +135,9 @@ async def test_workflow_callback_allows_omitted_conversation_id(
 ) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_deliver(**kwargs: object) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: object) -> WorkflowCallbackResult:
         captured.update(kwargs)
-        return RunWorkflowCallbackResult(
+        return WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="clean-task-1",
             normalized_status="Succeeded",
@@ -237,7 +145,7 @@ async def test_workflow_callback_allows_omitted_conversation_id(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 
@@ -256,8 +164,8 @@ async def test_workflow_callback_allows_omitted_conversation_id(
 async def test_workflow_callback_unknown_conversation_returns_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_deliver(**kwargs: object) -> RunWorkflowCallbackResult:
-        return RunWorkflowCallbackResult(
+    async def fake_deliver(**kwargs: object) -> WorkflowCallbackResult:
+        return WorkflowCallbackResult(
             outcome="unknown_conversation",
             task_id="task-1",
             normalized_status="Succeeded",
@@ -265,7 +173,7 @@ async def test_workflow_callback_unknown_conversation_returns_404(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_run_workflow_status",
+        "openhands.agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 

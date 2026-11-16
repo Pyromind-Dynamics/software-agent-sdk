@@ -43,6 +43,7 @@ from harness_adapter.pi_adapter.tool_output import (
     ToolOutputPolicy,
 )
 from pydantic import BaseModel, ValidationError
+from pyromind_agent_server.api.schemas import AgentLLMConfig
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
@@ -56,7 +57,6 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 
-from openhands.agent_server.pyromind_router import AgentLLMConfig
 from openhands.sdk.workspace.local import LocalWorkspace
 
 
@@ -95,10 +95,11 @@ async def test_validation_reads_conversation_file_and_forwards_request_context(
     workflow = tmp_path / "public_data" / "workflow_canvas" / "workflow.py"
     workflow.parent.mkdir(parents=True)
     workflow.write_text("workflow = InputNode()")
-    captured = {}
+    captured = []
+    validated_workflow = {"id": "w1", "nodes": [], "edges": []}
 
     def fake_post(url, *, headers, json, timeout):
-        captured.update(url=url, headers=headers, json=json, timeout=timeout)
+        captured.append({"url": url, "headers": headers, "json": json})
         return SimpleNamespace(
             status_code=200,
             text="ok",
@@ -107,6 +108,7 @@ async def test_validation_reads_conversation_file_and_forwards_request_context(
                 "data": {
                     "valid": True,
                     "workflow_id": "w1",
+                    "workflow": validated_workflow,
                     "errors": [],
                     "warnings": [],
                 },
@@ -127,11 +129,14 @@ async def test_validation_reads_conversation_file_and_forwards_request_context(
     )
 
     assert result["is_error"] is False
-    assert captured["json"]["dsl"] == "workflow = InputNode()"
-    assert captured["headers"]["cookie"] == "auth=secret"
-    assert captured["headers"]["authorization"] == "Bearer secret"
-    assert captured["headers"]["x-cluster"] == "cluster-a"
-    assert captured["headers"]["accept-language"] == "zh-CN"
+    assert len(captured) == 2
+    assert captured[0]["json"]["dsl"] == "workflow = InputNode()"
+    assert captured[1]["json"] == {"workflow": validated_workflow}
+    for call in captured:
+        assert call["headers"]["cookie"] == "auth=secret"
+        assert call["headers"]["authorization"] == "Bearer secret"
+        assert call["headers"]["x-cluster"] == "cluster-a"
+        assert call["headers"]["accept-language"] == "zh-CN"
 
 
 async def test_validation_projects_401_without_retry(tmp_path, monkeypatch) -> None:
@@ -2596,7 +2601,7 @@ async def test_training_analysis_artifact_hook_is_best_effort(tmp_path, register
                 result={"task_id": action.task_id, "training_nodes": nodes},
             )
 
-    host._factories["training_analysis"] = lambda _: Tool()
+    host._factories["training_analysis"] = cast(Any, lambda _: Tool())
 
     async def register(scope, task_id, result, _context):
         assert (scope, task_id, result) == ("c", "10348", nodes)

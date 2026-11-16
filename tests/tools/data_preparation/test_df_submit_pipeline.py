@@ -31,6 +31,7 @@ from openhands.tools.data_preparation.runner import LabelingModelGateway
 from openhands.tools.data_preparation.submission import (
     SubmissionFiles as _SubmissionFiles,
 )
+from openhands.tools.workflow.task_submission import WorkflowResourceValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -500,13 +501,18 @@ def test_executor_missing_runtime_dir(tmp_path: Path) -> None:
     assert "runtime_dir" in obs.text
 
 
+@pytest.mark.parametrize("resource_error", [False, True])
+@pytest.mark.parametrize("guarded", [False, True])
 def test_executor_submit_failure_omits_progress_fields(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    resource_error: bool,
+    guarded: bool,
 ) -> None:
-    """A failed submission must not leak run/output dirs that would make the
-    frontend render a live progress panel for a task that never exists."""
-    executor = _make_executor(tmp_path)
+    """失败不能产生任务进度；资源拒绝属于确定未提交。"""
+    executor = _make_executor(
+        tmp_path, submission_guard=(lambda: None) if guarded else None
+    )
     script = tmp_path / "pipeline.py"
     script.write_text("print('hi')")
     conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
@@ -528,7 +534,11 @@ def test_executor_submit_failure_omits_progress_fields(
     )
 
     def _fail_submit(**kwargs: Any) -> None:
-        raise RuntimeError("boom")
+        raise (
+            WorkflowResourceValidationError("boom")
+            if resource_error
+            else RuntimeError("boom")
+        )
 
     monkeypatch.setattr(
         "openhands.tools.data_preparation.platform_submit.submit_workflow_task",
@@ -550,6 +560,8 @@ def test_executor_submit_failure_omits_progress_fields(
     assert observation.run_id is None
     assert observation.output_dir is None
     assert "boom" in observation.text
+    assert ("uncertain" in observation.text) is (guarded and not resource_error)
+    assert observation.failure_stage == ("resources" if resource_error else None)
 
 
 def test_executor_missing_node_fails_before_upload(

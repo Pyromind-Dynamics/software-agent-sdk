@@ -8,11 +8,13 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from pyromind_runtime.domain.task_correlation import TaskOrigin
 
 from openhands.tools.workflow import task_submission
 from openhands.tools.workflow.task_submission import (
     _retry_transient,
     submit_workflow_task,
+    workflow_submission_scope,
 )
 
 
@@ -126,6 +128,57 @@ def test_submit_workflow_task_retries_ssl_create(
     assert client.studio.create.call_count == 2
 
 
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_resource_rejection_prevents_platform_create_and_scope_registration(test_mode):
+    client = MagicMock()
+    workflow = {"id": "actual-frozen", "nodes": [], "edges": []}
+    checked = []
+
+    def reject(definition):
+        checked.append(definition)
+        raise ValueError("WORKFLOW_RESOURCES_INSUFFICIENT")
+
+    with workflow_submission_scope(TaskOrigin(), resource_validator=reject) as scope:
+        with pytest.raises(ValueError, match="WORKFLOW_RESOURCES_INSUFFICIENT"):
+            submit_workflow_task(
+                client=client,
+                workflow=workflow,
+                name="admission",
+                conversation_id="c",
+                test_mode=test_mode,
+            )
+        assert scope.submissions == {} and scope.direct_tasks == set()
+    assert checked == [workflow]
+    client.studio.create.assert_not_called()
+
+
+def test_each_direct_task_checks_resources_before_create():
+    client = MagicMock()
+    client.studio.create.return_value = SimpleNamespace(
+        task_id="task", status="Pending"
+    )
+    checked = []
+
+    def admit(workflow):
+        checked.append(workflow["id"])
+        if len(checked) == 2:
+            raise ValueError("RESOURCE_CHECK_FAILED")
+
+    with workflow_submission_scope(TaskOrigin(), resource_validator=admit):
+        submit_workflow_task(
+            client=client, workflow={"id": "first"}, name="first", conversation_id="c"
+        )
+        with pytest.raises(ValueError, match="RESOURCE_CHECK_FAILED"):
+            submit_workflow_task(
+                client=client,
+                workflow={"id": "second"},
+                name="second",
+                conversation_id="c",
+            )
+    assert checked == ["first", "second"]
+    assert client.studio.create.call_count == 1
+
+
 @pytest.mark.asyncio
 async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
     import asyncio
@@ -138,6 +191,7 @@ async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
     from openhands.tools.workflow.task_submission import workflow_submission_scope
 
     requests = {}
+    admitted = []
     client = MagicMock()
 
     def create(request):
@@ -148,11 +202,16 @@ async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
 
     async def submit(identity):
         origin = TaskOrigin(type="subagent", subagent_id=identity)
-        with workflow_submission_scope(origin) as scope:
+        with workflow_submission_scope(
+            origin,
+            resource_validator=lambda workflow: admitted.append(
+                (identity, workflow["owner"])
+            ),
+        ) as scope:
             await asyncio.to_thread(
                 submit_workflow_task,
                 client=client,
-                workflow={},
+                workflow={"owner": identity},
                 name=identity,
                 conversation_id="c",
                 task_kind="data_preparation",
@@ -164,6 +223,8 @@ async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
     assert first is not None and second is not None
     assert first.subagent_id == "worker-1" and second.subagent_id == "worker-2"
     assert first.task_kind == second.task_kind == "data_preparation"
+    assert sorted(admitted) == [("worker-1", "worker-1"), ("worker-2", "worker-2")]
     submit_workflow_task(client=client, workflow={}, name="main", conversation_id="c")
+    assert len(admitted) == 2
     main = parse_task_correlation(requests["main"].out_id)
     assert main is not None and main.type == "main" and main.subagent_id is None

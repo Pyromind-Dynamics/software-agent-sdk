@@ -58,20 +58,33 @@ def current_task_correlation() -> TaskCorrelation | None:
 _submission_scope: ContextVar[WorkflowSubmissionScope | None] = ContextVar(
     "workflow_submission_scope", default=None
 )
+_resource_validator: ContextVar[Callable[[dict], None] | None] = ContextVar(
+    "workflow_resource_validator", default=None
+)
 
 
 @contextmanager
-def workflow_submission_scope(origin: TaskOrigin) -> Iterator[WorkflowSubmissionScope]:
+def workflow_submission_scope(
+    origin: TaskOrigin,
+    *,
+    resource_validator: Callable[[dict], None] | None = None,
+) -> Iterator[WorkflowSubmissionScope]:
     scope = WorkflowSubmissionScope(origin)
     token = _submission_scope.set(scope)
+    resource_token = _resource_validator.set(resource_validator)
     try:
         yield scope
     finally:
+        _resource_validator.reset(resource_token)
         _submission_scope.reset(token)
 
 
 class WorkflowTaskSubmissionError(RuntimeError):
     """Raised when Pyromind does not create a workflow task."""
+
+
+class WorkflowResourceValidationError(ValueError):
+    """资源检查未通过，尚未调用平台创建任务。"""
 
 
 def _retry_transient[T](
@@ -141,11 +154,20 @@ def submit_workflow_task(
     )
     if submission_handler is not None and not test_mode:
         token = _current_correlation.set(correlation)
+        # 受托的 Runtime 会检查解析后的实际定义，不能在写回执后重复检查。
+        resource_token = _resource_validator.set(None)
         try:
             response = submission_handler(workflow, name, source_code)
         finally:
+            _resource_validator.reset(resource_token)
             _current_correlation.reset(token)
     else:
+        validator = _resource_validator.get()
+        if validator is not None:
+            try:
+                validator(workflow)
+            except Exception as exc:
+                raise WorkflowResourceValidationError(str(exc)) from exc
         request = TrainingTaskCreateRequest(
             name=name, workflow=workflow, out_id=correlation.to_out_id()
         )

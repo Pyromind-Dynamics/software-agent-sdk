@@ -1,12 +1,4 @@
-"""Definition of the ``workflow_debug`` tool.
-
-Thin wrapper around :class:`~openhands.tools.workflow.run_workflow.RunWorkflowTool`
-that always submits with ``test_mode=True`` (platform ``execution_mode=test``).
-
-测试 / 调试 / 试跑统一走本工具，不再让 Agent 直接调用
-``run_workflow(test_mode=true)``。异步提交成功时返回 ``keep_ui_lock=True``
-（``run_workflow`` 正式执行不返回该字段）。
-"""
+"""通过仅供调试的执行服务提交测试工作流。"""
 
 from __future__ import annotations
 
@@ -25,11 +17,11 @@ from openhands.sdk.tool import (
 )
 from openhands.tools.utils.workspace_files import read_workspace_text
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
-from openhands.tools.workflow.run_workflow import (
+from openhands.tools.workflow_debug.execution import (
     DEFAULT_MAX_ATTEMPTS,
-    RunWorkflowAction,
-    RunWorkflowExecutor,
-    RunWorkflowObservation,
+    WorkflowDebugSubmissionAction,
+    WorkflowDebugSubmissionExecutor,
+    WorkflowDebugSubmissionObservation,
 )
 
 
@@ -75,10 +67,10 @@ class WorkflowDebugAction(Action):
 
 
 class WorkflowDebugObservation(Observation):
-    """Result of one workflow debug/test attempt.
+    """单次工作流调试执行结果。
 
-    Includes ``keep_ui_lock`` for the frontend; production ``run_workflow``
-    observations do not carry this field.
+    包含供前端使用的 ``keep_ui_lock`` 字段；正式运行的
+    ``submit_workflow`` 观测结果不携带此字段。
     """
 
     status: Literal[
@@ -117,16 +109,16 @@ class WorkflowDebugObservation(Observation):
 TOOL_DESCRIPTION = """Test-run (debug) the current Pyromind workflow on the platform.
 
 Use this tool whenever the user asks to test, debug, 测试, 调试, or 试跑 a workflow.
-This is the only tool for debug/test runs — do **not** use `run_workflow` for
-测试/调试/试跑 (`run_workflow` has no agent-facing `test_mode` parameter).
+This is the only tool for debug/test runs — do **not** use `submit_workflow` for
+测试/调试/试跑 (`submit_workflow` has no agent-facing `test_mode` parameter).
 
 `public_data/workflow_canvas/workflow.py` is a declarative DSL, not a runnable Python script. Pass its
 workspace-relative path as `dsl_path` (default `public_data/workflow_canvas/workflow.py`); the tool reads the file itself. Do not execute
 it locally with bash or Python.
 
-This tool delegates to `run_workflow`'s executor with internal `test_mode=true`
+This tool always submits with platform `execution_mode=test`
 (platform `execution_mode=test`). `test_mode` is **not** an agent-facing
-`run_workflow` action field — Agents must call this tool for test/debug runs.
+`submit_workflow` action field — Agents must call this tool for test/debug runs.
 Submission is **asynchronous**: it returns a task ID after the platform accepts
 the run and sets `keep_ui_lock=true` so the Web UI stays locked until the
 Kafka/platform callback delivers the terminal status. That callback injects a
@@ -148,15 +140,15 @@ How to use the result:
 - Round limit reached: if the tool reports the round attempt limit (10 accepted
   submissions) was reached and the user explicitly asks to keep debugging, call
   `workflow_debug` again with `reset_round=true` to start a fresh round.
-- Do not use this tool for production run/publish — use `run_workflow` instead.
-  Production `run_workflow` does not return `keep_ui_lock`.
+- Do not use this tool for production run/publish — use `submit_workflow` instead.
+  Production `submit_workflow` does not return `keep_ui_lock`.
 """  # noqa: E501
 
 
 def _to_debug_observation(
-    observation: RunWorkflowObservation,
+    observation: WorkflowDebugSubmissionObservation,
 ) -> WorkflowDebugObservation:
-    """Map a run_workflow observation and set keep_ui_lock for async debug."""
+    """转换 submit_workflow 观测结果，并为异步调试设置 keep_ui_lock。"""
     return WorkflowDebugObservation.from_text(
         text=observation.text,
         is_error=observation.is_error,
@@ -172,10 +164,10 @@ def _to_debug_observation(
 class WorkflowDebugExecutor(
     ToolExecutor[WorkflowDebugAction, WorkflowDebugObservation]
 ):
-    """Delegate to :class:`RunWorkflowExecutor` with internal ``test_mode=True``.
+    """委托仅供调试的提交执行器完成提交。
 
-    Successful async submissions always surface ``keep_ui_lock=True`` so the
-    frontend can lock the UI until the platform callback completes.
+    异步提交成功后始终返回 ``keep_ui_lock=True``，以便前端锁定界面，
+    直到平台回调完成。
     """
 
     def __init__(
@@ -185,9 +177,9 @@ class WorkflowDebugExecutor(
         env: str | None = None,
         current_user: object | None = None,
         headers: dict[str, str] | None = None,
-        run_executor: RunWorkflowExecutor | None = None,
+        run_executor: WorkflowDebugSubmissionExecutor | None = None,
     ) -> None:
-        self._run_executor = run_executor or RunWorkflowExecutor(
+        self._run_executor = run_executor or WorkflowDebugSubmissionExecutor(
             cluster=cluster,
             env=env,
             current_user=current_user,
@@ -233,14 +225,13 @@ class WorkflowDebugExecutor(
                 error_log=str(exc),
             )
         observation = self._run_executor(
-            RunWorkflowAction(
+            WorkflowDebugSubmissionAction(
                 note=action.note,
                 dsl=dsl_source,
                 name=action.name,
                 reset_round=action.reset_round,
             ),
             conversation,
-            test_mode=True,
         )
         return _to_debug_observation(observation)
 

@@ -263,22 +263,46 @@ def test_sandbox_upload_uses_the_workspace_mount(
     )
 
 
+@pytest.mark.parametrize(
+    ("cluster", "headers", "expected_image"),
+    [
+        ("us-west-2", {}, "pyrominddynamics/jupyter-lab-with-ssh:v0.9"),
+        (
+            "cn-east-1",
+            {},
+            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+            "sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+        ),
+        (
+            "cn-east-1#pre",
+            {},
+            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+            "sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+        ),
+        (
+            "us-west-1",
+            {"x-cluster": "cn-east-1#pre"},
+            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+            "sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+        ),
+    ],
+)
 def test_sandbox_create_uses_default_image_for_regional_cluster(
     monkeypatch: pytest.MonkeyPatch,
+    cluster: str,
+    headers: dict[str, str],
+    expected_image: str,
 ) -> None:
     client = MagicMock()
     client.sandboxes.create.return_value = _sandbox(status="creating")
     _patch_client(monkeypatch, client)
 
-    observation = SandboxCreateExecutor(**_executor_kwargs(cluster="us-west-2"))(
-        SandboxCreateAction(wait_timeout=0), _fake_conversation()
-    )
+    observation = SandboxCreateExecutor(
+        **_executor_kwargs(cluster=cluster, headers=headers)
+    )(SandboxCreateAction(wait_timeout=0), _fake_conversation())
 
     assert not observation.is_error
-    assert (
-        client.sandboxes.create.call_args[0][0].image
-        == "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
-    )
+    assert client.sandboxes.create.call_args[0][0].image == expected_image
 
 
 def test_sandbox_create_other_cluster_default_image(
@@ -299,15 +323,17 @@ def test_sandbox_create_other_cluster_default_image(
     )
 
 
+@pytest.mark.parametrize("cluster", ["us-west-1", "cn-east-1"])
 def test_sandbox_create_uses_deployment_default_image(
     monkeypatch: pytest.MonkeyPatch,
+    cluster: str,
 ) -> None:
     client = MagicMock()
     client.sandboxes.create.return_value = _sandbox(status="running")
     _patch_client(monkeypatch, client)
 
     SandboxCreateExecutor(
-        **_executor_kwargs(cluster="us-west-1"),
+        **_executor_kwargs(cluster=cluster, headers={}),
         default_image="registry.test/embodied-runtime:1.29.5",
     )(SandboxCreateAction(wait_timeout=0), _fake_conversation())
 

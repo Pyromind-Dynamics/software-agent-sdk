@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from copy import deepcopy
 from pathlib import PurePosixPath
 
 from pydantic import JsonValue
@@ -11,6 +12,7 @@ from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
+from harness_adapter.workflow_validation import ResourceValidatedWorkflowDslExecutor
 from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
 from openhands.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
@@ -24,15 +26,14 @@ from openhands.tools.utils.storage_paths import (
     StoragePathError,
     to_tool_storage_path,
 )
-from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.storage_paths import validate_persistent_output_paths
 from openhands.tools.workflow.task_submission import (
+    WorkflowResourceValidationError,
     create_workflow_api_client,
     submit_workflow_task,
 )
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
-    ValidateWorkflowDslExecutor,
 )
 
 
@@ -117,12 +118,15 @@ class PlatformWorkflowSubmission:
         )
         dsl = source.decode("utf-8")
         name = path.stem
-        validation = ValidateWorkflowDslExecutor(headers=headers)(
+        validation = ResourceValidatedWorkflowDslExecutor(headers=headers)(
             ValidateWorkflowDslAction(dsl=dsl, name=name)
         )
         if validation.is_error or validation.valid is not True:
             raise ValueError(validation.text or "workflow DSL validation failed")
-        workflow = convert_dsl_to_xyflow(dsl, name=name)
+        workflow = getattr(validation, "validated_workflow", None)
+        if not isinstance(workflow, dict):
+            raise ValueError("workflow validation returned no validated definition")
+        workflow = deepcopy(workflow)
         nodes = workflow.get("nodes", [])
         validate_persistent_output_paths(nodes)
         node_types: list[JsonValue] = [
@@ -145,6 +149,31 @@ class PlatformWorkflowSubmission:
             "summary": summary,
             "source": dsl,
         }
+
+    async def validate_resources(
+        self, workflow: JsonObject, context: RequestContext
+    ) -> None:
+        await asyncio.to_thread(self._validate_resources, workflow, context)
+
+    @staticmethod
+    def _validate_resources(workflow: JsonObject, context: RequestContext) -> None:
+        headers = {
+            key: value
+            for key, value in {
+                "cookie": context.cookie,
+                "authorization": context.authorization,
+                "x-cluster": platform_cluster_route(context.x_cluster),
+            }.items()
+            if value
+        }
+        # 直接校验版本处理后的实际定义，保留所有显式资源值及节点信息。
+        validation = ResourceValidatedWorkflowDslExecutor(
+            headers=headers
+        ).validate_resources(dict(workflow))
+        if validation.is_error or validation.valid is not True:
+            raise WorkflowResourceValidationError(
+                validation.text or "workflow resource validation failed"
+            )
 
     async def submit(
         self,

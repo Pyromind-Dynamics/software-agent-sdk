@@ -43,6 +43,9 @@ class FakeSubmission:
             },
         }
 
+    async def validate_resources(self, workflow: dict, context: RequestContext) -> None:
+        pass
+
     async def submit(
         self,
         workflow: dict,
@@ -500,3 +503,59 @@ async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
             "call-1",
         )
     ]
+
+
+async def test_resource_failure_precedes_receipt_and_can_be_rechecked(tmp_path):
+    runtime, _, submission, context = await _runtime(tmp_path)
+
+    async def reject(workflow: dict, context: RequestContext) -> None:
+        raise ValueError("WORKFLOW_RESOURCES_INSUFFICIENT max_gpu_count=4")
+
+    submission.validate_resources = reject
+    try:
+        with pytest.raises(ValueError, match="WORKFLOW_RESOURCES_INSUFFICIENT"):
+            await runtime.prepare_workflow_execution(
+                "workflow-conversation",
+                "/train.py",
+                context,
+                request_id="resource-check",
+            )
+        store = FileProductStore(tmp_path / "workflow-conversation")
+        assert not store.load_workflow_execution_requests()
+        assert not submission.submissions
+        submission.validate_resources = FakeSubmission.validate_resources.__get__(
+            submission
+        )
+        result = await runtime.prepare_workflow_execution(
+            "workflow-conversation", "/train.py", context, request_id="resource-check"
+        )
+        assert result["status"] == "submitted" and len(submission.submissions) == 1
+    finally:
+        await runtime.close()
+
+
+async def test_request_id_is_generated_only_after_resource_admission(
+    tmp_path, monkeypatch
+):
+    runtime, _, submission, context = await _runtime(tmp_path)
+
+    def unexpected_request_id():
+        pytest.fail("资源预检失败时不应生成正式 request_id")
+
+    async def reject(workflow, ctx):
+        raise ValueError("WORKFLOW_RESOURCES_INSUFFICIENT")
+
+    monkeypatch.setattr(
+        "pyromind_runtime.application.conversation_runtime.uuid4", unexpected_request_id
+    )
+    monkeypatch.setattr(submission, "validate_resources", reject)
+    try:
+        with pytest.raises(ValueError, match="WORKFLOW_RESOURCES_INSUFFICIENT"):
+            await runtime.prepare_workflow_execution(
+                "workflow-conversation", "/train.py", context
+            )
+        assert not FileProductStore(
+            tmp_path / "workflow-conversation"
+        ).load_workflow_execution_requests()
+    finally:
+        await runtime.close()

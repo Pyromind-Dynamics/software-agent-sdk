@@ -18,7 +18,6 @@ from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_p
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
 
-from harness_adapter.openhands_adapter.session_factory import current_user_from_context
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
@@ -32,6 +31,7 @@ from harness_adapter.pi_adapter.tool_output import (
     resolve_tool_output_policy,
     truncate_tool_content,
 )
+from harness_adapter.tool_context import current_user_from_context
 from harness_adapter.version_tools import (
     ExecutionCall,
     ProductVersionsAction,
@@ -39,6 +39,7 @@ from harness_adapter.version_tools import (
     VersionCall,
     submission_bridge,
 )
+from harness_adapter.workflow_validation import check_workflow_resources
 from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
@@ -86,7 +87,6 @@ from openhands.tools.utils.platform_env import (
     platform_cluster_target,
 )
 from openhands.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
-from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     workflow_submission_scope,
@@ -97,6 +97,7 @@ from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslExecutor,
 )
 from openhands.tools.workflow_debug import WorkflowDebugTool
+from openhands.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
 
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
@@ -736,7 +737,15 @@ class PyromindBusinessToolHost:
             if tool.executor is not None:
                 self._active_executors[key] = tool.executor
             try:
-                with workflow_submission_scope(origin) as submissions:
+                with workflow_submission_scope(
+                    origin,
+                    resource_validator=lambda workflow: check_workflow_resources(
+                        workflow,
+                        headers=_forward_headers(
+                            context.request_context, include_cookie=True
+                        ),
+                    ),
+                ) as submissions:
                     observation = await asyncio.to_thread(
                         tool, action, cast(Any, facade)
                     )

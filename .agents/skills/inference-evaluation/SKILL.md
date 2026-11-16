@@ -71,7 +71,7 @@ storage 使用 Inference → CPU；clone/download 在 Inference 前增加对应�
 其 model_path 输出绑定 Inference.model_path，再连接 Inference.endpoint → CPU.param。
 不要手写评测 workflow.py 或通过另一工具重复提交；工具生成并提交同一份最终工作流。
 无需在本机运行 GPU 推理，不手工上传或修改内置脚本，不传 script_path、model_profile、
-output_schema 或 convert_format。不使用 workflow_debug 或 run_workflow。
+output_schema 或 convert_format。不使用 workflow_debug 或 submit_workflow。
 所选 checkpoint 使用 model_source.type=checkpoint；full 直接推理，lora 合并准确 adapter 和基模，
 参见已有预测评分契约。不接受已有外部 endpoint 或自定义节点类型。
 

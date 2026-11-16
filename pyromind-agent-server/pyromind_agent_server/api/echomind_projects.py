@@ -105,7 +105,7 @@ def _build_dataset_start_context(project: ProjectInfo, node_id: str) -> str:
 
 
 def _require_sandbox_credentials(request: Request) -> None:
-    if os.getenv("PYROMIND_HARNESS_BACKEND", "").strip().lower() != "pi":
+    if os.getenv("PYROMIND_HARNESS_BACKEND", "pi").strip().lower() != "pi":
         return
     if os.getenv("PYROMIND_PI_TERMINAL_BACKEND", "").strip().lower() != "sandbox":
         return

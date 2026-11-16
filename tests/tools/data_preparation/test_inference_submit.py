@@ -52,6 +52,7 @@ from openhands.tools.data_preparation.stop_task import (
 )
 from openhands.tools.data_preparation.submission import SubmissionConfig
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
+from openhands.tools.workflow.task_submission import WorkflowResourceValidationError
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslExecutor,
     ValidateWorkflowDslObservation,
@@ -1067,6 +1068,29 @@ def test_ambiguous_platform_submission_is_not_repeated(inference_submission):
     )
     assert resumed.is_error and "uncertain" in resumed.text
     ctx.submit.assert_called_once()
+
+
+def test_resource_rejection_is_failed_and_can_resume(inference_submission):
+    ctx = inference_submission
+    ctx.submit.side_effect = WorkflowResourceValidationError(
+        "WORKFLOW_RESOURCES_INSUFFICIENT"
+    )
+    result = ctx.executor(ctx.action, ctx.conversation)
+    assert result.is_error and result.run_id
+    assert "uncertain" not in result.text
+    assert result.failure_stage == "resources"
+    run = ctx.store.load_pipeline_runs()[result.run_id]
+    assert run.submission_status == "failed" and run.task_id is None
+    ctx.submit.side_effect = None
+    resumed = ctx.executor(
+        DfSubmitEvaluationAction(
+            operation="resume",
+            resume_run_id=result.run_id,
+            input_path=ctx.action.input_path,
+        ),
+        ctx.conversation,
+    )
+    assert not resumed.is_error and resumed.task_id == "task-1"
 
 
 @pytest.mark.parametrize("invalid_metrics", [False, True])

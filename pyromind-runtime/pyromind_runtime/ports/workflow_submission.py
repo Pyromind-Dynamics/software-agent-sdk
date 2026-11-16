@@ -12,6 +12,12 @@ class WorkflowSubmissionPort(Protocol):
         self, workflow_path: str, context: RequestContext
     ) -> JsonObject: ...
 
+    async def validate_resources(
+        self, workflow: JsonObject, context: RequestContext
+    ) -> None:
+        """接纳提交回执前，校验实际生效的工作流定义。"""
+        ...
+
     async def submit(
         self,
         workflow: JsonObject,

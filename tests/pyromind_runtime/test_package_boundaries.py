@@ -475,7 +475,7 @@ def test_return_addresses_stay_in_the_product_contract_and_out_of_model_argument
     from pyromind_runtime.domain.task_correlation import TaskCorrelation
     from pyromind_runtime.ports.harness import ExternalTaskNotification
 
-    from openhands.tools.workflow import RunWorkflowAction
+    from openhands.tools.workflow.submit_workflow import SubmitWorkflowAction
     from openhands.tools.workflow_debug.definition import WorkflowDebugAction
 
     assert "correlation" in ExternalTaskNotification.model_fields
@@ -487,7 +487,7 @@ def test_return_addresses_stay_in_the_product_contract_and_out_of_model_argument
         "subagent_id",
         "task_kind",
     }
-    for action in (RunWorkflowAction, WorkflowDebugAction, DfSubmitPipelineAction):
+    for action in (SubmitWorkflowAction, WorkflowDebugAction, DfSubmitPipelineAction):
         assert not {"correlation", "origin", "subagent_id"}.intersection(
             action.model_fields
         )

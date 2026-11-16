@@ -321,3 +321,31 @@ def test_external_task_registry_cannot_transfer_ownership_or_change_the_recipien
     restored = registry.resolve("c", "task")
     assert restored is not None
     assert restored["correlation"] == payload["correlation"]
+
+
+async def test_unknown_product_callback_never_falls_back_to_legacy_session(tmp_path):
+    runtime = ConversationRuntime(
+        tmp_path, {"pi": FakeAdapter("pi")}, default_harness_id="pi"
+    )
+    try:
+        result = await WorkflowStatusDispatcher(runtime).dispatch(
+            task_id="unknown",
+            status="Succeeded",
+            conversation_id="missing",
+        )
+        assert result.outcome == "unknown_conversation"
+        assert not (tmp_path / "missing" / "metadata.json").exists()
+    finally:
+        await runtime.close()
+
+
+def test_retired_production_workflow_tool_cannot_be_resolved():
+    from typing import Any, cast
+
+    import pytest
+
+    from openhands.sdk.tool import Tool
+    from openhands.sdk.tool.registry import resolve_tool
+
+    with pytest.raises(KeyError, match="run_workflow"):
+        resolve_tool(Tool(name="run_workflow"), cast(Any, None))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 from typing import Any
+from uuid import uuid4
 
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
@@ -291,6 +292,22 @@ class Versions:
                     for key in keys
                 )
         return result
+
+    def resolve_run_definition(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        definition: JsonObject,
+    ) -> tuple[JsonObject, dict[str, str]]:
+        """解析本次预检使用的版本引用，不冻结执行请求。"""
+        check_persistable(definition)
+        project = self.project(conversation_id, context)
+        assert project is not None
+        inputs: dict[str, str] = {}
+        effective = self.resolve_inputs(
+            project, definition, inputs, context, f"preflight:{uuid4().hex}"
+        )
+        return effective, inputs
 
     def prepare_run(
         self,

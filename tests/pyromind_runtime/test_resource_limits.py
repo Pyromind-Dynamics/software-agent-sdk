@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from harness_adapter.openhands_adapter.adapter import OPENHANDS_CAPABILITIES
 from harness_adapter.pi_adapter.adapter import PI_CAPABILITIES, _session_config
 from pydantic import ValidationError
 from pyromind_agent_server.bootstrap import resource_limits_from_environment
@@ -51,7 +50,6 @@ def test_resource_limits_reject_invalid_environment(
 
 
 def test_resource_limits_are_a_cross_harness_contract() -> None:
-    assert OPENHANDS_CAPABILITIES.enforced_limits == {"memory", "nproc"}
     assert PI_CAPABILITIES.enforced_limits == {"memory", "nproc"}
 
     spec = SessionSpec(
