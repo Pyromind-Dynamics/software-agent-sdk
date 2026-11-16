@@ -41,7 +41,7 @@ PYTHON
 fi
 
 # Override EXPERIMENT_DB_BACKEND=sqlite to use a local database.
-export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-mariadb}"
+export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-sqlite}"
 case "${EXPERIMENT_DB_BACKEND}" in
   sqlite)
     export EXPERIMENT_SQLITE_PATH="${EXPERIMENT_SQLITE_PATH:-${SCRIPT_DIR}/workspace/experiments/experiments.sqlite3}"
@@ -103,8 +103,11 @@ fi
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
 # export LLM_MODEL="${LLM_MODEL:-deepseek-v4.1-flash-1017}"
 # export LLM_BASE_URL="${LLM_BASE_URL:-https://token-plan-cn-east-1.pyromind-asia.cn/v1}"
-export LLM_MODEL="deepseek/deepseek-v4.1-flash-1017"
-export LLM_BASE_URL="https://openrouter.ai/api/v1"
+export PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET="Obah981G36018bmI8Cboaz6lMvf4t3OI"
+export OPENAI_API_KEY="AQXP7X5RZURITVB0JD7H"
+export DF_API_KEY="AQXP7X5RZURITVB0JD7H"
+export LLM_MODEL="openai/deepseek-v4.1-flash-1017"
+export LLM_BASE_URL="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 
