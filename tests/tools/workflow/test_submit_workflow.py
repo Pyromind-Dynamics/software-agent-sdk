@@ -21,7 +21,7 @@ def test_submit_workflow_rejects_the_removed_storage_alias():
         module.SubmitWorkflowAction(workflow_path="storage/project/workflow.py")
 
 
-def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypatch):
+def test_submit_workflow_tool_submits_directly_with_current_identity(monkeypatch):
     captured: dict = {}
 
     class Secrets:
@@ -37,7 +37,8 @@ def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypa
             raise_for_status=lambda: None,
             json=lambda: {
                 "request_id": json["request_id"],
-                "status": "awaiting_confirmation",
+                "status": "submitted",
+                "task_id": "task-123",
                 "summary": {"name": "sft"},
             },
         )
@@ -53,7 +54,10 @@ def test_submit_workflow_tool_stages_confirmation_with_current_identity(monkeypa
         module.SubmitWorkflowAction(workflow_path="/workspace/project/workflow.py"),
         cast(BaseConversation, conversation),
     )
-    assert observation.status == "awaiting_confirmation"
+    assert observation.status == "submitted"
+    assert observation.task_id == "task-123"
+    assert "task-123" in observation.text
+    assert "awaiting user confirmation" not in observation.text
     assert captured["url"].endswith(
         f"/conversations/{conversation_id.hex}/workflow-executions"
     )

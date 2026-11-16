@@ -69,6 +69,37 @@ def test_child_lifecycle_never_changes_parent_status():
     assert interrupted.type == "operation.failed"
 
 
+async def test_initial_child_queue_state_is_retained_on_snapshot_reload(tmp_path):
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42")
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id="parent", user_id="42", workspace_root=str(tmp_path)
+        ),
+        context,
+    )
+    store = runtime._store("parent")
+    details = {"subagent": {"version": 1, "role": "search", "status": "queued"}}
+    (started,) = translate_runner_event(
+        {
+            "eventId": "child:start",
+            "sessionId": "parent",
+            "runId": "child",
+            "kind": "subagent.started",
+            "payload": {"label": "search", "details": details},
+        }
+    )
+    store.append(
+        ProductEvent(
+            conversation_id="parent", type="operation.started", payload=started.payload
+        )
+    )
+    operation = store.load_snapshot().timeline[-1]
+    assert operation.kind == "operation"
+    assert operation.details == details
+    await runtime.close()
+
+
 def test_pinned_genome_compatibility_package_preserves_implementation():
     root = Path(__file__).resolve().parents[2] / "harness-adapter/pi-runtime"
     with (
@@ -79,8 +110,11 @@ def test_pinned_genome_compatibility_package_preserves_implementation():
         for entry in old.getmembers():
             if not entry.isfile():
                 continue
-            previous = old.extractfile(entry).read()
-            current = new.extractfile(entry.name).read()
+            old_file = old.extractfile(entry)
+            new_file = new.extractfile(entry.name)
+            assert old_file is not None and new_file is not None
+            previous = old_file.read()
+            current = new_file.read()
             if entry.name == "package/package.json":
                 previous, current = json.loads(previous), json.loads(current)
                 assert (

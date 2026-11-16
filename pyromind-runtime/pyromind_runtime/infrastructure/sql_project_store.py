@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import JSON, Column, Integer, MetaData, String, Table
+from sqlalchemy import Column, MetaData, String, Table
 
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 
@@ -17,10 +17,8 @@ projects = Table(
     Column("conversation_id", String(128), nullable=False),
     Column("cluster", String(255)),
     Column("profile_id", String(128)),
-    Column("current_revision", Integer, nullable=False),
-    Column("context", JSON),
-    Column("creation_metadata", JSON),
-    Column("context_sequence", Integer, nullable=False, server_default="0"),
+    Column("creation_command_id", String(128)),
+    Column("workflow_plan_path", String(4096)),
 )
 
 

@@ -2,23 +2,30 @@
 
 ## 准备阶段
 
-Manager 使用场景 Skill 的 checklist.json 收集事实、资源和执行约束。
-read、write、edit、terminal、ask_user 负责探查和交互，inspect_resource
-使用当前请求凭据读取 Storage。resolved facts 必须引用 message:/operation: 或
-resource: 依据，update_preparation(expected_revision, facts) 增量保存事实。
-set_preparation_plan(expected_revision, plan, entry_task_id, role_id) 提交完整计划。
-任务输入引用 plan.resources，edges 连接 stage.id。
+Manager 使用 model-evaluation-preparation Skill 判断信息是否足够。
+read、terminal 负责数据与知识探查，ask_user 补充无法查证的信息或用户决策。
+Checklist 只在 Skill 中引导判断，不保存逐项答案、证据目录或完成进度。
+唯一的准备工具 set_preparation_plan(plan, entry_task_id) 接收完整可审阅计划；
+任务输入引用 plan.resources，edges 连接 stage.id，入口角色由节点目录推导。
 
-workflow_nodes 声明可用节点、任务类型和角色，Runtime 校验结构、引用与角色权限。
-Init、Dataset、Train、Eval 保持独立角色配置。准备信息在用户审阅期间可继续修改。
-新消息撤销 ready 并推进修订号，创建按钮使用最新准备版本。
+workflow-nodes.json 声明可用节点、任务类型和角色，Runtime 仅校验计划结构、
+引用与角色权限；信息是否充分由 LLM 判断。Init、Dataset、Train、Eval 保持独立配置。
+提交成功设为 ready，发出原 preparation.changed 并展示计划，不启动任务。
+新消息或用户答复撤销 ready；Adapter 在模型请求前取得 Runtime 修订号，
+提交时通过受信上下文传递，拒绝过期模型请求，LLM 无需维护版本。
+
+前端只展示计划预览与创建按钮，按 phase 和 review_pending 判断就绪状态。
+SQL 只保存计划、入口任务、审阅状态和版本；快照额外提供节点目录。
+历史会话已清空，不再接收旧 Checklist 字段，也不保留 facts/missing 展示适配。
+本次同步更新前后端契约，不修改数据库表或运行中的平台任务。
 
 ## Project 创建
 
 用户提交 create_project(command_id, expected_preparation_revision)。
 SQL Store 在单个事务中保存 Project 和用户接受的准备快照。重复创建返回同一 Project。
 事务失败整体回滚，创建后的工具策略在空闲边界激活。
-Runtime 通过幂等 Project 通知把接受的计划、入口任务和事实交给 Manager。
+Runtime 通过幂等 Project 通知把接受的计划和入口任务交给 Manager。
+已确认业务信息放在计划约束及任务描述中，不复制另一份事实。
 Manager 用普通 write 创建 public_data/workflowPLAN.json，再委派入口任务。
 
 Project 创建保存计划，原生插件保存子 Agent 的会话和运行记录。

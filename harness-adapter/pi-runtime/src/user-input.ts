@@ -89,6 +89,14 @@ export function createAskUserTool(
     label: "ask_user",
     description: spec.description,
     parameters: spec.inputSchema as TSchema,
+    prepareArguments(args: unknown) {
+      if (!isRecord(args) || typeof args.presentation !== "string" || args.presentation.length > 262144) return args;
+      try {
+        const presentation: unknown = JSON.parse(args.presentation);
+        if (isRecord(presentation)) return { ...args, presentation };
+      } catch { /* Native validation reports invalid presentation. */ }
+      return args;
+    },
     // The human wait must serialize with the rest of the tool batch: no other
     // tool call may run while the question is open.
     executionMode: "sequential",

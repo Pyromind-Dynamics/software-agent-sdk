@@ -25,6 +25,7 @@ from openhands.tools.utils.storage_paths import (
     to_tool_storage_path,
 )
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
+from openhands.tools.workflow.storage_paths import validate_persistent_output_paths
 from openhands.tools.workflow.task_submission import (
     create_workflow_api_client,
     submit_workflow_task,
@@ -123,6 +124,7 @@ class PlatformWorkflowSubmission:
             raise ValueError(validation.text or "workflow DSL validation failed")
         workflow = convert_dsl_to_xyflow(dsl, name=name)
         nodes = workflow.get("nodes", [])
+        validate_persistent_output_paths(nodes)
         node_types: list[JsonValue] = [
             str(node.get("data", {}).get("nodeType", ""))
             for node in nodes

@@ -314,27 +314,25 @@ def test_version_code_respects_architecture_boundaries():
             assert not any(name and ".infrastructure" in name for name in imports)
 
 
-async def test_confirmation_checks_snapshot_before_platform_submit(version_runtime):
-    from pyromind_runtime.domain.commands import PermissionResponseCommand
-
+async def test_direct_submission_checks_snapshot_before_platform_submit(
+    version_runtime, monkeypatch
+):
     runtime, submission, context = version_runtime
-    await runtime.prepare_workflow_execution(
-        "c", "/workspace/project/workflow.py", context, request_id="request"
-    )
-    project = runtime.versions.store.bound_project("c")
-    version = runtime.versions.store.list_versions(project.id)[0]
-    runtime.versions.snapshots.path(version.manifest.storage_ref, context).write_text(
-        "tampered"
-    )
+    prepare_run = runtime.versions.prepare_run
+
+    def tampered_run(*args, **kwargs):
+        run = prepare_run(*args, **kwargs)
+        project = runtime.versions.store.bound_project("c")
+        version = runtime.versions.store.list_versions(project.id)[0]
+        runtime.versions.snapshots.path(
+            version.manifest.storage_ref, context
+        ).write_text("tampered")
+        return run
+
+    monkeypatch.setattr(runtime.versions, "prepare_run", tampered_run)
     with pytest.raises(ValueError, match="digest changed"):
-        await runtime.submit_command(
-            "c",
-            PermissionResponseCommand(
-                command_id="confirm",
-                permission_id="workflow-run:request",
-                decision="allow_once",
-            ),
-            context,
+        await runtime.prepare_workflow_execution(
+            "c", "/workspace/project/workflow.py", context, request_id="request"
         )
     assert submission.submissions == []
 

@@ -235,7 +235,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         )
         if preparation_store
         else None,
-        resource_inspector=StorageResourceInspector(),
+        resource_media_reader=StorageResourceInspector(),
         external_task_query=PlatformWorkflowSubmission(),
         observer=build_execution_observer(service.conversations_dir),
         external_tasks=external_tasks,
@@ -250,7 +250,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         evaluation_storage_factory=build_evaluation_storage,
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
-    pi_adapter.set_preparation_handler(runtime.preparation_call)
+    pi_adapter.set_preparation_handler(
+        runtime.preparation_call, runtime.preparation_revision
+    )
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "
         "PYROMIND_HARNESS_BACKEND=%s registered_harnesses=%s "

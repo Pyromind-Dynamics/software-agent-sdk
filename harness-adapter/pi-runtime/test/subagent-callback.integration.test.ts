@@ -32,9 +32,9 @@ test("real children submit with distinct stable origins and resume only on their
   const peer = {emit: () => {}, request: async (method: string, params: any) => {
     if (method === "role.tool.execute") {
       submissions.push(params);
-      return params.name === "df_submit_pipeline"
+      return params.tool_name === "df_submit_pipeline"
         ? {content:[{type:"text",text:"Pipeline submitted"}],details:{status:"Pending",task_id:"pipeline-1",run_id:"pipeline-run-1"},is_error:false}
-        : {content:[{type:"text",text:"Awaiting confirmation"}],details:{status:"awaiting_confirmation",request_id:`request-${submissions.length}`},is_error:false};
+        : {content:[{type:"text",text:"Workflow submitted"}],details:{status:"submitted",request_id:`request-${submissions.length}`,task_id:`task-${submissions.length}`},is_error:false};
     }
     return {allow:true};
   }} as unknown as JsonlRpcPeer;
@@ -48,14 +48,13 @@ test("real children submit with distinct stable origins and resume only on their
   const execute = (task: string) => tool.execute(crypto.randomUUID(),{agent:"train",task,async:true},undefined,undefined,session.extensionRunner.createContext());
   const first: any = await execute("lane-one"), second: any = await execute("lane-two");
   const status = (id: string) => readFile(join(subagents.paths.stateRoot,"async-subagent-runs",id,"status.json"),"utf8").then(JSON.parse);
-  await eventually(async () => {assert.equal(submissions.length,2); assert.equal((await status(first.details.asyncId)).state,"complete"); assert.equal((await status(second.details.asyncId)).state,"complete");});
-  await eventually(async () => {
-    for (const id of [first.details.asyncId, second.details.asyncId]) {
-      await readFile(join(subagents.paths.stateRoot, "async-subagent-results", "completion-replay", `${id}.json`));
-    }
+  const waitForCompletionReplay = (id: string) => eventually(async () => {
+    await readFile(join(subagents.paths.stateRoot, "async-subagent-results", "completion-replay", `${id}.json`));
   });
+  await eventually(async () => {assert.equal(submissions.length,2); assert.equal((await status(first.details.asyncId)).state,"complete"); assert.equal((await status(second.details.asyncId)).state,"complete");});
+  await Promise.all([first.details.asyncId, second.details.asyncId].map(waitForCompletionReplay));
   const parentRequests = () => requests.filter(body => body.tools?.some((tool: any) => tool.function.name === "subagent"));
-  assert.equal(parentRequests().length, 1, "staged workflow must not wake the parent");
+  assert.equal(parentRequests().length, 1, "pending workflow must not wake the parent");
   assert.doesNotMatch(await readFile(config.session_path, "utf8"), /STAGED_WORKFLOW_REPORT/);
   const one = submissions[0].origin, two = submissions[1].origin;
   assert.equal(one.type,"subagent"); assert.notEqual(one.subagent_id,two.subagent_id);
@@ -69,6 +68,7 @@ test("real children submit with distinct stable origins and resume only on their
   const beforePipeline = parentRequests().length;
   const pipeline: any = await execute("DATASET_PENDING");
   await eventually(async () => {assert.equal(submissions.length,3); assert.equal((await status(pipeline.details.asyncId)).state,"complete");});
+  await waitForCompletionReplay(pipeline.details.asyncId);
   assert.equal(parentRequests().length,beforePipeline,"pending pipeline must not wake the parent");
   assert.doesNotMatch(await readFile(config.session_path,"utf8"),/STAGED_DATASET_REPORT/);
   const pipelineOrigin = submissions[2].origin;

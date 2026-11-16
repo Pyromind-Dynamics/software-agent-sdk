@@ -1,12 +1,5 @@
 """Dynamic workflow tool for sub-agent orchestration."""
 
-from openhands.tools.workflow.analyze_task_failure import (
-    AnalyzeTaskFailureAction,
-    AnalyzeTaskFailureExecutor,
-    AnalyzeTaskFailureObservation,
-    AnalyzeTaskFailureTool,
-    TaskNodeInfo,
-)
 from openhands.tools.workflow.definition import (
     WorkflowAction,
     WorkflowFileObservation,
@@ -28,6 +21,13 @@ from openhands.tools.workflow.impl import (
     WorkflowScriptError,
     read_workflow_file,
 )
+from openhands.tools.workflow.inspect_workflow_task import (
+    InspectWorkflowTaskAction,
+    InspectWorkflowTaskExecutor,
+    InspectWorkflowTaskObservation,
+    InspectWorkflowTaskTool,
+    WorkflowNodeStatus,
+)
 from openhands.tools.workflow.run_workflow import (
     RunWorkflowAction,
     RunWorkflowExecutor,
@@ -44,10 +44,6 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 
 
 __all__ = [
-    "AnalyzeTaskFailureAction",
-    "AnalyzeTaskFailureExecutor",
-    "AnalyzeTaskFailureObservation",
-    "AnalyzeTaskFailureTool",
     "DslToXyflowAction",
     "DslToXyflowExecutor",
     "DslToXyflowObservation",
@@ -56,7 +52,10 @@ __all__ = [
     "RunWorkflowExecutor",
     "RunWorkflowObservation",
     "RunWorkflowTool",
-    "TaskNodeInfo",
+    "InspectWorkflowTaskAction",
+    "InspectWorkflowTaskExecutor",
+    "InspectWorkflowTaskObservation",
+    "InspectWorkflowTaskTool",
     "convert_dsl_to_xyflow",
     "convert_xyflow_to_dsl",
     "ValidateWorkflowDslAction",
@@ -68,6 +67,7 @@ __all__ = [
     "WorkflowExecutor",
     "WorkflowFileObservation",
     "WorkflowObservation",
+    "WorkflowNodeStatus",
     "WorkflowScriptError",
     "WorkflowTool",
     "WorkflowToolSet",

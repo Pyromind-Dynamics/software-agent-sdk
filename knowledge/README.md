@@ -14,6 +14,21 @@ Agent 生产运行时通过 `PYROMIND_KNOWLEDGE_BASE_PATH`（默认指向本目�
 
 [PyroMind Python SDK](https://pypi.org/project/pyromind-sdk/) 通过 PyPI 安装，`make build`（`uv sync --dev`）会默认安装。
 
+## 节点契约来源
+
+`nodes/` 的输入输出表按 2026-11-10 生产环境 `us-west-1` 的
+`GET /user_node/all_with_status` 返回定义同步。该目录包含系统节点和共享节点；
+`GET /std2/studio_api/api/object_info` 只覆盖其中的系统节点，不能用于判断整个节点库是否完整。
+
+表中的必填状态与默认值分别记录：有默认值不表示输入可省略；“未声明”表示 schema 未提供默认值，
+不代表实际运行时一定没有默认行为。GPU、中心仓模型和数据集候选随集群变化；
+其他环境以该环境的实时定义与 `validate_workflow_dsl` 校验为准。
+schema 中的候选列表不证明数据或模型当前已成功加载，运行能力仍需实际任务验证。
+
+`dataset_processing_workflow.py` 保留数据处理拓扑示例；2026-11-10 的 us-west-1 校验中，
+PathJoin→DatasetToJsonl、DatasetToJsonl→DatasetConfig 两条连线存在类型不匹配。
+不要将该文件直接作为已通过校验的模板，也不要仅为绕过校验插入未经验证的类型转换。
+
 ## Agent 检索路径
 
 Agent 需要查知识库时，先用文件读取工具打开 `knowledge/index.md`，再打开匹配的原始页面；

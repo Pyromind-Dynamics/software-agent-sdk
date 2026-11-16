@@ -8,15 +8,16 @@
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| system_prompt_field | STRING | 否 | system prompt 字段名。默认值：空字符串 |
-| user_prompt_field | STRING | 否 | user prompt 字段名。默认值：空字符串 |
-| image_field | STRING | 是 | 图片字段名。默认值：空字符串 |
-| assistant_response_field | STRING | 否 | 助手回复 / ground-truth 字段名。默认值：`gt` |
-| rejected_field | STRING | 否 | 拒绝回复 / rejected messages 字段名。默认值：`rejected_answer` |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| image_field | STRING | 是 | `""` | — | 图片字段名 |
+| system_prompt_field | STRING | 否 | `""` | — | system prompt 字段名 |
+| user_prompt_field | STRING | 否 | `""` | — | user prompt 字段名 |
+| assistant_response_field | STRING | 否 | `"gt"` | — | 助手回复 / ground-truth 字段名 |
+| rejected_field | STRING | 否 | `"rejected_answer"` | — | 拒绝回复 / rejected messages 字段名 |
+
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | dataset_kind_config | STRING\|DATASET_KIND_CONFIG | 来自 Kind Config Builder 节点的 dataset kind 配置 YAML |

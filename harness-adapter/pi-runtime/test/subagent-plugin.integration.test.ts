@@ -51,6 +51,11 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   let {session, subagents} = await createPiSession(config,peer);
   t.after(async () => { await subagents.stopAll(); await session.abort(); await session.waitForIdle(); await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"});session.dispose();await subagents.close(); });
   await subagents.attach(session);
+  const launchId = 'test-launch-receipt';
+  subagents.observeCall(launchId, { agent: 'search', task: 'Not started', async: true });
+  subagents.observeProgress({ details: { runId: launchId } }, launchId);
+  subagents.observeResult({ details: { runId: launchId }, isError: true }, launchId);
+  assert.equal(events.some(event => event.runId === launchId), false);
   let tool = session.getToolDefinition("subagent")!;
   assert.ok(tool);
   const execute = (args: any) => tool.execute(crypto.randomUUID(), args, undefined, undefined, session.extensionRunner.createContext());
@@ -68,6 +73,8 @@ test("real plugin bridges tools and model, resumes persisted history, and owns b
   const { description, parameters } = parentRequest.tools.find((tool: any) => tool.function.name === "subagent").function;
   assert.deepEqual(Object.keys(parameters.properties).sort(), ["action", "agent", "async", "context", "id", "message", "task"]);
   assert.deepEqual(parameters.properties.action.enum, ["status", "steer", "resume", "stop", "list"]);
+  assert.match(parameters.properties.action.description, /Do not combine/);
+  assert.match(parameters.properties.agent.description, /Omit action, id, and message/);
   assert.match(description, /search: read-only research/);
   assert.match(description, /general_purpose: analysis/);
   assert.match(description, /action:"resume"/);

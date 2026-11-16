@@ -63,10 +63,7 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "edit",
         "terminal",
         "ask_user",
-        "get_preparation",
-        "update_preparation",
         "set_preparation_plan",
-        "inspect_resource",
     }
     assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ("model-evaluation-preparation",)
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
@@ -361,7 +358,6 @@ def test_preparation_binding_uses_the_same_project_identity(tmp_path):
             stages=(ExperimentStage(id="dataset", name="Dataset", kind="dataset"),),
         ),
         creation_command_id="create",
-        initial_run_id="run",
         cluster="us-west-1#pre",
     )
     store = ProjectStore.for_conversations_dir(tmp_path / "conversations")

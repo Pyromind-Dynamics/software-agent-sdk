@@ -8,17 +8,17 @@
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| model_path | STRING | 是 | HuggingFace 模型名或本地路径。默认值：`Qwen/Qwen3-VL-2B-Instruct` |
-| model_type | STRING | 否 | 模型架构类型（`auto`、`qwen3vl`、`qwen3.5`）。选项：`auto`, `qwen3vl`, `qwen3.5` |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| model_path | STRING | 是 | `""` | — | HuggingFace 模型名或本地路径 |
+| model_type | STRING | 否 | `"auto"` | 可选值：`"auto"`、`"qwen3vl"`、`"qwen3.5"` | 模型架构类型（`auto`、`qwen3vl`、`qwen3.5`） |
 
-`model_path` 的默认值不表示该模型存在于 Clone 模板中。模型获取方式以
+`model_path` 的 schema 默认值为空字符串，但该输入仍为必填，生成工作流时填写真实路径或连接模型输出。模型获取方式以
 `CloneAndCacheModel` 的当前环境可用列表为准；不在列表中时使用
 `DownloadAndCacheModel`。
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | model_config | STRING\|MODEL_CONFIG | 模型配置 YAML 字符串 |

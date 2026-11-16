@@ -43,7 +43,6 @@ from pyromind_runtime.domain.commands import (
     CommandReceipt,
     CreateProjectCommand,
     InputResponseCommand,
-    PermissionResponseCommand,
     ProductCommand,
     RollbackWorkflowCommand,
     UserMessageCommand,
@@ -71,11 +70,9 @@ from pyromind_runtime.domain.experiment_plans import (
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import (
     PREPARATION_TOOLS,
-    InspectResource,
     PreparationView,
     ProjectView,
     SetPreparationPlan,
-    UpdatePreparation,
 )
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
@@ -113,7 +110,7 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 from pyromind_runtime.ports.observability import ExecutionObserver
-from pyromind_runtime.ports.preparation import PreparationStore, ResourceInspector
+from pyromind_runtime.ports.preparation import PreparationStore, ResourceMediaReader
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
@@ -202,7 +199,7 @@ class ConversationRuntime:
         default_harness_id: str = "openhands",
         external_task_query: ExternalTaskQueryPort | None = None,
         preparation_store: PreparationStore | None = None,
-        resource_inspector: ResourceInspector | None = None,
+        resource_media_reader: ResourceMediaReader | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
         observer: ExecutionObserver | None = None,
         external_tasks: ExternalTaskRegistry | None = None,
@@ -229,7 +226,7 @@ class ConversationRuntime:
         self._preparations = (
             Preparations(preparation_store) if preparation_store else None
         )
-        self._resource_inspector = resource_inspector
+        self._resource_media_reader = resource_media_reader
         self._external_task_query = external_task_query
         self._execution_event_task: asyncio.Task[None] | None = None
         self._experiment_plan_project_binder = experiment_plan_project_binder
@@ -366,7 +363,6 @@ class ConversationRuntime:
         import base64
 
         from pyromind_runtime.application.input_presentation import input_media_path
-        from pyromind_runtime.ports.preparation import ResourceMediaReader
 
         store = await self._read_store(conversation_id, context)
         pending = next(
@@ -380,10 +376,10 @@ class ConversationRuntime:
         if pending is None:
             raise FileNotFoundError("pending input not found")
         path = input_media_path(pending, content_index, image_index)
-        if not isinstance(self._resource_inspector, ResourceMediaReader):
+        if self._resource_media_reader is None:
             raise ValueError("image preview is unavailable")
         body, mime_type = await self._plan_io(
-            self._resource_inspector.read_media, path, context
+            self._resource_media_reader.read_media, path, context
         )
         return {"url": f"data:{mime_type};base64,{base64.b64encode(body).decode()}"}
 
@@ -492,6 +488,16 @@ class ConversationRuntime:
             conversation_id, tool_name, arguments, context
         )
 
+    async def preparation_revision(
+        self, conversation_id: str, context: RequestContext
+    ) -> int:
+        owner = self._preparation_owner(conversation_id, context)
+        if not self._store(conversation_id).permits_tool("set_preparation_plan"):
+            raise PermissionError("plan submission is not enabled")
+        assert self._preparations is not None
+        state = await self._plan_io(self._preparations.store.get, owner)
+        return state.revision
+
     async def _activate_development_policy(
         self,
         conversation_id: str,
@@ -542,45 +548,16 @@ class ConversationRuntime:
             raise ValueError("x-cluster is required to create a Project")
         return cluster
 
-    def _preparation_evidence(self, conversation_id: str) -> dict[str, str]:
-        snapshot = self._store(conversation_id).load_snapshot()
-        result = {}
-        for item in snapshot.timeline:
-            if item.kind == "message" and item.role == "user":
-                result["message:" + item.item_id] = "User message"
-            elif (
-                item.kind == "operation"
-                and item.status == "completed"
-                and item.name
-                in {
-                    "read",
-                    "terminal",
-                    "grep",
-                    "find",
-                    "ls",
-                    "search",
-                    "ask_user",
-                    "inspect_resource",
-                }
-            ):
-                result["operation:" + item.item_id] = item.name
-        return result
-
     async def get_preparation(
         self, conversation_id: str, context: RequestContext
     ) -> PreparationView:
         await self._read_store(conversation_id, context)
         owner = self._preparation_owner(conversation_id, context)
         assert self._preparations is not None
-        view = await self._plan_io(self._preparations.store.get, owner)
-        return view.model_copy(
-            update={
-                "evidence": {
-                    **view.evidence,
-                    **self._preparation_evidence(conversation_id),
-                }
-            }
-        )
+        state = await self._plan_io(self._preparations.store.get, owner)
+        policy = self._store(conversation_id).preparation_policy()
+        assert policy is not None
+        return PreparationView.from_state(state, policy)
 
     async def get_project(
         self, conversation_id: str, context: RequestContext
@@ -601,44 +578,19 @@ class ConversationRuntime:
         if not self._store(conversation_id).permits_tool(tool_name):
             raise PermissionError("preparation tool is not enabled")
         assert self._preparations is not None
-        if tool_name == "get_preparation":
-            view = await self.get_preparation(conversation_id, context)
-            return view.model_dump(mode="json")
-        if tool_name == "update_preparation":
-            view = await self.get_preparation(conversation_id, context)
-            updated = await self._plan_io(
-                self._preparations.update,
-                owner,
-                UpdatePreparation.model_validate(arguments),
-                set(view.evidence),
-            )
-            self._notify_preparation(conversation_id, "preparation.changed")
-            return updated.model_dump(mode="json")
-        if tool_name == "set_preparation_plan":
-            updated = await self._plan_io(
-                self._preparations.set_plan,
-                owner,
-                SetPreparationPlan.model_validate(arguments),
-            )
-            self._notify_preparation(conversation_id, "preparation.changed")
-            return updated.model_dump(mode="json")
-        if self._resource_inspector is None:
-            raise ValueError(
-                "Resource inspection is unavailable; "
-                "ask the user for missing information"
-            )
-        request = InspectResource.model_validate(arguments)
-        result = await self._plan_io(self._resource_inspector.inspect, request, context)
-        reference = "resource:" + uuid4().hex
-        revision = await self._plan_io(
-            self._preparations.store.add_evidence,
+        if context.preparation_revision is None:
+            raise ValueError("plan submission requires its model context revision")
+        policy = self._store(conversation_id).preparation_policy()
+        assert policy is not None
+        updated = await self._plan_io(
+            self._preparations.set_plan,
             owner,
-            reference,
-            f"{request.kind} {request.path}; {result.get('scope', '')}; "
-            f"truncated={result.get('truncated', False)}",
+            SetPreparationPlan.model_validate(arguments),
+            policy,
+            context.preparation_revision,
         )
         self._notify_preparation(conversation_id, "preparation.changed")
-        return {**result, "evidence_ref": reference, "revision": revision}
+        return {"phase": updated.phase, "revision": updated.revision}
 
     async def _create_project(
         self,
@@ -710,11 +662,6 @@ class ConversationRuntime:
                                     )
                                     if preparation.entry_task
                                     else None,
-                                    "facts": {
-                                        key: fact.value
-                                        for key, fact in preparation.facts.items()
-                                        if fact.status == "resolved"
-                                    },
                                 },
                                 ensure_ascii=False,
                             )
@@ -809,7 +756,6 @@ class ConversationRuntime:
         request = WorkflowExecutionRequest(
             request_id=identity,
             conversation_id=conversation_id,
-            permission_id=identity,
             workflow_path="version://" + record.id,
             correlation=correlation,
             fingerprint=digest,
@@ -1641,7 +1587,6 @@ class ConversationRuntime:
                     conversation_id=spec.conversation_id,
                     profile_id=context.profile_id,
                 ),
-                spec.preparation_policy,
             )
         handle = await adapter.create_session(spec, context)
         self._log_timing(
@@ -1858,7 +1803,7 @@ class ConversationRuntime:
         ):
             if self._preparations is None:
                 raise ValueError("preparation store is unavailable")
-            revision = await self._plan_io(
+            await self._plan_io(
                 self._preparations.store.invalidate,
                 PlanOwner(
                     user_id=context.user_id,
@@ -1867,14 +1812,6 @@ class ConversationRuntime:
                 ),
                 command.command_id,
             )
-            if (
-                isinstance(command, InputResponseCommand)
-                and command.status == "answered"
-                and revision is not None
-            ):
-                context = replace(
-                    context, input_response_metadata={"preparation_revision": revision}
-                )
             self._notify_preparation(conversation_id, "preparation.changed")
         if isinstance(command, InputResponseCommand):
             # HTTP cancellation must not interrupt a claimed answer between
@@ -1920,19 +1857,6 @@ class ConversationRuntime:
                 return await self._submit_input_response(
                     active, store, command, receipt, context
                 )
-            if isinstance(command, PermissionResponseCommand):
-                request = next(
-                    (
-                        item
-                        for item in store.load_workflow_execution_requests().values()
-                        if item.permission_id == command.permission_id
-                    ),
-                    None,
-                )
-                if request is not None:
-                    return await self._respond_to_workflow_execution(
-                        store, request, command, receipt, context
-                    )
             first_command = (
                 isinstance(command, UserMessageCommand)
                 and conversation_id in self._first_command_pending
@@ -2204,17 +2128,16 @@ class ConversationRuntime:
         request = WorkflowExecutionRequest(
             request_id=identity,
             conversation_id=conversation_id,
-            permission_id=f"workflow-run:{identity}",
             correlation=correlation,
             workflow_path=workflow_path,
             fingerprint=fingerprint,
             workflow=workflow,
             summary=summary,
         )
-        admitted = store.save_workflow_execution_request(
+        admitted, created = store.save_workflow_execution_request(
             request, expected_revision=None, reuse_duplicate=True
         )
-        if admitted.request_id != request.request_id:
+        if not created:
             return {
                 "request_id": admitted.request_id,
                 "status": admitted.status,
@@ -2222,44 +2145,7 @@ class ConversationRuntime:
                 "task_id": admitted.task_id,
                 "reused": True,
             }
-        event, _ = store.append(
-            ProductEvent(
-                event_id=f"workflow-run:{identity}:permission",
-                conversation_id=conversation_id,
-                type="permission.requested",
-                payload={
-                    "permission_id": request.permission_id,
-                    "operation_ids": [identity],
-                    "description": (
-                        f"确认运行工作流 {summary.get('name', 'workflow')}？"
-                        f"节点数：{summary.get('node_count', '?')}；"
-                        f"版本：{fingerprint[:12]}；路径：{workflow_path}"
-                    ),
-                    "choices": ["allow_once", "deny"],
-                },
-            )
-        )
-        self._publish(event)
-        return {"request_id": identity, "status": request.status, "summary": summary}
-
-    async def _respond_to_workflow_execution(
-        self,
-        store: FileProductStore,
-        request: WorkflowExecutionRequest,
-        command: PermissionResponseCommand,
-        receipt: CommandReceipt,
-        context: RequestContext,
-    ) -> CommandReceipt:
-        if request.status != "awaiting_confirmation":
-            response = {
-                "request_id": request.request_id,
-                "status": request.status,
-                "task_id": request.task_id,
-            }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        if command.decision == "allow_once" and self.versions is not None:
+        if self.versions is not None:
             from pyromind_runtime.application.versions import snapshot_result
 
             project = self.versions.project(
@@ -2279,61 +2165,6 @@ class ConversationRuntime:
                                 snapshot_result(version),
                                 context,
                             )
-        next_status = "submitting" if command.decision == "allow_once" else "cancelled"
-        updated = request.model_copy(
-            update={"status": next_status, "revision": request.revision + 1}
-        )
-        try:
-            admitted = store.save_workflow_execution_request(
-                updated, expected_revision=request.revision, reuse_duplicate=True
-            )
-        except ValueError:
-            latest = store.load_workflow_execution_requests()[request.request_id]
-            response = {
-                "request_id": latest.request_id,
-                "status": latest.status,
-                "task_id": latest.task_id,
-            }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        reused = admitted.request_id != request.request_id
-        resolved, _ = store.append(
-            ProductEvent(
-                event_id=f"workflow-run:{request.request_id}:resolved",
-                conversation_id=request.conversation_id,
-                type="permission.resolved",
-                payload={
-                    "permission_id": request.permission_id,
-                    "decision": "deny" if reused else command.decision,
-                    **(
-                        {"reason": "An identical workflow already has an execution."}
-                        if reused
-                        else {}
-                    ),
-                },
-            )
-        )
-        self._publish(resolved)
-        if reused:
-            response = {
-                "request_id": admitted.request_id,
-                "status": admitted.status,
-                "task_id": admitted.task_id,
-                "reused": True,
-            }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        if next_status == "cancelled":
-            self._emit_workflow_execution_message(
-                store, request, "cancelled", "已取消运行工作流。"
-            )
-            response = {"request_id": request.request_id, "status": "cancelled"}
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        assert self._workflow_submission is not None
         try:
             task_id = await self._workflow_submission.submit(
                 request.workflow,
@@ -2349,30 +2180,28 @@ class ConversationRuntime:
                 request.request_id,
                 type(exc).__name__,
             )
-            uncertain = updated.model_copy(
+            uncertain = request.model_copy(
                 update={
                     "status": "uncertain",
-                    "revision": updated.revision + 1,
+                    "revision": request.revision + 1,
                     "error": type(exc).__name__,
                 }
             )
             store.save_workflow_execution_request(
-                uncertain, expected_revision=updated.revision
+                uncertain, expected_revision=request.revision
             )
             message = "提交结果未确认，请先在平台核对是否已产生任务，避免重复运行。"
             self._emit_workflow_execution_message(store, request, "uncertain", message)
-            response = {
+            return {
                 "request_id": request.request_id,
                 "status": "uncertain",
+                "summary": summary,
                 "error": message,
             }
-            return store.complete_command(
-                receipt.model_copy(update={"status": "completed", "response": response})
-            )
-        submitted = updated.model_copy(
+        submitted = request.model_copy(
             update={
                 "status": "submitted",
-                "revision": updated.revision + 1,
+                "revision": request.revision + 1,
                 "task_id": task_id,
             }
         )
@@ -2393,7 +2222,7 @@ class ConversationRuntime:
         }
         self.register_external_task(request.conversation_id, payload)
         store.save_workflow_execution_request(
-            submitted, expected_revision=updated.revision
+            submitted, expected_revision=request.revision
         )
         await self.reconcile_versions(request.conversation_id, context)
         self._emit_workflow_execution_message(
@@ -2403,14 +2232,12 @@ class ConversationRuntime:
         if active is not None:
             async with self._notification_resume_lock:
                 await self._sync_workflow_task_context(active, store)
-        response = {
+        return {
             "request_id": request.request_id,
             "status": "submitted",
             "task_id": task_id,
+            "summary": summary,
         }
-        return store.complete_command(
-            receipt.model_copy(update={"status": "completed", "response": response})
-        )
 
     def _emit_workflow_execution_message(
         self,
@@ -3023,11 +2850,18 @@ class ConversationRuntime:
                     preparation = await self._plan_io(
                         self._preparations.store.get, owner
                     )
+                    policy = store.preparation_policy()
+                    assert policy is not None
                     project = await self._plan_io(
                         self._preparations.store.project, owner
                     )
                     snapshot = snapshot.model_copy(
-                        update={"preparation": preparation, "project": project}
+                        update={
+                            "preparation": PreparationView.from_state(
+                                preparation, policy
+                            ),
+                            "project": project,
+                        }
                     )
                 snapshots.append(snapshot)
             except Exception:
@@ -4111,10 +3945,11 @@ def _build_external_task_notification(
         if status == "failed":
             instruction = (
                 f"Production workflow task {task.task_id} failed. Call "
-                "analyze_task_failure with this task_id and use the diagnosis "
+                "inspect_workflow_task with this task_id to find failed nodes, then "
+                "call it with each failed node_id and include_log=true. Use the logs "
                 "to continue the user's task. Fix verified technical issues within "
-                "the authorized scope, then validate and stage the revised workflow "
-                "with submit_workflow for user confirmation."
+                "the authorized scope, then validate and submit the revised workflow "
+                "with submit_workflow."
             )
         elif status == "succeeded":
             if has_training_node:
@@ -4160,9 +3995,11 @@ def _build_external_task_notification(
         elif status == "failed":
             visible_text = f"工作流调试运行失败\n\n- task_id: {task.task_id}"
             instruction = (
-                "The workflow debug run failed. Call analyze_task_failure with "
-                f"task_id={task.task_id!r}, fix the workflow using that diagnosis, "
-                "then continue the normal debug loop within the attempt budget."
+                "The workflow debug run failed. Call inspect_workflow_task with "
+                f"task_id={task.task_id!r} to find failed nodes, then call it with "
+                "each failed node_id and include_log=true. Fix the workflow from "
+                "the logs, then continue the normal debug loop within the attempt "
+                "budget."
             )
         else:
             instruction = (

@@ -42,6 +42,18 @@ const toolSpec = {
   inputSchema: { type: "object" } as JsonObject,
 };
 
+test("ask_user normalizes a stringified presentation without accepting arrays or invalid JSON", () => {
+  const tool = createAskUserTool(recordingPeer(), toolSpec, new InputWaitRegistry(), () => true);
+  const args = {questions: [], presentation: '{"content":[{"type":"text","text":"Review"}]}'};
+  assert.deepEqual(tool.prepareArguments?.(args), {
+    questions: [], presentation: {content: [{type: "text", text: "Review"}]},
+  });
+  for (const presentation of ["[]", "null", "invalid"]) {
+    const invalid = {...args, presentation};
+    assert.equal(tool.prepareArguments?.(invalid), invalid);
+  }
+});
+
 test("ask_user tool returns the answer as JSON content", async () => {
   const waits = new InputWaitRegistry();
   const peer = recordingPeer((_method, params) => {

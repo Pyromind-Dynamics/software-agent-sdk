@@ -547,7 +547,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
         assert len(adapter.external_task_notifications) == 1
         _, notice, _ = adapter.external_task_notifications[0]
         assert notice.correlation == correlation
-        assert "analyze_task_failure" in notice.hidden_text
+        assert "inspect_workflow_task" in notice.hidden_text
         assert adapter.sent == []
         assert "test-cookie" not in store.events_path.read_text()
     finally:
@@ -817,7 +817,7 @@ async def test_runtime_owns_workflow_debug_callback_policy(tmp_path) -> None:
 
     failed = adapter.external_task_notifications[0][1]
     succeeded = adapter.external_task_notifications[1][1]
-    assert "analyze_task_failure" in failed.hidden_text
+    assert "inspect_workflow_task" in failed.hidden_text
     assert failed.trigger_turn is True
     assert failed.reset_attempt_budget is False
     assert succeeded.reset_attempt_budget is True

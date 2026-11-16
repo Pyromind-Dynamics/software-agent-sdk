@@ -197,10 +197,10 @@ async def test_unavailable_child_stays_pending_until_acknowledged(
         await runtime.close()
 
 
-async def test_confirmation_keeps_the_child_origin_and_rejects_other_profiles(tmp_path):
+async def test_direct_submission_keeps_child_origin_and_rejects_other_profiles(
+    tmp_path,
+):
     from dataclasses import replace
-
-    from pyromind_runtime.domain.commands import PermissionResponseCommand
 
     runtime, adapter, submission, context = await _runtime(tmp_path)
     origin = TaskOrigin(type="subagent", subagent_id="worker")
@@ -212,7 +212,7 @@ async def test_confirmation_keeps_the_child_origin_and_rejects_other_profiles(tm
                 replace(context, profile_id="another-profile"),
                 origin=origin,
             )
-        await runtime.prepare_workflow_execution(
+        result = await runtime.prepare_workflow_execution(
             "workflow-conversation",
             "/workflow.py",
             context,
@@ -220,19 +220,10 @@ async def test_confirmation_keeps_the_child_origin_and_rejects_other_profiles(tm
             request_id="child-request",
         )
         store = FileProductStore(tmp_path / "workflow-conversation")
-        assert [
-            item.permission_id for item in store.load_snapshot().pending_permissions
-        ] == ["workflow-run:child-request"]
+        assert result["status"] == "submitted"
+        assert result["task_id"] == "task-123"
+        assert not store.load_snapshot().pending_permissions
         assert adapter.sent == []
-        await runtime.submit_command(
-            "workflow-conversation",
-            PermissionResponseCommand(
-                command_id="approve",
-                permission_id="workflow-run:child-request",
-                decision="allow_once",
-            ),
-            context,
-        )
         assert submission.correlations[0] is not None
         assert submission.correlations[0].origin == origin
         assert (

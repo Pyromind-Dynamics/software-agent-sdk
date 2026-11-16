@@ -8,15 +8,15 @@
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| model | STRING | 是 | 字符串。默认值：- |
-| save_path | STRING | 是 | 字符串。默认值：`path/to/save/model` |
-| model_name | STRING | 是 | 字符串。默认值：`rl_model` |
-| save_format | STRING | 是 | 字符串。默认值：`pkl` Options: pkl, onnx, torchscript, safetensors |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| model | STRING | 是 | 未声明 | — | 字符串 |
+| save_path | STRING | 是 | `"path/to/save/model"` | — | 字符串 |
+| model_name | STRING | 是 | `"rl_model"` | — | 字符串 |
+| save_format | STRING | 是 | `"pkl"` | 可选值：`"pkl"`、`"onnx"`、`"torchscript"`、`"safetensors"` | 字符串 |
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | save_path | STRING | 字符串 |

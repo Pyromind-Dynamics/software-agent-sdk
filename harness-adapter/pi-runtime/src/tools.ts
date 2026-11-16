@@ -62,6 +62,7 @@ export interface SkillRootConfig {
 }
 
 export interface CreateToolsOptions {
+  toolContext?: () => JsonObject;
   terminalEnvironment?: Record<string, string>;
   terminalTimeouts?: SandboxTerminalTimeouts;
   /** Base64 characters one staging line carries; see the sandbox transport. */
@@ -184,7 +185,7 @@ export async function createTools(
       "write",
     ),
     terminal,
-    ...businessTools.map((config) => businessTool(peer, config)),
+    ...businessTools.map((config) => businessTool(peer, config, undefined, options.toolContext)),
   ];
 }
 
@@ -282,7 +283,7 @@ async function createSandboxTools(
   const workflow = createLane("workflow");
   options.onExecutionReady?.(workflow.access);
   options.onSandboxToolsReady?.({ main, workflow, createLane });
-  return [...main.tools, ...businessTools.map((config) => businessTool(peer, config))];
+  return [...main.tools, ...businessTools.map((config) => businessTool(peer, config, undefined, options.toolContext))];
 }
 
 function createSandboxLaneTools(
@@ -365,10 +366,11 @@ function bindPathTool(
   };
 }
 
-export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string): AgentTool<TSchema, unknown> & { executeChild: (id: string, args: unknown, signal?: AbortSignal, origin?: JsonObject) => Promise<any> } {
+export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, role?: string, toolContext?: () => JsonObject): AgentTool<TSchema, unknown> & { executeChild: (id: string, args: unknown, signal?: AbortSignal, origin?: JsonObject) => Promise<any> } {
   const executeChild = async (callId: string, params: unknown, signal?: AbortSignal, origin?: JsonObject) => {
       if (!isRecord(params)) throw new Error("tool arguments must be an object");
       const response = await peer.request(role ? "role.tool.execute" : "tool.execute", {
+        ...toolContext?.(),
         ...(role ? { role } : {}),
         tool_call_id: callId,
         ...(origin ? { origin } : {}),
@@ -389,16 +391,6 @@ export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, rol
   };
   return { name: config.name, label: config.name, description: config.description,
     parameters: config.inputSchema as TSchema, executeChild,
-    ...(config.name === "update_preparation" ? {
-      prepareArguments(args: unknown) {
-        if (!isRecord(args) || typeof args.facts !== "string" || args.facts.length > 262144) return args;
-        try {
-          const facts: unknown = JSON.parse(args.facts);
-          if (isRecord(facts)) return { ...args, facts };
-        } catch { /* Native validation reports malformed facts. */ }
-        return args;
-      },
-    } : {}),
     execute: (id, args, signal) => executeChild(id, args, signal),
   };
 }

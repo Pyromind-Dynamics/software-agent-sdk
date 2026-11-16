@@ -17,17 +17,19 @@ import {
 } from "../src/tools.js";
 import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
 
-test("only update_preparation unwraps a JSON facts object before validation", () => {
-  const peer = {} as JsonlRpcPeer;
-  const config = { name: "update_preparation", description: "", inputSchema: {} };
-  const tool = businessTool(peer, config);
-  const args = { expected_revision: 5, facts: '{"goal":{"value":"train"}}' };
-  assert.deepEqual(tool.prepareArguments?.(args), { ...args, facts: { goal: { value: "train" } } });
-  for (const facts of ["not JSON", "[]", "null"]) {
-    const invalid = { ...args, facts };
-    assert.equal(tool.prepareArguments?.(invalid), invalid);
-  }
-  assert.equal(businessTool(peer, { ...config, name: "set_preparation_plan" }).prepareArguments, undefined);
+test("business tools carry trusted context separately from model arguments", async () => {
+  let request: unknown;
+  const peer = { request: async (_method: string, params: unknown) => {
+    request = params; return {content: [], details: {}, is_error: false};
+  } } as unknown as JsonlRpcPeer;
+  const config = { name: "set_preparation_plan", description: "", inputSchema: {} };
+  const tool = businessTool(peer, config, undefined, () => ({preparation_revision: 5}));
+  const args = {entry_task_id: "first", plan: {}};
+  await tool.execute("call", args, undefined);
+  assert.deepEqual(request, {
+    preparation_revision: 5, tool_call_id: "call",
+    tool_name: "set_preparation_plan", arguments: args,
+  });
 });
 
 test("business tool content converts OpenHands inline image URLs for Pi", () => {

@@ -1,4 +1,4 @@
-"""Agent-facing entry point for the Product Runtime's confirmed workflow run."""
+"""Agent-facing entry point for the Product Runtime's workflow submission."""
 
 from __future__ import annotations
 
@@ -57,6 +57,7 @@ class SubmitWorkflowAction(Action):
 class SubmitWorkflowObservation(Observation):
     request_id: str | None = None
     status: str | None = None
+    task_id: str | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -103,16 +104,21 @@ class SubmitWorkflowExecutor(
             result = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             return SubmitWorkflowObservation.from_text(
-                text=f"workflow preparation failed: {exc}", is_error=True
+                text=f"workflow submission failed: {exc}", is_error=True
             )
         if not isinstance(result, dict):
             return SubmitWorkflowObservation.from_text(
-                text="workflow preparation returned invalid data", is_error=True
+                text="workflow submission returned invalid data", is_error=True
             )
         return SubmitWorkflowObservation.from_text(
-            text="The workflow is awaiting user confirmation in the Copilot dialog.",
+            text=(
+                f"Workflow submission status: {result.get('status')}. "
+                f"Task ID: {result.get('task_id') or 'unavailable'}."
+                + (f" {result['error']}" if result.get("error") else "")
+            ),
             request_id=result.get("request_id"),
             status=result.get("status"),
+            task_id=result.get("task_id"),
             summary=result.get("summary")
             if isinstance(result.get("summary"), dict)
             else {},
@@ -133,9 +139,9 @@ class SubmitWorkflowTool(
         return [
             cls(
                 description=(
-                    "Request formal execution of an existing Storage workflow. "
-                    "The server validates it and opens a user confirmation dialog; "
-                    "the platform task is created only after confirmation. "
+                    "Submit an existing Storage workflow for formal execution. "
+                    "The server validates it and creates the platform task directly, "
+                    "without a user confirmation dialog. "
                     "Call only when the user requests execution."
                 ),
                 action_type=SubmitWorkflowAction,

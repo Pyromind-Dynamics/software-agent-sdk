@@ -1,42 +1,39 @@
-"""Real Pi preparation through the platform-independent Runtime entry points."""
+"""Real Pi calls with model responses supplied by a local streaming server."""
 
 import asyncio
 import json
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.domain.commands import (
-    InputResponseCommand,
-    UserMessageCommand,
-)
+from pyromind_runtime.domain.commands import InputResponseCommand, UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.preparation import (
-    ChecklistField,
-    PreparationPolicy,
-)
-from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
 from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
 
-from .test_preparation import preparation_setup as preparation_setup
+from .test_preparation import (
+    preparation_setup as preparation_setup,
+    ready_request as ready_request,
+)
 
 
-def stream(tool=None, arguments=None):
-    if tool:
-        delta = {
+def stream(tool=None, arguments=None, call="call"):
+    delta = (
+        {
             "tool_calls": [
                 {
                     "index": 0,
-                    "id": f"call-{tool}",
+                    "id": call,
                     "type": "function",
                     "function": {"name": tool, "arguments": json.dumps(arguments)},
                 }
             ]
         }
-    else:
-        delta = {"content": "Preparation saved."}
+        if tool
+        else {"content": "Plan submitted for review."}
+    )
     chunks = [
         {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
         {
@@ -49,81 +46,48 @@ def stream(tool=None, arguments=None):
             ]
         },
     ]
-    content = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
     return web.Response(
-        text=content + "data: [DONE]\n\n", content_type="text/event-stream"
+        text="".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        + "data: [DONE]\n\n",
+        content_type="text/event-stream",
     )
 
 
-async def test_preparation_plan_uses_revision_delivered_with_answer(
-    preparation_setup, tmp_path, monkeypatch
+@pytest.mark.parametrize("concurrent_edit", [False, True])
+async def test_single_plan_tool_after_question_and_stale_model_request(
+    preparation_setup, ready_request, tmp_path, monkeypatch, concurrent_edit
 ):
-    store, owner, _ = preparation_setup
-    engine = store.engine
-    with engine.begin() as connection:
-        from pyromind_runtime.infrastructure.sql_preparation import preparations
-
-        connection.execute(preparations.delete())
+    store, owner, policy = preparation_setup
     context = RequestContext(user_id=owner.user_id, profile_id=owner.profile_id)
     captured = []
+    request_started, release = asyncio.Event(), asyncio.Event()
 
     async def respond(request):
         payload = await request.json()
         captured.append(payload)
         if len(captured) == 1:
             return stream(
-                "update_preparation",
-                {
-                    "expected_revision": 1,
-                    "facts": {
-                        "goal": {
-                            "value": "Review data",
-                            "evidence_refs": list(
-                                runtime._preparation_evidence(owner.conversation_id)
-                            ),
-                        }
-                    },
-                },
-            )
-        if len(captured) == 2:
-            return stream(
                 "ask_user",
                 {
                     "questions": [
-                        {"id": "scope", "prompt": "Review which data?", "options": []}
-                    ],
+                        {"id": "scope", "prompt": "Which data?", "options": []}
+                    ]
                 },
+                "question",
             )
-        if len(captured) == 3:
-            answer = json.loads(payload["messages"][-1]["content"])
+        if len(captured) == 2:
+            request_started.set()
+            await release.wait()
             return stream(
                 "set_preparation_plan",
-                {
-                    "expected_revision": answer.get("preparation_revision", 0),
-                    "entry_task_id": "review",
-                    "role_id": "eval",
-                    "plan": {
-                        "goal": "Review data",
-                        "resources": [
-                            {
-                                "id": "data",
-                                "name": "Data",
-                                "storage_path": "/workspace/data.jsonl",
-                            }
-                        ],
-                        "stages": [{"id": "eval", "kind": "eval", "name": "Eval"}],
-                        "tasks": [
-                            {
-                                "id": "review",
-                                "kind": "review",
-                                "name": "Review",
-                                "description": "Review the confirmed data.",
-                                "stage_id": "eval",
-                                "inputs": [{"name": "dataset", "resource_id": "data"}],
-                            }
-                        ],
-                    },
-                },
+                ready_request.model_dump(mode="json"),
+                "plan-first",
+            )
+        if concurrent_edit and len(captured) == 3:
+            return stream(
+                "set_preparation_plan",
+                ready_request.model_dump(mode="json"),
+                "plan-latest",
             )
         return stream()
 
@@ -133,34 +97,23 @@ async def test_preparation_plan_uses_revision_delivered_with_answer(
     root = tmp_path / "conversations"
     adapter = PiAdapter(root, terminal_backend="os-sandbox")
     runtime = ConversationRuntime(
-        root,
-        adapter,
-        default_harness_id="pi",
-        preparation_store=SQLPreparationStore(engine),
+        root, adapter, default_harness_id="pi", preparation_store=store
     )
-    adapter.set_preparation_handler(runtime.preparation_call)
+    adapter.set_preparation_handler(
+        runtime.preparation_call, runtime.preparation_revision
+    )
     try:
         async with TestServer(app) as server:
-            identity = owner.conversation_id
             await runtime.create_conversation(
                 SessionSpec(
-                    conversation_id=identity,
+                    conversation_id=owner.conversation_id,
                     user_id=owner.user_id,
                     profile_id=owner.profile_id,
-                    workspace_root=str(root / identity),
+                    workspace_root=str(root / owner.conversation_id),
                     user_input_enabled=True,
-                    tool_allowlist=(
-                        "update_preparation",
-                        "ask_user",
-                        "set_preparation_plan",
-                    ),
+                    tool_allowlist=("ask_user", "set_preparation_plan"),
                     delegated_roles=(DelegatedRole(name="eval"),),
-                    preparation_policy=PreparationPolicy(
-                        checklist_id="review",
-                        version=1,
-                        allowed_roles=("eval",),
-                        fields=(ChecklistField(key="goal", label="Goal"),),
-                    ),
+                    preparation_policy=policy,
                     model_configuration={
                         "model": "eval-test-model",
                         "base_url": str(server.make_url("/v1")),
@@ -170,21 +123,21 @@ async def test_preparation_plan_uses_revision_delivered_with_answer(
                 context,
             )
             await runtime.submit_command(
-                identity,
+                owner.conversation_id,
                 UserMessageCommand(
-                    command_id="start", content=(TextContent(text="Review data"),)
+                    command_id="start", content=(TextContent(text="Evaluate data"),)
                 ),
                 context,
             )
-            async with asyncio.timeout(15):
+            async with asyncio.timeout(20):
                 while not (
-                    snapshot := await runtime.get_snapshot(identity, context)
+                    snapshot := await runtime.get_snapshot(
+                        owner.conversation_id, context
+                    )
                 ).pending_inputs:
                     await asyncio.sleep(0.01)
-                before = await runtime.get_preparation(identity, context)
-                assert before.revision == 2 and before.missing == ()
                 await runtime.submit_command(
-                    identity,
+                    owner.conversation_id,
                     InputResponseCommand.model_validate(
                         {
                             "command_id": "answer",
@@ -195,17 +148,29 @@ async def test_preparation_plan_uses_revision_delivered_with_answer(
                     ),
                     context,
                 )
-                while len(captured) < 4:
+                await request_started.wait()
+                if concurrent_edit:
+                    store.invalidate(owner, "newer-input")
+                release.set()
+                while (
+                    await runtime.get_preparation(owner.conversation_id, context)
+                ).phase != "ready":
                     await asyncio.sleep(0.01)
-            assert (
-                json.loads(captured[2]["messages"][-1]["content"])[
-                    "preparation_revision"
-                ]
-                == 3
+            ready = store.get(owner)
+            assert ready.revision == (4 if concurrent_edit else 3)
+            assert store.project(owner) is None
+            names = {tool["function"]["name"] for tool in captured[0]["tools"]}
+            assert names == {"ask_user", "set_preparation_plan"}
+            answer = json.loads(captured[1]["messages"][-1]["content"])
+            assert set(answer) == {"status", "answers"}
+            properties = next(
+                tool["function"]["parameters"]["properties"]
+                for tool in captured[0]["tools"]
+                if tool["function"]["name"] == "set_preparation_plan"
             )
-            ready = await runtime.get_preparation(identity, context)
-            assert ready.phase == "ready" and ready.revision == 4, captured[3][
-                "messages"
-            ][-1]
+            assert set(properties) == {"plan", "entry_task_id"}
+            if concurrent_edit:
+                assert "Review context changed" in json.dumps(captured[2]["messages"])
     finally:
+        release.set()
         await runtime.close()

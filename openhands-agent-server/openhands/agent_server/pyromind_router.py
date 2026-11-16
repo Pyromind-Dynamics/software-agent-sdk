@@ -127,9 +127,9 @@ from openhands.tools.workflow import (
     RunWorkflowTool,
     ValidateWorkflowDslTool,
 )
-from openhands.tools.workflow.analyze_task_failure import AnalyzeTaskFailureTool
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
+from openhands.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
 from openhands.tools.workflow.submit_workflow import (
     PYROMIND_PRODUCT_USER_ID_SECRET,
     SubmitWorkflowTool,
@@ -343,7 +343,9 @@ def _build_agent_with_profile(
     validation_tool, validation_secrets = _build_workflow_validation_tool(
         http_request, request.extra
     )
-    analysis_tool, analysis_secrets = _build_analyze_task_failure_tool(http_request)
+    inspection_tool, inspection_secrets = _build_inspect_workflow_task_tool(
+        http_request
+    )
     training_tool, training_secrets = _build_training_analysis_tool(
         http_request, request.extra, skills_path
     )
@@ -383,7 +385,7 @@ def _build_agent_with_profile(
             *sandbox_tools,
             *storage_tools,
             validation_tool,
-            analysis_tool,
+            inspection_tool,
             training_tool,
             *([label_studio_tool] if label_studio_tool is not None else []),
         ],
@@ -398,7 +400,7 @@ def _build_agent_with_profile(
     secrets: dict[str, SecretSource] = {
         **terminal_secrets,
         **validation_secrets,
-        **analysis_secrets,
+        **inspection_secrets,
         **training_secrets,
         **run_secrets,
         **debug_secrets,
@@ -483,18 +485,17 @@ def _build_workflow_validation_tool(
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
 
 
-def _build_analyze_task_failure_tool(
+def _build_inspect_workflow_task_tool(
     http_request: Request,
 ) -> tuple[Tool, dict[str, SecretSource]]:
-    """Build ``analyze_task_failure`` with studio_api auth wiring."""
+    """Build ``inspect_workflow_task`` with studio_api auth wiring."""
     headers, secret_headers, secrets = _build_studio_api_auth(http_request)
-    secrets = _load_auth_token(http_request, secrets)
     params: dict[str, Any] = {}
     if headers:
         params["headers"] = headers
     if secret_headers:
         params["secret_headers"] = secret_headers
-    return Tool(name=AnalyzeTaskFailureTool.name, params=params), secrets
+    return Tool(name=InspectWorkflowTaskTool.name, params=params), secrets
 
 
 def _build_training_analysis_tool(

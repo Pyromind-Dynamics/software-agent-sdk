@@ -4,23 +4,23 @@
 
 ## 1.1 功能概述
 
-Merge LoRA adapter into base weights (PEFT merge_and_unload) and save model + processor to a standalone directory. Base model id/path may be omitted if adapter_config.json contains base_model_path_or_path.
+将 LoRA adapter 合并到基座模型，输出独立模型与 processor 目录。`model_path` 在当前 schema 中为必填端口，生成工作流时应显式填写或连接基座模型路径；不能因为默认值为空字符串就省略该输入。当前合并节点仅允许单张 GPU。
 
 ## 1.2 输入类型
 
-| 参数 | 数据类型 | 必填 | 描述 |
-|------|---------|------|------|
-| lora_path | STRING | 是 | Lora path |
-| output_path | STRING | 是 | 合并模型的持久化输出目录，使用 `/workspace/...` |
-| model_path | STRING | 是 | HuggingFace 模型名或本地路径。默认值：空字符串 |
-| model_type | STRING | 否 | 模型架构类型（`auto`、`qwen3vl`、`qwen3.5`）。默认值：`auto` |
-| gpu_count | INT | 是 | GPU 数量。默认值：`1` |
-| gpu_product | STRING | 是 | GPU 型号（以部署环境实际可用的显卡为准）。选项：`NVIDIA-H200`、`NVIDIA-H100-80GB-HBM3` |
+| 参数 | 数据类型 | 必填 | 默认值 | 约束 | 描述 |
+|---|---|---|---|---|---|
+| lora_path | STRING | 是 | 未声明 | — | Lora path |
+| output_path | STRING | 是 | 未声明 | — | 合并模型的持久化输出目录，使用 `/workspace/...` |
+| model_path | STRING | 是 | `""` | — | HuggingFace 模型名或本地路径 |
+| gpu_count | INT | 是 | `1` | 最小 1；最大 1 | GPU 数量 |
+| gpu_product | STRING | 是 | `"NVIDIA-H100-NVL"` | 可选值：`"NVIDIA-H100-NVL"`、`"NVIDIA-L40S"` | GPU 型号（以部署环境实际可用的显卡为准） |
+| model_type | STRING | 否 | `"auto"` | 可选值：`"auto"`、`"qwen3vl"`、`"qwen3.5"` | 模型架构类型（`auto`、`qwen3vl`、`qwen3.5`） |
 
 > **注意：** GPU 型号与数量以部署环境实际可用的显卡为准。
 
 ## 1.3 输出类型
 
 | 参数 | 数据类型 | 描述 |
-|------|---------|------|
+|---|---|---|
 | merged_model_path | STRING | 合并后全量模型路径 |
