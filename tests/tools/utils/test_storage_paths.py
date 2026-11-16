@@ -1,6 +1,6 @@
 import pytest
 
-from openhands.tools.utils.storage_paths import (
+from pyromind_common.tools.utils.storage_paths import (
     StoragePathError,
     to_agent_storage_path,
     to_storage_path,

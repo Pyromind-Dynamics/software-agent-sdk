@@ -4,6 +4,11 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_common.tools.utils.workspace_files import (
+    WorkspaceFileNotFoundError,
+    read_workspace_text,
+)
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import InputResponseCommand, ProductCommand
 from pyromind_runtime.domain.content import JsonObject
@@ -22,12 +27,6 @@ from pyromind_runtime.ports.harness import (
     SessionSpec,
 )
 
-from openhands.sdk.workspace.local import LocalWorkspace
-from openhands.tools.utils.workspace_files import (
-    WorkspaceFileNotFoundError,
-    read_workspace_text,
-)
-
 
 class FakeAdapter:
     capabilities = HarnessCapabilities(
@@ -40,7 +39,7 @@ class FakeAdapter:
         external_task_resume=True,
     )
 
-    def __init__(self, harness_id: str = "openhands") -> None:
+    def __init__(self, harness_id: str = "pi") -> None:
         self.harness_id = harness_id
         self.queues: dict[str, asyncio.Queue[HarnessEvent | None]] = {}
         self.sent: list[tuple[str, ProductCommand, RequestContext]] = []

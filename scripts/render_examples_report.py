@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
-from openhands.sdk.utils.github import sanitize_openhands_mentions
+from pyromind_common.sdk.utils.github import sanitize_openhands_mentions
 
 
 @dataclass(slots=True)

@@ -3,10 +3,8 @@ name = "harness-adapter"
 version = "0.1.0"
 description = "Harness adapters for the Pyromind runtime"
 requires-python = ">=3.12"
-dependencies = ["pyromind-runtime", "agentgenome==0.6.49"]
+dependencies = ["pyromind-runtime", "pyromind-common", "agentgenome==0.6.49"]
 
-[project.optional-dependencies]
-openhands = ["openhands-agent-server"]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

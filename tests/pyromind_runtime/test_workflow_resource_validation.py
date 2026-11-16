@@ -1,11 +1,13 @@
 import httpx
 import pytest
+
 from harness_adapter.workflow_validation import (
     ResourceValidatedWorkflowDslExecutor,
     WorkflowResourceValidationObservation,
 )
-
-from openhands.tools.workflow.validate_workflow_dsl import ValidateWorkflowDslAction
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslAction,
+)
 from tests.tools.workflow.test_validate_workflow_dsl import (
     _Response,
     _valid_response as _structure_valid_response,
@@ -196,7 +198,7 @@ def test_resource_endpoint_can_be_explicitly_configured(monkeypatch):
 
 
 def test_legacy_openhands_validator_remains_structure_only(monkeypatch):
-    from openhands.tools.workflow.validate_workflow_dsl import (
+    from pyromind_common.tools.workflow.validate_workflow_dsl import (
         ValidateWorkflowDslExecutor,
         ValidateWorkflowDslObservation,
         ValidateWorkflowDslTool,
@@ -220,9 +222,8 @@ async def test_pi_validation_uses_new_resource_checker(tmp_path, monkeypatch):
         execute_validation_tool,
         validation_tool_spec,
     )
+    from pyromind_common.sdk.workspace.local import LocalWorkspace
     from pyromind_runtime.domain.context import RequestContext
-
-    from openhands.sdk.workspace.local import LocalWorkspace
 
     (tmp_path / "workflow.py").write_text("test = Train()")
     calls = []

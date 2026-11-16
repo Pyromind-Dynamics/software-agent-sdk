@@ -22,7 +22,7 @@ from typing import Any
 
 import streamlit as st
 
-from openhands.sdk.logger import ENV_LOG_DIR
+from pyromind_common.sdk.logger import ENV_LOG_DIR
 
 
 ENV_ROOT = os.getenv("OPENHANDS_COMPLETION_LOGS_ROOT")

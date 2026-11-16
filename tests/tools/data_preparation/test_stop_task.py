@@ -5,11 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from openhands.tools.data_preparation.platform_submit import (
+from pyromind_common.tools.data_preparation.platform_submit import (
     DataPreparationTaskAssociation,
     DataPreparationTaskStore,
 )
-from openhands.tools.data_preparation.stop_task import (
+from pyromind_common.tools.data_preparation.stop_task import (
     DfStopTaskAction,
     DfStopTaskExecutor,
     _coerce_task_id,

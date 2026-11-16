@@ -9,6 +9,8 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import event
+
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -29,7 +31,6 @@ from pyromind_runtime.infrastructure.sql_preparation import (
 )
 from pyromind_runtime.infrastructure.sql_project_store import metadata, projects
 from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
-from sqlalchemy import event
 
 from .fake_adapter import FakeAdapter
 from .test_product_api import _app
@@ -418,7 +419,7 @@ async def test_http_prepare_create_and_cross_profile_denial(
     runtime = ConversationRuntime(
         tmp_path / "conversations", adapter, preparation_store=store
     )
-    profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="openhands")
+    profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="pi")
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(profile))
     try:

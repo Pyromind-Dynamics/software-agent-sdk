@@ -1,6 +1,6 @@
 """Tests for redact utility functions."""
 
-from openhands.sdk.utils.redact import (
+from pyromind_common.sdk.utils.redact import (
     SENSITIVE_URL_PARAMS,
     redact_url_credentials,
     redact_url_credentials_in_text,

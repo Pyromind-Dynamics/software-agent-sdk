@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from openhands.agent_server.storage_quota import (
+from pyromind_agent_server.storage_quota import (
     OH_CONVERSATION_STORAGE_QUOTA_ENV,
     OH_STORAGE_QUOTA_DEVICE_ENV,
     OH_STORAGE_QUOTA_REQUIRED_ENV,
@@ -45,18 +45,18 @@ def test_quota_from_env(monkeypatch):
 
 def _make_running_quota(monkeypatch, calls, tmp_path, limit):
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
 
     def fake_run(args, **kwargs):
         calls.append(args)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    monkeypatch.setattr("pyromind_agent_server.storage_quota.subprocess.run", fake_run)
     return ConversationStorageQuota(limit)
 
 
@@ -93,7 +93,7 @@ def test_disabled_quota_skips_commands(monkeypatch, tmp_path):
     directory.mkdir()
     calls = []
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.subprocess.run",
+        "pyromind_agent_server.storage_quota.subprocess.run",
         lambda *args, **kwargs: calls.append(args) and SimpleNamespace(returncode=0),
     )
 
@@ -126,14 +126,14 @@ def test_quota_command_failure_returns_false(monkeypatch, tmp_path):
     directory = tmp_path / "conv"
     directory.mkdir()
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.subprocess.run",
+        "pyromind_agent_server.storage_quota.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=1, stdout="", stderr="operation not permitted"
         ),
@@ -150,15 +150,15 @@ def _fake_device_for(mount_point, devices):
 def test_run_uses_device_node_when_available(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     dev = tmp_path / "dev-node"
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._device_node_for",
+        "pyromind_agent_server.storage_quota._device_node_for",
         lambda _: dev,
     )
 
@@ -166,7 +166,7 @@ def test_run_uses_device_node_when_available(monkeypatch, tmp_path):
         calls.append(args)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    monkeypatch.setattr("pyromind_agent_server.storage_quota.subprocess.run", fake_run)
     quota = ConversationStorageQuota(10)
     assert quota.apply(tmp_path, UUID("af3258e4-6542-408a-ba43-1c6f8ee37821")) is True
     assert calls and all(str(dev) in args for args in calls)
@@ -175,21 +175,21 @@ def test_run_uses_device_node_when_available(monkeypatch, tmp_path):
 def test_run_falls_back_to_mountpoint_without_device(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._device_node_for", lambda _: None
+        "pyromind_agent_server.storage_quota._device_node_for", lambda _: None
     )
 
     def fake_run(args, **kwargs):
         calls.append(args)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    monkeypatch.setattr("pyromind_agent_server.storage_quota.subprocess.run", fake_run)
     quota = ConversationStorageQuota(10)
     assert quota.apply(tmp_path, UUID("af3258e4-6542-408a-ba43-1c6f8ee37821")) is True
     assert calls and str(tmp_path) in calls[0]
@@ -199,15 +199,15 @@ def test_device_node_parses_mountinfo_major_minor(monkeypatch, tmp_path):
 
     mountinfo = "23 21 259:5 / /workspace rw,relatime - xfs /dev/nvme1n1 rw,prjquota"
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.Path.read_text",
+        "pyromind_agent_server.storage_quota.Path.read_text",
         lambda self: mountinfo,
     )
     made = []
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.os.mknod",
+        "pyromind_agent_server.storage_quota.os.mknod",
         lambda path, mode, dev: made.append((path, mode, dev)),
     )
-    from openhands.agent_server.storage_quota import _device_node_for
+    from pyromind_agent_server.storage_quota import _device_node_for
 
     node = _device_node_for(Path("/workspace"))
     assert node is not None
@@ -218,14 +218,14 @@ def test_device_node_prefers_existing_source_device(monkeypatch, tmp_path):
     device.write_text("block device")
     mountinfo = f"23 21 259:5 / /workspace rw,relatime - xfs {device} rw,prjquota"
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.Path.read_text",
+        "pyromind_agent_server.storage_quota.Path.read_text",
         lambda self: mountinfo,
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.stat.S_ISBLK",
+        "pyromind_agent_server.storage_quota.stat.S_ISBLK",
         lambda _mode: True,
     )
-    from openhands.agent_server.storage_quota import _device_node_for
+    from pyromind_agent_server.storage_quota import _device_node_for
 
     assert _device_node_for(Path("/workspace")) == device
 
@@ -259,11 +259,11 @@ def test_apply_uses_configured_device(monkeypatch, tmp_path):
     directory.mkdir()
     calls = []
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     dev = tmp_path / "real-device"
 
@@ -271,7 +271,7 @@ def test_apply_uses_configured_device(monkeypatch, tmp_path):
         calls.append(args)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    monkeypatch.setattr("pyromind_agent_server.storage_quota.subprocess.run", fake_run)
     quota = ConversationStorageQuota(10, device=dev)
     assert quota.apply(directory, UUID(int=3))
     assert calls and all(str(dev) in args for args in calls)
@@ -281,7 +281,7 @@ def test_apply_records_last_error_on_mountpoint_failure(monkeypatch, tmp_path):
     directory = tmp_path / "conv"
     directory.mkdir()
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: None
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: None
     )
     quota = ConversationStorageQuota(10)
     assert not quota.apply(directory, UUID(int=4))
@@ -292,14 +292,14 @@ def test_run_records_command_failure_detail(monkeypatch, tmp_path):
     directory = tmp_path / "conv"
     directory.mkdir()
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._device_node_for", lambda _: None
+        "pyromind_agent_server.storage_quota._device_node_for", lambda _: None
     )
 
     def failing_run(args, **kwargs):
@@ -308,7 +308,7 @@ def test_run_records_command_failure_detail(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.subprocess.run", failing_run
+        "pyromind_agent_server.storage_quota.subprocess.run", failing_run
     )
     quota = ConversationStorageQuota(10)
     assert not quota.apply(directory, UUID(int=5))
@@ -324,18 +324,18 @@ def test_preflight_disabled_quota_returns_empty(monkeypatch):
 def _preflight_mount(monkeypatch, tmp_path, fs_type, options, report_ok=True):
     monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._fs_type_and_options",
+        "pyromind_agent_server.storage_quota._fs_type_and_options",
         lambda _: (fs_type, options),
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._device_node_for", lambda _: None
+        "pyromind_agent_server.storage_quota._device_node_for", lambda _: None
     )
 
     def runner(*args, **kwargs):
@@ -343,7 +343,7 @@ def _preflight_mount(monkeypatch, tmp_path, fs_type, options, report_ok=True):
         stderr = "" if report_ok else "No such device or address"
         return SimpleNamespace(returncode=status, stdout="", stderr=stderr)
 
-    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", runner)
+    monkeypatch.setattr("pyromind_agent_server.storage_quota.subprocess.run", runner)
 
 
 def test_preflight_reports_filesystem_problems(monkeypatch, tmp_path):
@@ -372,7 +372,7 @@ def test_preflight_ok_returns_empty(monkeypatch, tmp_path):
 def test_preflight_unknown_mountpoint(monkeypatch, tmp_path):
     monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: None
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: None
     )
     problems = preflight_storage_quota(workspace_root=tmp_path)
     assert problems and "mountpoint" in problems[0]
@@ -381,18 +381,18 @@ def test_preflight_unknown_mountpoint(monkeypatch, tmp_path):
 def _patch_running_quota_env(monkeypatch, tmp_path, calls):
     monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
 
     def fake_run(args, **kwargs):
         calls.append(args)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("openhands.agent_server.storage_quota.subprocess.run", fake_run)
+    monkeypatch.setattr("pyromind_agent_server.storage_quota.subprocess.run", fake_run)
 
 
 def test_ensure_conversation_quota_accepts_hex_id(monkeypatch, tmp_path):
@@ -422,14 +422,14 @@ def test_ensure_conversation_quota_fails_closed_when_required(monkeypatch, tmp_p
     monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
     monkeypatch.setenv(OH_STORAGE_QUOTA_REQUIRED_ENV, "1")
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.subprocess.run",
+        "pyromind_agent_server.storage_quota.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=1, stdout="", stderr="operation not permitted"
         ),
@@ -445,14 +445,14 @@ def test_ensure_conversation_quota_warns_when_not_required(monkeypatch, tmp_path
     monkeypatch.setenv(OH_CONVERSATION_STORAGE_QUOTA_ENV, "500M")
     monkeypatch.delenv(OH_STORAGE_QUOTA_REQUIRED_ENV, raising=False)
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.shutil.which",
+        "pyromind_agent_server.storage_quota.shutil.which",
         lambda _: "/usr/bin/xfs_quota",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
+        "pyromind_agent_server.storage_quota._mountpoint_for", lambda _: tmp_path
     )
     monkeypatch.setattr(
-        "openhands.agent_server.storage_quota.subprocess.run",
+        "pyromind_agent_server.storage_quota.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=1, stdout="", stderr="operation not permitted"
         ),

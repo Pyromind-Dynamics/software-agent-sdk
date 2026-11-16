@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from openhands.sdk.utils.path import (
+from pyromind_common.sdk.utils.path import (
     is_absolute_path_source,
     is_host_absolute_path,
     is_local_path_source,

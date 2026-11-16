@@ -14,21 +14,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openhands.tools.label_studio.converter import (
+from pyromind_common.tools.label_studio.converter import (
     AVITrainToLabelStudioConverter,
     ConversionError,
     LabelStudioToAVITrainConverter,
     _geometry_from,
 )
-from openhands.tools.label_studio.executor import _project_ref
-from openhands.tools.label_studio.field_map import (
+from pyromind_common.tools.label_studio.executor import _project_ref
+from pyromind_common.tools.label_studio.field_map import (
     DEFAULT_FIELD_MAPS,
     EXPORT_FIELD_MAP,
     default_field_map,
     field_map_digest,
     parse_field_map,
 )
-from openhands.tools.label_studio.skill_helpers import (
+from pyromind_common.tools.label_studio.skill_helpers import (
     LabelConfigValidationError,
     required_controls,
     validate_label_config_xml,

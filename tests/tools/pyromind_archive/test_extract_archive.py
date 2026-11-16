@@ -5,8 +5,8 @@ from uuid import UUID
 import httpx
 from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.tools.pyromind_archive import (
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.tools.pyromind_archive import (
     ExtractArchiveAction,
     ExtractArchiveExecutor,
     ExtractArchiveTool,
@@ -80,7 +80,7 @@ def test_extract_archive_submits_zip_workflow(monkeypatch):
     )
     client_factory = MagicMock(return_value=mock_client)
     monkeypatch.setattr(
-        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_archive.definition.create_workflow_api_client",
         client_factory,
     )
 
@@ -136,7 +136,7 @@ def test_extract_archive_auto_detects_tar_gz(monkeypatch):
         task_id="task-456", name="agent-extract", status="Pending"
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_archive.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
 
@@ -210,7 +210,7 @@ def test_extract_archive_custom_output_dir(monkeypatch):
         task_id="task-789", name="agent-extract", status="Pending"
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_archive.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
 
@@ -244,7 +244,7 @@ def test_extract_archive_strips_workspace_prefix(monkeypatch):
         task_id="task-ws", name="agent-extract", status="Pending"
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_archive.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
 
@@ -343,7 +343,7 @@ def test_extract_archive_appends_suffix_when_default_dir_exists(monkeypatch):
         task_id="task-dup", name="agent-extract", status="Pending"
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_archive.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
 
@@ -378,7 +378,7 @@ def test_extract_archive_skips_existing_suffixed_dirs(monkeypatch):
         task_id="task-dup2", name="agent-extract", status="Pending"
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_archive.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_archive.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
 

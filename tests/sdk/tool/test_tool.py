@@ -7,15 +7,15 @@ from abc import ABC
 import pytest
 from pydantic import Field, ValidationError
 
-from openhands.sdk.tool import Action
-from openhands.sdk.tool.spec import Tool
-from openhands.sdk.tool.tool import (
+from pyromind_common.sdk.tool import Action
+from pyromind_common.sdk.tool.spec import Tool
+from pyromind_common.sdk.tool.tool import (
     _action_types_with_risk,
     _action_types_with_summary,
     _create_action_type_with_summary,
     create_action_type_with_risk,
 )
-from openhands.sdk.utils.models import _get_checked_concrete_subclasses
+from pyromind_common.sdk.utils.models import _get_checked_concrete_subclasses
 
 
 # Must live at module scope (Pydantic rejects <locals> classes).
@@ -163,7 +163,7 @@ def test_tool_field_descriptions():
     assert fields["name"].description is not None
     assert "Name of the tool class" in fields["name"].description
     assert (
-        "Import it from an `openhands.tools.<module>` subpackage."
+        "Import it from an `pyromind_common.tools.<module>` subpackage."
         in fields["name"].description
     )
 

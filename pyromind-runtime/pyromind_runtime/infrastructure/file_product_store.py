@@ -129,7 +129,7 @@ class FileProductStore:
         snapshot: ConversationSnapshot,
         *,
         user_id: str,
-        harness_id: str = "openhands",
+        harness_id: str = "pi",
         profile_id: str | None = None,
         tool_allowlist: tuple[str, ...] | None = None,
         skill_allowlist: tuple[str, ...] | None = None,

@@ -6,13 +6,13 @@ Tests the check_session_api_key dependency with multiple session API keys suppor
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
-from openhands.agent_server import dependencies as dependencies_module
-from openhands.agent_server.config import Config
-from openhands.agent_server.dependencies import (
+from pyromind_agent_server import dependencies as dependencies_module
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.dependencies import (
     check_session_api_key,
     get_current_user_id,
 )
-from openhands.agent_server.pyromind_auth import CurrentLoginUser
+from pyromind_common.platform.auth import CurrentLoginUser
 
 
 def _make_app(session_api_keys: list[str]) -> FastAPI:

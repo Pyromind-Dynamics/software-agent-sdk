@@ -56,25 +56,30 @@ class PackageConfig:
 
 PACKAGES: tuple[PackageConfig, ...] = (
     PackageConfig(
-        name="openhands-sdk",
-        pyproject=REPO_ROOT / "openhands-sdk" / "pyproject.toml",
-        source_roots=(REPO_ROOT / "openhands-sdk" / "openhands" / "sdk",),
+        name="pyromind-common",
+        pyproject=REPO_ROOT / "pyromind-common" / "pyproject.toml",
+        source_roots=(REPO_ROOT / "pyromind-common" / "pyromind_common",),
     ),
     PackageConfig(
-        name="openhands-tools",
-        pyproject=REPO_ROOT / "openhands-tools" / "pyproject.toml",
-        source_roots=(REPO_ROOT / "openhands-tools" / "openhands" / "tools",),
+        name="pyromind-runtime",
+        pyproject=REPO_ROOT / "pyromind-runtime" / "pyproject.toml",
+        source_roots=(REPO_ROOT / "pyromind-runtime" / "pyromind_runtime",),
     ),
     PackageConfig(
-        name="openhands-workspace",
-        pyproject=REPO_ROOT / "openhands-workspace" / "pyproject.toml",
-        source_roots=(REPO_ROOT / "openhands-workspace" / "openhands" / "workspace",),
+        name="harness-adapter",
+        pyproject=REPO_ROOT / "harness-adapter" / "pyproject.toml",
+        source_roots=(REPO_ROOT / "harness-adapter" / "harness_adapter",),
     ),
     PackageConfig(
-        name="openhands-agent-server",
-        pyproject=REPO_ROOT / "openhands-agent-server" / "pyproject.toml",
+        name="pyromind-agent-server",
+        pyproject=REPO_ROOT / "pyromind-agent-server" / "pyproject.toml",
+        source_roots=(REPO_ROOT / "pyromind-agent-server" / "pyromind_agent_server",),
+    ),
+    PackageConfig(
+        name="pyromind-embodied-runtime",
+        pyproject=REPO_ROOT / "pyromind-embodied-runtime" / "pyproject.toml",
         source_roots=(
-            REPO_ROOT / "openhands-agent-server" / "openhands" / "agent_server",
+            REPO_ROOT / "pyromind-embodied-runtime" / "pyromind_embodied_runtime",
         ),
     ),
 )

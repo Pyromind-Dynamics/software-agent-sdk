@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import SecretStr
 
-from openhands.sdk.utils.cipher import Cipher
-from openhands.sdk.utils.pydantic_secrets import (
+from pyromind_common.sdk.utils.cipher import Cipher
+from pyromind_common.sdk.utils.pydantic_secrets import (
     REDACTED_SECRET_VALUE,
     decrypt_str_with_cipher_or_keep,
     is_redacted_secret,
@@ -297,128 +297,6 @@ def test_roundtrip_plaintext_mode(mock_info):
 
 
 # ── Real Pydantic integration tests ─────────────────────────────────────
-
-
-def test_real_pydantic_roundtrip_encrypted(cipher):
-    """Test encryption via actual Pydantic serialization (not mocks)."""
-    from openhands.agent_server.persistence.models import CustomSecret
-
-    # Create with plaintext
-    secret = CustomSecret(name="TEST_KEY", secret=SecretStr("my-secret-value"))
-
-    # Serialize with encrypted context (real model_dump call)
-    data = secret.model_dump(
-        mode="json", context={"expose_secrets": "encrypted", "cipher": cipher}
-    )
-
-    # Verify encrypted (not plaintext, not redacted)
-    assert data["secret"] != "my-secret-value"
-    assert data["secret"] != REDACTED_SECRET_VALUE
-    assert isinstance(data["secret"], str)
-
-    # Validate (decrypt) with cipher context (real model_validate call)
-    restored = CustomSecret.model_validate(data, context={"cipher": cipher})
-    assert restored.secret is not None
-    assert restored.secret.get_secret_value() == "my-secret-value"
-
-
-def test_real_pydantic_roundtrip_plaintext():
-    """Test plaintext via actual Pydantic serialization (not mocks)."""
-    from openhands.agent_server.persistence.models import CustomSecret
-
-    # Create with plaintext
-    secret = CustomSecret(name="TEST_KEY", secret=SecretStr("my-secret-value"))
-
-    # Serialize with plaintext context
-    data = secret.model_dump(mode="json", context={"expose_secrets": "plaintext"})
-
-    # Verify plaintext
-    assert data["secret"] == "my-secret-value"
-
-    # Validate (no cipher - just wraps in SecretStr)
-    restored = CustomSecret.model_validate(data)
-    assert restored.secret is not None
-    assert restored.secret.get_secret_value() == "my-secret-value"
-
-
-def test_real_pydantic_redacted_mode():
-    """Test redaction via actual Pydantic serialization (default behavior)."""
-    from openhands.agent_server.persistence.models import CustomSecret
-
-    # Create with plaintext
-    secret = CustomSecret(name="TEST_KEY", secret=SecretStr("my-secret-value"))
-
-    # Serialize without context (default = redacted)
-    data = secret.model_dump(mode="json")
-
-    # Verify redacted - Pydantic returns SecretStr repr for json mode
-    # which is "**********" (the default SecretStr repr)
-    assert data["secret"] == REDACTED_SECRET_VALUE
-
-
-def test_real_pydantic_nested_secrets_roundtrip(cipher):
-    """Test encryption of nested secrets in Secrets model."""
-    from openhands.agent_server.persistence.models import CustomSecret, Secrets
-
-    # Create Secrets with multiple custom secrets
-    secrets = Secrets(
-        custom_secrets={
-            "API_KEY": CustomSecret(
-                name="API_KEY", secret=SecretStr("sk-123"), description="API key"
-            ),
-            "DB_PASS": CustomSecret(
-                name="DB_PASS",
-                secret=SecretStr("password123"),
-                description="DB password",
-            ),
-        }
-    )
-
-    # Serialize with cipher (encrypts all secrets)
-    data = secrets.model_dump(mode="json", context={"cipher": cipher})
-
-    # Verify all secrets are encrypted
-    for name in ["API_KEY", "DB_PASS"]:
-        assert data["custom_secrets"][name]["secret"] not in [
-            "sk-123",
-            "password123",
-            REDACTED_SECRET_VALUE,
-        ]
-
-    # Validate (decrypt) all secrets
-    restored = Secrets.model_validate(data, context={"cipher": cipher})
-    assert restored.custom_secrets["API_KEY"].secret is not None
-    assert restored.custom_secrets["API_KEY"].secret.get_secret_value() == "sk-123"
-    assert restored.custom_secrets["DB_PASS"].secret is not None
-    assert restored.custom_secrets["DB_PASS"].secret.get_secret_value() == "password123"
-
-
-def test_real_pydantic_persisted_settings_roundtrip(cipher):
-    """Test PersistedSettings serialization with encrypted LLM api_key.
-
-    This tests the primary use case: full PersistedSettings with
-    agent_settings.llm.api_key encrypted and round-tripped.
-    """
-    from openhands.agent_server.persistence.models import PersistedSettings
-
-    # Create settings with secret
-    settings = PersistedSettings()
-    settings.agent_settings.llm.api_key = SecretStr("sk-test-key-12345")
-
-    # Serialize with cipher
-    data = settings.model_dump(mode="json", context={"cipher": cipher})
-    encrypted_key = data["agent_settings"]["llm"]["api_key"]
-
-    # Should be encrypted (not plaintext, not redacted)
-    assert encrypted_key != "sk-test-key-12345"
-    assert encrypted_key != REDACTED_SECRET_VALUE
-
-    # Deserialize (decrypt)
-    restored = PersistedSettings.model_validate(data, context={"cipher": cipher})
-    restored_key = restored.agent_settings.llm.api_key
-    assert restored_key is not None
-    assert isinstance(restored_key, SecretStr)
-    assert restored_key.get_secret_value() == "sk-test-key-12345"
 
 
 # ── decrypt_str_with_cipher_or_keep / validate_secret_dict tests ────────

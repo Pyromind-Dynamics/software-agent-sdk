@@ -4,9 +4,10 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from sqlalchemy.engine import URL, make_url
+
 from pyromind_runtime.infrastructure.sql_database import create_database_engine
 from pyromind_runtime.infrastructure.sql_preparation import SQLPreparationStore
-from sqlalchemy.engine import URL, make_url
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

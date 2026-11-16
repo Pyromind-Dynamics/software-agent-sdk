@@ -4,17 +4,17 @@ import zlib
 from typing import Any
 
 import pytest
-from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
-from openhands.agent_server.kafka_bus.handlers import (
+from pyromind_agent_server.kafka_bus.handlers import (
     studio_workflow_notify_handler as handler_module,
 )
-from openhands.agent_server.kafka_bus.handlers.studio_workflow_notify_handler import (
+from pyromind_agent_server.kafka_bus.handlers.studio_workflow_notify_handler import (
     StudioWorkflowNotifyHandler,
     TrainingTaskEventType,
 )
-from openhands.agent_server.kafka_bus.message_event import MessageEvent
-from openhands.agent_server.workflow_status import WorkflowCallbackResult
+from pyromind_agent_server.kafka_bus.message_event import MessageEvent
+from pyromind_agent_server.workflow_status import WorkflowCallbackResult
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
 @pytest.mark.asyncio

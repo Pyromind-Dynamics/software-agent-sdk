@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pyromind_agent_server.echomind_projects import ProjectStore
 from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.preparation import ProjectView
-
-from openhands.agent_server.echomind_projects import ProjectStore
 
 
 class EchoMindExperimentPlanProjectBinder:

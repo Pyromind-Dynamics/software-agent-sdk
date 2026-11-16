@@ -112,7 +112,7 @@ jobs:
             - name: Build binary (Windows)
               if: runner.os == 'Windows'
               shell: bash
-              run: uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+              run: uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec
 
             - name: Smoke-test binary
               shell: bash

@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from openhands.sdk.utils.paging import page_iterator
+from pyromind_common.sdk.utils.paging import page_iterator
 
 
 @dataclass

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openhands.tools.label_studio.api_client import (
+from pyromind_common.tools.label_studio.api_client import (
     LabelStudioAPIClient,
     LabelStudioAPIError,
 )

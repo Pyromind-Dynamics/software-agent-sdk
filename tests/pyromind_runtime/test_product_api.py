@@ -5,24 +5,24 @@ import hashlib
 import json
 from pathlib import Path
 
-import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
 from fastapi import FastAPI
+
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
+from pyromind_agent_server.config import Config
 from pyromind_agent_server.profiles import (
     ConversationProfile,
 )
+from pyromind_agent_server.service_context import ProductServiceContext
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
-
-from openhands.agent_server.config import Config
-from openhands.agent_server.conversation_service import ConversationService
 
 from .fake_adapter import FakeAdapter
 
@@ -35,7 +35,7 @@ def _app(tmp_path, runtime: ConversationRuntime) -> FastAPI:
         enable_session_api_key_auth=False,
         enable_pyromind_jwt_auth=False,
     )
-    app.state.conversation_service = ConversationService(
+    app.state.conversation_service = ProductServiceContext(
         conversations_dir=tmp_path / "conversations"
     )
     app.state.product_runtime = runtime

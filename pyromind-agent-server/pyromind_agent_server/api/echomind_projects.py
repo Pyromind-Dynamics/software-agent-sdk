@@ -8,30 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from pyromind_runtime.domain.commands import UserMessageCommand
-from pyromind_runtime.domain.content import TextContent
-from pyromind_runtime.domain.context import RequestContext
 
-from openhands.agent_server.dependencies import check_session_api_key
-from openhands.agent_server.echomind_projects import (
-    ProjectClusterMismatchError,
-    ProjectInfo,
-    ProjectNotFoundError,
-    ProjectStore,
-    ProjectSummary,
-)
-from openhands.agent_server.echomind_stage_executors import (
-    get_project_node_executor,
-)
-from openhands.agent_server.echomind_stage_runs import (
-    ProjectArtifactDocument,
-    ProjectRunStore,
-    StageRun,
-    run_project_node,
-)
-from openhands.agent_server.pyromind_auth import (
-    parse_auth_token_from_cookie_header,
-)
 from pyromind_agent_server.api.router import (
     _require_profile,
     configure_session,
@@ -39,7 +16,30 @@ from pyromind_agent_server.api.router import (
     get_conversation_service,
     get_product_runtime,
 )
+from pyromind_agent_server.dependencies import check_session_api_key
+from pyromind_agent_server.echomind_projects import (
+    ProjectClusterMismatchError,
+    ProjectInfo,
+    ProjectNotFoundError,
+    ProjectStore,
+    ProjectSummary,
+)
+from pyromind_agent_server.echomind_stage_executors import (
+    get_project_node_executor,
+)
+from pyromind_agent_server.echomind_stage_runs import (
+    ProjectArtifactDocument,
+    ProjectRunStore,
+    StageRun,
+    run_project_node,
+)
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_common.platform.auth import (
+    parse_auth_token_from_cookie_header,
+)
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.context import RequestContext
 
 
 router = APIRouter(

@@ -2,6 +2,17 @@ import json
 from uuid import uuid4
 
 import pytest
+
+from pyromind_agent_server.agent_profiles.echomind_manager import (
+    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+    ECHOMIND_MANAGER_PROFILE,
+)
+from pyromind_agent_server.echomind_projects import (
+    ProjectClusterMismatchError,
+    ProjectNotFoundError,
+    ProjectStore,
+)
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
 )
@@ -14,17 +25,6 @@ from pyromind_runtime.domain.experiment_plans import (
     WorkflowPlan,
 )
 from pyromind_runtime.domain.preparation import ProjectView
-
-from openhands.agent_server.agent_profiles.echomind_manager import (
-    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
-    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
-    ECHOMIND_MANAGER_PROFILE,
-)
-from openhands.agent_server.echomind_projects import (
-    ProjectClusterMismatchError,
-    ProjectNotFoundError,
-    ProjectStore,
-)
 
 
 def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:

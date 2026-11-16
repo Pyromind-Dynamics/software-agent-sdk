@@ -3,8 +3,8 @@
 import pytest
 from jsonschema import Draft202012Validator
 
-from openhands.tools.label_studio import LabelStudioProjectTool
-from openhands.tools.label_studio.executor import LabelStudioProjectExecutor
+from pyromind_common.tools.label_studio import LabelStudioProjectTool
+from pyromind_common.tools.label_studio.executor import LabelStudioProjectExecutor
 
 
 def test_tool_name_and_schema_are_registered() -> None:

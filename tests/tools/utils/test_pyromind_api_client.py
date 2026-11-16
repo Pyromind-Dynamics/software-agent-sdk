@@ -3,8 +3,8 @@ import time
 import jwt
 import pytest
 
-from openhands.tools.utils import pyromind_api_client
-from openhands.tools.utils.pyromind_api_client import (
+from pyromind_common.tools.utils import pyromind_api_client
+from pyromind_common.tools.utils.pyromind_api_client import (
     _build_access_key_request_headers,
     _build_sensitive_access_key_request,
     _build_sensitive_data_request_key,

@@ -1,11 +1,8 @@
 # UV workspace configuration
 [tool.uv.workspace]
 members = [
-    "openhands-sdk",
-    "openhands-tools",
-    "openhands-embodied-runtime",
-    "openhands-workspace",
-    "openhands-agent-server",
+    "pyromind-embodied-runtime",
+    "pyromind-common",
     "pyromind-runtime",
     "harness-adapter",
     "pyromind-agent-server",
@@ -31,11 +28,8 @@ constraint-dependencies = [
 # Workspace sources for intra-repo dependencies
 [tool.uv.sources]
 agentgenome = { path = "vendor/agentgenome-0.6.60-py3-none-any.whl" }
-openhands-sdk = { workspace = true }
-openhands-tools = { workspace = true }
-openhands-embodied-runtime = { workspace = true }
-openhands-workspace = { workspace = true }
-openhands-agent-server = { workspace = true }
+pyromind-embodied-runtime = { workspace = true }
+pyromind-common = { workspace = true }
 pyromind-runtime = { workspace = true }
 harness-adapter = { workspace = true }
 pyromind-agent-server = { workspace = true }
@@ -89,14 +83,12 @@ extend-select = ["B006", "B008", "B039", "RUF012"]
 [tool.ruff.lint.per-file-ignores]
 # Test files often have unused arguments (fixtures, mocks, interface implementations)
 "tests/**/*.py" = ["ARG"]
-"openhands-tools/openhands/tools/node_signature/definition.py" = ["E501"]
-"openhands-tools/openhands/tools/node_signature/impl.py" = ["E501"]
 # Skill node scripts run on platform nodes with Python 3.10; UP017 would
 # rewrite timezone.utc back to UTC (3.11+) and break them at import time.
 ".agents/skills/data-processing/scripts/edp/*.py" = ["UP017"]
 
 [tool.ruff.per-file-target-version]
-"openhands-embodied-runtime/**/*.py" = "py310"
+"pyromind-embodied-runtime/**/*.py" = "py310"
 
 
 # Allowlist safe default calls for flake8-bugbear rules (e.g., FastAPI Depends)
@@ -107,7 +99,7 @@ extend-immutable-calls = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["openhands"]
+known-first-party = ["pyromind_common", "pyromind_agent_server", "pyromind_runtime", "harness_adapter"]
 combine-as-imports = true
 force-single-line = false
 lines-after-imports = 2
@@ -130,11 +122,8 @@ markers = [
 # This is needed for VSCode to properly resolve imports across multiple packages in the monorepo
 [tool.pyright]
 include = [
-    "openhands-sdk",
-    "openhands-tools",
-    "openhands-embodied-runtime",
-    "openhands-workspace",
-    "openhands-agent-server",
+    "pyromind-embodied-runtime",
+    "pyromind-common",
     "pyromind-runtime",
     "harness-adapter",
     "pyromind-agent-server",
@@ -143,11 +132,8 @@ include = [
     "scripts"
 ]
 extraPaths = [
-    "openhands-sdk",
-    "openhands-tools",
-    "openhands-embodied-runtime",
-    "openhands-workspace",
-    "openhands-agent-server",
+    "pyromind-embodied-runtime",
+    "pyromind-common",
     "pyromind-runtime",
     "harness-adapter",
     "pyromind-agent-server",

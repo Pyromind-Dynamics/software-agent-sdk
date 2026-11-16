@@ -12,7 +12,7 @@ UNDERLINE := \033[4m
 
 # Required uv version
 REQUIRED_UV_VERSION := 0.8.13
-PKGS ?= openhands-sdk openhands-tools openhands-workspace openhands-agent-server
+PKGS ?= pyromind-common pyromind-runtime harness-adapter pyromind-agent-server
 
 .PHONY: build format lint clean help check-uv-version
 
@@ -83,13 +83,13 @@ help:
 
 build-server: check-uv-version
 	@$(ECHO) "$(CYAN)Building agent-server executable...$(RESET)"
-	@uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+	@uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec
 	@$(ECHO) "$(GREEN)Build complete! Executable is in dist/agent-server/$(RESET)"
 
 test-server-schema: check-uv-version
 	set -euo pipefail;
 	# Generate OpenAPI JSON inline (no file left in repo)
-	uv run python -c 'import os,json; from openhands.agent_server.api import api; open("openapi.json","w").write(json.dumps(api.openapi(), indent=2))'
+	uv run python -c 'import os,json; from pyromind_agent_server.app import api; open("openapi.json","w").write(json.dumps(api.openapi(), indent=2))'
 	npx --yes @apidevtools/swagger-cli@^4 validate openapi.json
 	# Clean up temp schema
 	rm -f openapi.json

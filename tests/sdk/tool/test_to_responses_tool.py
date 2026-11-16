@@ -1,7 +1,7 @@
 from typing import ClassVar
 
-from openhands.sdk.tool.schema import Action, Observation
-from openhands.sdk.tool.tool import ToolDefinition
+from pyromind_common.sdk.tool.schema import Action, Observation
+from pyromind_common.sdk.tool.tool import ToolDefinition
 
 
 class A(Action):
@@ -10,7 +10,7 @@ class A(Action):
 
 class Obs(Observation):
     def to_llm_content(self):  # type: ignore[override]
-        from openhands.sdk.llm import TextContent
+        from pyromind_common.sdk.llm import TextContent
 
         return [TextContent(text="ok")]
 

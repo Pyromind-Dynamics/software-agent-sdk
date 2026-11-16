@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from openhands.tools.label_studio.definition import LabelStudioProjectAction
-from openhands.tools.label_studio.executor import LabelStudioProjectExecutor
+from pyromind_common.tools.label_studio.definition import LabelStudioProjectAction
+from pyromind_common.tools.label_studio.executor import LabelStudioProjectExecutor
 
 
 @pytest.mark.parametrize("relative_media_url", [False, True])

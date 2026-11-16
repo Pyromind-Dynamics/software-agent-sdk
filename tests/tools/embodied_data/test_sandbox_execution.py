@@ -4,8 +4,8 @@ import shutil
 from pathlib import Path
 
 import pytest
-from openhands_embodied_runtime.lerobot_v21 import validate_lerobot_v21_dataset
-from openhands_embodied_runtime.sandbox_runner import _parser, run_full, run_plan
+from pyromind_embodied_runtime.lerobot_v21 import validate_lerobot_v21_dataset
+from pyromind_embodied_runtime.sandbox_runner import _parser, run_full, run_plan
 
 
 def test_sandbox_runner_plans_batches_validates_and_publishes(
@@ -19,7 +19,7 @@ def test_sandbox_runner_plans_batches_validates_and_publishes(
         self_collected_path,
         run_dir,
         idle_min_duration_s=10,
-        runtime_revision="openhands-embodied-runtime==1.29.5",
+        runtime_revision="pyromind-embodied-runtime==0.1.0",
     )
     completed = run_full(
         self_collected_path,
@@ -29,7 +29,7 @@ def test_sandbox_runner_plans_batches_validates_and_publishes(
         confirm_subtasks=True,
         confirm_derived_action=True,
         idle_min_duration_s=10,
-        runtime_revision="openhands-embodied-runtime==1.29.5",
+        runtime_revision="pyromind-embodied-runtime==0.1.0",
     )
 
     assert planned["complete"] is True
@@ -54,7 +54,7 @@ def test_sandbox_runner_plans_batches_validates_and_publishes(
         confirm_derived_action=True,
         idle_min_duration_s=10,
         resume=True,
-        runtime_revision="openhands-embodied-runtime==1.29.5",
+        runtime_revision="pyromind-embodied-runtime==0.1.0",
     )
     assert resumed["complete"] is True
     assert resumed["phase"] == "resume"
@@ -130,8 +130,8 @@ def test_sandbox_runner_cleans_mounted_huggingface_lerobot_source(
 def test_sandbox_runtime_sources_parse_as_python_310() -> None:
     runtime_root = (
         Path(__file__).parents[3]
-        / "openhands-embodied-runtime"
-        / "openhands_embodied_runtime"
+        / "pyromind-embodied-runtime"
+        / "pyromind_embodied_runtime"
     )
     for source_path in runtime_root.glob("*.py"):
         ast.parse(

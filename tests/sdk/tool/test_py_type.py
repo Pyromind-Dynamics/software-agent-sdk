@@ -1,8 +1,8 @@
-"""Tests for py_type function in openhands.sdk.tool.schema."""
+"""Tests for py_type function in pyromind_common.sdk.tool.schema."""
 
 from typing import Any
 
-from openhands.sdk.tool.schema import py_type
+from pyromind_common.sdk.tool.schema import py_type
 
 
 class TestPyTypePrimitiveTypes:

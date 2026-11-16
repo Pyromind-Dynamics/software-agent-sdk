@@ -48,12 +48,12 @@ from pyromind_sdk.client.models import (
     VolumeMount,
 )
 
-from openhands.sdk.profiles.processing_profile import (
+from pyromind_common.sdk.profiles.processing_profile import (
     ProcessingProfile,
     ProcessingStep,
     VerdictRule,
 )
-from openhands.tools.sandbox import create_sandbox_api_client
+from pyromind_common.tools.sandbox import create_sandbox_api_client
 
 
 if TYPE_CHECKING:

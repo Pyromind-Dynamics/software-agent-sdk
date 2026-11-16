@@ -3,19 +3,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openhands.sdk import register_tool
-from openhands.sdk.conversation.state import ConversationState
-from openhands.sdk.llm.message import ImageContent, TextContent
-from openhands.sdk.tool import ToolDefinition
-from openhands.sdk.tool.registry import list_usable_tools, resolve_tool
-from openhands.sdk.tool.schema import Action, Observation
-from openhands.sdk.tool.spec import Tool
-from openhands.sdk.tool.tool import ToolExecutor
+from pyromind_common.sdk.conversation.state import ToolState
+from pyromind_common.sdk.llm.message import ImageContent, TextContent
+from pyromind_common.sdk.tool import ToolDefinition, register_tool
+from pyromind_common.sdk.tool.registry import list_usable_tools, resolve_tool
+from pyromind_common.sdk.tool.schema import Action, Observation
+from pyromind_common.sdk.tool.spec import Tool
+from pyromind_common.sdk.tool.tool import ToolExecutor
 
 
-def _create_mock_conv_state() -> ConversationState:
-    """Create a mock ConversationState for testing."""
-    mock_conv_state = MagicMock(spec=ConversationState)
+def _create_mock_conv_state() -> ToolState:
+    """Create a mock ToolState for testing."""
+    mock_conv_state = MagicMock(spec=ToolState)
     mock_conv_state.workspace = "workspace/project"
     mock_conv_state.persistence_dir = None
     return mock_conv_state
@@ -42,7 +41,7 @@ class _ConfigurableHelloTool(ToolDefinition):
     @classmethod
     def create(
         cls,
-        conv_state: ConversationState,
+        conv_state: ToolState,
         greeting: str = "Hello",
         punctuation: str = "!",
     ):

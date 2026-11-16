@@ -39,7 +39,7 @@ from harness_adapter.pi_adapter.business_tool_host import (
 )
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
-from openhands.tools.sandbox import (
+from pyromind_common.tools.sandbox import (
     create_sandbox_api_client,
     default_sandbox_image,
     run_terminal_command,

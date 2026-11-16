@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from uuid import uuid4
 
+import httpx
+import pytest
+from pydantic import BaseModel, ValidationError
+
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import harness_adapter.pi_adapter.business_tool_host as business_tool_host_module
 import harness_adapter.pi_adapter.sandbox_workspace as sandbox_workspace_module
-import httpx
-import pytest
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.pi_adapter.adapter import (
     _copy_business_tool_outputs_for_fork,
@@ -42,8 +44,8 @@ from harness_adapter.pi_adapter.tool_output import (
     PLATFORM_MAX_INLINE_TEXT_BYTES,
     ToolOutputPolicy,
 )
-from pydantic import BaseModel, ValidationError
 from pyromind_agent_server.api.schemas import AgentLLMConfig
+from pyromind_common.sdk.workspace.local import LocalWorkspace
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
@@ -56,8 +58,6 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
-
-from openhands.sdk.workspace.local import LocalWorkspace
 
 
 class _LifecycleFakeRunner:
@@ -2580,7 +2580,7 @@ async def test_terminal_permission_recovery_survives_missing_parent_run(
 
 @pytest.mark.parametrize("register_fails", [False, True])
 async def test_training_analysis_artifact_hook_is_best_effort(tmp_path, register_fails):
-    from openhands.tools.training_analysis import (
+    from pyromind_common.tools.training_analysis import (
         TrainingAnalysisAction,
         TrainingAnalysisObservation,
     )

@@ -1,6 +1,6 @@
-from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
-from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
-from openhands.sdk.utils import env_util
+from pyromind_agent_server.kafka_bus.kafka_bus import KafkaMessageBus
+from pyromind_agent_server.kafka_bus.kafka_topic import KafkaTopic
+from pyromind_common.sdk.utils import env_util
 
 
 def test_kafka_env_can_target_pre_while_server_stays_in_dev(monkeypatch):

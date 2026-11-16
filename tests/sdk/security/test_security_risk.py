@@ -4,7 +4,7 @@ from itertools import product
 
 import pytest
 
-from openhands.sdk.security.risk import SecurityRisk
+from pyromind_common.sdk.security.risk import SecurityRisk
 
 
 def test_security_risk_enum_values():

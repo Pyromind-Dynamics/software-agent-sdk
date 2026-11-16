@@ -12,11 +12,6 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
-from pyromind_runtime.application.pipeline_runs import PipelineRuns
-from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
-from pyromind_runtime.domain.task_correlation import TaskOrigin
-from pyromind_runtime.domain.versions import VersionToolRequest
 
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
@@ -40,37 +35,37 @@ from harness_adapter.version_tools import (
     submission_bridge,
 )
 from harness_adapter.workflow_validation import check_workflow_resources
-from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.secret import StaticSecret
-from openhands.sdk.tool import ToolDefinition
-from openhands.sdk.workspace.base import BaseWorkspace
-from openhands.sdk.workspace.local import LocalWorkspace
-from openhands.tools.data_preparation import (
+from pyromind_common.platform.auth import parse_auth_token_from_cookie_header
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.secret import StaticSecret
+from pyromind_common.sdk.tool import ToolDefinition
+from pyromind_common.sdk.workspace.base import BaseWorkspace
+from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_common.tools.data_preparation import (
     DfCheckProgressTool,
     DfStopTaskTool,
     DfSubmitEvaluationTool,
     DfSubmitPipelineTool,
 )
-from openhands.tools.data_preparation.inference import InferencePipelineHandler
-from openhands.tools.data_preparation.sandbox_execution import (
+from pyromind_common.tools.data_preparation.inference import InferencePipelineHandler
+from pyromind_common.tools.data_preparation.sandbox_execution import (
     ENV_SANDBOX_DATAFLOW_PYTHON,
 )
-from openhands.tools.environment_processing import (
+from pyromind_common.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
     EdpSubmitTool,
 )
-from openhands.tools.label_studio import (
+from pyromind_common.tools.label_studio import (
     LABEL_STUDIO_TOKEN_SECRET,
     LabelStudioProjectTool,
 )
-from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
-from openhands.tools.pyromind_dataset import (
+from pyromind_common.tools.pyromind_cleaning import RunDatasetCleaningTool
+from pyromind_common.tools.pyromind_dataset import (
     GetStorageUrlTool,
     UploadFileToPyromindTool,
 )
-from openhands.tools.sandbox import (
+from pyromind_common.tools.sandbox import (
     SandboxCreateTool,
     SandboxDeleteFileTool,
     SandboxDeleteTool,
@@ -80,24 +75,29 @@ from openhands.tools.sandbox import (
     SandboxUploadTool,
     SandboxWriteFileTool,
 )
-from openhands.tools.training_analysis import TrainingAnalysisTool
-from openhands.tools.update_plan import UpdatePlanTool
-from openhands.tools.utils.platform_env import (
+from pyromind_common.tools.training_analysis import TrainingAnalysisTool
+from pyromind_common.tools.update_plan import UpdatePlanTool
+from pyromind_common.tools.utils.platform_env import (
     platform_cluster_route,
     platform_cluster_target,
 )
-from openhands.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
-from openhands.tools.workflow.task_submission import (
+from pyromind_common.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
+from pyromind_common.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     workflow_submission_scope,
 )
-from openhands.tools.workflow.validate_workflow_dsl import (
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
     ValidateWorkflowDslExecutor,
 )
-from openhands.tools.workflow_debug import WorkflowDebugTool
-from openhands.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
+from pyromind_common.tools.workflow_debug import WorkflowDebugTool
+from pyromind_common.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
+from pyromind_runtime.domain.task_correlation import TaskOrigin
+from pyromind_runtime.domain.versions import VersionToolRequest
 
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
@@ -284,7 +284,7 @@ def _llm_credential_secrets(context: ToolExecutionContext) -> dict[str, StaticSe
 
 
 class _ToolConversationFacade:
-    """The deliberately small OpenHands compatibility boundary used by Pi."""
+    """Conversation context supplied by Pi to shared product tools."""
 
     def __init__(
         self,
@@ -478,7 +478,9 @@ class PyromindBusinessToolHost:
         }
 
     def terminal_environment(self, context: ToolExecutionContext) -> dict[str, str]:
-        from openhands.tools.data_preparation.runner import terminal_model_environment
+        from pyromind_common.tools.data_preparation.runner import (
+            terminal_model_environment,
+        )
 
         environment = terminal_model_environment(
             _ToolConversationFacade(context).state.agent.llm

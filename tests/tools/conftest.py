@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from openhands.sdk.workspace.models import CommandResult, FileOperationResult
+from pyromind_common.sdk.workspace.models import CommandResult, FileOperationResult
 
 
 class HostBackedSandboxWorkspace:

@@ -7,10 +7,24 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
+from pyromind_agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
+from pyromind_agent_server.evaluation_storage import build_evaluation_storage
+from pyromind_agent_server.experiment_plan_projects import (
+    EchoMindExperimentPlanProjectBinder,
+)
+from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_agent_server.observability import build_execution_observer
+from pyromind_agent_server.plan_database import build_experiment_plan_store
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.resource_inspector import StorageResourceInspector
+from pyromind_agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.workflow_status import set_workflow_status_dispatcher
+from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
@@ -24,20 +38,6 @@ from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIn
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
-
-from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
-from openhands.agent_server.storage_quota import ensure_conversation_quota
-from openhands.agent_server.workflow_status import set_workflow_status_dispatcher
-from pyromind_agent_server.evaluation_storage import build_evaluation_storage
-from pyromind_agent_server.experiment_plan_projects import (
-    EchoMindExperimentPlanProjectBinder,
-)
-from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
-from pyromind_agent_server.observability import build_execution_observer
-from pyromind_agent_server.plan_database import build_experiment_plan_store
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
-from pyromind_agent_server.resource_inspector import StorageResourceInspector
-from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
 logger = logging.getLogger(__name__)
@@ -306,7 +306,7 @@ def resource_limits_from_environment() -> ResourceLimits:
 
 
 def install_product_api(app: FastAPI) -> FastAPI:
-    """Compose Product API around the existing OpenHands application."""
+    """Install the product API and own its runtime lifecycle."""
     from pyromind_agent_server.api.echomind_projects import (
         router as echomind_projects_router,
     )
@@ -321,18 +321,11 @@ def install_product_api(app: FastAPI) -> FastAPI:
     @asynccontextmanager
     async def product_lifespan(current_app: FastAPI):
         async with original_lifespan(current_app):
-            runtime = ensure_product_runtime(current_app)
-            if runtime is not None:
-                await runtime.recover_version_metadata()
-                await runtime.start_execution_events()
             try:
+                await start_product_runtime(current_app)
                 yield
             finally:
-                runtime = getattr(current_app.state, "product_runtime", None)
-                if isinstance(runtime, ConversationRuntime):
-                    await runtime.close()
-                set_workflow_status_dispatcher(None)
-                current_app.state.product_runtime = None
+                await stop_product_runtime(current_app)
 
     app.router.lifespan_context = product_lifespan
     app.include_router(create_product_router())
@@ -340,3 +333,18 @@ def install_product_api(app: FastAPI) -> FastAPI:
     app.include_router(echomind_projects_router)
     app.include_router(create_evaluation_runs_router())
     return app
+
+
+async def start_product_runtime(app: FastAPI) -> None:
+    runtime = ensure_product_runtime(app)
+    if runtime is not None:
+        await runtime.recover_version_metadata()
+        await runtime.start_execution_events()
+
+
+async def stop_product_runtime(app: FastAPI) -> None:
+    runtime = getattr(app.state, "product_runtime", None)
+    if isinstance(runtime, ConversationRuntime):
+        await runtime.close()
+    set_workflow_status_dispatcher(None)
+    app.state.product_runtime = None

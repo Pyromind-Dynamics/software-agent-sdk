@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError, create_model
+
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import (
@@ -314,7 +315,7 @@ def test_input_command_intent_survives_completion_and_reload(tmp_path: Path) -> 
 def test_missing_harness_metadata_defaults_to_openhands(tmp_path: Path) -> None:
     store = _store(tmp_path)
     metadata = store.metadata_path.read_text()
-    store.metadata_path.write_text(metadata.replace('"harness_id":"openhands",', ""))
+    store.metadata_path.write_text(metadata.replace('"harness_id":"pi",', ""))
     assert store.harness_id() == "openhands"
 
 

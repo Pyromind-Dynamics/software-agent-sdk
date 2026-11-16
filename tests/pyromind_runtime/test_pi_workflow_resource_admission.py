@@ -4,15 +4,15 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from pydantic import BaseModel
+
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
 )
-from pydantic import BaseModel
+from pyromind_common.tools.data_preparation.submission import SubmissionObservation
+from pyromind_common.tools.workflow.task_submission import submit_workflow_task
 from pyromind_runtime.domain.context import RequestContext
-
-from openhands.tools.data_preparation.submission import SubmissionObservation
-from openhands.tools.workflow.task_submission import submit_workflow_task
 from tests.pyromind_runtime.test_workflow_resource_validation import _resource_response
 
 

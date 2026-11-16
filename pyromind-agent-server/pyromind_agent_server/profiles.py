@@ -4,13 +4,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from pyromind_agent_server.agent_profiles.echomind_manager import (
+    ECHOMIND_MANAGER_PROFILE,
+)
 from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.ports.harness import DelegatedRole
-
-from openhands.agent_server.agent_profiles.echomind_manager import (
-    ECHOMIND_MANAGER_PROFILE,
-)
 
 
 @dataclass(frozen=True, slots=True)

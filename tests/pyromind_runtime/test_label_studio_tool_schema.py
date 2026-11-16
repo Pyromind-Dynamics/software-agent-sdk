@@ -5,13 +5,13 @@ import subprocess
 from pathlib import Path
 
 import pytest
+
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
 )
+from pyromind_common.tools.label_studio.definition import LabelStudioProjectAction
 from pyromind_runtime.domain.context import RequestContext
-
-from openhands.tools.label_studio.definition import LabelStudioProjectAction
 
 
 @pytest.fixture

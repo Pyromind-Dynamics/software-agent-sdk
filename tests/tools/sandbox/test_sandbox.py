@@ -13,11 +13,11 @@ from uuid import UUID
 import pytest
 from pyromind_sdk.client.models import SandboxResponse, SandboxType
 
-from openhands.sdk.conversation.base import BaseConversation
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.tool import Tool
-from openhands.sdk.tool.registry import resolve_tool
-from openhands.tools.sandbox import (
+from pyromind_common.sdk.conversation.base import ToolConversation
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.tool import Tool
+from pyromind_common.sdk.tool.registry import resolve_tool
+from pyromind_common.tools.sandbox import (
     SandboxCreateAction,
     SandboxCreateExecutor,
     SandboxDeleteAction,
@@ -51,11 +51,11 @@ def _executor_kwargs(**overrides: Any) -> dict[str, Any]:
     return defaults
 
 
-def _fake_conversation() -> BaseConversation:
+def _fake_conversation() -> ToolConversation:
     registry = SecretRegistry()
     registry.update_secrets({"auth_token": "jwt-token"})
     return cast(
-        BaseConversation,
+        ToolConversation,
         SimpleNamespace(
             id=_CONVERSATION_ID,
             workspace=SimpleNamespace(working_dir="/tmp"),
@@ -66,11 +66,11 @@ def _fake_conversation() -> BaseConversation:
 
 def _patch_client(monkeypatch: pytest.MonkeyPatch, client: MagicMock) -> None:
     monkeypatch.setattr(
-        "openhands.tools.workflow.task_submission.get_api_key",
+        "pyromind_common.tools.workflow.task_submission.get_api_key",
         lambda **kwargs: "access-key-1",
     )
     monkeypatch.setattr(
-        "openhands.tools.workflow.task_submission.get_pyromind_api_client",
+        "pyromind_common.tools.workflow.task_submission.get_pyromind_api_client",
         lambda **kwargs: client,
     )
 
@@ -154,7 +154,9 @@ def _fake_terminal(
         terminals.append(terminal)
         return terminal
 
-    monkeypatch.setattr("openhands.tools.sandbox.definition.connect", fake_connect)
+    monkeypatch.setattr(
+        "pyromind_common.tools.sandbox.definition.connect", fake_connect
+    )
     return terminals
 
 
@@ -582,7 +584,9 @@ def test_sandbox_write_file_surfaces_a_staging_failure(
     def broken_connect(url: str, **kwargs: object) -> object:
         raise RuntimeError("ws refused")
 
-    monkeypatch.setattr("openhands.tools.sandbox.definition.connect", broken_connect)
+    monkeypatch.setattr(
+        "pyromind_common.tools.sandbox.definition.connect", broken_connect
+    )
 
     observation = SandboxWriteFileExecutor(**_executor_kwargs())(
         SandboxWriteFileAction(sandbox_id=_SANDBOX_ID, path="notes.md", content="hi\n"),
@@ -638,7 +642,7 @@ def test_sandbox_write_file_protocol_round_trips_through_a_shell(
         cwd=tmp_path,
     )
     monkeypatch.setattr(
-        "openhands.tools.sandbox.definition.connect",
+        "pyromind_common.tools.sandbox.definition.connect",
         lambda url, **kwargs: _RealShellTerminal(process),
     )
     payload = ("hello 中文\n" * 200).encode()
@@ -864,7 +868,9 @@ def test_sandbox_terminal_surfaces_errors(
     def broken_connect(url: str, **kwargs: object) -> object:
         raise RuntimeError("ws refused")
 
-    monkeypatch.setattr("openhands.tools.sandbox.definition.connect", broken_connect)
+    monkeypatch.setattr(
+        "pyromind_common.tools.sandbox.definition.connect", broken_connect
+    )
 
     observation = SandboxTerminalExecutor(**_executor_kwargs())(
         SandboxTerminalAction(sandbox_id=_SANDBOX_ID, command="ls"),

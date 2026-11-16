@@ -17,22 +17,22 @@ RUNNER_PATH = SCRIPTS_DIR / "sandbox_runner.py"
 PROFILE_PATH = (
     SCRIPTS_DIR
     / "pod_runtime"
-    / "openhands"
+    / "pyromind_common"
     / "sdk"
     / "profiles"
     / "processing_profile.py"
 )
 
 _SHIM_PACKAGES = (
-    "openhands",
-    "openhands.sdk",
-    "openhands.sdk.profiles",
-    "openhands.tools",
+    "pyromind_common",
+    "pyromind_common.sdk",
+    "pyromind_common.sdk.profiles",
+    "pyromind_common.tools",
 )
 _TRANSIENT_MODULES = (
     *_SHIM_PACKAGES,
-    "openhands.tools.sandbox",
-    "openhands.sdk.profiles.processing_profile",
+    "pyromind_common.tools.sandbox",
+    "pyromind_common.sdk.profiles.processing_profile",
     "sandbox_runner_under_test",
 )
 
@@ -63,12 +63,12 @@ def runner() -> Any:
             shim = types.ModuleType(name)
             shim.__path__ = []
             sys.modules[name] = shim
-        sys.modules["openhands.sdk.profiles.processing_profile"] = _load_module(
-            "openhands.sdk.profiles.processing_profile", PROFILE_PATH
+        sys.modules["pyromind_common.sdk.profiles.processing_profile"] = _load_module(
+            "pyromind_common.sdk.profiles.processing_profile", PROFILE_PATH
         )
-        sandbox_shim = types.ModuleType("openhands.tools.sandbox")
+        sandbox_shim = types.ModuleType("pyromind_common.tools.sandbox")
         setattr(sandbox_shim, "create_sandbox_api_client", lambda **kwargs: None)
-        sys.modules["openhands.tools.sandbox"] = sandbox_shim
+        sys.modules["pyromind_common.tools.sandbox"] = sandbox_shim
         return _load_module("sandbox_runner_under_test", RUNNER_PATH)
     finally:
         for name in _TRANSIENT_MODULES:

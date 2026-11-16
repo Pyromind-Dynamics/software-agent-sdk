@@ -23,10 +23,10 @@ _POD_RUNTIME = _EDP / "pod_runtime"
 _RUNNER = _EDP / "sandbox_runner.py"
 
 _SHIM_MODULES = {
-    "openhands.sdk.profiles.processing_profile": (
-        "openhands/sdk/profiles/processing_profile.py"
+    "pyromind_common.sdk.profiles.processing_profile": (
+        "pyromind_common/sdk/profiles/processing_profile.py"
     ),
-    "openhands.tools.sandbox": "openhands/tools/sandbox/__init__.py",
+    "pyromind_common.tools.sandbox": "pyromind_common/tools/sandbox/__init__.py",
 }
 
 
