@@ -13,7 +13,7 @@ export class PiEventNormalizer {
   private messageRole: "user" | "assistant" | undefined;
   private readonly toolArguments = new Map<string, JsonValue>();
 
-  constructor(private readonly sessionId: string, private readonly runId: string, private readonly pendingCommandIds: string[] = []) {}
+  constructor(private readonly sessionId: string, private readonly runId: string, private readonly pendingCommandIds: string[] = [], private readonly storageUrls = new Map<string, string>()) {}
 
   translate(event: AgentSessionEvent): RunnerEvent[] {
     switch (event.type) {
@@ -35,6 +35,15 @@ export class PiEventNormalizer {
         tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.partialResult),
       })];
       case "tool_execution_end": {
+        if (event.toolName === "get_storage_url" && !event.isError && isRecord(event.result) && Array.isArray(event.result.content)) {
+          for (const block of event.result.content) {
+            if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+            for (const url of block.text.match(URL_PATTERN) ?? []) {
+              const key = signedUrlIdentity(url);
+              if (key) this.storageUrls.set(key, url);
+            }
+          }
+        }
         const arguments_ = this.toolArguments.get(event.toolCallId);
         this.toolArguments.delete(event.toolCallId);
         const result = resultPayload(event.result);
@@ -65,7 +74,11 @@ export class PiEventNormalizer {
     const id = this.messageRole === message.role && this.messageId ? this.messageId : randomUUID();
     this.messageId = undefined;
     this.messageRole = undefined;
-    const events = [this.make("message.completed", { message_id: id, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content: messageContent(message) })];
+    const content = messageContent(message, message.role === "assistant"
+      ? (text) => text.replace(MARKDOWN_LINK_PATTERN, (_link, label: string, url: string) =>
+          `${label}${this.storageUrls.get(signedUrlIdentity(url) ?? "") ?? url})`)
+      : undefined);
+    const events = [this.make("message.completed", { message_id: id, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content })];
     this.commandId = undefined;
     if (message.role === "assistant") {
       events.push(this.make("usage.updated", usagePayload(message.usage)));
@@ -81,10 +94,25 @@ export class PiEventNormalizer {
 
 function visibleToolName(name: string): string { return name === "bash" ? "terminal" : name; }
 
-function messageContent(message: UserMessage | AssistantMessage): JsonValue[] {
-  if (typeof message.content === "string") return [{ type: "text", text: message.content }];
+const URL_PATTERN = /https?:\/\/[^\s<>"'`\\)\]]+/g;
+const MARKDOWN_LINK_PATTERN = /(\[[^\]\n]*\]\()(https?:\/\/[^\s<>"'`\\)\]]+)\)/g;
+
+function signedUrlIdentity(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (!url.searchParams.has("X-Amz-Signature")) return undefined;
+    url.searchParams.delete("X-Amz-Signature");
+    url.searchParams.sort();
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
+function messageContent(message: UserMessage | AssistantMessage, restore: (text: string) => string = (text) => text): JsonValue[] {
+  if (typeof message.content === "string") return [{ type: "text", text: restore(message.content) }];
   return message.content.flatMap((block): JsonValue[] => block.type === "text"
-    ? [{ type: "text", text: block.text }]
+    ? [{ type: "text", text: restore(block.text) }]
     : block.type === "image" ? [{ type: "image", mime_type: block.mimeType, data: block.data }] : []);
 }
 

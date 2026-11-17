@@ -46,6 +46,18 @@ status in workflowPLAN. The user responds directly in the confirmation panel.
 A native turn ending or a platform task succeeding does not prove business
 completion. You decide whether results meet the goal, need more work, or warrant
 a different direction. Runtime records platform facts and enforces permissions.
+After accepting a task, fill its named outputs with the actual artifact paths,
+not null placeholders, and record its report and verified evidence. Reconcile
+the containing stage as well: it is completed only when you have accepted all
+its required tasks. Keep it pending or in_progress while work remains.
+Before announcing project delivery, write the complete workflowPLAN as valid
+JSON, then parse the saved file and check every task, stage, output path and
+decision together. A delivered project cannot still contain an in_progress
+stage or unresolved required outputs. Repair stale fields before delivery;
+do not infer acceptance from native termination or change platform facts.
+For a partial handoff, explicitly record the remaining work instead of marking
+the whole project delivered. Use get_storage_url for each artifact and copy
+the returned Markdown link verbatim; never reconstruct a signed URL.
 Stopping a native child does not cancel remote work: have that child use its
 platform stop tool and verify the result, or use conversation cancellation.
 Stay within the user's authorization; baseline work does not authorize training.
