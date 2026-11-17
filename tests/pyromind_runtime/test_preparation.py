@@ -411,14 +411,17 @@ async def test_http_prepare_create_and_cross_profile_denial(
     preparation_setup, tmp_path
 ):
     store, _, _ = preparation_setup
-    adapter = FakeAdapter()
+    adapter = FakeAdapter("pi")
     adapter.capabilities = adapter.capabilities.model_copy(
         update={"user_input_reply": True}
     )
     runtime = ConversationRuntime(
-        tmp_path / "conversations", adapter, preparation_store=store
+        tmp_path / "conversations",
+        adapter,
+        default_harness_id="pi",
+        preparation_store=store,
     )
-    profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="openhands")
+    profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="pi")
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(profile))
     try:

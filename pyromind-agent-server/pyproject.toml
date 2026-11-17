@@ -5,8 +5,11 @@ description = "Pyromind HTTP, authentication, and composition layer"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.104",
-    "harness-adapter[openhands]",
-    "openhands-agent-server",
+    "harness-adapter",
+    "pyromind-common",
+    "aiokafka>=0.12,<1",
+    "uvicorn>=0.31.1",
+    "wsproto>=1.2.0",
     "pyromind-runtime[database]",
     "sqlalchemy>=2,<3",
     "pymysql>=1.1,<2",

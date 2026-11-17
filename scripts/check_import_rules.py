@@ -181,6 +181,31 @@ def main(files: list[str] | None = None) -> int:
                 )
             all_violations.extend(violations)
 
+    pyromind_rules = {
+        "pyromind-common/pyromind_common/sdk": (
+            "openhands",
+            "pyromind_common.tools",
+            "pyromind_agent_server",
+        ),
+        "pyromind-common/pyromind_common/tools": (
+            "openhands",
+            "pyromind_agent_server",
+        ),
+        "pyromind-agent-server/pyromind_agent_server": ("openhands",),
+    }
+    for relative, forbidden in pyromind_rules.items():
+        package = repo_root / relative
+        if files and not any(Path(f).resolve().is_relative_to(package) for f in files):
+            continue
+        for file in package.rglob("*.py"):
+            for imported in get_imports_from_file(file):
+                if any(
+                    imported == name or imported.startswith(name + ".")
+                    for name in forbidden
+                ):
+                    print(f"[ERROR] {file.relative_to(repo_root)}: imports {imported}")
+                    all_violations.append((file, imported))
+
     if all_violations:
         print(
             "\nImport dependency rules:\n"

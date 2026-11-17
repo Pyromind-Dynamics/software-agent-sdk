@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pyromind_runtime.domain.context import RequestContext
-
-from openhands.agent_server.pyromind_auth import (
+from pyromind_common.platform.auth import (
     CurrentLoginUser,
     get_current_login_user_from_token,
     parse_auth_token_from_cookie_header,
 )
+from pyromind_runtime.domain.context import RequestContext
 
 
 def current_user_from_context(context: RequestContext) -> CurrentLoginUser | None:

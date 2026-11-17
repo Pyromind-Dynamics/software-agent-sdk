@@ -28,6 +28,8 @@ COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
 COPY --chown=${USERNAME}:${USERNAME} openhands-embodied-runtime ./openhands-embodied-runtime
 COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
 COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} pyromind-common ./pyromind-common
+COPY --chown=${USERNAME}:${USERNAME} pyromind-embodied-runtime ./pyromind-embodied-runtime
 COPY --chown=${USERNAME}:${USERNAME} pyromind-runtime ./pyromind-runtime
 COPY --chown=${USERNAME}:${USERNAME} harness-adapter ./harness-adapter
 COPY --chown=${USERNAME}:${USERNAME} pyromind-agent-server ./pyromind-agent-server
@@ -55,7 +57,8 @@ RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     uv sync --frozen --dev --no-editable --extra boto3 $EXTRA_FLAGS
 
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
-    uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+    uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec \
+    && cp /agent-server/dist/pyromind-agent-server /agent-server/dist/openhands-agent-server
 # Fail fast if the expected binary is missing
 RUN test -x /agent-server/dist/openhands-agent-server
 
@@ -290,6 +293,23 @@ COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
 ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
 ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
+
+
+FROM builder AS pyromind-binary-builder
+ARG USERNAME UID GID ENABLE_VERTEX
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    uv sync --frozen --dev --no-editable --extra boto3
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec
+RUN test -x /agent-server/dist/pyromind-agent-server
+
+FROM base-image-minimal AS pyromind-binary
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=pyromind-binary-builder /agent-server/dist/pyromind-agent-server /usr/local/bin/pyromind-agent-server
+COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
+ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
+ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
+ENTRYPOINT ["tini", "--", "/usr/local/bin/pyromind-agent-server"]
 
 
 FROM base-image-minimal AS product

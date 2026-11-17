@@ -24,7 +24,10 @@ class ToolChecker(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         """Check if register_tool is imported."""
-        if node.module and "openhands.sdk.tool" in node.module:
+        if node.module and any(
+            node.module == prefix or node.module.startswith(prefix + ".")
+            for prefix in ("openhands.sdk.tool", "pyromind_common.sdk.tool")
+        ):
             for alias in node.names:
                 if alias.name == "register_tool":
                     self.imports_register_tool = True
@@ -133,7 +136,10 @@ def main(files: list[str] | None = None) -> int:
         0 if no violations found, 1 otherwise.
     """
     repo_root = Path(__file__).parent.parent
-    tools_path = repo_root / "openhands-tools" / "openhands" / "tools"
+    tools_paths = [
+        repo_root / "openhands-tools" / "openhands" / "tools",
+        repo_root / "pyromind-common" / "pyromind_common" / "tools",
+    ]
 
     # Skip checking certain files/directories
     skip_patterns = {
@@ -155,12 +161,12 @@ def main(files: list[str] | None = None) -> int:
         files_to_check = [
             Path(f).resolve()
             for f in files
-            if str(tools_path) in str(Path(f).resolve())
+            if any(Path(f).resolve().is_relative_to(path) for path in tools_paths)
             and Path(f).name.endswith(".py")
         ]
     else:
         # Check all Python files in tools directory
-        files_to_check = list(tools_path.rglob("*.py"))
+        files_to_check = [file for path in tools_paths for file in path.rglob("*.py")]
 
     # Filter out files matching skip patterns
     files_to_check = [

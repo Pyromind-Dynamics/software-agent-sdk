@@ -6,10 +6,14 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
-
-from openhands.tools.utils.platform_env import platform_headers, platform_portal_url
-from openhands.tools.workflow.task_submission import WorkflowResourceValidationError
-from openhands.tools.workflow.validate_workflow_dsl import (
+from pyromind_common.tools.utils.platform_env import (
+    platform_headers,
+    platform_portal_url,
+)
+from pyromind_common.tools.workflow.task_submission import (
+    WorkflowResourceValidationError,
+)
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
     TOOL_DESCRIPTION as STRUCTURE_TOOL_DESCRIPTION,
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor as StructureValidationExecutor,
@@ -23,7 +27,7 @@ from openhands.tools.workflow.validate_workflow_dsl import (
 
 
 if TYPE_CHECKING:
-    from openhands.sdk.conversation.base import BaseConversation
+    from pyromind_common.sdk.conversation.base import ToolConversation
 
 
 class WorkflowAvailableResource(BaseModel):
@@ -88,7 +92,7 @@ class ResourceValidatedWorkflowDslExecutor(StructureValidationExecutor):
     def __call__(
         self,
         action: ValidateWorkflowDslAction,
-        conversation: BaseConversation | None = None,
+        conversation: ToolConversation | None = None,
     ) -> ValidateWorkflowDslObservation:
         try:
             dsl = self._resolve_dsl(action, conversation)

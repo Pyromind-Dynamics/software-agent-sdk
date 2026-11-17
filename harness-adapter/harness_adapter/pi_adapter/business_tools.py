@@ -4,18 +4,18 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.workspace.base import BaseWorkspace
+from pyromind_common.tools.utils.platform_env import platform_cluster_route
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslAction,
+    ValidateWorkflowDslTool,
+)
 from pyromind_runtime.domain.context import RequestContext
 
 from harness_adapter.workflow_validation import (
     RESOURCE_TOOL_DESCRIPTION,
     ResourceValidatedWorkflowDslExecutor,
-)
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.workspace.base import BaseWorkspace
-from openhands.tools.utils.platform_env import platform_cluster_route
-from openhands.tools.workflow.validate_workflow_dsl import (
-    ValidateWorkflowDslAction,
-    ValidateWorkflowDslTool,
 )
 
 

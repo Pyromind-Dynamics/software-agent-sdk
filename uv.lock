@@ -28,6 +28,8 @@ members = [
     "openhands-tools",
     "openhands-workspace",
     "pyromind-agent-server",
+    "pyromind-common",
+    "pyromind-embodied-runtime",
     "pyromind-runtime",
 ]
 constraints = [
@@ -1815,6 +1817,7 @@ version = "0.1.0"
 source = { editable = "harness-adapter" }
 dependencies = [
     { name = "agentgenome" },
+    { name = "pyromind-common" },
     { name = "pyromind-runtime" },
 ]
 
@@ -1827,6 +1830,7 @@ openhands = [
 requires-dist = [
     { name = "agentgenome", path = "vendor/agentgenome-0.6.60-py3-none-any.whl" },
     { name = "openhands-agent-server", marker = "extra == 'openhands'", editable = "openhands-agent-server" },
+    { name = "pyromind-common", editable = "pyromind-common" },
     { name = "pyromind-runtime", editable = "pyromind-runtime" },
 ]
 provides-extras = ["openhands"]
@@ -7038,28 +7042,116 @@ name = "pyromind-agent-server"
 version = "0.1.0"
 source = { editable = "pyromind-agent-server" }
 dependencies = [
+    { name = "aiokafka" },
     { name = "alembic" },
     { name = "fastapi" },
-    { name = "harness-adapter", extra = ["openhands"] },
-    { name = "openhands-agent-server" },
+    { name = "harness-adapter" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "pymysql" },
+    { name = "pyromind-common" },
     { name = "pyromind-runtime", extra = ["database"] },
     { name = "sqlalchemy" },
+    { name = "uvicorn" },
+    { name = "wsproto" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "aiokafka", specifier = ">=0.12,<1" },
     { name = "alembic", specifier = ">=1.13,<2" },
     { name = "fastapi", specifier = ">=0.104" },
-    { name = "harness-adapter", extras = ["openhands"], editable = "harness-adapter" },
-    { name = "openhands-agent-server", editable = "openhands-agent-server" },
+    { name = "harness-adapter", editable = "harness-adapter" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.39.1,<2" },
     { name = "opentelemetry-sdk", specifier = ">=1.39.1,<2" },
     { name = "pymysql", specifier = ">=1.1,<2" },
+    { name = "pyromind-common", editable = "pyromind-common" },
     { name = "pyromind-runtime", extras = ["database"], editable = "pyromind-runtime" },
     { name = "sqlalchemy", specifier = ">=2,<3" },
+    { name = "uvicorn", specifier = ">=0.31.1" },
+    { name = "wsproto", specifier = ">=1.2.0" },
+]
+
+[[package]]
+name = "pyromind-common"
+version = "1.29.3"
+source = { editable = "pyromind-common" }
+dependencies = [
+    { name = "binaryornot" },
+    { name = "cachetools" },
+    { name = "cryptography" },
+    { name = "deprecation" },
+    { name = "filelock" },
+    { name = "func-timeout" },
+    { name = "httpx", extra = ["socks"] },
+    { name = "huggingface-hub" },
+    { name = "libtmux" },
+    { name = "litellm" },
+    { name = "openpyxl" },
+    { name = "pillow" },
+    { name = "py-landlock", marker = "sys_platform == 'linux'" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+    { name = "pyjwt" },
+    { name = "pyromind-runtime" },
+    { name = "pyromind-sdk", marker = "python_full_version < '3.14'" },
+    { name = "python-json-logger" },
+    { name = "python-socks" },
+    { name = "rich" },
+    { name = "tenacity" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-bash" },
+    { name = "wandb" },
+    { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "binaryornot", specifier = ">=0.4.4" },
+    { name = "cachetools" },
+    { name = "cryptography", specifier = ">=44" },
+    { name = "deprecation", specifier = ">=2.1.0" },
+    { name = "filelock", specifier = ">=3.20.1" },
+    { name = "func-timeout", specifier = ">=4.3.5" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
+    { name = "huggingface-hub", specifier = ">=0.25" },
+    { name = "libtmux", specifier = ">=0.53.0" },
+    { name = "litellm", specifier = ">=1.97.0" },
+    { name = "openpyxl", specifier = ">=3.1" },
+    { name = "pillow", specifier = ">=12.1.1" },
+    { name = "py-landlock", marker = "sys_platform == 'linux'", specifier = ">=0.1.1" },
+    { name = "pyarrow", specifier = ">=17.0" },
+    { name = "pydantic", specifier = ">=2.12.5" },
+    { name = "pyjwt", specifier = ">=2" },
+    { name = "pyromind-runtime", editable = "pyromind-runtime" },
+    { name = "pyromind-sdk", marker = "python_full_version < '3.14'", specifier = ">=0.1.9" },
+    { name = "python-json-logger", specifier = ">=3.3.0" },
+    { name = "python-socks", specifier = ">=1.0.0" },
+    { name = "rich", specifier = ">=14.3.3" },
+    { name = "tenacity", specifier = ">=9.1.2" },
+    { name = "tree-sitter", specifier = ">=0.25" },
+    { name = "tree-sitter-bash", specifier = ">=0.25" },
+    { name = "wandb", specifier = ">=0.23.1" },
+    { name = "websockets", specifier = ">=12" },
+]
+
+[[package]]
+name = "pyromind-embodied-runtime"
+version = "0.1.0"
+source = { editable = "pyromind-embodied-runtime" }
+dependencies = [
+    { name = "imageio-ffmpeg" },
+    { name = "numpy" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "imageio-ffmpeg", specifier = ">=0.6.0" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "pyarrow", specifier = ">=17.0" },
+    { name = "pydantic", specifier = ">=2.11.7,<3" },
 ]
 
 [[package]]

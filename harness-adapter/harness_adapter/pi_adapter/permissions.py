@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from openhands.sdk.event import ActionEvent
-from openhands.sdk.llm import MessageToolCall, TextContent
-from openhands.sdk.security import ConfirmRisky, PatternSecurityAnalyzer
+from pyromind_common.sdk.event import ActionEvent
+from pyromind_common.sdk.llm import MessageToolCall, TextContent
+from pyromind_common.sdk.security import ConfirmRisky
+from pyromind_common.sdk.security.defense_in_depth import PatternSecurityAnalyzer
 
 
 class TerminalPermissionPolicy:

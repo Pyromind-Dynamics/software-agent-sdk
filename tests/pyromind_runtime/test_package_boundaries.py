@@ -19,18 +19,23 @@ from pyromind_agent_server.api.evaluation_runs import (
     get_evaluation_storage,
 )
 from pyromind_agent_server.api.router import create_product_router
+from pyromind_agent_server.dependencies import check_session_api_key
+from pyromind_common.tools.data_preparation.evaluation_submit import (
+    DfSubmitEvaluationAction,
+)
+from pyromind_common.tools.data_preparation.inference import InferenceOptions
+from pyromind_common.tools.data_preparation.platform_submit import (
+    DfSubmitPipelineAction,
+)
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslAction,
+)
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.application.snapshot_projector import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
-
-from openhands.agent_server.dependencies import check_session_api_key
-from openhands.tools.data_preparation.evaluation_submit import DfSubmitEvaluationAction
-from openhands.tools.data_preparation.inference import InferenceOptions
-from openhands.tools.data_preparation.platform_submit import DfSubmitPipelineAction
-from openhands.tools.workflow.validate_workflow_dsl import ValidateWorkflowDslAction
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -472,11 +477,10 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
 
 
 def test_return_addresses_stay_in_the_product_contract_and_out_of_model_arguments():
+    from pyromind_common.tools.workflow.submit_workflow import SubmitWorkflowAction
+    from pyromind_common.tools.workflow_debug.definition import WorkflowDebugAction
     from pyromind_runtime.domain.task_correlation import TaskCorrelation
     from pyromind_runtime.ports.harness import ExternalTaskNotification
-
-    from openhands.tools.workflow.submit_workflow import SubmitWorkflowAction
-    from openhands.tools.workflow_debug.definition import WorkflowDebugAction
 
     assert "correlation" in ExternalTaskNotification.model_fields
     assert set(TaskCorrelation.model_fields) == {
@@ -573,7 +577,7 @@ def test_preparation_checklist_resolves_from_source_bundle_or_configured_root(
 
 
 def test_frozen_bundle_includes_preparation_and_role_skill_assets():
-    spec = ROOT / "openhands-agent-server/openhands/agent_server/agent-server.spec"
+    spec = ROOT / "pyromind-agent-server/pyromind_agent_server/agent-server.spec"
     function = next(
         node
         for node in ast.parse(spec.read_text()).body

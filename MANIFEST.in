@@ -46,3 +46,16 @@ include openhands-agent-server/openhands/agent_server/agent-server.spec
 
 # VSCode extensions
 recursive-include openhands-agent-server/openhands/agent_server/vscode_extensions *
+
+# Pyromind packages coexist with the retained OpenHands distributions.
+recursive-include pyromind-common *.py *.toml py.typed *.profile
+recursive-include pyromind-embodied-runtime *.py *.toml py.typed
+recursive-include pyromind-runtime *.py *.toml py.typed
+recursive-include pyromind-agent-server *.py *.toml *.spec py.typed
+recursive-include harness-adapter *.py *.toml *.ts *.json *.md *.tgz
+recursive-include .agents *
+recursive-include knowledge *
+recursive-include vendor *.whl
+prune harness-adapter/pi-runtime/node_modules
+prune harness-adapter/pi-runtime/dist
+recursive-exclude * __pycache__ *.pyc

@@ -6,7 +6,7 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
-from openhands.agent_server.workflow_status import (
+from pyromind_agent_server.workflow_status import (
     WorkflowCallbackResult,
     normalize_platform_status,
 )

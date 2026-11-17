@@ -1,33 +1,13 @@
 from pathlib import Path
-from typing import cast
 from uuid import UUID
 
-import pytest
+from pyromind_agent_server.agent_profiles.pyromind import PYROMIND_KB_INSTRUCTIONS
 from pyromind_agent_server.api.schemas import AgentLLMConfig
-
-from openhands.agent_server.agent_profiles.pyromind import PYROMIND_KB_INSTRUCTIONS
-from openhands.agent_server.event_service import EventService
-from openhands.agent_server.pyromind_auth import (
-    CurrentLoginUser,
-)
-from openhands.agent_server.pyromind_constants import (
-    PYROMIND_APP_TAG_KEY,
-    PYROMIND_APP_TAG_VALUE,
-)
-from openhands.agent_server.pyromind_router import (
-    PYROMIND_AUTH_TOKEN_SECRET,
-    PYROMIND_PRODUCT_USER_ID_SECRET,
-    PYROMIND_X_CLUSTER_SECRET,
+from pyromind_agent_server.pyromind_router import (
     _build_debug_context_headers,
-    apply_pyromind_validation_context,
 )
-from openhands.tools.pyromind_dataset.definition import (
-    PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
-    PYROMIND_STORAGE_HEADERS_STATE_KEY,
-)
-from openhands.tools.workflow.validate_workflow_dsl import (
-    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
-    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
+from pyromind_common.platform.auth import (
+    CurrentLoginUser,
 )
 
 
@@ -204,58 +184,11 @@ def test_build_debug_context_headers_uses_current_user_context():
     }
 
 
-@pytest.mark.asyncio
-async def test_pyromind_validation_context_uses_websocket_user_headers():
-    service = _FakeEventService({PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE})
-    current_user = CurrentLoginUser(
-        username="debug-user-42",
-        email="debug-user-42@example.test",
-        user_id=42,
-        cookie="auth_token=websocket-token; other=value",
-        x_cluster="websocket-cluster",
-    )
-
-    await apply_pyromind_validation_context(
-        cast(EventService, service), current_user, x_cluster="websocket-cluster"
-    )
-
-    assert service.secrets == {
-        PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
-        PYROMIND_AUTH_TOKEN_SECRET: "websocket-token",
-        PYROMIND_STORAGE_AUTH_COOKIE_SECRET: "auth_token=websocket-token; other=value",
-        PYROMIND_X_CLUSTER_SECRET: "websocket-cluster",
-        PYROMIND_PRODUCT_USER_ID_SECRET: "42",
-    }
-    assert service.agent_state == {
-        PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"},
-        PYROMIND_STORAGE_HEADERS_STATE_KEY: {"x-cluster": "websocket-cluster"},
-    }
-
-
 def test_parse_auth_token_from_cookie_header_extracts_jwt():
-    from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
+    from pyromind_common.platform.auth import parse_auth_token_from_cookie_header
 
     assert (
         parse_auth_token_from_cookie_header("auth_token=jwt-token; other=value")
         == "jwt-token"
     )
     assert parse_auth_token_from_cookie_header(None) is None
-
-
-@pytest.mark.asyncio
-async def test_pyromind_validation_context_ignores_non_pyromind_conversations():
-    service = _FakeEventService({})
-    current_user = CurrentLoginUser(
-        username="debug-user-42",
-        email="debug-user-42@example.test",
-        user_id=42,
-        cookie="auth_token=websocket-token",
-        x_cluster="websocket-cluster",
-    )
-
-    await apply_pyromind_validation_context(
-        cast(EventService, service), current_user, x_cluster="websocket-cluster"
-    )
-
-    assert service.secrets == {}
-    assert service.agent_state == {}

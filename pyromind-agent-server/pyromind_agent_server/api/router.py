@@ -30,15 +30,15 @@ from pyromind_runtime.infrastructure.file_product_store import (
 )
 from pyromind_runtime.ports.harness import SessionSpec
 
-from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.dependencies import check_session_api_key
 from pyromind_agent_server.api.schemas import (
     CreateConversationRequest,
     ForkConversationRequest,
 )
 from pyromind_agent_server.auth_context import request_context
 from pyromind_agent_server.bootstrap import ensure_product_runtime
+from pyromind_agent_server.dependencies import check_session_api_key
 from pyromind_agent_server.profiles import DEFAULT_PRODUCT_PROFILE, ConversationProfile
+from pyromind_agent_server.service_context import ProductServiceContext
 
 
 _SSE_HEARTBEAT_SECONDS = 15.0
@@ -59,9 +59,9 @@ def get_product_runtime(request: Request) -> ConversationRuntime:
     return runtime
 
 
-def get_conversation_service(request: Request) -> ConversationService:
+def get_conversation_service(request: Request) -> ProductServiceContext:
     service = getattr(request.app.state, "conversation_service", None)
-    if not isinstance(service, ConversationService):
+    if not isinstance(service, ProductServiceContext):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Conversation service is not available",
@@ -80,6 +80,13 @@ async def configure_session(
     request: Request, conversation_id: str, profile: ConversationProfile
 ) -> None:
     if profile.configuration_version:
+        runtime = get_product_runtime(request)
+        store = FileProductStore(
+            get_conversation_service(request).conversations_dir / conversation_id
+        )
+        store.authorize(request_context(request).user_id, profile.profile_id)
+        if store.harness_id() not in runtime.adapters:
+            return
         await get_product_runtime(request).apply_session_configuration(
             conversation_id,
             SessionPolicy(
@@ -182,6 +189,8 @@ def create_product_router(
             )
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
+        except ProductRuntimeError as exc:
+            raise _product_error(exc) from exc
         except ValueError as exc:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
@@ -459,12 +468,12 @@ def create_product_router(
     return router
 
 
-def _profile_marker_path(service: ConversationService, conversation_id: str) -> Path:
+def _profile_marker_path(service: ProductServiceContext, conversation_id: str) -> Path:
     return service.conversations_dir / conversation_id / _AGENT_PROFILE_MARKER
 
 
 def _profile_matches(
-    service: ConversationService,
+    service: ProductServiceContext,
     conversation_id: str,
     profile: ConversationProfile,
 ) -> bool:
@@ -497,7 +506,7 @@ def _require_profile(
 
 
 def _assign_profile_id(
-    service: ConversationService,
+    service: ProductServiceContext,
     conversation_id: str,
     profile: ConversationProfile,
     user_id: str,
@@ -515,7 +524,7 @@ def _assign_profile_id(
 
 
 def _write_profile_marker(
-    service: ConversationService,
+    service: ProductServiceContext,
     conversation_id: str,
     profile: ConversationProfile,
 ) -> None:

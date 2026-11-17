@@ -44,6 +44,7 @@ from harness_adapter.pi_adapter.tool_output import (
 )
 from pydantic import BaseModel, ValidationError
 from pyromind_agent_server.api.schemas import AgentLLMConfig
+from pyromind_common.sdk.workspace.local import LocalWorkspace
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
@@ -56,8 +57,6 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
-
-from openhands.sdk.workspace.local import LocalWorkspace
 
 
 class _LifecycleFakeRunner:
@@ -229,7 +228,7 @@ def configured_skills_directory(tmp_path) -> Path:
     for resource in (
         "data-processing/scripts/cleaning",
         "data-processing/scripts/preparation",
-        "data-processing/scripts/edp",
+        "data-processing/scripts/pyromind-edp",
         "training-analysis/scripts",
     ):
         (skills / resource).mkdir(parents=True)
@@ -2580,7 +2579,7 @@ async def test_terminal_permission_recovery_survives_missing_parent_run(
 
 @pytest.mark.parametrize("register_fails", [False, True])
 async def test_training_analysis_artifact_hook_is_best_effort(tmp_path, register_fails):
-    from openhands.tools.training_analysis import (
+    from pyromind_common.tools.training_analysis import (
         TrainingAnalysisAction,
         TrainingAnalysisObservation,
     )

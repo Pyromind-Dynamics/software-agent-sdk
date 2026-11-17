@@ -8,7 +8,7 @@ from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INST
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.ports.harness import DelegatedRole
 
-from openhands.agent_server.agent_profiles.echomind_manager import (
+from pyromind_agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_PROFILE,
 )
 
@@ -96,7 +96,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=24,
+    configuration_version=25,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",

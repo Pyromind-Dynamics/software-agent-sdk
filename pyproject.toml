@@ -6,6 +6,8 @@ members = [
     "openhands-embodied-runtime",
     "openhands-workspace",
     "openhands-agent-server",
+    "pyromind-common",
+    "pyromind-embodied-runtime",
     "pyromind-runtime",
     "harness-adapter",
     "pyromind-agent-server",
@@ -36,6 +38,8 @@ openhands-tools = { workspace = true }
 openhands-embodied-runtime = { workspace = true }
 openhands-workspace = { workspace = true }
 openhands-agent-server = { workspace = true }
+pyromind-common = { workspace = true }
+pyromind-embodied-runtime = { workspace = true }
 pyromind-runtime = { workspace = true }
 harness-adapter = { workspace = true }
 pyromind-agent-server = { workspace = true }
@@ -135,6 +139,8 @@ include = [
     "openhands-embodied-runtime",
     "openhands-workspace",
     "openhands-agent-server",
+    "pyromind-common",
+    "pyromind-embodied-runtime",
     "pyromind-runtime",
     "harness-adapter",
     "pyromind-agent-server",
@@ -148,6 +154,8 @@ extraPaths = [
     "openhands-embodied-runtime",
     "openhands-workspace",
     "openhands-agent-server",
+    "pyromind-common",
+    "pyromind-embodied-runtime",
     "pyromind-runtime",
     "harness-adapter",
     "pyromind-agent-server",
