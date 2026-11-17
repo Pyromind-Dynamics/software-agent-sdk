@@ -41,7 +41,7 @@ PYTHON
 fi
 
 # Override EXPERIMENT_DB_BACKEND=sqlite to use a local database.
-export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-sqlite}"
+export EXPERIMENT_DB_BACKEND="${EXPERIMENT_DB_BACKEND:-mariadb}"
 case "${EXPERIMENT_DB_BACKEND}" in
   sqlite)
     export EXPERIMENT_SQLITE_PATH="${EXPERIMENT_SQLITE_PATH:-${SCRIPT_DIR}/workspace/experiments/experiments.sqlite3}"
@@ -109,6 +109,8 @@ export DF_API_KEY="AQXP7X5RZURITVB0JD7H"
 export LLM_MODEL="openai/deepseek-v4.1-flash-1017"
 export LLM_BASE_URL="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+# Use the same model credential when Pi creates or restores a session.
+export LLM_API_KEY="${OPENAI_API_KEY}"
 
 
 export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
