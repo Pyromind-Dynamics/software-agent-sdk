@@ -6,12 +6,15 @@ from typing import Any, cast
 
 from pyromind_runtime.domain.context import RequestContext
 
+from harness_adapter.workflow_validation import (
+    RESOURCE_TOOL_DESCRIPTION,
+    ResourceValidatedWorkflowDslExecutor,
+)
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.tools.utils.platform_env import platform_cluster_route
 from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
-    ValidateWorkflowDslExecutor,
     ValidateWorkflowDslTool,
 )
 
@@ -24,7 +27,7 @@ def validation_tool_spec() -> dict[str, Any]:
         raise TypeError("validate_workflow_dsl schema must be an object")
     return {
         "name": tool.name,
-        "description": tool.description,
+        "description": RESOURCE_TOOL_DESCRIPTION,
         "input_schema": schema,
     }
 
@@ -45,7 +48,7 @@ async def execute_validation_tool(
         )
         if value
     }
-    executor = ValidateWorkflowDslExecutor(headers=headers)
+    executor = ResourceValidatedWorkflowDslExecutor(headers=headers)
     conversation = SimpleNamespace(
         workspace=workspace,
         state=SimpleNamespace(agent_state={}, secret_registry=SecretRegistry()),

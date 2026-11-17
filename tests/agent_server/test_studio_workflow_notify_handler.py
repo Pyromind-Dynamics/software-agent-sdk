@@ -14,7 +14,7 @@ from openhands.agent_server.kafka_bus.handlers.studio_workflow_notify_handler im
     TrainingTaskEventType,
 )
 from openhands.agent_server.kafka_bus.message_event import MessageEvent
-from openhands.agent_server.run_workflow_callback import RunWorkflowCallbackResult
+from openhands.agent_server.workflow_status import WorkflowCallbackResult
 
 
 @pytest.mark.asyncio
@@ -23,9 +23,9 @@ async def test_terminal_notification_uses_generic_workflow_callback(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_deliver(**kwargs: Any) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: Any) -> WorkflowCallbackResult:
         captured.update(kwargs)
-        return RunWorkflowCallbackResult(
+        return WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="clean-task-1",
             normalized_status="Succeeded",
@@ -34,7 +34,7 @@ async def test_terminal_notification_uses_generic_workflow_callback(
 
     monkeypatch.setattr(
         handler_module,
-        "deliver_run_workflow_status",
+        "deliver_workflow_status",
         fake_deliver,
     )
 
@@ -73,9 +73,9 @@ async def test_debug_out_id_passes_from_workflow_debug(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_deliver(**kwargs: Any) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: Any) -> WorkflowCallbackResult:
         captured.update(kwargs)
-        return RunWorkflowCallbackResult(
+        return WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="debug-task-1",
             normalized_status="Failed",
@@ -84,7 +84,7 @@ async def test_debug_out_id_passes_from_workflow_debug(
 
     monkeypatch.setattr(
         handler_module,
-        "deliver_run_workflow_status",
+        "deliver_workflow_status",
         fake_deliver,
     )
 
@@ -124,14 +124,14 @@ async def test_missing_or_foreign_out_id_is_discarded(
 ) -> None:
     called = False
 
-    async def fake_deliver(**kwargs: Any) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: Any) -> WorkflowCallbackResult:
         nonlocal called
         called = True
         raise AssertionError("invalid out_id must not be delivered")
 
     monkeypatch.setattr(
         handler_module,
-        "deliver_run_workflow_status",
+        "deliver_workflow_status",
         fake_deliver,
     )
 
@@ -168,9 +168,9 @@ async def test_compressed_error_msg_is_decoded(
     """Compressed error_msg from middleware must be decoded without zlib error."""
     captured: dict[str, Any] = {}
 
-    async def fake_deliver(**kwargs: Any) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: Any) -> WorkflowCallbackResult:
         captured.update(kwargs)
-        return RunWorkflowCallbackResult(
+        return WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="compressed-task-1",
             normalized_status="Failed",
@@ -179,7 +179,7 @@ async def test_compressed_error_msg_is_decoded(
 
     monkeypatch.setattr(
         handler_module,
-        "deliver_run_workflow_status",
+        "deliver_workflow_status",
         fake_deliver,
     )
 
@@ -217,14 +217,14 @@ async def test_non_terminal_notification_is_ignored(
 ) -> None:
     called = False
 
-    async def fake_deliver(**kwargs: Any) -> RunWorkflowCallbackResult:
+    async def fake_deliver(**kwargs: Any) -> WorkflowCallbackResult:
         nonlocal called
         called = True
         raise AssertionError("non-terminal status must not be dispatched")
 
     monkeypatch.setattr(
         handler_module,
-        "deliver_run_workflow_status",
+        "deliver_workflow_status",
         fake_deliver,
     )
 

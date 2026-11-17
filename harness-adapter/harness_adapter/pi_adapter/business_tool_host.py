@@ -18,7 +18,6 @@ from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_p
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
 
-from harness_adapter.openhands_adapter.session_factory import current_user_from_context
 from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
@@ -32,6 +31,7 @@ from harness_adapter.pi_adapter.tool_output import (
     resolve_tool_output_policy,
     truncate_tool_content,
 )
+from harness_adapter.tool_context import current_user_from_context
 from harness_adapter.version_tools import (
     ExecutionCall,
     ProductVersionsAction,
@@ -39,6 +39,7 @@ from harness_adapter.version_tools import (
     VersionCall,
     submission_bridge,
 )
+from harness_adapter.workflow_validation import check_workflow_resources
 from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.secret import StaticSecret
@@ -86,7 +87,6 @@ from openhands.tools.utils.platform_env import (
     platform_cluster_target,
 )
 from openhands.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
-from openhands.tools.workflow.run_workflow import WORKFLOW_ATTEMPT_STATE_KEY
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     workflow_submission_scope,
@@ -97,6 +97,7 @@ from openhands.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslExecutor,
 )
 from openhands.tools.workflow_debug import WorkflowDebugTool
+from openhands.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
 
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
@@ -387,6 +388,7 @@ class PyromindBusinessToolHost:
         )
         self._pipeline_runs = pipeline_runs
         self.version_call: VersionCall | None = None
+        self.training_artifact_hook: Callable[..., Awaitable[int]] | None = None
         self.execution_call: ExecutionCall | None = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
         for path in (
@@ -735,7 +737,15 @@ class PyromindBusinessToolHost:
             if tool.executor is not None:
                 self._active_executors[key] = tool.executor
             try:
-                with workflow_submission_scope(origin) as submissions:
+                with workflow_submission_scope(
+                    origin,
+                    resource_validator=lambda workflow: check_workflow_resources(
+                        workflow,
+                        headers=_forward_headers(
+                            context.request_context, include_cookie=True
+                        ),
+                    ),
+                ) as submissions:
                     observation = await asyncio.to_thread(
                         tool, action, cast(Any, facade)
                     )
@@ -802,6 +812,42 @@ class PyromindBusinessToolHost:
             details = observation.model_dump(
                 mode="json", exclude={"content", "is_error"}
             )
+            if (
+                name == TrainingAnalysisTool.name
+                and arguments.get("operation") == "artifacts"
+                and not observation.is_error
+                and self.training_artifact_hook is not None
+            ):
+                artifacts = details.get("result") or {}
+                nodes = artifacts.get("training_nodes")
+                if isinstance(nodes, list) and artifacts.get(
+                    "task_id"
+                ) == arguments.get("task_id"):
+                    try:
+                        count = await self.training_artifact_hook(
+                            context.conversation_id,
+                            artifacts["task_id"],
+                            nodes,
+                            context.request_context,
+                        )
+                        receipt = {
+                            "status": "registered" if count else "unavailable",
+                            "checkpoints": count,
+                        }
+                    except Exception as exc:
+                        logger.warning(
+                            "Training artifact registration pending: %s",
+                            type(exc).__name__,
+                        )
+                        receipt = {"status": "pending"}
+                    details["lineage"] = receipt
+                    content.insert(
+                        0,
+                        {
+                            "type": "text",
+                            "text": json.dumps({"lineage": receipt}) + "\n",
+                        },
+                    )
             if len(submissions.submissions) == 1:
                 details["correlation"] = next(
                     iter(submissions.submissions.values())

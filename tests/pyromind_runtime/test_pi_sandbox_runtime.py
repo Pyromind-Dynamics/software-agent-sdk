@@ -303,6 +303,22 @@ def test_sandbox_settings_default_to_platform_resources(monkeypatch) -> None:
     assert SandboxSettings.from_extra({"sandbox": {"cpu": "8"}}).memory == "16Gi"
 
 
+@pytest.mark.parametrize("cluster", ["cn-east-1", "cn-east-1#pre", "us-west-1"])
+@pytest.mark.parametrize("image", [None, "registry.test/custom:1"])
+def test_create_uses_cluster_default_or_explicit_image(cluster: str, image: str | None):
+    client = _FakeSandboxClient()
+    client.cluster = cluster
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+    asyncio.run(manager._create(client, SandboxSettings(image=image), "conv-1"))
+    expected = (
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
+        if cluster.startswith("cn-east-1")
+        else "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
+    )
+    assert client.requests[0].image == (image or expected)
+
+
 def test_ensure_creates_and_prepares_a_sandbox(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:

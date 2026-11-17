@@ -4,7 +4,9 @@ from pyromind_agent_server.bootstrap import install_product_api
 
 
 def create_app(config: Config | None = None):
-    return install_product_api(create_openhands_app(config))
+    return install_product_api(
+        create_openhands_app(config, include_conversation_api=False)
+    )
 
 
 api = create_app()

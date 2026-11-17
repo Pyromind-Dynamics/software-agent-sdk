@@ -277,10 +277,14 @@ class TrainingEvaluations:
                 },
             },
         )
-        if parent.result != result:
+        if parent.result != result or parent.evaluations != tuple(steps):
             self.store.save_pipeline_run(
                 parent.model_copy(
-                    update={"result": result, "revision": parent.revision + 1}
+                    update={
+                        "result": result,
+                        "evaluations": tuple(steps),
+                        "revision": parent.revision + 1,
+                    }
                 ),
                 expected_revision=parent.revision,
             )

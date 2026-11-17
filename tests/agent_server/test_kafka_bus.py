@@ -22,7 +22,7 @@ from openhands.agent_server.kafka_bus.handlers.studio_workflow_notify_handler im
 from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
 from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
 from openhands.agent_server.kafka_bus.message_event import MessageEvent
-from openhands.agent_server.run_workflow_callback import RunWorkflowCallbackResult
+from openhands.agent_server.workflow_status import WorkflowCallbackResult
 
 
 @pytest.fixture
@@ -422,7 +422,7 @@ async def test_studio_workflow_handler_ignores_non_terminal_and_wrong_type():
 
     with patch(
         "openhands.agent_server.kafka_bus.handlers."
-        "studio_workflow_notify_handler.deliver_run_workflow_status",
+        "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
         await handler.handle(
@@ -445,7 +445,7 @@ async def test_studio_workflow_handler_ignores_non_terminal_and_wrong_type():
 async def test_studio_workflow_handler_delivers_terminal_status():
     handler = StudioWorkflowNotifyHandler()
     deliver = AsyncMock(
-        return_value=RunWorkflowCallbackResult(
+        return_value=WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="t1",
             normalized_status="Succeeded",
@@ -455,7 +455,7 @@ async def test_studio_workflow_handler_delivers_terminal_status():
 
     with patch(
         "openhands.agent_server.kafka_bus.handlers."
-        "studio_workflow_notify_handler.deliver_run_workflow_status",
+        "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
         await handler.handle(
@@ -487,7 +487,7 @@ async def test_studio_workflow_handler_delivers_terminal_status():
 async def test_studio_workflow_handler_delivers_debug_terminal_status():
     handler = StudioWorkflowNotifyHandler()
     deliver = AsyncMock(
-        return_value=RunWorkflowCallbackResult(
+        return_value=WorkflowCallbackResult(
             outcome="delivered_async",
             task_id="t1",
             normalized_status="Failed",
@@ -497,7 +497,7 @@ async def test_studio_workflow_handler_delivers_debug_terminal_status():
 
     with patch(
         "openhands.agent_server.kafka_bus.handlers."
-        "studio_workflow_notify_handler.deliver_run_workflow_status",
+        "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
         await handler.handle(
@@ -530,7 +530,7 @@ async def test_studio_workflow_handler_skips_when_conversation_not_on_pod():
     """Broadcast: pods without the conversation must exit without raising."""
     handler = StudioWorkflowNotifyHandler()
     deliver = AsyncMock(
-        return_value=RunWorkflowCallbackResult(
+        return_value=WorkflowCallbackResult(
             outcome="unknown_conversation",
             task_id="t1",
             normalized_status="Succeeded",
@@ -540,7 +540,7 @@ async def test_studio_workflow_handler_skips_when_conversation_not_on_pod():
 
     with patch(
         "openhands.agent_server.kafka_bus.handlers."
-        "studio_workflow_notify_handler.deliver_run_workflow_status",
+        "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
         await handler.handle(
@@ -567,7 +567,7 @@ async def test_studio_workflow_handler_discards_missing_out_id():
 
     with patch(
         "openhands.agent_server.kafka_bus.handlers."
-        "studio_workflow_notify_handler.deliver_run_workflow_status",
+        "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
         await handler.handle(
@@ -600,7 +600,7 @@ async def test_studio_workflow_handler_discards_foreign_out_id():
 
     with patch(
         "openhands.agent_server.kafka_bus.handlers."
-        "studio_workflow_notify_handler.deliver_run_workflow_status",
+        "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
         await handler.handle(

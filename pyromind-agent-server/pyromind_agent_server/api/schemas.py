@@ -1,11 +1,48 @@
 from __future__ import annotations
 
-from typing import Any
+import os
+from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pyromind_runtime.domain.content import JsonObject
 
-from openhands.agent_server.pyromind_router import AgentLLMConfig
+
+_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+
+
+class AgentLLMConfig(BaseModel):
+    """前端提交的模型配置，供 Product API 与 Pi 链路使用。"""
+
+    model: str = Field(
+        default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o"),
+    )
+    api_key: str | None = Field(
+        default_factory=lambda: os.environ.get("OPENAI_API_KEY"),
+    )
+    base_url: str | None = Field(
+        default_factory=lambda: os.environ.get("LLM_BASE_URL"),
+    )
+    api: Literal["openai-completions", "openai-responses"] | None = None
+    context_window: int | None = Field(default=None, gt=0)
+    timeout: int | None = Field(
+        default=None,
+        description=("LLM request timeout in seconds. Server-default 60s when unset."),
+    )
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def normalize_base_url(cls, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return value
+
+        base_url = value.strip().rstrip("/")
+        if not base_url:
+            return None
+
+        if base_url.endswith(_OPENAI_CHAT_COMPLETIONS_SUFFIX):
+            return base_url[: -len(_OPENAI_CHAT_COMPLETIONS_SUFFIX)]
+
+        return base_url
 
 
 class CreateConversationRequest(BaseModel):

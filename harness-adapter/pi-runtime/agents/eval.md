@@ -22,6 +22,8 @@ and report.json, verify counts and coverage, and write the evidence, limitations
 and output paths in a task-local Markdown report. End with a short Markdown
 reply to Manager giving the report path and outcome. Explain missing inputs in
 the reply. Reporting must reuse predictions and
-must not restart GPU inference. Never edit the experiment's global guidance,
+must not restart GPU inference. If the task calls for local CPU scoring, follow
+inference-evaluation's local JSON delivery contract and include the validated file
+path in the final report. Never edit the experiment's global guidance,
 launch another role, train, deploy or cut traffic. Do not invent paths, fingerprints
 or metrics. Use the user's language and keep credentials out of every result.

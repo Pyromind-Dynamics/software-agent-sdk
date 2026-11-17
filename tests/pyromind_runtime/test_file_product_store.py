@@ -434,11 +434,16 @@ def test_replay_stops_at_the_tail_without_reading_the_log(
 
 def test_replay_returns_events_when_the_cursor_precedes_the_tail(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     store = _store(tmp_path)
     for index in range(3):
         store.append(_status_event(f"event-{index}", "running"))
 
+    def unexpected_full_read(*args, **kwargs):
+        pytest.fail("a current suffix should not parse the full log")
+
+    monkeypatch.setattr(store, "_load_events", unexpected_full_read)
     assert [event.seq for event in store.replay(1)] == [2, 3]
 
 

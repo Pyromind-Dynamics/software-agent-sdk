@@ -368,7 +368,7 @@ def _find_http_exception(exc: BaseExceptionGroup) -> HTTPException | None:
     return None
 
 
-def _add_api_routes(app: FastAPI) -> None:
+def _add_api_routes(app: FastAPI, *, include_conversation_api: bool = True) -> None:
     """Add all API routes to the FastAPI application."""
     app.include_router(server_details_router)
 
@@ -394,9 +394,11 @@ def _add_api_routes(app: FastAPI) -> None:
     ]
 
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
-    api_router.include_router(event_router)
-    api_router.include_router(conversation_router)
-    api_router.include_router(tool_router)
+    # Pi 使用 Product API，保留服务基础设施但不开放 SDK 会话执行入口。
+    if include_conversation_api:
+        api_router.include_router(event_router)
+        api_router.include_router(conversation_router)
+        api_router.include_router(tool_router)
     api_router.include_router(bash_router)
     api_router.include_router(git_router)
     api_router.include_router(file_router)
@@ -409,7 +411,8 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(mcp_router)
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)
-    api_router.include_router(workflow_canvas_router)
+    if include_conversation_api:
+        api_router.include_router(workflow_canvas_router)
     api_router.include_router(profiles_router)
     api_router.include_router(agent_profiles_router)
     api_router.include_router(pyromind_router)
@@ -418,7 +421,8 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(auth_router)
     app.include_router(api_router)
 
-    app.include_router(openai_router, dependencies=[Depends(check_openai_api_key)])
+    if include_conversation_api:
+        app.include_router(openai_router, dependencies=[Depends(check_openai_api_key)])
 
     # Debug-platform webhook: intentionally NOT behind check_session_api_key
     # (see pyromind_debug_webhook_router's docstring for why) or the dormant
@@ -437,7 +441,8 @@ def _add_api_routes(app: FastAPI) -> None:
     workspace_api_router.include_router(workspace_router)
     app.include_router(workspace_api_router)
 
-    app.include_router(sockets_router)
+    if include_conversation_api:
+        app.include_router(sockets_router)
 
 
 def _setup_static_files(app: FastAPI, config: Config) -> None:
@@ -637,11 +642,14 @@ def _add_exception_handlers(api: FastAPI) -> None:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-def create_app(config: Config | None = None) -> FastAPI:
+def create_app(
+    config: Config | None = None, *, include_conversation_api: bool = True
+) -> FastAPI:
     """Create and configure the FastAPI application.
 
     Args:
         config: Configuration object. If None, uses default config.
+        include_conversation_api: 是否挂载 SDK 会话执行接口；Pi 服务关闭此项。
 
     Returns:
         Configured FastAPI application.
@@ -651,7 +659,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app = _create_fastapi_instance(config)
     app.state.config = config
 
-    _add_api_routes(app)
+    _add_api_routes(app, include_conversation_api=include_conversation_api)
     _setup_static_files(app, config)
     app.add_middleware(
         CORSDispatcher,

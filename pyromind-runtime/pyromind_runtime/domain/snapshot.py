@@ -12,7 +12,7 @@ from pydantic import (
 
 from pyromind_runtime.domain.base import AwareDatetime, ContractModel
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
-from pyromind_runtime.domain.content import ContentBlock, JsonObject
+from pyromind_runtime.domain.content import ContentBlock, JsonObject, TextContent
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import (
     ExperimentContextView,
@@ -265,3 +265,34 @@ class ConversationSummary(ContractModel):
     status: ConversationStatus
     through_seq: int = Field(ge=0)
     title: str | None = None
+    updated_at: AwareDatetime | None = None
+    project_id: str | None = None
+    cluster: str | None = None
+
+    @classmethod
+    def from_snapshot(cls, snapshot: ConversationSnapshot) -> ConversationSummary:
+        project = snapshot.project
+        title = project.plan.goal if project else None
+        if not title and snapshot.preparation and snapshot.preparation.plan:
+            title = snapshot.preparation.plan.goal
+        if not title:
+            for item in snapshot.timeline:
+                if isinstance(item, TimelineMessage) and item.role == "user":
+                    title = next(
+                        (
+                            block.text.strip()[:40]
+                            for block in item.content
+                            if isinstance(block, TextContent) and block.text.strip()
+                        ),
+                        None,
+                    )
+                    break
+        return cls(
+            conversation_id=snapshot.conversation_id,
+            status=snapshot.status,
+            through_seq=snapshot.through_seq,
+            updated_at=snapshot.updated_at,
+            title=title,
+            project_id=project.project_id if project else None,
+            cluster=project.cluster if project else None,
+        )

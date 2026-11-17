@@ -4,8 +4,7 @@ description: >-
   仅当用户要求在不修改节点、模型或参数的前提下，对当前 Pyromind 工作流进行测试/调试/debug/试跑
   （在平台上真实执行一次并根据报错修复）时使用。若请求同时包含换模型、改参数、改结构或生成
   workflow，使用 generate-workflow-dsl，本轮不得调用 workflow_debug。调用 `workflow_debug`
-  工具（内部委托 `run_workflow(test_mode=true)`；原 `debug_workflow` / `pyromind_debug` 已停用，
-  也不要再直接调 `run_workflow` 的 test_mode）。
+  工具，使用固定 test mode 的调试提交实现。
   用户可能会用"测试"“test”“调试”“debug”“试跑”等任意说法表达同一个诉求：把工作流提交到平台
   真实跑一次。驱动"触发测试 → Kafka/callback 终态自动续跑会话 → 失败则按报错内容局部修改
   再测；成功则简短通知用户并等待后续输入"。
@@ -30,25 +29,16 @@ triggers:
 
 ## 概述
 
-> **迁移说明：** 原 `debug_workflow` 工具（`pyromind_debug` 包）已从 Agent 工具列表移除。
-> 测试/调试/试跑统一使用 **`workflow_debug`**（见
-> `openhands-tools/openhands/tools/workflow_debug/`）。该工具内部调用
-> `run_workflow(..., test_mode=True)`，Agent **不要**再直接对 `run_workflow` 传
-> `test_mode=true`。
-
 用户说"测试”“test”“调试”“debug”“试跑"这个工作流，指的都是同一件事：调用
 **`workflow_debug`**，把当前工作目录下的 `workflow.py` DSL 提交到 Pyromind 平台**真实
 test 执行**一次（平台侧附加 `execution_mode=test`）。
 
 这是**异步提交**：工具在平台接受任务后返回 `task_id`、初始状态（如 `Pending`/`Running`）
-和 `keep_ui_lock=true`。提交时 `out_id` 为 `agent1#debug#<conversation_id>`（正式
-`run_workflow` 为 `agent1#<conversation_id>`）。平台终态经 **Kafka**
-（`StudioWorkflowNotifyHandler` → `deliver_run_workflow_status(..., auto_run=True)`）
-注入 `<system_reminder>` 并**自动继续本会话**。
+和 `keep_ui_lock=true`。提交关联信息标记 `task_kind=workflow_debug`。平台终态经 Kafka
+或回调入口分发给 Product Runtime，再按任务归属将运行结果送回当前会话。
 
-> **重要：** Kafka 消息是通用的。只有带 `debug#` 标记（即由 **`workflow_debug`** 发起）的
-> 任务，才执行下面「成功仅提示并等待用户 / 失败重生成 DSL 再测」的约定；正式
-> `run_workflow` 终态用通用 resume 指引，不要套用本技能的成功等待逻辑。
+只有调试任务才执行本技能中的成功等待或失败修复逻辑。正式运行通过 `submit_workflow`
+进入 Product Runtime 提交链路。
 
 ## 工具与参数
 
@@ -68,9 +58,9 @@ bash/Python 本地执行 `workflow.py`（声明式 DSL）。
 
 | 工具 | 作用 | 何时使用 |
 |------|------|----------|
-| `validate_workflow_dsl` | 静态结构校验 | 每次写入/修改 `workflow.py` 后 |
+| `validate_workflow_dsl` | 新 workflow 的结构与资源校验 | 每次写入/修改 `workflow.py` 后 |
 | `workflow_debug` | 平台真实 test；Kafka callback 终态 + auto_run | 用户要求测试/调试/试跑 |
-| `run_workflow` | 正式运行/发布（无 `keep_ui_lock`） | 用户要求正式运行/发布 |
+| `submit_workflow` | 经 Product Runtime 正式提交 | 用户要求正式运行/发布 |
 
 ## 前置条件
 
@@ -104,7 +94,7 @@ bash/Python 本地执行 `workflow.py`（声明式 DSL）。
 
 - **仅当终态来自 `workflow_debug` 任务时**：只提示一句「本次 test 工作流成功」，然后
   **等待用户下一步指示**（不要自动发布、不要继续改文件、不要再调 `workflow_debug`）
-- 若终态来自正式 `run_workflow`，按通用会话指引继续，不要套用本条「仅提示并等待」
+- 若终态来自正式 `submit_workflow`，按通用会话指引继续，不要套用本条「仅提示并等待」
 
 ## 与用户的沟通（进行中）
 

@@ -15,14 +15,16 @@ from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.tool import Tool
 from openhands.sdk.tool.registry import resolve_tool
 from openhands.sdk.workspace.local import LocalWorkspace
-from openhands.tools.workflow import RunWorkflowObservation
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
-from openhands.tools.workflow.run_workflow import RunWorkflowExecutor
 from openhands.tools.workflow_debug import (
     WorkflowDebugAction,
     WorkflowDebugExecutor,
     WorkflowDebugObservation,
     WorkflowDebugTool,
+)
+from openhands.tools.workflow_debug.execution import (
+    WorkflowDebugSubmissionExecutor,
+    WorkflowDebugSubmissionObservation,
 )
 
 
@@ -80,7 +82,7 @@ def test_workflow_debug_tool_create_and_resolve() -> None:
     )
     assert "test_mode" not in tool.action_type.model_fields
     assert "keep_ui_lock" in tool.observation_type.model_fields  # type: ignore[union-attr]
-    assert "keep_ui_lock" not in RunWorkflowObservation.model_fields
+    assert "keep_ui_lock" not in WorkflowDebugSubmissionObservation.model_fields
 
     resolved = resolve_tool(
         Tool(name="workflow_debug", params=params),
@@ -120,7 +122,9 @@ def test_workflow_debug_submits_with_test_mode(
             text="",
         )
 
-    monkeypatch.setattr(RunWorkflowExecutor, "_convert_dsl_to_xyflow", fake_convert)
+    monkeypatch.setattr(
+        WorkflowDebugSubmissionExecutor, "_convert_dsl_to_xyflow", fake_convert
+    )
     _write_workflow_file(tmp_path)
 
     observation = WorkflowDebugExecutor(**_executor_kwargs())(
@@ -151,7 +155,7 @@ def test_workflow_debug_forces_keep_ui_lock_on_success(
 ) -> None:
     """Async submit must return keep_ui_lock=True for the frontend lock."""
     run_executor = MagicMock()
-    run_executor.return_value = RunWorkflowObservation.from_text(
+    run_executor.return_value = WorkflowDebugSubmissionObservation.from_text(
         text="submitted",
         status="Pending",
         task_id="task-1",
@@ -167,7 +171,7 @@ def test_workflow_debug_forces_keep_ui_lock_on_success(
     assert isinstance(observation, WorkflowDebugObservation)
     assert observation.keep_ui_lock is True
     assert observation.task_id == "task-1"
-    assert run_executor.call_args.kwargs.get("test_mode") is True
+    assert "test_mode" not in run_executor.call_args.kwargs
     call_action = run_executor.call_args.args[0]
     assert "test_mode" not in type(call_action).model_fields
     assert call_action.dsl == _DSL_TEXT
@@ -176,7 +180,7 @@ def test_workflow_debug_forces_keep_ui_lock_on_success(
 
 def test_workflow_debug_defaults_to_standard_workflow_path(tmp_path: Path) -> None:
     run_executor = MagicMock()
-    run_executor.return_value = RunWorkflowObservation.from_text(
+    run_executor.return_value = WorkflowDebugSubmissionObservation.from_text(
         text="submitted",
         status="Pending",
         task_id="task-1",
@@ -227,7 +231,7 @@ def test_workflow_debug_requires_conversation_to_read_file(tmp_path: Path) -> No
 
 def test_workflow_debug_does_not_lock_on_error(tmp_path: Path) -> None:
     run_executor = MagicMock()
-    run_executor.return_value = RunWorkflowObservation.from_text(
+    run_executor.return_value = WorkflowDebugSubmissionObservation.from_text(
         text="failed",
         status="Failed",
         attempt=1,

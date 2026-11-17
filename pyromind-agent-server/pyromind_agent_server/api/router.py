@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 from pathlib import Path
@@ -14,8 +16,13 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.errors import ProductRuntimeError, UserInputValidationError
+from pyromind_runtime.domain.experiments import (
+    ExperimentCatalog,
+    ExperimentMetric,
+    ExperimentVersion,
+)
 from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.snapshot import ConversationSnapshot, ConversationSummary
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
     FileProductStore,
@@ -69,38 +76,95 @@ def context_for_profile(request: Request, profile: ConversationProfile):
     return replace(request_context(request), profile_id=profile.profile_id)
 
 
+async def configure_session(
+    request: Request, conversation_id: str, profile: ConversationProfile
+) -> None:
+    if profile.configuration_version:
+        await get_product_runtime(request).apply_session_configuration(
+            conversation_id,
+            SessionPolicy(
+                configuration_version=profile.configuration_version,
+                tool_allowlist=profile.tool_allowlist,
+                skill_allowlist=profile.skill_allowlist,
+                development_tool_allowlist=profile.development_tool_allowlist,
+                development_skill_allowlist=profile.development_skill_allowlist,
+                product_instructions=profile.instructions,
+                delegated_roles=tuple(
+                    role.model_dump(mode="json")
+                    for role in profile.delegated_roles or ()
+                ),
+                command_allowlist=profile.command_allowlist,
+                preparation_policy=profile.preparation_policy,
+            ),
+            context_for_profile(request, profile),
+        )
+
+
 def create_product_router(
     profile: ConversationProfile = DEFAULT_PRODUCT_PROFILE,
 ) -> APIRouter:
     def context_for(request: Request):
         return context_for_profile(request, profile)
 
-    async def configure(request: Request, conversation_id: str):
-        if profile.configuration_version:
-            await get_product_runtime(request).apply_session_configuration(
-                conversation_id,
-                SessionPolicy(
-                    configuration_version=profile.configuration_version,
-                    tool_allowlist=profile.tool_allowlist,
-                    skill_allowlist=profile.skill_allowlist,
-                    development_tool_allowlist=profile.development_tool_allowlist,
-                    development_skill_allowlist=profile.development_skill_allowlist,
-                    product_instructions=profile.instructions,
-                    delegated_roles=tuple(
-                        role.model_dump(mode="json")
-                        for role in profile.delegated_roles or ()
-                    ),
-                    command_allowlist=profile.command_allowlist,
-                    preparation_policy=profile.preparation_policy,
-                ),
-                context_for(request),
-            )
-
     router = APIRouter(
         prefix=profile.route_prefix,
         tags=["Product API"],
         dependencies=[Depends(check_session_api_key)],
     )
+
+    @router.get("/{conversation_id}/experiments", response_model=ExperimentCatalog)
+    async def get_experiments(
+        conversation_id: str, request: Request
+    ) -> ExperimentCatalog:
+        _require_profile(request, conversation_id, profile)
+        try:
+            return await get_product_runtime(request).get_experiments(
+                conversation_id, context_for(request)
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+
+    @router.get(
+        "/{conversation_id}/experiments/{experiment_id}",
+        response_model=ExperimentVersion,
+    )
+    async def get_experiment(
+        conversation_id: str, experiment_id: str, request: Request
+    ) -> ExperimentVersion:
+        catalog = await get_experiments(conversation_id, request)
+        result = next(
+            (
+                item
+                for item in catalog.versions
+                if item.experiment_id == experiment_id
+                or any(attempt.run_id == experiment_id for attempt in item.attempts)
+            ),
+            None,
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="Experiment was not found")
+        return result
+
+    @router.get(
+        "/{conversation_id}/experiment-metrics",
+        response_model=tuple[ExperimentMetric, ...],
+    )
+    async def get_experiment_metrics(
+        conversation_id: str,
+        request: Request,
+        metric: str | None = None,
+        comparison_group: str | None = None,
+    ) -> tuple[ExperimentMetric, ...]:
+        _require_profile(request, conversation_id, profile)
+        try:
+            return await get_product_runtime(request).get_experiment_metrics(
+                conversation_id,
+                context_for(request),
+                metric=metric,
+                comparison_group=comparison_group,
+            )
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
 
     @router.post("/{conversation_id}/workflow-executions")
     async def prepare_workflow_execution(
@@ -169,32 +233,31 @@ def create_product_router(
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
 
+    def profile_conversation_ids(request: Request) -> tuple[str, ...]:
+        service = get_conversation_service(request)
+        if not service.conversations_dir.is_dir():
+            return ()
+        user_id = context_for(request).user_id
+        return tuple(
+            directory.name
+            for directory in service.conversations_dir.iterdir()
+            if directory.is_dir()
+            and _profile_matches(service, directory.name, profile)
+            and _assign_profile_id(service, directory.name, profile, user_id)
+        )
+
     @router.get("", response_model=tuple[ConversationSnapshot, ...])
     async def list_conversations(request: Request) -> tuple[ConversationSnapshot, ...]:
-        service = get_conversation_service(request)
-        if (
-            profile.conversation_marker is not None
-            and service.conversations_dir.is_dir()
-        ):
-            for conversation_dir in service.conversations_dir.iterdir():
-                if conversation_dir.is_dir() and _profile_matches(
-                    service, conversation_dir.name, profile
-                ):
-                    _assign_profile_id(
-                        service,
-                        conversation_dir.name,
-                        profile,
-                        context_for(request).user_id,
-                    )
-        snapshots = await get_product_runtime(request).list_snapshots(
-            context_for(request)
+        ids = await asyncio.to_thread(profile_conversation_ids, request)
+        return await get_product_runtime(request).list_snapshots(
+            context_for(request), conversation_ids=ids
         )
-        if profile.conversation_marker is None:
-            return snapshots
-        return tuple(
-            snapshot
-            for snapshot in snapshots
-            if _profile_matches(service, snapshot.conversation_id, profile)
+
+    @router.get("/summaries", response_model=tuple[ConversationSummary, ...])
+    async def list_summaries(request: Request) -> tuple[ConversationSummary, ...]:
+        ids = await asyncio.to_thread(profile_conversation_ids, request)
+        return await get_product_runtime(request).list_summaries(
+            context_for(request), conversation_ids=ids
         )
 
     @router.get("/{conversation_id}/snapshot", response_model=ConversationSnapshot)
@@ -202,9 +265,8 @@ def create_product_router(
         conversation_id: str,
         request: Request,
     ) -> ConversationSnapshot:
-        _require_profile(request, conversation_id, profile)
+        await asyncio.to_thread(_require_profile, request, conversation_id, profile)
         try:
-            await configure(request, conversation_id)
             return await get_product_runtime(request).get_snapshot(
                 conversation_id, context_for(request)
             )
@@ -230,7 +292,7 @@ def create_product_router(
     ) -> CommandReceipt:
         _require_profile(request, conversation_id, profile)
         try:
-            await configure(request, conversation_id)
+            await configure_session(request, conversation_id, profile)
             return await get_product_runtime(request).submit_command(
                 conversation_id, command, context_for(request)
             )
@@ -279,12 +341,13 @@ def create_product_router(
         after_seq: Annotated[int | None, Query(alias="afterSeq", ge=0)] = None,
         last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     ) -> StreamingResponse:
+        started = time.perf_counter()
         cursor = _resolve_cursor(after_seq, last_event_id)
         context = context_for(request)
         runtime = get_product_runtime(request)
-        _require_profile(request, conversation_id, profile)
+        await asyncio.to_thread(_require_profile, request, conversation_id, profile)
         try:
-            await runtime.get_snapshot(conversation_id, context)
+            await runtime.authorize_event_stream(conversation_id, context)
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
         except (
@@ -295,7 +358,7 @@ def create_product_router(
         ) as exc:
             raise _not_found(conversation_id) from exc
         return StreamingResponse(
-            _sse_stream(runtime, conversation_id, cursor, context),
+            _sse_stream(runtime, conversation_id, cursor, context, started),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -511,8 +574,15 @@ async def _sse_stream(
     conversation_id: str,
     after_seq: int,
     context,
+    started: float | None = None,
 ) -> AsyncGenerator[str]:
     events = runtime.stream_events(conversation_id, after_seq, context)
+    if started is not None:
+        logging.getLogger(__name__).info(
+            "sse_first_frame_ms=%.3f profile_id=%s result=ok",
+            (time.perf_counter() - started) * 1000,
+            context.profile_id,
+        )
     # Flush the HTTP response immediately, even when the cursor is already at
     # the latest persisted event. This lets clients establish the SSE channel
     # before submitting the first command without waiting for a heartbeat.

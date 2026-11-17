@@ -40,8 +40,8 @@ from harness_adapter.pi_adapter.business_tool_host import (
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from openhands.tools.sandbox import (
-    DEFAULT_SANDBOX_IMAGE,
     create_sandbox_api_client,
+    default_sandbox_image,
     run_terminal_command,
     terminal_base_url,
     write_sandbox_file,
@@ -716,7 +716,7 @@ class SandboxExecutionManager:
     ) -> SandboxResponse:
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
-            image=settings.image or DEFAULT_SANDBOX_IMAGE,
+            image=settings.image or default_sandbox_image(client.cluster),
             resources=ResourceConfig(
                 cpu=settings.cpu,
                 memory=settings.memory,
@@ -1225,6 +1225,9 @@ class SandboxExecutionManager:
         files: list[tuple[str, str]] = []
         for destination_root, source_root in self._resource_roots:
             source = os.fspath(source_root)
+            if os.path.isfile(source) and not os.path.islink(source):
+                files.append((f"{workspace_path}/{destination_root}", source))
+                continue
             if not os.path.isdir(source):
                 continue
             for directory, directories, names in os.walk(source):

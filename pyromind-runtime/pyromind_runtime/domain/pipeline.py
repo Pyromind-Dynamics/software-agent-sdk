@@ -7,6 +7,7 @@ from pydantic import Field
 
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.training_evaluation import StepEvaluation
 
 
 class PipelineRun(ContractModel):
@@ -15,6 +16,9 @@ class PipelineRun(ContractModel):
     conversation_id: str
     definition: JsonObject
     result: JsonObject = Field(default_factory=dict)
+    evaluations: tuple[StepEvaluation, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     fingerprint: str
     output_dir: str
     revision: int = Field(default=1, ge=1)

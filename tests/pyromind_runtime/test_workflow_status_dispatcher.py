@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
@@ -241,6 +242,7 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
     assert adapter.external_task_notifications == []
 
     await runtime.get_snapshot("conversation-2", RequestContext(user_id="42"))
+    await asyncio.wait_for(runtime._read_recoveries["conversation-2"], 3)
 
     assert store.load_snapshot().external_tasks[0].resume_pending is False
     assert adapter.external_task_notifications[0][0] == "conversation-2"
@@ -319,3 +321,31 @@ def test_external_task_registry_cannot_transfer_ownership_or_change_the_recipien
     restored = registry.resolve("c", "task")
     assert restored is not None
     assert restored["correlation"] == payload["correlation"]
+
+
+async def test_unknown_product_callback_never_falls_back_to_legacy_session(tmp_path):
+    runtime = ConversationRuntime(
+        tmp_path, {"pi": FakeAdapter("pi")}, default_harness_id="pi"
+    )
+    try:
+        result = await WorkflowStatusDispatcher(runtime).dispatch(
+            task_id="unknown",
+            status="Succeeded",
+            conversation_id="missing",
+        )
+        assert result.outcome == "unknown_conversation"
+        assert not (tmp_path / "missing" / "metadata.json").exists()
+    finally:
+        await runtime.close()
+
+
+def test_retired_production_workflow_tool_cannot_be_resolved():
+    from typing import Any, cast
+
+    import pytest
+
+    from openhands.sdk.tool import Tool
+    from openhands.sdk.tool.registry import resolve_tool
+
+    with pytest.raises(KeyError, match="run_workflow"):
+        resolve_tool(Tool(name="run_workflow"), cast(Any, None))

@@ -18,17 +18,20 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
     monkeypatch.setattr(module, "download_file_from_pyromind", download)
     monkeypatch.setattr(
         module,
-        "ValidateWorkflowDslExecutor",
-        lambda **kwargs: lambda action: SimpleNamespace(is_error=False, valid=True),
+        "ResourceValidatedWorkflowDslExecutor",
+        lambda **kwargs: (
+            lambda action: SimpleNamespace(
+                is_error=False,
+                valid=True,
+                validated_workflow={
+                    "name": "server-normalized",
+                    "nodes": [{"data": {"nodeType": "ModelTrainSFTNode"}}],
+                    "edges": [],
+                },
+            )
+        ),
     )
-    monkeypatch.setattr(
-        module,
-        "convert_dsl_to_xyflow",
-        lambda dsl, name: {
-            "name": name,
-            "nodes": [{"data": {"nodeType": "ModelTrainSFTNode"}}],
-        },
-    )
+
     result = module.PlatformWorkflowSubmission._prepare(
         "/workspace/.pyromind-agent/conversation/workflow.py",
         RequestContext(user_id="42", cookie="auth_token=ephemeral"),
@@ -37,6 +40,9 @@ def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):
     summary = result["summary"]
     assert isinstance(summary, dict)
     assert summary["has_training_node"] is True
+    workflow = result["workflow"]
+    assert isinstance(workflow, dict)
+    assert workflow["name"] == "server-normalized"
     assert result["fingerprint"]
 
 
@@ -61,13 +67,18 @@ def test_prepare_accepts_public_and_storage_api_workflow_paths(
     )
     monkeypatch.setattr(
         module,
-        "ValidateWorkflowDslExecutor",
-        lambda **kwargs: lambda action: SimpleNamespace(is_error=False, valid=True),
-    )
-    monkeypatch.setattr(
-        module,
-        "convert_dsl_to_xyflow",
-        lambda dsl, name: {"name": name, "nodes": []},
+        "ResourceValidatedWorkflowDslExecutor",
+        lambda **kwargs: (
+            lambda action: SimpleNamespace(
+                is_error=False,
+                valid=True,
+                validated_workflow={
+                    "name": "server-normalized",
+                    "nodes": [{"data": {"nodeType": "ModelTrainSFTNode"}}],
+                    "edges": [],
+                },
+            )
+        ),
     )
 
     module.PlatformWorkflowSubmission._prepare(path, RequestContext(user_id="42"))
@@ -89,7 +100,7 @@ def test_prepare_rejects_the_former_pi_mount():
         "storage/../workflow.py",
         "storage/project/file.txt",
         "/workflow.py",
-        # The removed alias is no longer a way to name a workflow.
+        # 已删除的别名不能再用于指定工作流。
         "storage/project/workflow.py",
     ],
 )
@@ -128,3 +139,96 @@ def test_submit_never_retries_platform_create(monkeypatch, route, env, cluster, 
     assert seen["routing"]["headers"] == {"x-cluster": header}
     assert seen["retry_create"] is False
     assert seen["conversation_id"] == "conversation-1"
+
+
+def test_final_resource_check_uses_effective_workflow_and_request_identity(monkeypatch):
+    seen = {}
+    effective = {
+        "name": "frozen",
+        "nodes": [{"id": "gpu", "data": {"config": {"gpu_count": 8}}}],
+    }
+
+    class Validator:
+        def __init__(self, headers):
+            seen["headers"] = headers
+
+        def validate_resources(self, workflow):
+            seen["workflow"] = workflow
+            return SimpleNamespace(
+                valid=False, is_error=True, text="资源不足，max_gpu_count=4"
+            )
+
+    monkeypatch.setattr(module, "ResourceValidatedWorkflowDslExecutor", Validator)
+    with pytest.raises(ValueError, match="资源不足"):
+        module.PlatformWorkflowSubmission._validate_resources(
+            effective,
+            RequestContext(
+                user_id="42",
+                cookie="auth_token=test",
+                authorization="Bearer test",
+                x_cluster="cluster#pre",
+            ),
+        )
+    assert seen["workflow"] == effective
+    assert seen["headers"]["x-cluster"] == "cluster#pre"
+    assert seen["headers"]["authorization"] == "Bearer test"
+
+
+def test_final_resource_check_does_not_omit_values_equal_to_client_defaults(
+    monkeypatch,
+):
+    seen = []
+    workflow = {
+        "name": "w",
+        "nodes": [
+            {
+                "id": "1",
+                "data": {
+                    "nodeType": "CustomCommandNode",
+                    "config": {"gpu_count": 4, "cpu": 8, "memory": 64},
+                    "nodeDefinition": {
+                        "input": {
+                            "required": {
+                                "gpu_count": ["INT", {"default": 4}],
+                                "cpu": ["INT", {"default": 8}],
+                                "memory": ["INT", {"default": 64}],
+                            }
+                        }
+                    },
+                },
+            }
+        ],
+        "edges": [],
+    }
+
+    class Validator:
+        def __init__(self, **kwargs):
+            pass
+
+        def validate_resources(self, workflow):
+            seen.append(workflow)
+            return SimpleNamespace(is_error=False, valid=True)
+
+    monkeypatch.setattr(module, "ResourceValidatedWorkflowDslExecutor", Validator)
+    module.PlatformWorkflowSubmission._validate_resources(
+        workflow, RequestContext(user_id="42")
+    )
+    assert seen[0]["nodes"][0]["data"]["config"] == {
+        "gpu_count": 4,
+        "cpu": 8,
+        "memory": 64,
+    }
+    assert "nodeDefinition" in workflow["nodes"][0]["data"]
+
+
+def test_prepare_requires_the_validated_workflow_instead_of_reparsing(monkeypatch):
+    monkeypatch.setattr(module, "download_file_from_pyromind", lambda **kw: b"workflow")
+    monkeypatch.setattr(
+        module,
+        "ResourceValidatedWorkflowDslExecutor",
+        lambda **kw: lambda action: SimpleNamespace(is_error=False, valid=True),
+    )
+    with pytest.raises(ValueError, match="no validated definition"):
+        module.PlatformWorkflowSubmission._prepare(
+            "/project/workflow.py", RequestContext(user_id="42")
+        )

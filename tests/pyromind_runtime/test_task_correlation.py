@@ -271,6 +271,7 @@ async def test_suspended_callback_is_saved_and_recipient_recovers_after_restart(
     runtime = ConversationRuntime(tmp_path, recovered, default_harness_id="pi")
     try:
         await runtime.get_snapshot("workflow-conversation", context)
+        await asyncio.wait_for(runtime._read_recoveries["workflow-conversation"], 3)
         assert recovered.external_task_notifications == []
         store.append(
             ProductEvent(
@@ -280,6 +281,7 @@ async def test_suspended_callback_is_saved_and_recipient_recovers_after_restart(
             )
         )
         await runtime.get_snapshot("workflow-conversation", context)
+        await asyncio.wait_for(runtime._read_recoveries["workflow-conversation"], 3)
         assert len(recovered.external_task_notifications) == 1
         assert recovered.external_task_notifications[0][1].correlation == correlation
     finally:

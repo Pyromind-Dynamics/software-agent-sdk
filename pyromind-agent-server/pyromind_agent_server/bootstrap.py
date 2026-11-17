@@ -9,7 +9,6 @@ from pathlib import Path
 from fastapi import FastAPI
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
-from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -21,13 +20,14 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIndex
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
-from openhands.agent_server.run_workflow_callback import set_workflow_status_dispatcher
 from openhands.agent_server.storage_quota import ensure_conversation_quota
+from openhands.agent_server.workflow_status import set_workflow_status_dispatcher
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
@@ -98,11 +98,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     if service is None:
         return None
     raw_backend = os.getenv("PYROMIND_HARNESS_BACKEND")
-    backend = (raw_backend or "openhands").strip().lower()
-    if backend not in {"openhands", "pi"}:
+    backend = (raw_backend or "pi").strip().lower()
+    if backend != "pi":
         raise RuntimeError(f"Unsupported PYROMIND_HARNESS_BACKEND: {backend}")
-    openhands_adapter = OpenHandsAdapter(lambda: app.state.conversation_service)
-    adapters: dict[str, HarnessAdapter] = {"openhands": openhands_adapter}
     version_path = Path(
         os.getenv("PYROMIND_VERSION_DB_PATH")
         or service.conversations_dir.parent / "product-versions" / "versions.sqlite3"
@@ -110,6 +108,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     versions = Versions(
         SQLiteVersionStore(version_path),
         PlatformArtifactSnapshots(version_path.parent / "snapshot-staging"),
+        archive_runs=os.getenv("PYROMIND_RUN_ARCHIVES_ENABLED", "0") == "1",
     )
 
     async def version_call(
@@ -141,7 +140,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             correlation=correlation,
         )
 
-    openhands_adapter.set_version_handler(version_call, execution_call)
     terminal_backend: str | None = None
     external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
 
@@ -152,8 +150,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             external_tasks,
             versions=versions,
         )
-
-    openhands_adapter.set_pipeline_runs(pipeline_runs)
 
     workflows = None
     workflow_enabled = os.getenv("PYROMIND_AGENTGENOME_ENABLED", "0") == "1"
@@ -180,8 +176,14 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow_call=workflow_call if workflow_enabled else None,
     )
     pi_adapter.set_version_handler(version_call, execution_call)
-    adapters["pi"] = pi_adapter
-    if workflow_enabled and backend == "pi":
+
+    async def record_training_artifacts(scope, task_id, nodes, context):
+        assert isinstance(runtime, ConversationRuntime)
+        return await runtime.record_training_artifacts(scope, task_id, nodes, context)
+
+    pi_adapter.set_training_artifact_hook(record_training_artifacts)
+    adapters: dict[str, HarnessAdapter] = {"pi": pi_adapter}
+    if workflow_enabled:
 
         def execution_host(scope: str) -> ExecutionHost:
             def subscribe(execution_id: str, sink: WorkflowEventSink | None) -> None:
@@ -230,6 +232,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         adapters,
         default_harness_id=backend,
         preparation_store=preparation_store,
+        experiment_index=SQLExperimentIndex(preparation_store.engine)
+        if preparation_store is not None
+        else None,
         experiment_plan_project_binder=EchoMindExperimentPlanProjectBinder(
             service.conversations_dir
         )
@@ -260,7 +265,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         "release_grace_seconds=%d resource_retention_seconds=%d "
         "max_active_conversations=%d conversations_dir=%s",
         backend,
-        raw_backend if raw_backend is not None else "<unset, defaulting to openhands>",
+        raw_backend if raw_backend is not None else "<unset, defaulting to pi>",
         sorted(adapters),
         terminal_backend or "-",
         idle_eviction_seconds,

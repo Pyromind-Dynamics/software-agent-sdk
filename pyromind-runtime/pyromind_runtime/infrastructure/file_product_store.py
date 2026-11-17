@@ -273,7 +273,7 @@ class FileProductStore:
         return self._load_metadata().x_cluster
 
     def save_x_cluster(self, x_cluster: str | None) -> None:
-        if not x_cluster or not x_cluster.strip():
+        if not x_cluster or not x_cluster.strip() or self.load_x_cluster() == x_cluster:
             return
         with self._lock():
             metadata = self._load_metadata()
@@ -283,6 +283,9 @@ class FileProductStore:
             self._atomic_write(self.metadata_path, metadata.model_dump_json())
 
     def assign_profile_id_if_missing(self, *, user_id: str, profile_id: str) -> bool:
+        metadata = self._load_metadata()
+        if metadata.profile_id is not None:
+            return metadata.user_id == user_id and metadata.profile_id == profile_id
         with self._lock():
             metadata = self._load_metadata()
             if metadata.user_id != user_id:
@@ -473,11 +476,27 @@ class FileProductStore:
             raise ValueError("after_seq must be non-negative")
         with self._lock():
             marker = self._tail_marker()
-            if marker is not None and marker.seq <= after_seq:
-                # The log ends at or before the caller's cursor, so there is
-                # nothing left to send. Proving that from the tail alone keeps
-                # a reconnect from re-parsing a multi-megabyte log.
-                return ()
+            metadata = self._load_metadata()
+            if (
+                marker is not None
+                and marker.seq == metadata.last_sequence
+                and marker.conversation_id == metadata.conversation_id
+            ):
+                remaining = marker.seq - after_seq
+                if remaining <= 0:
+                    return ()
+                if remaining <= _TAIL_WINDOW:
+                    suffix = self._load_events_tail(remaining)
+                    if (
+                        suffix is not None
+                        and len(suffix) == remaining
+                        and all(
+                            event.seq == seq
+                            and event.conversation_id == metadata.conversation_id
+                            for seq, event in enumerate(suffix, after_seq + 1)
+                        )
+                    ):
+                        return tuple(suffix)
             return tuple(
                 event
                 for event in self._load_events(repair_tail=True)
@@ -765,13 +784,16 @@ class FileProductStore:
         with path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             position = stream.tell()
-            buffer = b""
-            while position > 0 and buffer.count(b"\n") <= limit:
-                chunk = min(_TAIL_CHUNK_BYTES, position)
-                position -= chunk
+            chunks: list[bytes] = []
+            newline_count = 0
+            while position > 0 and newline_count <= limit:
+                size = min(_TAIL_CHUNK_BYTES, position)
+                position -= size
                 stream.seek(position)
-                buffer = stream.read(chunk) + buffer
-            lines = buffer.splitlines(keepends=True)
+                chunk = stream.read(size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+            lines = b"".join(reversed(chunks)).splitlines(keepends=True)
             if position > 0 and lines:
                 # The oldest line sits on a chunk boundary and may be partial.
                 lines = lines[1:]

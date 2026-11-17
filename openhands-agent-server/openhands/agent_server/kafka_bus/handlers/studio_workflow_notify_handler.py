@@ -9,8 +9,8 @@ from pyromind_sdk.client.models import StudioTaskStatus
 from openhands.agent_server.kafka_bus.kafka_handler import MessageHandler
 from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
 from openhands.agent_server.kafka_bus.message_event import MessageEvent
-from openhands.agent_server.run_workflow_callback import (
-    dispatch_run_workflow_status as deliver_run_workflow_status,
+from openhands.agent_server.workflow_status import (
+    dispatch_workflow_status as deliver_workflow_status,
 )
 from openhands.sdk.logger import get_logger
 from openhands.sdk.utils import env_util
@@ -58,23 +58,23 @@ class StudioWorkflowNotifyHandler(MessageHandler):
         return get_pod_name() + "-" + env_util.get_env_value()
 
     async def handle(self, event: MessageEvent):
-        """Handle studio workflow notify message.
+        """处理 Studio 工作流状态通知。
 
-        Multi-pod broadcast: each pod sees the same Kafka message. If this pod
-        does not have the conversation, ``deliver_run_workflow_status`` returns
-        ``unknown_conversation`` and we exit without error (no retry/DLQ).
+        多 Pod 广播时，每个 Pod 都会收到同一条 Kafka 消息。如果当前 Pod
+        没有对应会话，``deliver_workflow_status`` 返回 ``unknown_conversation``，
+        直接结束处理，不重试，也不进入死信队列。
 
-        Expected ``event.data``::
+        ``event.data`` 的预期结构::
 
             {
                 "task_id": ...,
                 "status": ...,
-                "out_id": "<JSON-serialized TaskCorrelation>",
+                "out_id": "<序列化为 JSON 的 TaskCorrelation>",
                 "error_msg": ...,
                 ...
             }
 
-        Only versioned agent JSON return addresses are accepted.
+        仅接受携带版本信息的 Agent JSON 回传地址。
         """
         if event.event_type != TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED:
             return
@@ -117,7 +117,7 @@ class StudioWorkflowNotifyHandler(MessageHandler):
         # error_msg 是 base64+zlib 压缩的 JSON，_decode_error_msg 会解压成可读文本
         error_log = _decode_error_msg(message_data.get("error_msg"))
 
-        result = await deliver_run_workflow_status(
+        result = await deliver_workflow_status(
             task_id=task_id,
             status=status.value,
             error_log=error_log,

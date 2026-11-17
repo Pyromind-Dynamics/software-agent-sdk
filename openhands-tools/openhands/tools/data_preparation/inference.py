@@ -19,6 +19,7 @@ from openhands.tools.utils.workspace_staging import publish_workspace_path
 from openhands.tools.workflow.definition import WORKFLOW_RELATIVE_PATH
 from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from openhands.tools.workflow.task_submission import (
+    WorkflowResourceValidationError,
     submit_workflow_task,
 )
 from openhands.tools.workflow.validate_workflow_dsl import (
@@ -89,6 +90,11 @@ class InferenceOptions(BaseModel):
             "catalog model identifier for clone (exact enum value, including its "
             "namespace), or a repository name for download."
         ),
+    )
+    source_checkpoint_version_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Version ID of the checkpoint used as model_path.",
     )
     selection_run_id: str | None = Field(
         default=None,
@@ -575,6 +581,8 @@ class InferencePipelineHandler:
                     "report_spec_path",
                 }
             )
+            if inference["source_checkpoint_version_id"] is None:
+                inference.pop("source_checkpoint_version_id")
             inference["model_path"] = model_reference(
                 options.model_path, evaluation_options.model_source
             )
@@ -771,6 +779,8 @@ class InferencePipelineHandler:
             self.runs.finish_submission(run_id, revision, task_id, "submitted")
         except Exception as exc:
             if task_id is None:
+                if isinstance(exc, WorkflowResourceValidationError):
+                    submitting = False
                 self.runs.finish_submission(
                     run_id, revision, None, "uncertain" if submitting else "failed"
                 )
@@ -797,6 +807,11 @@ class InferencePipelineHandler:
                             "validation_warnings": exc.validation.warnings,
                         }
                         if isinstance(exc, _WorkflowValidationError)
+                        else {}
+                    ),
+                    **(
+                        {"failure_stage": "resources"}
+                        if isinstance(exc, WorkflowResourceValidationError)
                         else {}
                     ),
                 }

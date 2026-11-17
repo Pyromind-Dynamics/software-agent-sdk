@@ -165,6 +165,7 @@ def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
     monkeypatch.setenv("PYROMIND_PI_MODEL_MAX_RETRIES", "1")
     monkeypatch.setenv("PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS", "500")
     monkeypatch.setenv("PYROMIND_PI_MODEL_IDLE_TIMEOUT_MS", "120000")
+    monkeypatch.setenv("PYROMIND_PI_MAX_OUTPUT_TOKENS", "2048")
 
     environment = _runner_environment()
 
@@ -175,6 +176,7 @@ def test_runner_environment_forwards_operator_tunables(monkeypatch) -> None:
     assert environment["PYROMIND_PI_MODEL_MAX_RETRIES"] == "1"
     assert environment["PYROMIND_PI_MODEL_RETRY_BASE_DELAY_MS"] == "500"
     assert environment["PYROMIND_PI_MODEL_IDLE_TIMEOUT_MS"] == "120000"
+    assert environment["PYROMIND_PI_MAX_OUTPUT_TOKENS"] == "2048"
 
 
 def test_runner_environment_forwards_langfuse_config(monkeypatch) -> None:

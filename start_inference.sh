@@ -63,6 +63,7 @@ esac
 export OPENAI_API_KEY
 export OPENROUTER_API_KEY
 export PYROMIND_HARNESS_BACKEND="pi"
+export PYROMIND_RUN_ARCHIVES_ENABLED=1
 # Studio, Storage and Sandbox route by this environment and the request region.
 export APP_ENV="${APP_ENV:-prod}"
 export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"

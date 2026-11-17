@@ -31,8 +31,8 @@ within the authorized task. Validate and submit the revised DSL yourself through
 submit_workflow. Ask the user directly with
 ask_user if a decision would change the agreed inputs, goal, or resource scope.
 
-On Studio success, inspect actual training outputs and use training-analysis
-when available. Verify and report the model or
+On Studio success, use training_analysis(operation="artifacts") on the submitted
+task ID and check the lineage receipt as described in training-analysis. Verify and report the model or
 checkpoint location, training configuration and diagnostics. Do not substitute
 the base model or training loss for a usable training output or model quality.
 Write the output paths and supporting evidence in a Markdown report in your

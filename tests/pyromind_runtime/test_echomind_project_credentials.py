@@ -1,3 +1,4 @@
+import pytest
 from fastapi import HTTPException
 from pyromind_agent_server.api.echomind_projects import (
     _require_sandbox_credentials,
@@ -19,8 +20,12 @@ def _request(headers: dict[str, str]) -> Request:
     )
 
 
-def test_dataset_start_requires_sandbox_credentials(monkeypatch) -> None:
-    monkeypatch.setenv("PYROMIND_HARNESS_BACKEND", "pi")
+@pytest.mark.parametrize("backend", [None, "pi"])
+def test_dataset_start_requires_sandbox_credentials(monkeypatch, backend) -> None:
+    if backend is None:
+        monkeypatch.delenv("PYROMIND_HARNESS_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("PYROMIND_HARNESS_BACKEND", backend)
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "sandbox")
 
     try:
