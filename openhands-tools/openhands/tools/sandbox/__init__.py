@@ -59,7 +59,6 @@ from openhands.tools.sandbox.storage_ops import (
 __all__ = [
     "SandboxCreateAction",
     "DEFAULT_SANDBOX_IMAGE",
-    "default_sandbox_image",
     "SandboxCreateExecutor",
     "SandboxCreateObservation",
     "SandboxCreateTool",
