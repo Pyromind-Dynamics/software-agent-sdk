@@ -2,17 +2,16 @@
 
 from collections.abc import Collection, Mapping
 
-from pydantic import Field, PrivateAttr, SecretStr
+from pydantic import BaseModel, Field, PrivateAttr, SecretStr
 
 from pyromind_common.sdk.logger import get_logger
 from pyromind_common.sdk.secret import SecretSource, SecretValue, StaticSecret
-from pyromind_common.sdk.utils.models import OpenHandsModel
 
 
 logger = get_logger(__name__)
 
 
-class SecretRegistry(OpenHandsModel):
+class SecretRegistry(BaseModel):
     """Manages secrets and injects them into bash commands when needed.
 
     The secret registry stores a mapping of secret keys to SecretSources

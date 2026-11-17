@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 import httpx
+
 from pyromind_common.tools.pyromind_dataset.definition import (
     StorageFileNotFoundError,
     _default_storage_base_url,
@@ -102,7 +103,7 @@ class PyromindEvaluationStorage(EvaluationStorage):
             ) from exc
 
     def list(self, prefix: str) -> set[str]:
-        # Unlike the advisory helper in openhands-tools, failures raise:
+        # Unlike the advisory storage helper, failures raise:
         # an unreachable listing must never be mistaken for an empty one.
         try:
             response = httpx.post(

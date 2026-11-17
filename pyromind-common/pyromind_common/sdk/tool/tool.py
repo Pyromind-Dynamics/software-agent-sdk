@@ -555,11 +555,7 @@ class ToolDefinition[ActionT, ObservationT](DiscriminatedUnionMixin, ABC):
 
         error_msg = (
             f"Unexpected kind '{kind}' for {cls.__name__}. "
-            f"Expected one of: {possible_kinds_str}. "
-            f"If you receive this error when trying to wrap a DiscriminatedUnion "
-            f"instance inside another pydantic model, you may need to use "
-            f"OpenHandsModel instead of BaseModel to make sure that an invalid "
-            f"schema has not been cached."
+            f"Expected one of: {possible_kinds_str}."
         )
         raise ValueError(error_msg)
 

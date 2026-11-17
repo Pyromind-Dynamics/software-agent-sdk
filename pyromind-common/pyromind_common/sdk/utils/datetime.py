@@ -16,5 +16,5 @@ def _uuid_to_hex(uuid_obj: UUID) -> str:
     return uuid_obj.hex
 
 
-OpenHandsUUID = Annotated[UUID, PlainSerializer(_uuid_to_hex, when_used="json")]
+PyromindUUID = Annotated[UUID, PlainSerializer(_uuid_to_hex, when_used="json")]
 """UUID type that serialises to a hex string (no hyphens) in JSON."""

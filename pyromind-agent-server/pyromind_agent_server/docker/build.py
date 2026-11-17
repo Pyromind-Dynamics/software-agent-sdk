@@ -29,6 +29,7 @@ from contextlib import chdir
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
+
 from pyromind_common.sdk.logger import IN_CI, get_logger, rolling_log_view
 from pyromind_common.sdk.workspace import PlatformType, TargetType
 
@@ -61,7 +62,7 @@ _SEMVER_RELEASE_RE = re.compile(
 
 def _default_sdk_project_root() -> Path:
     """
-    Resolve top-level OpenHands UV workspace root:
+    Resolve top-level Pyromind UV workspace root:
 
     Order:
       1) Walk up from CWD
@@ -72,7 +73,7 @@ def _default_sdk_project_root() -> Path:
     site_markers = ("site-packages", "dist-packages")
 
     def _is_workspace_root(d: Path) -> bool:
-        """Detect if d is the root of the Agent-SDK repo UV workspace."""
+        """Detect if d is the root of the Pyromind repo UV workspace."""
         _EXPECTED = (
             "pyromind-common/pyproject.toml",
             "pyromind-runtime/pyproject.toml",
@@ -121,7 +122,7 @@ def _default_sdk_project_root() -> Path:
         root = _climb(p) or p
         if not _is_workspace_root(root):
             raise RuntimeError(
-                f"{src}: couldn't find the OpenHands UV workspace root "
+                f"{src}: couldn't find the Pyromind UV workspace root "
                 f"starting at '{p}'.\n\n"
                 "Expected setup (repo root):\n"
                 "  pyproject.toml  # has [tool.uv.workspace] with members\n"
@@ -146,10 +147,10 @@ def _default_sdk_project_root() -> Path:
 
     # Final, user-facing guidance
     raise RuntimeError(
-        "Could not resolve the OpenHands UV workspace root.\n\n"
+        "Could not resolve the Pyromind UV workspace root.\n\n"
         "Expected repo layout:\n"
         "  pyproject.toml  (with [tool.uv.workspace].members "
-        "including openhands/* subprojects)\n"
+        "including pyromind-* and harness-adapter subprojects)\n"
         "  pyromind-common/pyproject.toml\n"
         "  pyromind-runtime/pyproject.toml\n"
         "  harness-adapter/pyproject.toml\n"
@@ -352,7 +353,7 @@ def _git_info() -> tuple[str, str]:
 
 def _package_version() -> str:
     """
-    Get the semantic version from the openhands-sdk package.
+    Get the semantic version from the pyromind-common package.
     This is used as a fallback when git-tag-derived release tags are unavailable.
     """
     try:
@@ -415,7 +416,7 @@ class BuildOptions(BaseModel):
     git_ref: str = Field(default=_DEFAULT_GIT_REF)
     sdk_project_root: Path = Field(
         default_factory=_default_sdk_project_root,
-        description="Path to OpenHands SDK root. Auto if None.",
+        description="Path to Pyromind workspace root. Auto if None.",
     )
     prebuilt_sdist: Path | None = Field(
         default=None,
@@ -1054,7 +1055,7 @@ def main(argv: list[str]) -> int:
         "--sdk-project-root",
         type=Path,
         default=None,
-        help="Path to OpenHands SDK root (default: auto-detect).",
+        help="Path to Pyromind workspace root (default: auto-detect).",
     )
     parser.add_argument(
         "--prebuilt-sdist",

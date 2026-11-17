@@ -1,6 +1,6 @@
 ---
 name: Feature Request or Enhancement
-description: Suggest a new feature or improvement for OpenHands SDK
+description: Suggest a new feature or improvement for Pyromind
 title: '[Feature]: '
 labels: [enhancement]
 body:
@@ -15,7 +15,7 @@ body:
       attributes:
           label: Is there an existing feature request for this?
           description: Please search existing issues and feature requests before creating a new one. If found, react or comment to the duplicate issue
-              instead of making a new one. <!-- TODO-openhands -->
+              instead of making a new one.
           options:
               - label: I have searched existing issues and feature requests, and this is not a duplicate.
                 required: true
@@ -78,8 +78,7 @@ body:
       id: feature-area
       attributes:
           label: Feature Area
-          description: Which part of OpenHands SDK does this feature relate to? If you select "Other", please specify the area in the Additional 
-              Context section below. <!-- TODO-openhands -->
+          description: Which Pyromind component does this feature affect? Add details below.
           options:
               - label: Agent API / Core functionality
               - label: Tools / Tool system
@@ -110,8 +109,8 @@ body:
           placeholder: |
               Example code or API design:
               ```python
-              from openhands.sdk import Agent, StateManager
+              from pyromind_agent_server.app import create_app
 
-              agent = Agent(state_manager=StateManager('file://agent_state.json'))
-              agent.save_state()
+              app = create_app()
+              # Describe the proposed product API behavior
               ```

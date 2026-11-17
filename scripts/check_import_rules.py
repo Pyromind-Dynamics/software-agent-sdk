@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Check import dependency rules across openhands packages.
+Check dependency boundaries across Pyromind packages.
 
 Rules:
 1. pyromind_common.sdk should NOT import from:
@@ -14,13 +14,7 @@ Rules:
    - openhands.workspace
    - pyromind_agent_server
 
-3. openhands.workspace can import from:
-   - pyromind_common.sdk
-   - pyromind_common.tools
-   BUT NOT from:
-   - pyromind_agent_server
-
-4. pyromind_agent_server can import from:
+3. pyromind_agent_server can import from:
    - pyromind_common.sdk
    - pyromind_common.tools
    BUT NOT from:
@@ -216,7 +210,6 @@ def main(files: list[str] | None = None) -> int:
             "(can import sdk)\n"
             "  - pyromind_agent_server: Cannot import workspace "
             "(can import sdk/tools)\n"
-            "  - openhands.workspace: Can import sdk/tools"
         )
         return 1
 

@@ -178,18 +178,7 @@ def clear_subclass_cache() -> None:
     _bump_subclass_generation()
 
 
-class OpenHandsModel(BaseModel):
-    """Deprecated: This class exists only for backward compatibility.
-
-    This class is no longer required for discriminated union support.
-    New code should extend pydantic.BaseModel directly instead of OpenHandsModel.
-
-    Existing code that extends OpenHandsModel will continue to work, but
-    migration to BaseModel is recommended.
-    """
-
-
-class DiscriminatedUnionMixin(OpenHandsModel):
+class DiscriminatedUnionMixin(BaseModel):
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         _bump_subclass_generation()

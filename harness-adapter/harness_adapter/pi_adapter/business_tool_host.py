@@ -354,7 +354,7 @@ ToolFactory = Callable[[ToolExecutionContext], ToolDefinition[Any, Any]]
 
 
 class PyromindBusinessToolHost:
-    """Expose tested OpenHands business executors through Pi's JSONL bridge."""
+    """Expose Pyromind business executors through Pi's JSONL bridge."""
 
     def __init__(
         self,

@@ -32,7 +32,7 @@ check-uv-version:
 	$(ECHO) "$(GREEN)uv version $$UV_VERSION meets requirements$(RESET)"
 
 build: check-uv-version
-	@$(ECHO) "$(CYAN)Setting up OpenHands V1 development environment...$(RESET)"
+	@$(ECHO) "$(CYAN)Setting up Pyromind development environment...$(RESET)"
 	@$(ECHO) "$(YELLOW)Installing dependencies with uv sync --dev...$(RESET)"
 	@uv sync --dev
 	@uv pip install --python .venv/bin/python -r requirements-terminal.txt
@@ -67,7 +67,7 @@ clean:
 
 # Show help
 help:
-	@$(ECHO) "$(CYAN)OpenHands V1 Makefile$(RESET)"
+	@$(ECHO) "$(CYAN)Pyromind Makefile$(RESET)"
 	@$(ECHO) ""
 	@$(ECHO) "$(UNDERLINE)Usage:$(RESET) make <COMMAND>"
 	@$(ECHO) ""

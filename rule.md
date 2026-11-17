@@ -9,7 +9,7 @@
                     |
               HarnessAdapter
                /           \
-      OpenHands Adapter    其他 Adapter
+      Harness A Adapter    其他 Adapter
 ```
 
 ## 强制约束
@@ -32,7 +32,7 @@ pyromind-agent-server -> harness-adapter -> pyromind-runtime
 - 依赖只能沿箭头方向，下层不得反向依赖上层。
 - `pyromind-runtime` 不得导入 FastAPI、`harness-adapter`、OpenHands、Pi 或服务端代码。
 - `harness-adapter` 不得依赖 `pyromind-agent-server`。
-- `openhands-sdk` 保持平台无关，不得加入 Pyromind 产品语义或依赖产品层。
+- `pyromind_common.sdk` 保持平台无关，不得加入 Pyromind 产品语义或依赖产品层。
 
 ## 职责归属
 
@@ -41,7 +41,7 @@ pyromind-agent-server -> harness-adapter -> pyromind-runtime
 - `pyromind-agent-server` 只负责 HTTP、鉴权、配置和依赖装配；路由必须调用 `ConversationRuntime`，不得直接操作 Harness 会话。
 - Harness 原生事件必须由 Adapter 转换为统一事件，禁止直接暴露给 API 或前端。
 - 持久化必须通过 Product Store / External Task Registry 端口；Cookie、Token、Authorization 等请求凭据不得落盘。
-- 平台工具可放在 `openhands-tools`，但业务流程、任务状态和恢复策略必须留在 Product Runtime。
+- 平台工具可放在 `pyromind_common.tools`，但业务流程、任务状态和恢复策略必须留在 Product Runtime。
 - 旧实现兼容代码必须封装在 Adapter 或独立兼容模块中，不得污染统一协议。
 
 ## 稳定边界

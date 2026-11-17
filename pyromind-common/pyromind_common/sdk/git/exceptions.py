@@ -1,4 +1,4 @@
-"""Git-related exceptions for OpenHands SDK."""
+"""Git-related exceptions for Pyromind."""
 
 
 class GitError(Exception):

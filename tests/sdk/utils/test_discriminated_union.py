@@ -2,8 +2,8 @@ from abc import ABC, abstractmethod
 from typing import ClassVar
 
 import pytest
-from litellm import BaseModel
 from pydantic import (
+    BaseModel,
     ConfigDict,
     Field,
     TypeAdapter,
@@ -13,7 +13,6 @@ from pydantic import (
 
 from pyromind_common.sdk.utils.models import (
     DiscriminatedUnionMixin,
-    OpenHandsModel,
 )
 
 
@@ -85,7 +84,7 @@ class Mythical(DiscriminatedUnionMixin, ABC):
         """Get a discription of the mythical beast"""
 
 
-class MythicalPack(OpenHandsModel):
+class MythicalPack(BaseModel):
     mythical: Mythical
 
 

@@ -1,11 +1,9 @@
 from typing import Any, Protocol
 
-from pydantic import Field
-
-from pyromind_common.sdk.utils.models import OpenHandsModel
+from pydantic import BaseModel, Field
 
 
-class ActiveLongTask(OpenHandsModel):
+class ActiveLongTask(BaseModel):
     """A long-running platform task submitted from a conversation.
 
     Tracked on ``ToolState.active_long_tasks`` so the presentation

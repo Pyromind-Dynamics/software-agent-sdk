@@ -3,7 +3,7 @@
 Mirrors the data-preparation platform submission pattern (``df_submit_pipeline``):
 stage the frozen runner + profile + pod runtime into a per-run Storage
 directory, build one ``CustomCommandCPUNode`` workflow per shard manifest
-whose command installs openhands-tools, injects credentials, and runs the
+whose command stages the Pyromind runtime, injects credentials, and runs the
 skill's ``sandbox_runner.py`` against the shard's Storage manifest, then
 submit and let the Kafka terminal callback resume the conversation.
 
@@ -80,9 +80,9 @@ MANIFEST_FILENAME = "manifest.jsonl"
 OUTPUT_SUBDIR = "run"  # runner --output-dir inside the pod mount
 SHARDS_INDEX_MAX_BYTES = 4 * 1024 * 1024  # shards.json is a small path index
 
-# The CustomCommandCPUNode pod runs Python 3.10 (conda), while the openhands
+# The CustomCommandCPUNode pod runs Python 3.10 (conda), while the full Pyromind
 # distributions require Python >= 3.12. The pod runtime stages a minimal
-# openhands namespace (processing_profile.py verbatim + a sandbox client
+# pyromind_common namespace (processing_profile.py verbatim + a sandbox client
 # shim) into the run's Storage mount, and the node installs only
 # pyromind-sdk from PyPI.
 POD_RUNTIME_DIR = "pod_runtime"
@@ -113,7 +113,7 @@ Submit environment-processing batches to Pyromind platform execution.
 
 Each shard manifest is submitted as its own one-node CustomCommandCPUNode
 workflow: the tool freezes the skill's sandbox_runner.py, the chosen
-ProcessingProfile, and a minimal pod runtime (openhands namespace shim +
+ProcessingProfile, and a minimal pod runtime (pyromind_common namespace shim +
 pod_requirements.txt) into a per-run Storage directory, then the node
 installs pyromind-sdk and httpx (Python 3.10 pod), injects the platform
 auth_token and the coding-agent LLM triple (conversation secrets, DF_*
@@ -423,9 +423,9 @@ def build_edp_command(
     if dedup_by_image:
         runner_args.append("--dedup-by-image")
 
-    # PYTHONPATH makes the staged pod_runtime openhands namespace visible;
+    # PYTHONPATH makes the staged pod_runtime pyromind_common namespace visible;
     # the frozen runner then imports processing_profile + the sandbox shim
-    # from the Storage mount instead of the (unavailable) openhands wheels.
+    # from the Storage mount instead of the (unavailable) full Pyromind distributions.
     pipeline_step = (
         f"{env_prefix} "
         f"PYTHONPATH={shlex.quote(pod_output)} "
@@ -558,7 +558,7 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
             conversation, runtime_dir, profile_path, profile_name, output_dir
         )
         # pod_runtime is uploaded preserving its relative tree so the pod's
-        # PYTHONPATH=<output_dir> resolves the openhands namespace shim.
+        # PYTHONPATH=<output_dir> resolves the pyromind_common namespace shim.
         for path in sorted(pod_runtime_dir.rglob("*")):
             if not path.is_file():
                 continue
