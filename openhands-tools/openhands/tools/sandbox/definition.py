@@ -50,8 +50,9 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.utils.platform_env import (
-    cluster_header,
+    platform_client_route,
     platform_cluster_route,
+    platform_cluster_target,
 )
 from openhands.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -72,16 +73,15 @@ MAX_FILE_TEXT_CHARS = 20000
 
 
 DEFAULT_SANDBOX_IMAGE = "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
+_CN_EAST_SANDBOX_IMAGE = (
+    "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+    "sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
+)
 
 
 def default_sandbox_image(cluster: str | None) -> str:
-    """按集群选择默认镜像，环境后缀不影响镜像选择。"""
-    if platform_cluster_route(cluster).partition("#")[0] == "cn-east-1":
-        return (
-            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
-            "sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
-        )
-    return DEFAULT_SANDBOX_IMAGE
+    _, region = platform_cluster_target(cluster)
+    return _CN_EAST_SANDBOX_IMAGE if region == "cn-east-1" else DEFAULT_SANDBOX_IMAGE
 
 
 def create_sandbox_api_client(
@@ -311,6 +311,7 @@ class SandboxCreateExecutor(
         self.default_image = default_image
 
     def _build_request(self, action: SandboxCreateAction) -> SandboxRequest:
+        route = platform_client_route(self.headers, cluster=self.cluster, env=self.env)
         resources = ResourceConfig(
             cpu=str(action.cpu),
             memory=action.memory or f"{action.cpu * 2}Gi",
@@ -319,11 +320,7 @@ class SandboxCreateExecutor(
             name=action.name,
             sandbox_type=SandboxType.CUSTOM,
             resources=resources,
-            image=(
-                action.image
-                or self.default_image
-                or default_sandbox_image(cluster_header(self.headers) or self.cluster)
-            ),
+            image=action.image or self.default_image or default_sandbox_image(route),
             volume_mounts=[
                 VolumeMount(
                     host_path=mount.host_path,

@@ -75,6 +75,7 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "subagent",
         "ask_user",
         "get_storage_url",
+        "propose_runtime_resources",
     }
     assert (
         ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist

@@ -41,12 +41,13 @@ from openhands.tools.workflow.task_submission import WorkflowResourceValidationE
 
 def test_normalize_storage_path_basic() -> None:
     assert _normalize_storage_path("/foo/bar", "x") == "/foo/bar"
-    assert _normalize_storage_path("foo/bar", "x") == "/foo/bar"
     assert _normalize_storage_path("/foo//bar/", "x") == "/foo/bar"
     assert _normalize_storage_path("/./foo/./bar", "x") == "/foo/bar"
 
 
 def test_normalize_storage_path_errors() -> None:
+    with pytest.raises(ValueError, match="must be absolute"):
+        _normalize_storage_path("foo/bar", "field")
     with pytest.raises(ValueError, match="must not be empty"):
         _normalize_storage_path("", "field")
     with pytest.raises(ValueError, match="must not be empty"):
@@ -90,8 +91,12 @@ def test_build_dataflow_command_structure() -> None:
         image_utils_api_version="1",
     )
     assert "python3 -m venv /tmp/df-venv" in cmd
-    assert "open-dataflow==1.0.13" in cmd
-    assert "opencv-python-headless==4.10.0.84" in cmd
+    assert (
+        "/tmp/df-venv/bin/pip install -r "
+        "/target-workspace/output/run1/runtime-r1/requirements-cpu.txt"
+    ) in cmd
+    assert "/tmp/df-venv/bin/pip install --no-deps open-dataflow==1.0.13" in cmd
+    assert "--use-deprecated=legacy-resolver" not in cmd
     assert "source_fingerprint.py" in cmd
     assert "mkdir -p" in cmd
     assert "/target-workspace/data/input.jsonl" in cmd
@@ -141,11 +146,19 @@ def test_resume_command_rejects_a_changed_source_fingerprint() -> None:
         convert_format="none",
         runtime_dir_name="runtime-r1",
         resumed=True,
+        reuse_runtime=True,
     )
 
     assert "--expected-report" in command
     assert "/output/run-resume/source_integrity.json" in command
     assert "resume_source_guard_rc" in command
+    assert (
+        "if [ -f "
+        "/target-workspace/output/run-resume/runtime-r1/requirements-cpu.txt ]; then"
+    ) in command
+    assert (
+        "else /tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver" in command
+    )
     syntax = subprocess.run(
         ["bash", "-n"], input=command, text=True, capture_output=True, check=False
     )

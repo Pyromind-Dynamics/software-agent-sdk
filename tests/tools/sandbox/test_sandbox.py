@@ -269,6 +269,11 @@ def test_sandbox_upload_uses_the_workspace_mount(
         ("us-west-2", {}, "pyrominddynamics/jupyter-lab-with-ssh:v0.9"),
         (
             "cn-east-1",
+            {"x-cluster": "us-west-2#pre"},
+            "pyrominddynamics/jupyter-lab-with-ssh:v0.9",
+        ),
+        (
+            "cn-east-1",
             {},
             "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
             "sweb.eval.x86_64.astropy_1776_astropy-12907:latest",

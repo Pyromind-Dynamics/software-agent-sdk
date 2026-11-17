@@ -1,8 +1,9 @@
-"""Tests for transient-network retry in the shared workflow submission helper."""
+"""Tests for the shared workflow submission helper."""
 
 from __future__ import annotations
 
 import ssl
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -177,6 +178,86 @@ def test_each_direct_task_checks_resources_before_create():
             )
     assert checked == ["first", "second"]
     assert client.studio.create.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("cluster", "use_handler", "uses_mirror"),
+    [
+        ("cn-east-1", False, True),
+        ("cn-east-1#pre", True, True),
+        ("us-west-2", False, False),
+    ],
+)
+def test_submit_workflow_task_applies_shanghai_pip_index(
+    cluster, use_handler, uses_mirror
+):
+    original = (
+        """sh -c 'printf "%s\\n" "$PIP_INDEX_URL"'\n"""
+        """pip() { printf "%s\\n" "$@"; }\n"""
+        "pip install -i https://private.example/simple package\n"
+        "exit 7"
+    )
+    node_types = [
+        "CustomCommandCPUNode",
+        "CustomCommandNode",
+        "CustomCommandGPUNode",
+        "ModelTrainSFTNode",
+    ]
+    workflow = {
+        "nodes": [
+            {"data": {"nodeType": node_type, "config": {"command": original}}}
+            for node_type in node_types
+        ]
+    }
+    result = SimpleNamespace(task_id="task-1", status="Pending")
+    client = MagicMock()
+    client.studio.cluster = cluster
+    client.studio.create.return_value = result
+    handler = MagicMock(return_value=result) if use_handler else None
+
+    submit_workflow_task(
+        client=client,
+        workflow=workflow,
+        name="test",
+        conversation_id="conversation-1",
+        submission_handler=handler,
+        source_code="source workflow",
+    )
+    if handler:
+        submitted, name, source_code = handler.call_args.args
+        assert name == "test"
+        assert source_code == "source workflow"
+        client.studio.create.assert_not_called()
+    else:
+        submitted = client.studio.create.call_args.args[0].workflow
+
+    mirror = "https://mirrors.aliyun.com/pypi/simple/"
+    expected = f"export PIP_INDEX_URL={mirror}\n{original}" if uses_mirror else original
+    assert [node["data"]["config"]["command"] for node in workflow["nodes"]] == [
+        original
+    ] * len(node_types)
+    commands = [node["data"]["config"]["command"] for node in submitted["nodes"]]
+    assert commands == [expected, expected, expected, original]
+
+    if uses_mirror:
+        completed = subprocess.run(
+            ["bash", "-c", commands[0]], capture_output=True, text=True, check=False
+        )
+        assert completed.returncode == 7
+        assert completed.stdout.splitlines() == [
+            mirror,
+            "install",
+            "-i",
+            "https://private.example/simple",
+            "package",
+        ]
+        submit_workflow_task(
+            client=client,
+            workflow=submitted,
+            name="test",
+            conversation_id="conversation-1",
+        )
+        assert client.studio.create.call_args.args[0].workflow == submitted
 
 
 @pytest.mark.asyncio

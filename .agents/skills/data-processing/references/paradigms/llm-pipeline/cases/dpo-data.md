@@ -101,7 +101,7 @@ storage = storage.step()
 ## 可选打标与过滤
 
 ```python
-from dataflow.operators.text_sft import AlpagasusFilter, RMFilter, RMSampleEvaluator
+from dataflow.operators.text_sft import AlpagasusFilter
 ```
 
 - 需要 LLM 判断偏好强弱时，用 `FormatStrPromptedGenerator` 对

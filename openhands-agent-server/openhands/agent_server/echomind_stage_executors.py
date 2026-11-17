@@ -62,10 +62,26 @@ class ContractProbeExecutor:
         )
 
 
+class PublishedRuntimeOnlyExecutor:
+    def run(
+        self,
+        *,
+        project: ProjectInfo,
+        node: ProjectNode,
+    ) -> StageExecutionResult:
+        del project, node
+        raise RuntimeError("This executor is only available in published Runtime")
+
+
 _CONTRACT_PROBE_EXECUTOR = ContractProbeExecutor()
+_PUBLISHED_RUNTIME_ONLY_EXECUTOR = PublishedRuntimeOnlyExecutor()
 _EXECUTORS: dict[str, ProjectNodeExecutor] = {
+    "artifact_replay": _CONTRACT_PROBE_EXECUTOR,
     "contract_probe": _CONTRACT_PROBE_EXECUTOR,
+    "dataset_runtime": _CONTRACT_PROBE_EXECUTOR,
+    "evaluator_runtime": _PUBLISHED_RUNTIME_ONLY_EXECUTOR,
     "shell": _CONTRACT_PROBE_EXECUTOR,
+    "train_runtime": _PUBLISHED_RUNTIME_ONLY_EXECUTOR,
 }
 
 

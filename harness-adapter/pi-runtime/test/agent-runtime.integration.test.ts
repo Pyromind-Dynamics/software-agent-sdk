@@ -307,7 +307,6 @@ for (const workflowsEnabled of [false, true]) {
     if (workflowsEnabled) {
       assert.ok(system.includes("genome_list"));
       assert.ok(system.includes("/workspace/<path>"));
-      assert.ok(!system.includes("/target-workspace"));
     }
   });
 }

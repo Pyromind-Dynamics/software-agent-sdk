@@ -58,6 +58,35 @@ async def test_archived_report_reads_storage_with_current_request_credentials(
     assert "auth_token" not in files.session_path.read_text()
 
 
+async def test_persisted_workspace_read_skips_recorded_sandbox(archived, monkeypatch):
+    adapter, handle, files = archived
+    files.save_sandbox({"sandbox_id": "existing-sandbox"})
+
+    async def sandbox_workspace(*args, **kwargs):
+        pytest.fail("persisted reads must not acquire the sandbox")
+
+    def download(**kwargs):
+        assert kwargs["storage_path"] == (
+            "/.pyromind-agent/conversation/public_data/graph-repairs/proposal.json"
+        )
+        assert kwargs["headers"]["cookie"] == "auth_token=current"
+        assert kwargs["timeout"] == 3
+        return b'{"node_id":"eval"}'
+
+    monkeypatch.setattr(adapter._sandbox, "workspace", sandbox_workspace)
+    monkeypatch.setattr(adapter_module, "download_file_from_pyromind", download)
+    assert (
+        await adapter.read_persisted_workspace_text(
+            handle,
+            "public_data/graph-repairs/proposal.json",
+            RequestContext(user_id="42", cookie="auth_token=current"),
+            max_bytes=2048,
+        )
+        == '{"node_id":"eval"}'
+    )
+    assert not adapter._sessions
+
+
 @pytest.mark.parametrize(
     "path",
     [

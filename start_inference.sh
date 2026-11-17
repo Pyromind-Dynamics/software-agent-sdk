@@ -236,8 +236,8 @@ fi
 # Keep DataFlow outside the agent-server venv: some native dependencies do not
 # provide Python 3.13 wheels. Every harness inherits the same interpreter via
 # DATAFLOW_PYTHON, so adapters do not need harness-specific setup.
-DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.10}"
-DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-venv}"
+DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.13}"
+DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-cpu-venv}"
 
 if [[ -z "${DATAFLOW_PYTHON:-}" ]]; then
   export DATAFLOW_PYTHON="${DATAFLOW_RUNTIME_DIR}/bin/python"
@@ -252,7 +252,19 @@ elif [[ ! -x "${DATAFLOW_PYTHON}" ]]; then
 fi
 export DATAFLOW_PYTHON
 
-if ! "${DATAFLOW_PYTHON}" -c '
+DATAFLOW_CPU_REQUIREMENTS="${PYROMIND_SKILLS_PATH}/data-processing/scripts/preparation/requirements-cpu.txt"
+DATAFLOW_RUNTIME_STAMP="$("${DATAFLOW_PYTHON}" -c '
+import hashlib
+import sys
+from pathlib import Path
+
+print(f"{sys.argv[1]}:{hashlib.sha256(Path(sys.argv[2]).read_bytes()).hexdigest()}")
+' "${DATAFLOW_VERSION}" "${DATAFLOW_CPU_REQUIREMENTS}")"
+DATAFLOW_STAMP_PATH="$(dirname "${DATAFLOW_PYTHON}")/../open-dataflow-version"
+
+if [[ ! -f "${DATAFLOW_STAMP_PATH}" ]] || \
+   [[ "$(cat "${DATAFLOW_STAMP_PATH}")" != "${DATAFLOW_RUNTIME_STAMP}" ]] || \
+   ! "${DATAFLOW_PYTHON}" -c '
 import importlib.metadata
 import sys
 
@@ -260,10 +272,11 @@ import dataflow
 
 sys.exit(importlib.metadata.version("open-dataflow") != sys.argv[1])
 ' "${DATAFLOW_VERSION}" 2>/dev/null; then
-  echo "Installing open-dataflow==${DATAFLOW_VERSION} into shared runtime..."
-  uv pip install \
-    --python "${DATAFLOW_PYTHON}" \
+  echo "Installing DataFlow CPU dependencies into shared runtime..."
+  uv pip install --python "${DATAFLOW_PYTHON}" -r "${DATAFLOW_CPU_REQUIREMENTS}"
+  uv pip install --python "${DATAFLOW_PYTHON}" --no-deps \
     "open-dataflow==${DATAFLOW_VERSION}"
+  printf '%s\n' "${DATAFLOW_RUNTIME_STAMP}" > "${DATAFLOW_STAMP_PATH}"
 fi
 
 "${DATAFLOW_PYTHON}" -c '

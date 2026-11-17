@@ -56,6 +56,7 @@ from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
 
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
+    RuntimeResourceProposer,
     ToolExecutionContext,
     _forward_headers,
 )
@@ -465,6 +466,9 @@ class PiAdapter:
     def set_workflow_preparer(self, callback: Any) -> None:
         self._business_tools.set_workflow_preparer(callback)
 
+    def set_runtime_resource_proposer(self, callback: RuntimeResourceProposer) -> None:
+        self._business_tools.set_runtime_resource_proposer(callback)
+
     def _prepare_session_workspace(self, root: Path, *, create: bool) -> None:
         return _prepare_workspace(
             root,
@@ -635,6 +639,30 @@ class PiAdapter:
             max_bytes=max_bytes,
         )
 
+    async def read_persisted_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        if self._terminal_backend != "sandbox":
+            return await self.read_workspace_text(
+                handle, path, context, max_bytes=max_bytes
+            )
+        root = self._safe_conversation_dir(handle.session_id)
+        config = PiSessionFiles(root).load_session()
+        extra = config.get("extra")
+        return await self._read_stored_workspace_text(
+            handle.session_id,
+            extra if isinstance(extra, dict) else {},
+            context,
+            path,
+            max_bytes,
+            timeout=3,
+        )
+
     async def _read_session_workspace_text(
         self,
         session: _PiSession,
@@ -645,7 +673,9 @@ class PiAdapter:
         if self._terminal_backend == "sandbox" and not self._has_execution_workspace(
             session
         ):
-            return await self._read_stored_workspace_text(session, path, max_bytes)
+            return await self._read_stored_workspace_text(
+                session.session_id, session.extra, session.context, path, max_bytes
+            )
         workspace = await self._workspace(session)
         try:
             return await asyncio.to_thread(
@@ -656,7 +686,9 @@ class PiAdapter:
             )
         except WorkspaceFileNotFoundError:
             if self._terminal_backend == "sandbox":
-                return await self._read_stored_workspace_text(session, path, max_bytes)
+                return await self._read_stored_workspace_text(
+                    session.session_id, session.extra, session.context, path, max_bytes
+                )
             return None
         except ValueError as exc:
             raise OSError(str(exc)) from exc
@@ -687,29 +719,32 @@ class PiAdapter:
 
     async def _read_stored_workspace_text(
         self,
-        session: _PiSession,
+        session_id: str,
+        extra: dict[str, Any],
+        context: RequestContext,
         path: str,
         max_bytes: int | None,
+        *,
+        timeout: float = 30,
     ) -> str | None:
         """Mounted workspace files survive the container's lifecycle in Storage."""
         relative = PurePosixPath(path)
         if relative.is_absolute() or ".." in relative.parts or "\\" in path:
             raise ValueError("Path must stay inside the conversation workspace")
-        context = session.context
         if not context.cookie and not context.authorization:
             return None
         base_url = (
-            session.extra.get("storage_base_url")
-            or session.extra.get("storage_api_base_url")
+            extra.get("storage_base_url")
+            or extra.get("storage_api_base_url")
             or _default_storage_base_url()
         )
         try:
             body = await asyncio.to_thread(
                 download_file_from_pyromind,
-                storage_path=f"{PYROMIND_AGENT_STORAGE_ROOT}/{session.session_id}/{relative.as_posix()}",
+                storage_path=f"{PYROMIND_AGENT_STORAGE_ROOT}/{session_id}/{relative.as_posix()}",
                 storage_base_url=base_url,
                 headers=_forward_headers(context, include_cookie=True),
-                timeout=30,
+                timeout=timeout,
                 max_bytes=max_bytes if max_bytes is not None else 2 * 1024 * 1024,
             )
             return body.decode("utf-8")

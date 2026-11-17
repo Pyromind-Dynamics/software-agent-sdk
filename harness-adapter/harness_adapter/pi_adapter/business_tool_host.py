@@ -13,7 +13,10 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
+from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
@@ -351,6 +354,11 @@ class _ToolConversationFacade:
 
 
 ToolFactory = Callable[[ToolExecutionContext], ToolDefinition[Any, Any]]
+RuntimeResourceProposer = Callable[
+    [str, JsonObject, RequestContext], Awaitable[JsonObject]
+]
+
+_RUNTIME_RESOURCE_PROPOSAL_TOOL = "propose_runtime_resources"
 
 
 class PyromindBusinessToolHost:
@@ -391,6 +399,7 @@ class PyromindBusinessToolHost:
         self.training_artifact_hook: Callable[..., Awaitable[int]] | None = None
         self.execution_call: ExecutionCall | None = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
+        self._runtime_resource_proposer: RuntimeResourceProposer | None = None
         for path in (
             self._cleaning_runtime,
             self._preparation_runtime,
@@ -530,6 +539,20 @@ class PyromindBusinessToolHost:
                     },
                 ).as_dict()
             )
+        if self._runtime_resource_proposer is not None:
+            specs.append(
+                BusinessToolSpec(
+                    _RUNTIME_RESOURCE_PROPOSAL_TOOL,
+                    "Prepare a Serving Inference and Tracer proposal for the "
+                    "current EchoMind Project. The user reviews and confirms it "
+                    "in the project workbench before resources are created or bound. "
+                    "Use the confirmed model name. To create Inference, provide "
+                    "the Storage model path and GPU type. To attach an existing "
+                    "Tracer, also provide its current Inference ID. "
+                    "Never pass credentials.",
+                    RuntimeResourceProposalArguments.model_json_schema(),
+                ).as_dict()
+            )
         tools: list[ToolDefinition[Any, Any]] = [
             UpdatePlanTool.create(cast(Any, SimpleNamespace(persistence_dir=None)))[0]
         ]
@@ -580,6 +603,9 @@ class PyromindBusinessToolHost:
     ) -> None:
         self._workflow_preparer = callback
 
+    def set_runtime_resource_proposer(self, callback: RuntimeResourceProposer) -> None:
+        self._runtime_resource_proposer = callback
+
     async def execute(
         self,
         name: str,
@@ -590,6 +616,38 @@ class PyromindBusinessToolHost:
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         origin = context.request_context.task_origin or TaskOrigin()
+        if name == _RUNTIME_RESOURCE_PROPOSAL_TOOL:
+            if self._runtime_resource_proposer is None or origin.type != "main":
+                raise PermissionError("Runtime resource proposals require the Manager.")
+            try:
+                proposal_args = RuntimeResourceProposalArguments.model_validate(
+                    arguments
+                ).model_dump(mode="json", exclude_none=True)
+            except ValidationError:
+                return BusinessToolResult(
+                    is_error=True,
+                    content=[
+                        {"type": "text", "text": "Invalid runtime resource options."}
+                    ],
+                    details={},
+                ).as_dict()
+            try:
+                proposal = await self._runtime_resource_proposer(
+                    context.conversation_id, proposal_args, context.request_context
+                )
+            except (ProductRuntimeError, ValueError) as exc:
+                return BusinessToolResult(
+                    is_error=True,
+                    content=[{"type": "text", "text": str(exc)}],
+                    details={},
+                ).as_dict()
+            return BusinessToolResult(
+                is_error=False,
+                content=[
+                    {"type": "text", "text": json.dumps(proposal, ensure_ascii=False)}
+                ],
+                details=proposal,
+            ).as_dict()
         if name == ProductVersionsTool.name:
             if self.version_call is None:
                 raise ValueError("version management is unavailable")

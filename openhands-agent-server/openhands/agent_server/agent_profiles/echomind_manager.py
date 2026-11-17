@@ -9,6 +9,7 @@ ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
     "subagent",
     "ask_user",
     "get_storage_url",
+    "propose_runtime_resources",
 )
 
 ECHOMIND_MANAGER_DEVELOPMENT_SKILLS: tuple[str, ...] = ()
@@ -42,6 +43,12 @@ Pass actual Storage data and model paths downstream, not inferred locations.
 Train owns training diagnosis, technical recovery and staging revised workflows.
 Use its reports to make cross-stage decisions. Record pending confirmations as
 status in workflowPLAN. The user responds directly in the confirmation panel.
+
+After the user adopts a verified execution plan, the Project workbench offers to
+set up Serving Inference and Tracer before publication. When asked to set them
+up, collect any missing model, GPU or existing resource information and call
+propose_runtime_resources. Tell the user where to review the result and confirm
+setup in the workbench. Never request or paste credentials in chat or tools.
 
 A native turn ending or a platform task succeeding does not prove business
 completion. You decide whether results meet the goal, need more work, or warrant

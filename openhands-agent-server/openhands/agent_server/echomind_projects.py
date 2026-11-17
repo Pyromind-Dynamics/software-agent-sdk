@@ -20,11 +20,18 @@ from openhands.agent_server.echomind_graph_templates import (
     EXPERIMENT_PLANNING_SKILL,
     build_graph_payload,
 )
+from openhands.agent_server.echomind_storage import ProjectLease, canonical_uuid
 
 
 ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
 ProjectLifecycle = Literal["development", "frozen"]
 ProjectNodeLaunchMode = Literal["agent", "executor"]
+ProjectNodeInputBindingKind = Literal[
+    "run_input",
+    "node_output",
+    "runtime_slot",
+    "literal",
+]
 RequirementStatus = Literal["confirmed", "missing"]
 ProjectNodeStatus = Literal[
     "idle",
@@ -49,6 +56,41 @@ class ProjectRequirement(BaseModel):
     status: RequirementStatus
 
 
+class ProjectNodeInputBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: ProjectNodeInputBindingKind
+    name: str | None = Field(default=None, max_length=128)
+    node_id: str | None = Field(default=None, max_length=128)
+    port: str | None = Field(default=None, max_length=128)
+    value: Any = None
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> ProjectNodeInputBinding:
+        if self.kind in {"run_input", "runtime_slot"} and not self.name:
+            raise ValueError(f"{self.kind} binding requires a name")
+        if self.kind == "node_output" and not (self.node_id and self.port):
+            raise ValueError("node_output binding requires node_id and port")
+        return self
+
+
+class ProjectNodeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_type: str = Field(min_length=1, max_length=256)
+    schema_ref: str = Field(min_length=1, max_length=512)
+    required: bool = True
+    binding: ProjectNodeInputBinding
+
+
+class ProjectNodeOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_type: str = Field(min_length=1, max_length=256)
+    schema_ref: str = Field(min_length=1, max_length=512)
+    required: bool = True
+
+
 class ProjectNode(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -56,9 +98,19 @@ class ProjectNode(BaseModel):
     type: ProjectNodeType
     title: str = Field(min_length=1, max_length=256)
     status: ProjectNodeStatus = "idle"
+    task_type: str | None = Field(default=None, max_length=256)
+    execution_role: str | None = Field(default=None, max_length=128)
     launch_mode: ProjectNodeLaunchMode = "executor"
     executor: str = Field(default="contract_probe", min_length=1, max_length=128)
+    implementation_ref: str | None = Field(default=None, max_length=4000)
+    implementation_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    inputs: dict[str, ProjectNodeInput] = Field(default_factory=dict)
+    outputs: dict[str, ProjectNodeOutput] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
+    policies: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProjectEdge(BaseModel):
@@ -81,7 +133,13 @@ class ProjectRecord(BaseModel):
     conversation_id: str
     cluster: str
     lifecycle: ProjectLifecycle = "development"
+    active_release_id: str | None = None
     frozen_at: datetime | None = None
+    source_project_id: str | None = None
+    runtime_contract_sha256: str | None = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+    validation_project_id: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -101,6 +159,7 @@ class ProjectGraph(BaseModel):
         node_ids = {node.id for node in self.nodes}
         if len(node_ids) != len(self.nodes):
             raise ValueError("graph node IDs must be unique")
+        nodes_by_id = {node.id: node for node in self.nodes}
 
         adjacency: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
         for edge in self.edges:
@@ -109,6 +168,23 @@ class ProjectGraph(BaseModel):
             if edge.source not in node_ids or edge.target not in node_ids:
                 raise ValueError("graph edge references an unknown node")
             adjacency[edge.source].append(edge.target)
+
+        for node in self.nodes:
+            for input_name, node_input in node.inputs.items():
+                binding = node_input.binding
+                if binding.kind != "node_output":
+                    continue
+                source = nodes_by_id.get(binding.node_id or "")
+                if source is None:
+                    raise ValueError(
+                        f"node input {node.id}.{input_name} references "
+                        "an unknown source node"
+                    )
+                if binding.port not in source.outputs:
+                    raise ValueError(
+                        f"node input {node.id}.{input_name} references "
+                        "an unknown source output"
+                    )
 
         visiting: set[str] = set()
         visited: set[str] = set()
@@ -155,6 +231,9 @@ class ProjectSummary(BaseModel):
     conversation_id: str
     cluster: str
     lifecycle: ProjectLifecycle
+    source_project_id: str | None = None
+    runtime_contract_sha256: str | None = None
+    validation_project_id: str | None = None
     node_count: int
     created_at: datetime
     updated_at: datetime
@@ -215,6 +294,19 @@ class ProjectStore:
             owner_user_id=owner_user_id,
         )
 
+    def save(self, project: ProjectInfo) -> ProjectInfo:
+        project_dir = self.root / canonical_uuid(
+            project.project.project_id,
+            kind="project",
+        )
+        project_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _write_json(project_dir / "graph.json", project.graph.model_dump(mode="json"))
+        _write_json(
+            project_dir / "project.json",
+            project.project.model_dump(mode="json"),
+        )
+        return project
+
     def _bind(
         self,
         *,
@@ -232,54 +324,51 @@ class ProjectStore:
         except ValueError as exc:
             raise ValueError("plan revision has an invalid project_id") from exc
 
-        final_dir = self.root / canonical_project_id
-        existing = self._load_optional(canonical_project_id)
-        if existing is not None:
-            if (
-                existing.project.owner_user_id != owner_user_id
-                or existing.project.conversation_id != conversation_id
-                or existing.project.cluster != cluster
-            ):
-                raise PermissionError("Project belongs to another owner")
-            graph_id = existing.graph.graph_id
-            created_at = existing.project.created_at
-        else:
-            graph_id = str(uuid4())
-            created_at = _utc_now()
+        with ProjectLease(self.root, canonical_project_id).acquire():
+            existing = self._load_optional(canonical_project_id)
+            if existing is not None:
+                if (
+                    existing.project.owner_user_id != owner_user_id
+                    or existing.project.conversation_id != conversation_id
+                    or existing.project.cluster != cluster
+                ):
+                    raise PermissionError("Project belongs to another owner")
+                if existing.project.lifecycle == "frozen":
+                    return existing
+                graph_id = existing.graph.graph_id
+                created_at = existing.project.created_at
+            else:
+                graph_id = str(uuid4())
+                created_at = _utc_now()
 
-        node_payloads, edge_payloads = build_graph_payload(plan=plan)
-        project = ProjectRecord(
-            project_id=project_id,
-            name=name,
-            description=description,
-            skill=skill,
-            requirements=_requirements_from_plan(plan),
-            owner_user_id=owner_user_id,
-            conversation_id=conversation_id,
-            cluster=cluster,
-            lifecycle="development",
-            created_at=created_at,
-        )
-        graph = ProjectGraph(
-            graph_id=graph_id,
-            project_id=project_id,
-            template=EXPERIMENT_GRAPH_TEMPLATE,
-            lifecycle="development",
-            nodes=[
-                ProjectNode.model_validate(node_payload)
-                for node_payload in node_payloads
-            ],
-            edges=[
-                ProjectEdge.model_validate(edge_payload)
-                for edge_payload in edge_payloads
-            ],
-        )
-
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        final_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _write_json(final_dir / "project.json", project.model_dump(mode="json"))
-        _write_json(final_dir / "graph.json", graph.model_dump(mode="json"))
-        return ProjectInfo(project=project, graph=graph)
+            node_payloads, edge_payloads = build_graph_payload(plan=plan)
+            project = ProjectRecord(
+                project_id=project_id,
+                name=name,
+                description=description,
+                skill=skill,
+                requirements=_requirements_from_plan(plan),
+                owner_user_id=owner_user_id,
+                conversation_id=conversation_id,
+                cluster=cluster,
+                lifecycle="development",
+                created_at=created_at,
+            )
+            graph = ProjectGraph(
+                graph_id=graph_id,
+                project_id=project_id,
+                template=EXPERIMENT_GRAPH_TEMPLATE,
+                lifecycle="development",
+                nodes=[
+                    ProjectNode.model_validate(node_payload)
+                    for node_payload in node_payloads
+                ],
+                edges=[
+                    ProjectEdge.model_validate(edge_payload)
+                    for edge_payload in edge_payloads
+                ],
+            )
+            return self.save(ProjectInfo(project=project, graph=graph))
 
     def load(
         self,
@@ -334,6 +423,9 @@ class ProjectStore:
                     conversation_id=project.project.conversation_id,
                     cluster=project.project.cluster,
                     lifecycle=project.project.lifecycle,
+                    source_project_id=project.project.source_project_id,
+                    runtime_contract_sha256=project.project.runtime_contract_sha256,
+                    validation_project_id=project.project.validation_project_id,
                     node_count=len(project.graph.nodes),
                     created_at=created_at,
                     updated_at=updated_at,
@@ -364,6 +456,9 @@ class ProjectStore:
         graph = ProjectGraph.model_validate_json(graph_path.read_text(encoding="utf-8"))
         if graph.project_id != project.project_id:
             raise ValueError("project graph belongs to another project")
+        if graph.lifecycle != project.lifecycle:
+            # project.json commits a lifecycle transition after graph.json is written.
+            graph = graph.model_copy(update={"lifecycle": project.lifecycle})
         return ProjectInfo(project=project, graph=graph)
 
 

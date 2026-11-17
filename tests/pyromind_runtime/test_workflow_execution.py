@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.domain.commands import (
     UserMessageCommand,
 )
-from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
@@ -559,3 +560,56 @@ async def test_request_id_is_generated_only_after_resource_admission(
         ).load_workflow_execution_requests()
     finally:
         await runtime.close()
+
+
+async def test_pi_manager_can_propose_runtime_resources_for_review(tmp_path):
+    skills = Path(__file__).parents[2] / ".agents" / "skills"
+    host = PyromindBusinessToolHost(
+        [skills / "data-processing", skills / "training-analysis"]
+    )
+    tool = "propose_runtime_resources"
+    context = ToolExecutionContext(
+        conversation_id="conversation-1",
+        workspace_root=tmp_path,
+        request_context=RequestContext(user_id="42", profile_id="echomind"),
+        model_configuration={},
+    )
+    calls: list[tuple[str, JsonObject, RequestContext]] = []
+
+    async def propose(
+        conversation_id: str, arguments: JsonObject, request_context: RequestContext
+    ) -> JsonObject:
+        calls.append((conversation_id, arguments, request_context))
+        return {"status": "awaiting_confirmation", "proposal_id": "proposal-1"}
+
+    assert tool not in {spec["name"] for spec in host.specs()}
+    host.set_runtime_resource_proposer(propose)
+    assert tool in {spec["name"] for spec in host.specs()}
+    result = await host.execute(
+        tool,
+        {"inference_id": "inference-1", "model_name": "model", "batch_size": 12},
+        context,
+    )
+    assert result["details"]["status"] == "awaiting_confirmation"
+    invalid = await host.execute(tool, {"admin_key": "fixture-secret"}, context)
+    assert invalid["is_error"]
+    assert "fixture-secret" not in str(invalid)
+    with pytest.raises(PermissionError):
+        await host.execute(
+            tool,
+            {},
+            replace(
+                context,
+                request_context=replace(
+                    context.request_context,
+                    task_origin=TaskOrigin(type="subagent", subagent_id="train-1"),
+                ),
+            ),
+        )
+    assert calls == [
+        (
+            "conversation-1",
+            {"inference_id": "inference-1", "model_name": "model", "batch_size": 12},
+            context.request_context,
+        )
+    ]

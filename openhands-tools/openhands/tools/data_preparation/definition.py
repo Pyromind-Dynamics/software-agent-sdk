@@ -30,7 +30,7 @@ from openhands.sdk.tool import (
 )
 from openhands.sdk.workspace.workspace import LocalWorkspace
 from openhands.tools.data_preparation.runner import (
-    DATAFLOW_RUNTIME_PACKAGES,
+    DATAFLOW_RUNTIME_FILENAMES,
     SUPPORTED_DATAFLOW_VERSION,
     LabelingModelGateway,
     ProcessLocalSampleExecutor,
@@ -70,15 +70,7 @@ from openhands.tools.utils.workspace_staging import (
 )
 
 
-RUNTIME_FILENAMES = (
-    "avi_pcb_runtime.py",
-    "df_logging.py",
-    "generate_report.py",
-    "image_utils.py",
-    "preparation_runtime.py",
-    "source_fingerprint.py",
-    "validate_prepared_data.py",
-)
+RUNTIME_FILENAMES = DATAFLOW_RUNTIME_FILENAMES
 
 _LOG_TAIL_CHARS = 6000
 _MANIFEST_RECORD_LIMIT = 50
@@ -1051,7 +1043,6 @@ class DfRunPipelineExecutor(ToolExecutor):
             or None,
             "venv": sandbox_dataflow_venv(SUPPORTED_DATAFLOW_VERSION),
             "dataflow_version": SUPPORTED_DATAFLOW_VERSION,
-            "packages": list(DATAFLOW_RUNTIME_PACKAGES),
             "model_profile": action.model_profile,
             "cwd": str(pipeline.absolute.parent),
             "pipeline": str(pipeline.absolute),

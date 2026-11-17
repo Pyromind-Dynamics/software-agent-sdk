@@ -319,10 +319,33 @@ def test_create_uses_cluster_default_or_explicit_image(cluster: str, image: str 
     assert client.requests[0].image == (image or expected)
 
 
+@pytest.mark.parametrize(
+    ("cluster", "image", "terminal_host"),
+    [
+        (
+            "us-west-1",
+            "pyrominddynamics/jupyter-lab-with-ssh:v0.9",
+            "pre-api.pyromind.ai",
+        ),
+        (
+            "cn-east-1",
+            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+            "sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+            "pre-api-cn-east-1.pyromind-asia.cn",
+        ),
+    ],
+)
 def test_ensure_creates_and_prepares_a_sandbox(
-    tmp_path: Path, files: PiSessionFiles, monkeypatch
+    tmp_path: Path,
+    files: PiSessionFiles,
+    monkeypatch,
+    cluster: str,
+    image: str,
+    terminal_host: str,
 ) -> None:
     client = _FakeSandboxClient()
+    client.cluster = cluster
+    monkeypatch.delenv("PYROMIND_SANDBOX_IMAGE", raising=False)
     commands: list[str] = []
     monkeypatch.setattr(
         "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
@@ -338,6 +361,7 @@ def test_ensure_creates_and_prepares_a_sandbox(
 
     assert client.lifecycle_calls == ["create:running"]
     assert client.requests[0].sandbox_type is SandboxType.CUSTOM
+    assert client.requests[0].image == image
     assert client.requests[0].resources == ResourceConfig(cpu="4", memory="8Gi")
     assert client.requests[0].volume_mounts == [
         VolumeMount(
@@ -348,12 +372,12 @@ def test_ensure_creates_and_prepares_a_sandbox(
     ]
     assert endpoint == {
         "base_url": "https://pre-api.pyromind.ai/api/v1",
-        "ws_base_url": "https://pre-api.pyromind.ai/api/v1",
+        "ws_base_url": f"https://{terminal_host}/api/v1",
         "sandbox_id": "sbx-1",
         "api_key": "access-key",
         "workspace_path": f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1",
         "storage_path": DEFAULT_MOUNT_PATH,
-        "cluster": "us-west-1",
+        "cluster": cluster,
     }
     # The TTY bridge echoes the command line, so the script must be shipped as a
     # file and the command itself must stay free of markers.

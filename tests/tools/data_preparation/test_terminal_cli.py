@@ -1,6 +1,7 @@
 """DataFlow's public terminal entry, without the removed business Tool."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -358,7 +359,6 @@ def interpreter_spec(venv, **overrides):
         "python": None,
         "venv": str(venv),
         "dataflow_version": "1.0.13",
-        "packages": ["open-dataflow==1.0.13"],
         "system_python": sys.executable,
     }
     spec.update(overrides)
@@ -404,38 +404,52 @@ def test_configured_interpreter_with_the_wrong_version_is_an_error(
     assert "0.9.9" in detail and "expected 1.0.13" in detail
 
 
-def test_cached_venv_is_reused_only_for_the_pinned_version(runtime, tmp_path):
+def test_cached_venv_is_reused_only_for_matching_cpu_requirements(runtime, tmp_path):
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin/python").write_text("")
+    requirements = tmp_path / "requirements-cpu.txt"
+    requirements.write_text("requests\n")
+    spec = interpreter_spec(venv, runtime_dir=tmp_path)
     stamp = venv / "open-dataflow-version"
-    stamp.write_text("0.9.0")
-    assert runtime._cached_venv_python(interpreter_spec(venv)) is None
     stamp.write_text("1.0.13")
-    assert runtime._cached_venv_python(interpreter_spec(venv)) == str(
-        venv / "bin/python"
-    )
+    assert runtime._cached_venv_python(spec) is None
+
+    digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+    stamp.write_text(f"1.0.13:{digest}")
+    assert runtime._cached_venv_python(spec) == str(venv / "bin/python")
+
+    requirements.write_text("requests\nhttpx\n")
+    assert runtime._cached_venv_python(spec) is None
 
 
 def test_prepare_installs_once_and_then_reuses_the_cached_venv(
     runtime, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(runtime, "_image_interpreters", lambda: ())
-    # A stub system interpreter keeps the bootstrap contract under test without
-    # reaching PyPI: it only has to materialize the venv's own interpreter.
-    system_python = tmp_path / "system-python"
-    system_python.write_text(
-        "#!/bin/sh\n"
-        'venv="$3"\n'
-        'mkdir -p "$venv/bin"\n'
-        "printf '#!/bin/sh\\nexit 0\\n' > \"$venv/bin/python\"\n"
-        'chmod +x "$venv/bin/python"\n'
-    )
-    system_python.chmod(0o755)
+    monkeypatch.setattr(runtime, "_interpreter_version", lambda python: None)
     venv = tmp_path / "venv"
-    spec = interpreter_spec(venv, system_python=str(system_python))
+    python = venv / "bin/python"
+    requirements = tmp_path / "requirements-cpu.txt"
+    requirements.write_text("requests\n")
+    spec = interpreter_spec(venv, runtime_dir=tmp_path)
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append(argv)
+        if argv[1:3] == ["-m", "venv"]:
+            python.parent.mkdir(parents=True)
+            python.touch()
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
     first = runtime._interpreter_report(spec, prepare=True)
     assert first["ready"] is True and first["source"] == "installed"
-    assert (venv / "open-dataflow-version").read_text() == "1.0.13"
     second = runtime._interpreter_report(spec, prepare=True)
     assert second["ready"] is True and second["source"] == "reused"
+    pip_install = [str(python), "-m", "pip", "install", "--quiet"]
+    assert commands == [
+        [sys.executable, "-m", "venv", str(venv)],
+        [*pip_install, "-r", str(requirements)],
+        [*pip_install, "--no-deps", "open-dataflow==1.0.13"],
+    ]

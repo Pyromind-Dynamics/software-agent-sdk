@@ -30,6 +30,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
         runtime.preparation_call, runtime.preparation_revision
     )
     adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
+    adapter.set_runtime_resource_proposer(AsyncMock())
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     try:
@@ -82,9 +83,13 @@ async def test_actual_manager_and_eval_host_create_through_api(
             assert {"read", "write", "edit", "terminal"} <= set(
                 session.config["tool_allowlist"]
             )
-            assert not {"grep", "find", "ls", "subagent"}.intersection(
-                session.config["tool_allowlist"]
-            )
+            assert not {
+                "grep",
+                "find",
+                "ls",
+                "subagent",
+                "propose_runtime_resources",
+            }.intersection(session.config["tool_allowlist"])
             ensure = AsyncMock(return_value={"sandbox_id": "preparation-sandbox"})
             monkeypatch.setattr(adapter._sandbox, "ensure", ensure)
             assert await adapter._runner_request(session, "sandbox.ensure", {}) == {
@@ -111,10 +116,12 @@ async def test_actual_manager_and_eval_host_create_through_api(
                 "subagent",
                 "ask_user",
                 "get_storage_url",
+                "propose_runtime_resources",
             }
             assert not session.config["skill_allowlist"]
             assert {item["name"] for item in adapter._tool_specs(session)} == {
                 "get_storage_url",
+                "propose_runtime_resources",
             }
 
             execute = AsyncMock(

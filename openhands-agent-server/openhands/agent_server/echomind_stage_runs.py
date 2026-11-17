@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from openhands.agent_server.echomind_graph_runs import ArtifactRef, TaskRun
 from openhands.agent_server.echomind_projects import (
     ProjectInfo,
     ProjectNode,
@@ -22,7 +23,18 @@ from openhands.agent_server.echomind_stage_executors import (
 )
 
 
-StageRunStatus = Literal["running", "succeeded", "failed"]
+StageRunStatus = Literal[
+    "pending",
+    "clarifying",
+    "running",
+    "waiting_user",
+    "waiting_external",
+    "paused",
+    "succeeded",
+    "failed",
+    "canceled",
+]
+StageRunMode = Literal["node_validation", "agent_development", "published_run"]
 
 
 def _utc_now() -> datetime:
@@ -57,18 +69,55 @@ class StageRun(BaseModel):
 
     schema_version: Literal[1] = 1
     run_id: str
+    graph_run_id: str | None = None
     project_id: str
     node_id: str
     node_type: ProjectNodeType
+    mode: StageRunMode = "node_validation"
+    attempt: int = Field(default=1, ge=1)
     executor: str
+    executor_kind: str | None = None
+    task_type: str | None = None
+    implementation_ref: str | None = None
+    implementation_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
     status: StageRunStatus
     message: str
     input_refs: list[str] = Field(default_factory=list)
+    output_refs: list[ArtifactRef] = Field(default_factory=list)
+    task_runs: list[TaskRun] = Field(default_factory=list)
     artifacts: list[ProjectArtifact] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    reused_from_stage_run_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_run_state(self) -> StageRun:
+        if self.reused_from_stage_run_id is not None and (
+            self.status != "succeeded" or not self.graph_run_id or self.task_runs
+        ):
+            raise ValueError("A reused StageRun must be a successful graph stage")
+        if self.mode == "published_run" and not self.graph_run_id:
+            raise ValueError("published StageRun requires a graph_run_id")
+        if any(task_run.stage_run_id != self.run_id for task_run in self.task_runs):
+            raise ValueError("StageRun task_runs must belong to the StageRun")
+        if self.status in {"running", "waiting_external", "paused"}:
+            if self.started_at is None:
+                raise ValueError(f"{self.status} StageRun requires started_at")
+        if self.status in {"succeeded", "failed", "canceled"}:
+            if self.finished_at is None:
+                raise ValueError(f"{self.status} StageRun requires finished_at")
+        elif self.finished_at is not None:
+            raise ValueError("non-terminal StageRun must not have finished_at")
+        if self.status == "failed" and not self.error:
+            raise ValueError("failed StageRun requires an error")
+        return self
 
 
 class ProjectArtifactDocument(BaseModel):
@@ -88,20 +137,55 @@ class ProjectRunStore:
         *,
         project: ProjectInfo,
         node: ProjectNode,
+        graph_run_id: str | None = None,
+        mode: StageRunMode = "node_validation",
+        attempt: int = 1,
+        input_refs: list[str] | None = None,
     ) -> StageRun:
         now = _utc_now()
         run = StageRun(
             run_id=str(uuid4()),
+            graph_run_id=graph_run_id,
             project_id=project.project.project_id,
             node_id=node.id,
             node_type=node.type,
+            mode=mode,
+            attempt=attempt,
             executor=node.executor,
+            executor_kind=node.executor,
+            task_type=node.task_type,
+            implementation_ref=node.implementation_ref,
+            implementation_digest=node.implementation_digest,
             status="running",
             message=f"Starting {node.title}.",
+            input_refs=input_refs or [],
             created_at=now,
             started_at=now,
         )
         self._write_run(run)
+        return run
+
+    def save(self, run: StageRun) -> StageRun:
+        self._write_run(run)
+        return run
+
+    def discard_reused_stage(self, run: StageRun) -> None:
+        if run.reused_from_stage_run_id is None:
+            raise ValueError("StageRun has no reused outputs to discard")
+        run_id = _canonical_id(run.run_id, kind="StageRun")
+        path = self._project_dir(run.project_id) / "runs" / f"{run_id}.json"
+        path.unlink(missing_ok=True)
+
+    def load(self, *, project_id: str, run_id: str) -> StageRun:
+        canonical_run_id = _canonical_id(run_id, kind="StageRun")
+        path = self._project_dir(project_id) / "runs" / f"{canonical_run_id}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"StageRun not found: {run_id}")
+        run = StageRun.model_validate_json(path.read_text(encoding="utf-8"))
+        if _canonical_id(run.project_id, kind="project") != _canonical_id(
+            project_id, kind="project"
+        ):
+            raise ValueError("StageRun belongs to another project")
         return run
 
     def succeed(
@@ -113,7 +197,7 @@ class ProjectRunStore:
         written_paths: list[Path] = []
         try:
             for payload in result.artifacts:
-                artifact, path = self._write_artifact(run, payload)
+                artifact, path = self.write_artifact(run, payload)
                 artifacts.append(artifact)
                 written_paths.append(path)
             completed = run.model_copy(
@@ -157,6 +241,17 @@ class ProjectRunStore:
             reverse=True,
         )
 
+    def list_for_graph_run(
+        self,
+        *,
+        project_id: str,
+        graph_run_id: str,
+    ) -> list[StageRun]:
+        return sorted(
+            (run for run in self.list(project_id) if run.graph_run_id == graph_run_id),
+            key=lambda run: (run.created_at, run.run_id),
+        )
+
     def load_artifact(
         self,
         *,
@@ -182,7 +277,7 @@ class ProjectRunStore:
             raise ValueError("artifact metadata does not match its storage path")
         return document
 
-    def _write_artifact(
+    def write_artifact(
         self,
         run: StageRun,
         payload: StageArtifactPayload,

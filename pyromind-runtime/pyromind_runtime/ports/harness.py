@@ -227,6 +227,20 @@ class OperationActivityReader(Protocol):
 
 
 @runtime_checkable
+class PersistedWorkspaceReader(Protocol):
+    async def read_persisted_workspace_text(
+        self,
+        handle: SessionHandle,
+        path: str,
+        context: RequestContext,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        """Read a persisted workspace file without starting execution resources."""
+        ...
+
+
+@runtime_checkable
 class SubmissionReceiptReader(Protocol):
     async def read_submission_receipt(
         self,

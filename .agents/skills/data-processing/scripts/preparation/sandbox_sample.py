@@ -63,14 +63,8 @@ _DATAFLOW_SUFFIXES = frozenset(
 _SNIFF_BYTES = 65536
 
 DATAFLOW_VERSION = "1.0.13"
-DATAFLOW_RUNTIME_PACKAGES = (
-    f"open-dataflow=={DATAFLOW_VERSION}",
-    "numpy==1.26.4",
-    "Pillow==12.1.1",
-    "opencv-python-headless==4.10.0.84",
-    "matplotlib==3.9.4",
-)
-DEFAULT_DATAFLOW_VENV = f"/tmp/pyromind-dataflow-venv-{DATAFLOW_VERSION}"
+CPU_REQUIREMENTS_FILENAME = "requirements-cpu.txt"
+DEFAULT_DATAFLOW_VENV = f"/tmp/pyromind-dataflow-venv-{DATAFLOW_VERSION}-cpu"
 # Interpreters a sandbox image may bake in at build time. They are probed in
 # order after the run spec's explicit ``python`` and win only when their
 # ``open-dataflow`` matches the pin.
@@ -120,7 +114,6 @@ def _interpreter_spec() -> dict[str, Any]:
         "python": os.environ.get("PYROMIND_SANDBOX_DATAFLOW_PYTHON"),
         "venv": os.environ.get("PYROMIND_SANDBOX_DATAFLOW_VENV", DEFAULT_DATAFLOW_VENV),
         "dataflow_version": DATAFLOW_VERSION,
-        "packages": list(DATAFLOW_RUNTIME_PACKAGES),
         "system_python": os.environ.get("PYROMIND_SANDBOX_SYSTEM_PYTHON"),
     }
 
@@ -131,6 +124,18 @@ def _image_interpreters() -> tuple[str, ...]:
     return tuple(dict.fromkeys([str(home), *IMAGE_DATAFLOW_PYTHONS]))
 
 
+def _cpu_requirements(spec: dict[str, Any]) -> Path:
+    return (
+        Path(spec.get("runtime_dir") or Path(__file__).resolve().parent)
+        / CPU_REQUIREMENTS_FILENAME
+    )
+
+
+def _runtime_stamp(spec: dict[str, Any]) -> str:
+    digest = hashlib.sha256(_cpu_requirements(spec).read_bytes()).hexdigest()
+    return f"{spec['dataflow_version']}:{digest}"
+
+
 def _cached_venv_python(spec: dict[str, Any]) -> str | None:
     """The cached venv interpreter when its stamp matches the pin."""
     venv = Path(str(spec["venv"]))
@@ -139,7 +144,7 @@ def _cached_venv_python(spec: dict[str, Any]) -> str | None:
     if not python.is_file() or not stamp.is_file():
         return None
     try:
-        if stamp.read_text(encoding="utf-8").strip() != str(spec["dataflow_version"]):
+        if stamp.read_text(encoding="utf-8").strip() != _runtime_stamp(spec):
             return None
     except OSError:
         return None
@@ -176,10 +181,18 @@ def _bootstrap_venv(spec: dict[str, Any]) -> tuple[str | None, str]:
     venv = Path(str(spec["venv"]))
     expected = str(spec["dataflow_version"])
     python = venv / "bin" / "python"
+    requirements = _cpu_requirements(spec)
     with _install_lock(venv):
         cached = _cached_venv_python(spec)
         if cached is not None:
             return cached, "reused"
+        try:
+            stamp = _runtime_stamp(spec)
+        except OSError as exc:
+            return (
+                None,
+                f"could not read CPU runtime requirements {requirements}: {exc}",
+            )
         system_python = _system_python(spec)
         _log(f"installing open-dataflow=={expected} into {venv} (first use)")
         venv.parent.mkdir(parents=True, exist_ok=True)
@@ -199,26 +212,26 @@ def _bootstrap_venv(spec: dict[str, Any]) -> tuple[str | None, str]:
                 f"could not create {venv}: "
                 f"{(created.stderr or created.stdout or '').strip()[-2000:]}"
             )
-        packages = [str(name) for name in spec["packages"]]
-        installed = subprocess.run(
-            [
-                str(python),
-                "-m",
-                "pip",
-                "install",
-                "--quiet",
-                "--use-deprecated=legacy-resolver",
-                *packages,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=float(spec.get("install_timeout", 3600)),
+        installs = (
+            ("-r", str(requirements)),
+            ("--no-deps", f"open-dataflow=={expected}"),
         )
-        if installed.returncode != 0:
-            shutil.rmtree(venv, ignore_errors=True)
-            detail = (installed.stderr or installed.stdout or "").strip()[-2000:]
-            return None, f"could not install {', '.join(packages)}: {detail}"
-        (venv / "open-dataflow-version").write_text(expected, encoding="utf-8")
+        for packages in installs:
+            try:
+                installed = subprocess.run(
+                    [str(python), "-m", "pip", "install", "--quiet", *packages],
+                    capture_output=True,
+                    text=True,
+                    timeout=float(spec.get("install_timeout", 3600)),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                shutil.rmtree(venv, ignore_errors=True)
+                return None, f"could not install {', '.join(packages)}: {exc}"
+            if installed.returncode != 0:
+                shutil.rmtree(venv, ignore_errors=True)
+                detail = (installed.stderr or installed.stdout or "").strip()[-2000:]
+                return None, f"could not install {', '.join(packages)}: {detail}"
+        (venv / "open-dataflow-version").write_text(stamp, encoding="utf-8")
         return str(python), "installed"
 
 
@@ -1115,7 +1128,6 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
         "python": config.get("python") or interpreter["python"],
         "venv": interpreter["venv"],
         "dataflow_version": interpreter["dataflow_version"],
-        "packages": interpreter["packages"],
         "pipeline": str(pipeline),
         "cwd": str(root),
         "args": normalized,

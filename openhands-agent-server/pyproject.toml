@@ -13,13 +13,14 @@ dependencies = [
   "fastapi>=0.104",
   "openhands-sdk",
   "openai>=2.33.0,<3",
+  "pyarrow>=17.0",
   "pydantic>=2",
   "PyJWT>=2",
   "sqlalchemy>=2",
   "uvicorn>=0.31.1",
   "websockets>=12",
   "wsproto>=1.2.0",
-  "pyromind-sdk>=0.1.8; python_full_version < '3.14'",
+  "pyromind-sdk>=0.1.17; python_full_version < '3.14'",
 ]
 
 [project.urls]
