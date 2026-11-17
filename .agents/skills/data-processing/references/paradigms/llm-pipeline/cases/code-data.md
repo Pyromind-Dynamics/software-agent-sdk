@@ -19,7 +19,7 @@ CodeInstructionGenerator
 from dataflow.operators.code import (
     CodeCodeToInstructionGenerator, CodeInstructionGenerator,
     CodeInstructionToCodeGenerator, CodeQualitySampleEvaluator,
-    CodeQualityScoreFilter, CodeSandboxSampleEvaluator,
+    CodeQualityScoreFilter,
 )
 
 CodeInstructionToCodeGenerator(llm_serving=llm).run(

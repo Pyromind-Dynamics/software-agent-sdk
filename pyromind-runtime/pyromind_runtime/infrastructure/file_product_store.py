@@ -465,6 +465,9 @@ class FileProductStore:
             return "openhands"
         return self._load_metadata().harness_id
 
+    def harness_capabilities(self) -> HarnessCapabilities:
+        return self._load_metadata().capabilities
+
     def load_snapshot(self) -> ConversationSnapshot:
         with self._lock():
             metadata = self._load_metadata()

@@ -1,0 +1,30 @@
+# The runner installs the pinned open-dataflow wheel separately with --no-deps.
+# Dependencies for the supported CPU operators and remote model serving.
+numpy==1.26.4
+pandas==2.3.3
+pyarrow==20.0.0
+Pillow==12.1.1
+opencv-python-headless==4.10.0.84
+matplotlib==3.9.4
+cloudpickle
+colorama
+colorlog
+datasketch
+fasttext; python_version >= "3.13"
+fasttext-wheel; python_version < "3.13"
+httpx
+huggingface-hub
+jsonschema
+math-verify
+nltk
+openai
+psutil
+pydantic
+PyYAML
+rapidfuzz
+redis
+requests
+rich
+tqdm
+word2number
+xxhash

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import httpx
@@ -28,6 +29,15 @@ from openhands.tools.utils.pyromind_api_client import (
 
 
 PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET = "auth_token"
+
+_SHANGHAI_PIP_PREAMBLE = (
+    "export PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/\n"
+)
+_CUSTOM_COMMAND_NODES = (
+    "CustomCommandCPUNode",
+    "CustomCommandNode",
+    "CustomCommandGPUNode",
+)
 
 # get_api_key raises httpx request errors while pyromind_sdk raises requests
 # errors (OSError subclasses); both cover SSL EOF / connection resets, which
@@ -117,6 +127,33 @@ def create_workflow_api_client(
     )
 
 
+def _workflow_for_cluster(workflow: dict, route: str) -> dict:
+    if platform_cluster_target(route)[1] != "cn-east-1":
+        return workflow
+    if not isinstance(workflow.get("nodes"), list):
+        return workflow
+
+    prepared = deepcopy(workflow)
+    for node in prepared["nodes"]:
+        data = node.get("data") if isinstance(node, dict) else None
+        if (
+            not isinstance(data, dict)
+            or data.get("nodeType") not in _CUSTOM_COMMAND_NODES
+        ):
+            continue
+        config = data.get("config")
+        if not isinstance(config, dict):
+            continue
+        command = config.get("command")
+        if (
+            isinstance(command, str)
+            and command.strip()
+            and not command.startswith(_SHANGHAI_PIP_PREAMBLE)
+        ):
+            config["command"] = _SHANGHAI_PIP_PREAMBLE + command
+    return prepared
+
+
 def submit_workflow_task(
     *,
     client: PyroMindAPIClient,
@@ -132,6 +169,7 @@ def submit_workflow_task(
     source_code: str | None = None,
 ) -> TrainingTaskCreateResponse:
     """Submit a Studio task carrying the caller's return address as JSON text."""
+    workflow = _workflow_for_cluster(workflow, str(client.studio.cluster))
     scope = _submission_scope.get()
     recipient = origin or (scope.origin if scope else TaskOrigin())
     correlation = TaskCorrelation(

@@ -9,6 +9,7 @@ from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 from openhands.tools.data_preparation.platform_submit import (
@@ -258,6 +259,49 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
         ("conversation-2", "task-2", "succeeded"),
         ("conversation-2", "task-2", "succeeded"),
     ]
+    await runtime.close()
+
+
+async def test_dispatcher_routes_graph_task_before_conversation_runtime(
+    tmp_path,
+) -> None:
+    runtime = ConversationRuntime(
+        tmp_path / "conversations",
+        {"openhands": FakeAdapter("openhands")},
+    )
+    calls: list[tuple[str, str, str, str | None]] = []
+
+    async def graph_task_handler(
+        *, task_id: str, status: str, conversation_id: str, task_kind: str | None
+    ) -> str | None:
+        calls.append((task_id, status, conversation_id, task_kind))
+        return conversation_id if conversation_id == "graph-conversation" else None
+
+    dispatcher = WorkflowStatusDispatcher(
+        runtime,
+        graph_task_handler=graph_task_handler,
+    )
+    result = await dispatcher.dispatch(
+        task_id="graph-task-1",
+        status="Succeeded",
+        correlation=TaskCorrelation(
+            conversation_id="graph-conversation", task_kind="echomind_train"
+        ),
+    )
+
+    assert result.outcome == "delivered_async"
+    assert result.conversation_id == "graph-conversation"
+    assert calls == [
+        ("graph-task-1", "Succeeded", "graph-conversation", "echomind_train")
+    ]
+    mismatched = await dispatcher.dispatch(
+        task_id="graph-task-1",
+        status="Succeeded",
+        correlation=TaskCorrelation(
+            conversation_id="unrelated-conversation", task_kind="echomind_train"
+        ),
+    )
+    assert mismatched.outcome == "unknown_task"
     await runtime.close()
 
 

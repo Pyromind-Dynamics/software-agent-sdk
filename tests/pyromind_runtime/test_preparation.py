@@ -14,7 +14,7 @@ from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.preparation import Preparations
 from pyromind_runtime.application.snapshot_projector import SnapshotProjector
-from pyromind_runtime.domain.commands import CreateProjectCommand
+from pyromind_runtime.domain.commands import CreateProjectCommand, UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
@@ -566,6 +566,71 @@ async def test_runtime_creation_restore_permissions_and_stage_protection(
             owner.conversation_id, RequestContext(user_id=owner.user_id)
         )
     await restored.close()
+
+
+async def test_bound_project_cluster_wins_over_stale_request_routing(
+    preparation_setup, ready_request, tmp_path
+):
+    preparation_store, owner, policy = preparation_setup
+    adapter = FakeAdapter()
+    conversations = tmp_path / "conversations"
+    runtime = ConversationRuntime(
+        conversations, adapter, preparation_store=preparation_store
+    )
+    context = RequestContext(
+        user_id=owner.user_id,
+        profile_id=owner.profile_id,
+        x_cluster="us-west-1",
+    )
+    conversation_id = owner.conversation_id
+    product_store = FileProductStore(conversations / conversation_id)
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id=conversation_id,
+            user_id=owner.user_id,
+            profile_id=owner.profile_id,
+            workspace_root=str(conversations),
+            preparation_policy=policy,
+            delegated_roles=(DelegatedRole(name="eval"),),
+        ),
+        context,
+    )
+    try:
+        snapshot = await runtime.get_snapshot(conversation_id, context)
+        assert snapshot.project is None
+        assert product_store.load_x_cluster() == "us-west-1"
+
+        ready = make_ready(preparation_store, owner, ready_request)
+        project = preparation_store.activate(
+            owner, ready.revision, "create", cluster="us-west-2"
+        )
+        assert project.cluster == "us-west-2"
+
+        snapshot = await runtime.get_snapshot(conversation_id, context)
+        assert snapshot.project == project
+        assert product_store.load_x_cluster() == "us-west-2"
+
+        product_store.save_x_cluster("us-west-1")
+        stream = runtime.stream_events(conversation_id, 0, context)
+        try:
+            assert (await anext(stream)).conversation_id == conversation_id
+            assert product_store.load_x_cluster() == "us-west-2"
+        finally:
+            await stream.aclose()
+
+        product_store.save_x_cluster("us-west-1")
+        receipt = await runtime.submit_command(
+            conversation_id,
+            UserMessageCommand(
+                command_id="continue", content=(TextContent(text="Continue debugging"),)
+            ),
+            context,
+        )
+        assert receipt.status == "completed"
+        assert adapter.sent[-1][2].x_cluster == "us-west-2"
+        assert product_store.load_x_cluster() == "us-west-2"
+    finally:
+        await runtime.close()
 
 
 async def test_http_prepare_create_and_cross_profile_denial(

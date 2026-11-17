@@ -170,6 +170,7 @@ class ExternalTaskState(ContractModel):
         "data_cleaning",
         "data_preparation",
         "workflow_debug",
+        "echomind_debug_repair",
         "environment_processing",
         "environment_processing_render",
         "environment_processing_aggregate",

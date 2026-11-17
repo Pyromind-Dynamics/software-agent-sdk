@@ -263,22 +263,30 @@ def test_sandbox_upload_uses_the_workspace_mount(
     )
 
 
-def test_sandbox_create_uses_default_image_for_regional_cluster(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("route", "expected_image"),
+    [
+        ("us-west-2#pre", "pyrominddynamics/jupyter-lab-with-ssh:v0.9"),
+        (
+            "cn-east-1#pre",
+            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+            "sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+        ),
+    ],
+)
+def test_sandbox_create_uses_default_image_for_request_cluster(
+    monkeypatch: pytest.MonkeyPatch, route: str, expected_image: str
 ) -> None:
     client = MagicMock()
     client.sandboxes.create.return_value = _sandbox(status="creating")
     _patch_client(monkeypatch, client)
 
-    observation = SandboxCreateExecutor(**_executor_kwargs(cluster="us-west-2"))(
-        SandboxCreateAction(wait_timeout=0), _fake_conversation()
-    )
+    observation = SandboxCreateExecutor(
+        **_executor_kwargs(headers={"x-cluster": route})
+    )(SandboxCreateAction(wait_timeout=0), _fake_conversation())
 
     assert not observation.is_error
-    assert (
-        client.sandboxes.create.call_args[0][0].image
-        == "pyrominddynamics/jupyter-lab-with-ssh:v0.9"
-    )
+    assert client.sandboxes.create.call_args[0][0].image == expected_image
 
 
 def test_sandbox_create_other_cluster_default_image(

@@ -144,9 +144,7 @@ messages 时选择 `vision`。具体完成标准见 PCB 场景文档。
 - `KBCChunkGenerator`、RDKit SMILES 等价评估、默认 CUDA 的质量过滤器。
 - `CodeSandboxSampleEvaluator`；不得执行生成代码。
 
-以上算子的导入路径同样见 [pipeline-reference.md](pipeline-reference.md) 的导入路径表
-（已列出 `KBCChunkGenerator`、`CodeSandboxSampleEvaluator`）；解禁前不要为了确认
-可用性去导入或翻源码。
+默认 CPU/API 算子的导入方式见 [pipeline-reference.md](pipeline-reference.md)。
 
 ## 图片补充参考
 

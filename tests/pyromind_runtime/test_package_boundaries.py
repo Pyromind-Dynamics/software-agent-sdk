@@ -14,6 +14,9 @@ from harness_adapter.pi_adapter.business_tool_host import (
     ToolExecutionContext,
     _ToolConversationFacade,
 )
+from pyromind_agent_server.api.echomind_projects import (
+    router as echomind_projects_router,
+)
 from pyromind_agent_server.api.evaluation_runs import (
     create_evaluation_runs_router,
     get_evaluation_storage,
@@ -54,6 +57,19 @@ def test_evaluation_auth_boundary_is_separate_from_product_api() -> None:
         if isinstance(route, APIRoute) and route.path.endswith("/snapshot")
     )
     assert check_session_api_key in dependency_calls(snapshot.dependant)
+
+
+def test_echomind_debug_adoption_routes_use_product_authentication() -> None:
+    routes = [
+        route
+        for route in echomind_projects_router.routes
+        if isinstance(route, APIRoute)
+        and route.path.endswith(("/debug-candidates", "/debug-adoption"))
+    ]
+    assert len(routes) == 3
+    for route in routes:
+        dependencies = {dep.call for dep in route.dependant.dependencies}
+        assert check_session_api_key in dependencies
 
 
 @pytest.mark.parametrize("env", ["pre", "pre2", "prod"])
@@ -493,6 +509,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "sandbox_create",
         "df_submit_evaluation",
         "request_experiment_task",
+        "propose_runtime_resources",
     }.intersection(tools)
     assert set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()) == {
         "read",
@@ -502,6 +519,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "subagent",
         "ask_user",
         "get_storage_url",
+        "propose_runtime_resources",
     }
     assert ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist == ()
     with pytest.raises(ValidationError):

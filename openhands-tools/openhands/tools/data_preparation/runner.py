@@ -1,10 +1,10 @@
 """Subprocess runner and LLM credential helpers for DataFlow pipelines.
 
-DataFlow runs isolated in a subprocess so heavy dependencies (torch,
-transformers, datasets) never enter the agent-server process. The ``text``
-profile uses the conversation LLM; the ``vision`` profile prefers server-wide
-``DF_*`` configuration, then DataFlow defaults, with the conversation LLM as a
-final fallback. Pipelines must never hardcode secrets.
+DataFlow runs in an isolated subprocess with pinned CPU dependencies. The
+``text`` profile uses the conversation LLM. The ``vision`` profile prefers
+server-wide ``DF_*`` configuration, then DataFlow defaults, with the
+conversation LLM as a final fallback. Both profiles call remote model APIs.
+Pipelines must never hardcode secrets.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import ast
 import hashlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -40,14 +41,16 @@ from openhands.tools.utils.dataflow_config import (
 
 SUPPORTED_DATAFLOW_VERSION = "1.0.13"
 
-# Platform runs and sandbox samples must agree on the DataFlow runtime, so both
-# install this pinned set.
-DATAFLOW_RUNTIME_PACKAGES = (
-    f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
-    "numpy==1.26.4",
-    "Pillow==12.1.1",
-    "opencv-python-headless==4.10.0.84",
-    "matplotlib==3.9.4",
+DATAFLOW_REQUIREMENTS_FILENAME = "requirements-cpu.txt"
+DATAFLOW_RUNTIME_FILENAMES = (
+    "avi_pcb_runtime.py",
+    "df_logging.py",
+    "generate_report.py",
+    "image_utils.py",
+    "preparation_runtime.py",
+    DATAFLOW_REQUIREMENTS_FILENAME,
+    "source_fingerprint.py",
+    "validate_prepared_data.py",
 )
 
 _DATAFLOW_CHECK_CACHE: dict[str, tuple[bool, str]] = {}
@@ -60,6 +63,16 @@ _FORBIDDEN_MANAGED_IMAGE_IMPORTS = {
     "requests",
     "urllib",
 }
+
+
+def dataflow_pip_install_commands(
+    *, pip_path: str, requirements_path: str
+) -> tuple[str, str]:
+    pip = shlex.quote(pip_path)
+    return (
+        f"{pip} install -r {shlex.quote(requirements_path)}",
+        f"{pip} install --no-deps open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+    )
 
 
 def resolve_dataflow_python(override: str | None = None) -> str:

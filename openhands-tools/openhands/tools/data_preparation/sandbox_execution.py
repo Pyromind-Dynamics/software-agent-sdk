@@ -419,4 +419,4 @@ def sandbox_dataflow_venv(version: str) -> str:
     configured = os.environ.get(ENV_SANDBOX_DATAFLOW_VENV)
     if configured:
         return configured
-    return f"{DEFAULT_DATAFLOW_VENV}-{version}"
+    return f"{DEFAULT_DATAFLOW_VENV}-{version}-cpu"

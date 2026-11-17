@@ -26,14 +26,13 @@ from dataflow.operators.general_text import (
 )
 # SFT 合成与筛选
 from dataflow.operators.text_sft import (
-    AlpagasusFilter, CondorGenerator, CondorRefiner, DeitaQualityFilter,
-    RMFilter, RMSampleEvaluator, SuperfilteringFilter,
+    AlpagasusFilter, CondorGenerator, CondorRefiner,
 )
 # Code 数据
 from dataflow.operators.code import (
     CodeCodeToInstructionGenerator, CodeInstructionGenerator,
     CodeInstructionToCodeGenerator, CodeQualitySampleEvaluator,
-    CodeQualityScoreFilter, CodeSandboxSampleEvaluator,
+    CodeQualityScoreFilter,
 )
 # Reasoning 数据
 from dataflow.operators.reasoning import (
@@ -42,8 +41,7 @@ from dataflow.operators.reasoning import (
     ReasoningQuestionCategorySampleEvaluator, ReasoningQuestionDifficultySampleEvaluator,
     ReasoningQuestionFilter, ReasoningQuestionGenerator,
 )
-# 知识清洗与 Storage
-from dataflow.operators.knowledge_cleaning import KBCChunkGenerator
+# Storage
 from dataflow.utils.storage import LazyFileStorage
 ```
 

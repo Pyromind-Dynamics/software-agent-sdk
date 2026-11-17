@@ -212,15 +212,30 @@ async def test_compressed_error_msg_is_decoded(
 
 
 @pytest.mark.asyncio
-async def test_non_terminal_notification_is_ignored(
+@pytest.mark.parametrize(
+    ("task_kind", "status", "expected"),
+    [
+        ("workflow_run", "Running", None),
+        ("echomind_dataset", "running", "Running"),
+        ("echomind_dataset", "new", "Pending"),
+    ],
+)
+async def test_non_terminal_notifications_only_dispatch_for_published_graphs(
     monkeypatch: pytest.MonkeyPatch,
+    task_kind: str,
+    status: str,
+    expected: str | None,
 ) -> None:
-    called = False
+    statuses: list[str] = []
 
     async def fake_deliver(**kwargs: Any) -> RunWorkflowCallbackResult:
-        nonlocal called
-        called = True
-        raise AssertionError("non-terminal status must not be dispatched")
+        statuses.append(kwargs["status"])
+        return RunWorkflowCallbackResult(
+            outcome="delivered_async",
+            task_id=kwargs["task_id"],
+            normalized_status=kwargs["status"],
+            conversation_id=kwargs["conversation_id"],
+        )
 
     monkeypatch.setattr(
         handler_module,
@@ -231,8 +246,15 @@ async def test_non_terminal_notification_is_ignored(
     await StudioWorkflowNotifyHandler().handle(
         MessageEvent(
             event_type=TrainingTaskEventType.TRAINING_TASK_STATUS_CHANGED,
-            data={"task_id": "task-1", "status": "Running"},
+            data={
+                "task_id": "task-1",
+                "status": status,
+                "out_id": TaskCorrelation(
+                    conversation_id="conversation-1",
+                    task_kind=task_kind,
+                ).to_out_id(),
+            },
         )
     )
 
-    assert called is False
+    assert statuses == ([] if expected is None else [expected])

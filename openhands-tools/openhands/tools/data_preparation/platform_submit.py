@@ -28,9 +28,12 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.data_preparation.runner import (
-    DATAFLOW_RUNTIME_PACKAGES,
+    DATAFLOW_REQUIREMENTS_FILENAME,
+    DATAFLOW_RUNTIME_FILENAMES,
+    SUPPORTED_DATAFLOW_VERSION,
     LabelingModelGateway,
     build_dataflow_env,
+    dataflow_pip_install_commands,
     runtime_bundle_fingerprint,
     runtime_public_names,
     validate_managed_image_pipeline,
@@ -75,15 +78,7 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
 
-RUNTIME_FILENAMES = (
-    "avi_pcb_runtime.py",
-    "df_logging.py",
-    "generate_report.py",
-    "image_utils.py",
-    "preparation_runtime.py",
-    "source_fingerprint.py",
-    "validate_prepared_data.py",
-)
+RUNTIME_FILENAMES = DATAFLOW_RUNTIME_FILENAMES
 IMAGE_UTILS_API_VERSION = "4"
 DATAFLOW_NODE_TYPE = "CustomCommandCPUNode"
 OutputSchema = Literal[
@@ -99,7 +94,13 @@ OutputSchema = Literal[
 ]
 PersistedTaskKind = Literal["data_preparation", "dataset_analysis", "data_synthesis"]
 
-DATA_PROCESSING_PACKAGES = DATAFLOW_RUNTIME_PACKAGES
+_LEGACY_RUNTIME_PACKAGES = (
+    f"open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
+    "numpy==1.26.4",
+    "Pillow==12.1.1",
+    "opencv-python-headless==4.10.0.84",
+    "matplotlib==3.9.4",
+)
 
 TOOL_DESCRIPTION = """\
 Submit an agent-authored Python pipeline for asynchronous execution on Pyromind.
@@ -734,6 +735,7 @@ class DfSubmitPipelineExecutor(
                 runtime_dir_name=runtime_dir_name,
                 runtime_storage_dir=runtime_storage_dir,
                 runtime_fingerprint=runtime_fingerprint,
+                reuse_runtime=resumed and action.script_path is None,
                 image_utils_api_version=image_utils_api_version,
                 output_schema=output_schema,
                 reuse_assessment=(
@@ -1082,6 +1084,7 @@ def _build_dataflow_command(
     runtime_dir_name: str = "",
     runtime_storage_dir: str | None = None,
     runtime_fingerprint: str | None = None,
+    reuse_runtime: bool = False,
     image_utils_api_version: str | None = None,
     output_schema: str | None = None,
     reuse_assessment: dict[str, Any] | None = None,
@@ -1105,11 +1108,12 @@ def _build_dataflow_command(
     pipeline_log = f"{pod_output_dir}/pipeline.log"
     validation_log = f"{pod_output_dir}/validation.log"
     report_log = f"{pod_output_dir}/report.log"
-    required_runtime_files = (
+    runtime_files = (
         RUNTIME_FILENAMES
         if runtime_dir_name or runtime_storage_dir
         else tuple(name for name in RUNTIME_FILENAMES if name != "image_utils.py")
     )
+    requirements = f"{pod_runtime_dir}/{DATAFLOW_REQUIREMENTS_FILENAME}"
 
     # Environment variables for LLM access
     env_parts = []
@@ -1144,19 +1148,35 @@ def _build_dataflow_command(
         pipeline_args.append(shlex.quote(f"{pod_output_dir}/{support_file_name}"))
 
     # Build the full command chain
-    packages = DATA_PROCESSING_PACKAGES
-    package_args = " ".join(shlex.quote(item) for item in packages)
+    pip_path = "/tmp/df-venv/bin/pip"
+    install_commands = dataflow_pip_install_commands(
+        pip_path=pip_path, requirements_path=requirements
+    )
+    setup_output = f">> {shlex.quote(setup_log)} 2>&1"
+    install = " && ".join(f"{command} {setup_output}" for command in install_commands)
+    required_runtime_files = runtime_files
+    if reuse_runtime:
+        # Older runtime bundles were published without the dependency manifest.
+        legacy_packages = " ".join(
+            shlex.quote(item) for item in _LEGACY_RUNTIME_PACKAGES
+        )
+        install = (
+            f"if [ -f {shlex.quote(requirements)} ]; then {install}; else "
+            f"{pip_path} install --use-deprecated=legacy-resolver "
+            f"{legacy_packages} {setup_output}; fi"
+        )
+        required_runtime_files = tuple(
+            name for name in runtime_files if name != DATAFLOW_REQUIREMENTS_FILENAME
+        )
     setup_steps = [
         f"mkdir -p {shlex.quote(pod_output_dir)}",
-        f"python3 -m venv /tmp/df-venv > {shlex.quote(setup_log)} 2>&1",
-        "/tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver "
-        + package_args
-        + f" >> {shlex.quote(setup_log)} 2>&1",
         f"test -f {shlex.quote(frozen_script)}",
         *[
             f"test -f {shlex.quote(f'{pod_runtime_dir}/{filename}')}"
             for filename in required_runtime_files
         ],
+        f"python3 -m venv /tmp/df-venv > {shlex.quote(setup_log)} 2>&1",
+        install,
     ]
     fingerprint_tool = f"{pod_runtime_dir}/source_fingerprint.py"
     setup_steps.append(

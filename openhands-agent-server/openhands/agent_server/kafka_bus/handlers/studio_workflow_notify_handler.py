@@ -90,7 +90,7 @@ class StudioWorkflowNotifyHandler(MessageHandler):
         if not isinstance(message_data, dict):
             return
         status = _get_task_status(message_data.get("status"))
-        if status is None or status not in _TERMINAL_STUDIO_STATUSES:
+        if status is None:
             return
 
         raw_task_id = message_data.get("task_id")
@@ -113,13 +113,21 @@ class StudioWorkflowNotifyHandler(MessageHandler):
                 event.message_id,
             )
             return
+        if status not in _TERMINAL_STUDIO_STATUSES and not (
+            correlation.type == "main" and correlation.task_kind.startswith("echomind_")
+        ):
+            return
 
         # error_msg 是 base64+zlib 压缩的 JSON，_decode_error_msg 会解压成可读文本
         error_log = _decode_error_msg(message_data.get("error_msg"))
 
         result = await deliver_run_workflow_status(
             task_id=task_id,
-            status=status.value,
+            status=(
+                StudioTaskStatus.PENDING.value
+                if status == StudioTaskStatus.NEW
+                else status.value
+            ),
             error_log=error_log,
             conversation_id=correlation.conversation_id,
             auto_run=True,
@@ -163,11 +171,9 @@ def _parse_conversation_id_from_out_id(out_id: object | None) -> str | None:
 def _get_task_status(task_status_value):
     if task_status_value is None:
         return None
+    raw_status = str(task_status_value).strip().lower()
     for status in StudioTaskStatus:
-        if (
-            status.value == str(task_status_value).strip()
-            or status.name == str(task_status_value).strip()
-        ):
+        if raw_status in {status.value.lower(), status.name.lower()}:
             return status
     return None
 
