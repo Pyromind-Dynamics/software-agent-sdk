@@ -5,8 +5,8 @@ Generate a .env file containing all config options
 
 import argparse
 
-from openhands.agent_server.config import get_default_config
-from openhands.agent_server.env_parser import to_env
+from pyromind_agent_server.config import get_default_config
+from pyromind_agent_server.env_parser import to_env
 
 
 if __name__ == "__main__":

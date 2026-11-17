@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, Mock
 import httpx
 import pytest
 
-from openhands.sdk.workspace.models import CommandResult, FileOperationResult
+from pyromind_common.sdk.workspace.models import CommandResult, FileOperationResult
 
 
 @pytest.fixture

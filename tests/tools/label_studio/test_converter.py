@@ -7,12 +7,12 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from openhands.tools.label_studio.converter import (
+from pyromind_common.tools.label_studio.converter import (
     AVITrainToLabelStudioConverter,
     ConversionError,
     LabelStudioToAVITrainConverter,
 )
-from openhands.tools.label_studio.field_map import parse_field_map
+from pyromind_common.tools.label_studio.field_map import parse_field_map
 
 
 EXAMPLES = Path(__file__).parents[3] / ".agents/skills/label-studio/references/examples"
@@ -1413,7 +1413,7 @@ def test_download_retries_a_transient_failure(monkeypatch):
         converter, "_storage_post", lambda route, body: {"data": {"url": "https://o/x"}}
     )
     monkeypatch.setattr(
-        "openhands.tools.label_studio.converter.time.sleep", lambda _seconds: None
+        "pyromind_common.tools.label_studio.converter.time.sleep", lambda _seconds: None
     )
     attempts: list[int] = []
 
@@ -1435,7 +1435,7 @@ def test_download_gives_up_after_the_retry_budget(monkeypatch):
         converter, "_storage_post", lambda route, body: {"data": {"url": "https://o/x"}}
     )
     monkeypatch.setattr(
-        "openhands.tools.label_studio.converter.time.sleep", lambda _seconds: None
+        "pyromind_common.tools.label_studio.converter.time.sleep", lambda _seconds: None
     )
     monkeypatch.setattr(
         httpx,

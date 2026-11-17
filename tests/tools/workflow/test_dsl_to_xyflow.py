@@ -1,8 +1,8 @@
 from typing import Any, cast
 
-from openhands.sdk.tool import Tool
-from openhands.sdk.tool.registry import resolve_tool
-from openhands.tools.workflow import (
+from pyromind_common.sdk.tool import Tool
+from pyromind_common.sdk.tool.registry import resolve_tool
+from pyromind_common.tools.workflow import (
     DslToXyflowAction,
     DslToXyflowExecutor,
     DslToXyflowObservation,

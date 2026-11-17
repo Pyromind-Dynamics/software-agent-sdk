@@ -1,4 +1,4 @@
-"""Tests for the Tool class in openhands.sdk.runtime.tool."""
+"""Tests for the Tool class in pyromind_common.sdk.runtime.tool."""
 
 from collections.abc import Sequence
 from typing import Any
@@ -6,8 +6,8 @@ from typing import Any
 import pytest
 from pydantic import Field
 
-from openhands.sdk.llm.message import ImageContent, TextContent
-from openhands.sdk.tool import (
+from pyromind_common.sdk.llm.message import ImageContent, TextContent
+from pyromind_common.sdk.tool import (
     Action,
     Observation,
     ToolAnnotations,
@@ -631,7 +631,7 @@ class TestTool:
 
     def test_security_risk_is_optional_field_in_schema(self):
         """Test that _create_action_type_with_risk makes security_risk an optional field defaulting to UNKNOWN."""  # noqa: E501
-        from openhands.sdk.tool.tool import create_action_type_with_risk
+        from pyromind_common.sdk.tool.tool import create_action_type_with_risk
 
         # Test with a simple action type
         action_type_with_risk = create_action_type_with_risk(ToolMockAction)

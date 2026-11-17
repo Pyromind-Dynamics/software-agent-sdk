@@ -5,9 +5,10 @@ import hashlib
 import json
 from pathlib import Path
 
-import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
 from fastapi import FastAPI
+
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
 from pyromind_agent_server.app import create_app

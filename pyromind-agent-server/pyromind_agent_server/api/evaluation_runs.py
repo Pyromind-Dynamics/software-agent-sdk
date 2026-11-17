@@ -48,6 +48,11 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+
+from pyromind_agent_server.api.router import get_product_runtime
+from pyromind_agent_server.auth_context import evaluation_request_context
+from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_runtime.application.evaluation_annotations import (
     AnnotationConflictError,
     AnnotationNotInitializedError,
@@ -70,11 +75,6 @@ from pyromind_runtime.ports.storage import (
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
 )
-from starlette.concurrency import run_in_threadpool
-
-from pyromind_agent_server.api.router import get_product_runtime
-from pyromind_agent_server.auth_context import evaluation_request_context
-from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 
 
 logger = logging.getLogger(__name__)

@@ -10,24 +10,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openhands.tools.label_studio.api_client import LabelStudioAPIError
-from openhands.tools.label_studio.converter import (
+from pyromind_common.tools.label_studio.api_client import LabelStudioAPIError
+from pyromind_common.tools.label_studio.converter import (
     DATASET_FILE_MAX_BYTES,
     ConversionError,
 )
-from openhands.tools.label_studio.definition import (
+from pyromind_common.tools.label_studio.definition import (
     LabelStudioProjectAction,
 )
-from openhands.tools.label_studio.executor import (
+from pyromind_common.tools.label_studio.executor import (
     LabelStudioProjectExecutor,
     _normalize_storage_path,
 )
-from openhands.tools.label_studio.export_ticket import PortalExportTicketProvider
-from openhands.tools.label_studio.field_map import default_field_map
-from openhands.tools.label_studio.models import ProjectState
-from openhands.tools.label_studio.skill_helpers import extract_control_values
-from openhands.tools.label_studio.token_provider import PortalTokenProvider
-from openhands.tools.pyromind_dataset.definition import StorageFileNotFoundError
+from pyromind_common.tools.label_studio.export_ticket import PortalExportTicketProvider
+from pyromind_common.tools.label_studio.field_map import default_field_map
+from pyromind_common.tools.label_studio.models import ProjectState
+from pyromind_common.tools.label_studio.skill_helpers import extract_control_values
+from pyromind_common.tools.label_studio.token_provider import PortalTokenProvider
+from pyromind_common.tools.pyromind_dataset.definition import StorageFileNotFoundError
 
 
 VALID_XML = (
@@ -192,7 +192,7 @@ def test_genome_jsonl_artifact_staging_rejects_oversized_files(
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"too large")
     monkeypatch.setattr(
-        "openhands.tools.label_studio.executor.DATASET_FILE_MAX_BYTES", 4
+        "pyromind_common.tools.label_studio.executor.DATASET_FILE_MAX_BYTES", 4
     )
 
     with pytest.raises(ValueError, match="missing or exceeds 4 bytes"):
@@ -302,7 +302,7 @@ class TestCreate:
                 executor, "_upload_to_storage", return_value=None
             ) as mock_upload,
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             mock_manifest = MockConverter.return_value.convert.return_value
@@ -375,10 +375,10 @@ class TestCreate:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
             caplog.at_level(
-                logging.WARNING, logger="openhands.tools.label_studio.executor"
+                logging.WARNING, logger="pyromind_common.tools.label_studio.executor"
             ),
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -422,10 +422,10 @@ class TestCreate:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
             caplog.at_level(
-                logging.WARNING, logger="openhands.tools.label_studio.executor"
+                logging.WARNING, logger="pyromind_common.tools.label_studio.executor"
             ),
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -514,7 +514,7 @@ class TestCreate:
             patch.object(executor, "_build_ls_api", return_value=mock_ls),
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             obs = executor(
@@ -558,7 +558,7 @@ class TestGet:
         executor: LabelStudioProjectExecutor,
         conversation: MagicMock,
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc",
@@ -652,7 +652,7 @@ class TestUpdateConfig:
         conversation: MagicMock,
         workspace_xml: Path,
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc", project_id=42, dataset_path="/d", adapter="avi_train"
@@ -675,7 +675,7 @@ class TestUpdateConfig:
         executor: LabelStudioProjectExecutor,
         conversation: MagicMock,
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc", project_id=42, dataset_path="/d", adapter="avi_train"
@@ -740,7 +740,7 @@ class TestUpdateConfig:
         executor: LabelStudioProjectExecutor,
         conversation: MagicMock,
     ) -> None:
-        from openhands.tools.label_studio.field_map import parse_field_map
+        from pyromind_common.tools.label_studio.field_map import parse_field_map
 
         # The project was converted through a map that renamed the quality
         # control, so the default name no longer satisfies its own config.
@@ -785,7 +785,7 @@ class TestExport:
         executor: LabelStudioProjectExecutor,
         conversation: MagicMock,
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc",
@@ -877,7 +877,7 @@ class TestErrorHandling:
         executor: LabelStudioProjectExecutor,
         conversation: MagicMock,
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc", project_id=42, dataset_path="/d", adapter="avi_train"
@@ -942,7 +942,7 @@ def test_create_widens_the_config_with_the_values_the_data_uses(
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state", return_value=None),
         patch(
-            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
         _mock_manifest(
@@ -983,7 +983,7 @@ def test_create_reports_bindings_that_name_an_undeclared_control(
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state", return_value=None),
         patch(
-            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
         _mock_manifest(
@@ -1022,7 +1022,7 @@ def test_create_reports_unmatched_regions_to_the_agent(
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state", return_value=None),
         patch(
-            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
         _mock_manifest(MockConverter, 1, b"[{}]", unmatched_regions=("boxes",))
@@ -1056,7 +1056,7 @@ def test_create_reports_unmatched_samples_to_the_agent(
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state", return_value=None),
         patch(
-            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
         _mock_manifest(MockConverter, 1, b"[{}]", unmatched_samples=("quality",))
@@ -1085,7 +1085,7 @@ def test_create_stays_quiet_when_every_verdict_mapped(
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state", return_value=None),
         patch(
-            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
         _mock_manifest(MockConverter, 1, b"[{}]")
@@ -1108,7 +1108,9 @@ def _create_patches(executor: LabelStudioProjectExecutor, mock_ls: MagicMock):
         patch.object(executor, "_build_ls_api", return_value=mock_ls),
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state", return_value=None),
-        patch("openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"),
+        patch(
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+        ),
     )
 
 
@@ -1118,7 +1120,7 @@ class TestCreateIdempotency:
     def test_existing_ready_project_is_reused(
         self, executor: LabelStudioProjectExecutor, conversation: MagicMock
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc",
@@ -1152,7 +1154,7 @@ class TestCreateIdempotency:
     def test_retry_resumes_from_the_recorded_batch(
         self, executor: LabelStudioProjectExecutor, conversation: MagicMock
     ) -> None:
-        from openhands.tools.label_studio.models import ProjectState
+        from pyromind_common.tools.label_studio.models import ProjectState
 
         state = ProjectState(
             project_ref="abc",
@@ -1201,7 +1203,7 @@ class TestCreateIdempotency:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -1244,7 +1246,7 @@ class TestCreateIdempotency:
                     executor, "_download_from_storage", return_value=payload
                 ) as mock_download,
                 patch(
-                    "openhands.tools.label_studio.executor."
+                    "pyromind_common.tools.label_studio.executor."
                     "AVITrainToLabelStudioConverter"
                 ) as MockConverter,
             ):
@@ -1278,7 +1280,7 @@ class TestCreateIdempotency:
             patch.object(executor, "_save_state", return_value=None),
             patch.object(executor, "_download_from_storage") as mock_download,
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -1305,7 +1307,7 @@ class TestCreateIdempotency:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -1337,7 +1339,7 @@ class TestCreateIdempotency:
                 patch.object(executor, "_upload_to_storage", return_value=None),
                 patch.object(executor, "_save_state", return_value=None),
                 patch(
-                    "openhands.tools.label_studio.executor."
+                    "pyromind_common.tools.label_studio.executor."
                     "AVITrainToLabelStudioConverter"
                 ) as MockConverter,
             ):
@@ -1366,7 +1368,7 @@ class TestCreateIdempotency:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             _mock_manifest(MockConverter, 3, b"[{},{},{}]")
@@ -1397,7 +1399,7 @@ class TestPortalWiring:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -1467,7 +1469,7 @@ class TestLoadState:
         self, executor: LabelStudioProjectExecutor, conversation: MagicMock
     ) -> None:
         with patch(
-            "openhands.tools.label_studio.executor.download_file_from_pyromind",
+            "pyromind_common.tools.label_studio.executor.download_file_from_pyromind",
             side_effect=StorageFileNotFoundError("gone"),
         ):
             assert executor._load_state("ref", conversation) is None
@@ -1476,7 +1478,7 @@ class TestLoadState:
         self, executor: LabelStudioProjectExecutor, conversation: MagicMock
     ) -> None:
         with patch(
-            "openhands.tools.label_studio.executor.download_file_from_pyromind",
+            "pyromind_common.tools.label_studio.executor.download_file_from_pyromind",
             side_effect=ValueError("storage down"),
         ):
             with pytest.raises(ValueError, match="storage down"):
@@ -1499,7 +1501,7 @@ class TestOrphanRecovery:
             patch.object(executor, "_upload_to_storage", return_value=None),
             patch.object(executor, "_save_state", return_value=None),
             patch(
-                "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+                "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
             ) as MockConverter,
         ):
             _mock_manifest(MockConverter, 1, b"[{}]")
@@ -1531,7 +1533,7 @@ def test_uploads_keep_the_object_name_storage_looks_for(conversation):
         uploaded.append({"name": local_path.name, "dir": target_dir})
 
     with patch(
-        "openhands.tools.label_studio.executor.upload_local_file_to_pyromind",
+        "pyromind_common.tools.label_studio.executor.upload_local_file_to_pyromind",
         fake_upload,
     ):
         executor._upload_to_storage(
@@ -1819,7 +1821,7 @@ def test_create_records_the_window_the_portal_reported(conversation):
         patch.object(executor, "_upload_to_storage", return_value=None),
         patch.object(executor, "_save_state") as save_state,
         patch(
-            "openhands.tools.label_studio.executor.AVITrainToLabelStudioConverter"
+            "pyromind_common.tools.label_studio.executor.AVITrainToLabelStudioConverter"
         ) as MockConverter,
     ):
         manifest = MockConverter.return_value.convert.return_value

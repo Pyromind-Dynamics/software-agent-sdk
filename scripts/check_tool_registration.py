@@ -24,9 +24,9 @@ class ToolChecker(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         """Check if register_tool is imported."""
-        if node.module and any(
-            node.module == prefix or node.module.startswith(prefix + ".")
-            for prefix in ("openhands.sdk.tool", "pyromind_common.sdk.tool")
+        if node.module and (
+            node.module == "pyromind_common.sdk.tool"
+            or node.module.startswith("pyromind_common.sdk.tool.")
         ):
             for alias in node.names:
                 if alias.name == "register_tool":
@@ -110,7 +110,7 @@ def check_tool_registration(
     if checker.tool_classes and not checker.imports_register_tool:
         errors.append(
             "File defines Tool classes but does not import register_tool "
-            "from openhands.sdk.tool"
+            "from pyromind_common.sdk.tool"
         )
 
     # Check that all defined tools are registered
@@ -136,10 +136,7 @@ def main(files: list[str] | None = None) -> int:
         0 if no violations found, 1 otherwise.
     """
     repo_root = Path(__file__).parent.parent
-    tools_paths = [
-        repo_root / "openhands-tools" / "openhands" / "tools",
-        repo_root / "pyromind-common" / "pyromind_common" / "tools",
-    ]
+    tools_path = repo_root / "pyromind-common" / "pyromind_common" / "tools"
 
     # Skip checking certain files/directories
     skip_patterns = {
@@ -161,12 +158,12 @@ def main(files: list[str] | None = None) -> int:
         files_to_check = [
             Path(f).resolve()
             for f in files
-            if any(Path(f).resolve().is_relative_to(path) for path in tools_paths)
+            if Path(f).resolve().is_relative_to(tools_path)
             and Path(f).name.endswith(".py")
         ]
     else:
         # Check all Python files in tools directory
-        files_to_check = [file for path in tools_paths for file in path.rglob("*.py")]
+        files_to_check = list(tools_path.rglob("*.py"))
 
     # Filter out files matching skip patterns
     files_to_check = [
@@ -196,7 +193,7 @@ def main(files: list[str] | None = None) -> int:
             "  - All ToolDefinition subclasses must be registered using "
             "register_tool()\n"
             "  - Add at module level: register_tool(ToolName.name, ToolName)\n"
-            "  - Import register_tool from openhands.sdk.tool"
+            "  - Import register_tool from pyromind_common.sdk.tool"
         )
         return 1
 

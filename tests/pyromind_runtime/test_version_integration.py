@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
 from harness_adapter import (
     artifact_snapshots as platform,
     workflow_submission as platform_submission,

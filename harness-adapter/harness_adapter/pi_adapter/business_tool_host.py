@@ -12,6 +12,29 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+
+from harness_adapter.pi_adapter.business_tools import (
+    execute_validation_tool,
+    validation_tool_spec,
+)
+from harness_adapter.pi_adapter.persistence import PiSessionFiles, SavedToolOutput
+from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
+from harness_adapter.pi_adapter.tool_output import (
+    ToolOutputPolicy,
+    business_tool_output_id,
+    normalize_utf8_text,
+    resolve_tool_output_policy,
+    truncate_tool_content,
+)
+from harness_adapter.tool_context import current_user_from_context
+from harness_adapter.version_tools import (
+    ExecutionCall,
+    ProductVersionsAction,
+    ProductVersionsTool,
+    VersionCall,
+    submission_bridge,
+)
+from harness_adapter.workflow_validation import check_workflow_resources
 from pyromind_common.platform.auth import parse_auth_token_from_cookie_header
 from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
 from pyromind_common.sdk.secret import StaticSecret
@@ -75,29 +98,6 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
-
-from harness_adapter.pi_adapter.business_tools import (
-    execute_validation_tool,
-    validation_tool_spec,
-)
-from harness_adapter.pi_adapter.persistence import PiSessionFiles, SavedToolOutput
-from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
-from harness_adapter.pi_adapter.tool_output import (
-    ToolOutputPolicy,
-    business_tool_output_id,
-    normalize_utf8_text,
-    resolve_tool_output_policy,
-    truncate_tool_content,
-)
-from harness_adapter.tool_context import current_user_from_context
-from harness_adapter.version_tools import (
-    ExecutionCall,
-    ProductVersionsAction,
-    ProductVersionsTool,
-    VersionCall,
-    submission_bridge,
-)
-from harness_adapter.workflow_validation import check_workflow_resources
 
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
@@ -379,7 +379,7 @@ class PyromindBusinessToolHost:
             )
         self._cleaning_runtime = roots["data-processing"] / "scripts" / "cleaning"
         self._preparation_runtime = roots["data-processing"] / "scripts" / "preparation"
-        self._edp_runtime = roots["data-processing"] / "scripts" / "pyromind-edp"
+        self._edp_runtime = roots["data-processing"] / "scripts" / "edp"
         self._training_runtime = roots["training-analysis"] / "scripts"
         self._inference_runtime = (
             skills_directory / "inference-evaluation" / "scripts"

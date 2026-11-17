@@ -46,7 +46,7 @@ from pyromind_runtime.application.snapshot_projector import project_stage_activi
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
-from pyromind_runtime.domain.capabilities import ResourceLimits
+from pyromind_runtime.domain.capabilities import HarnessCapabilities, ResourceLimits
 from pyromind_runtime.domain.commands import (
     CancelCommand,
     CommandReceipt,
@@ -89,6 +89,7 @@ from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ConversationSummary,
     ExternalTaskState,
+    TimelineNotice,
     TimelineOperation,
     WorkflowState,
 )
@@ -209,7 +210,7 @@ class ConversationRuntime:
         conversation_root: Path | str,
         adapters: HarnessAdapter | Mapping[str, HarnessAdapter],
         *,
-        default_harness_id: str = "openhands",
+        default_harness_id: str = "pi",
         external_task_query: ExternalTaskQueryPort | None = None,
         preparation_store: PreparationStore | None = None,
         resource_media_reader: ResourceMediaReader | None = None,
@@ -2058,7 +2059,8 @@ class ConversationRuntime:
                 tools = await asyncio.to_thread(store.development_policy)
                 if policy is not None and "subagent" in (tools.tool_allowlist or ()):
                     snapshot = project_stage_activity(snapshot, policy)
-            await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
+            if not snapshot.capabilities.read_only:
+                await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
             self._schedule_read_recovery(conversation_id, store, context)
             result = "ok"
             return snapshot
@@ -2070,6 +2072,31 @@ class ConversationRuntime:
     async def _load_saved_snapshot(
         self, conversation_id: str, store: FileProductStore, context: RequestContext
     ) -> ConversationSnapshot:
+        if store.harness_id() not in self.adapters:
+            snapshot = await asyncio.to_thread(store.load_snapshot)
+            return snapshot.model_copy(
+                update={
+                    "capabilities": HarnessCapabilities(read_only=True),
+                    "status": "closed",
+                    "active_run_id": None,
+                    "automatic_turns_suspended": True,
+                    "timeline": (
+                        *snapshot.timeline,
+                        TimelineNotice(
+                            item_id="legacy-harness-retired",
+                            started_seq=max(1, snapshot.through_seq),
+                            severity="warning",
+                            code="legacy_harness_retired",
+                            message=(
+                                "此 OpenHands 会话已归档，仅可查看历史记录和产物。"
+                                "请新建 Pi 会话继续。"
+                            ),
+                        ),
+                    ),
+                    "pending_inputs": (),
+                    "pending_permissions": (),
+                }
+            )
         if conversation_id not in self._active:
             await self._user_input.coordinate_recovery(store, conversation_id)
         snapshot = await asyncio.to_thread(store.load_snapshot)
@@ -2100,7 +2127,7 @@ class ConversationRuntime:
         *,
         recover_execution: bool = True,
     ) -> None:
-        if self._closing:
+        if self._closing or store.harness_id() not in self.adapters:
             return
         active = self._active.get(conversation_id)
         if recover_execution and active is not None and not active.stopping:
@@ -2278,6 +2305,7 @@ class ConversationRuntime:
         context: RequestContext,
     ) -> CommandReceipt:
         store = await self._authorized_store(conversation_id, context)
+        self._adapter(store.harness_id())
         store.require_command(command.type)
         if store.preparation_policy() is not None:
             current = store.access_policy()
@@ -2575,10 +2603,11 @@ class ConversationRuntime:
         workflow_storage_path: str | None = None,
         origin: TaskOrigin | None = None,
     ) -> dict[str, Any]:
-        if self._workflow_submission is None:
-            raise ValueError("workflow submission is unavailable")
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
+        self._adapter(store.harness_id())
+        if self._workflow_submission is None:
+            raise ValueError("workflow submission is unavailable")
         store.require_command("workflow_execution")
         correlation = TaskCorrelation(
             conversation_id=conversation_id,
@@ -2987,6 +3016,7 @@ class ConversationRuntime:
         # With no live conversation the gate waits for the next session start, so a
         # parked run never loses its notification.
         deferred = notify and active is None
+        retired = store.harness_id() not in self.adapters
         # Save results during suspension without waking the Agent; keep the marker.
         # Persisted policy is authoritative, even without a live session here.
         blocked = notify and snapshot.automatic_turns_suspended
@@ -2994,8 +3024,8 @@ class ConversationRuntime:
             **task.model_dump(mode="json"),
             "status": normalized,
             "updated_at": datetime.now().astimezone().isoformat(),
-            "resume_pending": terminal or deferred or blocked,
-            "resume_auto_run": auto_run,
+            "resume_pending": (terminal or deferred or blocked) and not retired,
+            "resume_auto_run": auto_run and not retired,
             "completion_result": {**task.completion_result, **completion_result}
             if completion_result is not None
             else task.completion_result,
@@ -3033,6 +3063,9 @@ class ConversationRuntime:
                 logger.exception(
                     "Could not update external task registry for %s", task_id
                 )
+        if retired:
+            self._publish(persisted)
+            return persisted
         if terminal:
             await self.reconcile_versions(
                 conversation_id, active.context if active else None
@@ -3438,6 +3471,8 @@ class ConversationRuntime:
         """
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
+        if store.harness_id() not in self.adapters:
+            return store
         if conversation_id in self._active or self._has_pending_external_work(
             await asyncio.to_thread(store.load_snapshot), context
         ):
@@ -4201,6 +4236,12 @@ class ConversationRuntime:
         try:
             return self.adapters[harness_id]
         except KeyError as exc:
+            if harness_id == "openhands":
+                raise ProductRuntimeError(
+                    "legacy_harness_retired",
+                    "This OpenHands conversation is archived and cannot continue. "
+                    "Create a new Pi conversation to continue.",
+                ) from exc
             raise ValueError(f"harness is not registered: {harness_id}") from exc
 
     async def _rollback_workflow(

@@ -1,6 +1,6 @@
 import json
 
-from openhands.agent_server.config import CONFIG_PATH_ENV, load_config
+from pyromind_agent_server.config import CONFIG_PATH_ENV, load_config
 
 
 def test_load_config_reads_registered_marketplaces_from_env(monkeypatch, tmp_path):

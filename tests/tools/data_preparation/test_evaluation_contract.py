@@ -5,12 +5,12 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from openhands.tools.data_preparation.evaluation_submit import (
+from pyromind_common.tools.data_preparation.evaluation_submit import (
     DfSubmitEvaluationAction,
     DfSubmitEvaluationExecutor,
     DfSubmitEvaluationTool,
 )
-from openhands.tools.data_preparation.platform_submit import (
+from pyromind_common.tools.data_preparation.platform_submit import (
     DfSubmitPipelineAction,
     DfSubmitPipelineTool,
 )

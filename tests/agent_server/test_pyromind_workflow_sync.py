@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from openhands.agent_server.pyromind_router import (
+from pyromind_agent_server.pyromind_router import (
     PyromindDebugCallbackRequest,
     PyromindWorkflowCallbackRequest,
     pyromind_debug_callback,
     pyromind_workflow_callback,
 )
-from openhands.agent_server.workflow_status import WorkflowCallbackResult
-from openhands.tools.pyromind_debug.broker import get_debug_result_broker
+from pyromind_agent_server.workflow_status import WorkflowCallbackResult
+from pyromind_common.tools.pyromind_debug.broker import get_debug_result_broker
 
 
 @pytest.mark.asyncio
@@ -69,7 +69,7 @@ async def test_workflow_callback_delegates_to_deliver(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_workflow_status",
+        "pyromind_agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 
@@ -110,7 +110,7 @@ async def test_workflow_callback_passes_from_workflow_debug(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_workflow_status",
+        "pyromind_agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 
@@ -145,7 +145,7 @@ async def test_workflow_callback_allows_omitted_conversation_id(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_workflow_status",
+        "pyromind_agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 
@@ -173,7 +173,7 @@ async def test_workflow_callback_unknown_conversation_returns_404(
         )
 
     monkeypatch.setattr(
-        "openhands.agent_server.pyromind_router.deliver_workflow_status",
+        "pyromind_agent_server.pyromind_router.deliver_workflow_status",
         fake_deliver,
     )
 

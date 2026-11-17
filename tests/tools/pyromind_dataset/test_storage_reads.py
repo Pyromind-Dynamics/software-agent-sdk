@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from openhands.tools.pyromind_dataset import definition as storage
+from pyromind_common.tools.pyromind_dataset import definition as storage
 
 
 @pytest.fixture

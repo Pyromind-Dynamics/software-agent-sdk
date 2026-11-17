@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from uuid import uuid4
 
+import httpx
+import pytest
+from pydantic import BaseModel, ValidationError
+
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import harness_adapter.pi_adapter.business_tool_host as business_tool_host_module
 import harness_adapter.pi_adapter.sandbox_workspace as sandbox_workspace_module
-import httpx
-import pytest
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.pi_adapter.adapter import (
     _copy_business_tool_outputs_for_fork,
@@ -42,7 +44,6 @@ from harness_adapter.pi_adapter.tool_output import (
     PLATFORM_MAX_INLINE_TEXT_BYTES,
     ToolOutputPolicy,
 )
-from pydantic import BaseModel, ValidationError
 from pyromind_agent_server.api.schemas import AgentLLMConfig
 from pyromind_common.sdk.workspace.local import LocalWorkspace
 from pyromind_runtime.domain.commands import UserMessageCommand
@@ -228,7 +229,7 @@ def configured_skills_directory(tmp_path) -> Path:
     for resource in (
         "data-processing/scripts/cleaning",
         "data-processing/scripts/preparation",
-        "data-processing/scripts/pyromind-edp",
+        "data-processing/scripts/edp",
         "training-analysis/scripts",
     ):
         (skills / resource).mkdir(parents=True)

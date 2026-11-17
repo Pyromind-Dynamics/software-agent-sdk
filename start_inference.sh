@@ -153,7 +153,7 @@ export PYROMIND_SECRET_PATH="${PYROMIND_SECRET_PATH:-/etc/secrets}"
 case "${OH_ENABLE_PYROMIND_JWT_AUTH}" in
   true|True|TRUE|1)
     uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python -c \
-      'from openhands.agent_server.pyromind_auth import find_secret_key; find_secret_key()'
+      'from pyromind_common.platform.auth import find_secret_key; find_secret_key()'
     ;;
 esac
 

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import httpx
+
 from pyromind_agent_server import bootstrap
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.config import Config
@@ -43,31 +44,15 @@ assert "/api/conversations" not in paths
 """)
 
 
-def test_legacy_service_and_tool_registry_remain_independent():
-    _python("""
-from openhands.agent_server.api import create_app as legacy_app
-from openhands.agent_server.config import Config as LegacyConfig
-from openhands.sdk.tool.registry import get_tool_module_qualnames as legacy_tools
-before = legacy_tools()
-from pyromind_common.tools.workflow.validate_workflow_dsl import ValidateWorkflowDslTool
-from pyromind_common.sdk.tool.registry import get_tool_module_qualnames as product_tools
-assert legacy_tools() == before
-assert product_tools()["validate_workflow_dsl"].startswith("pyromind_common.")
-app = legacy_app(LegacyConfig(static_files_path=None))
-assert "/api/conversations" in app.openapi()["paths"]
-""")
-
-
-def test_both_sandbox_asset_bundles_can_start():
-    scripts = ROOT / ".agents/skills/data-processing/scripts"
-    for name in ("edp", "pyromind-edp"):
-        subprocess.run(
-            [sys.executable, str(scripts / name / "sandbox_runner.py"), "--help"],
-            env={**os.environ, "PYTHONPATH": str(scripts / name / "pod_runtime")},
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+def test_canonical_sandbox_bundle_can_start_without_legacy_packages():
+    bundle = ROOT / ".agents/skills/data-processing/scripts/edp"
+    subprocess.run(
+        [sys.executable, str(bundle / "sandbox_runner.py"), "--help"],
+        env={**os.environ, "PYTHONPATH": str(bundle / "pod_runtime")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 async def test_deferred_product_service_initializes_pi_and_closes(

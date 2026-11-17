@@ -12,20 +12,18 @@ import pytest
 from PIL import Image
 from pydantic import SecretStr, ValidationError
 
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.llm import LLM, FailoverRouter
-from openhands.sdk.workspace.models import CommandResult
-from openhands.sdk.workspace.workspace import LocalWorkspace
-from openhands.tools.data_preparation.definition import (
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.workspace.models import CommandResult
+from pyromind_common.sdk.workspace.workspace import LocalWorkspace
+from pyromind_common.tools.data_preparation.definition import (
     RUNTIME_FILENAMES,
     DfRunPipelineAction,
     DfRunPipelineExecutor,
     DfRunPipelineObservation,
 )
-from openhands.tools.data_preparation.runner import (
+from pyromind_common.tools.data_preparation.runner import (
     LabelingModelGateway,
     ProcessLocalSampleExecutor,
-    _concrete_llm,
     build_dataflow_env,
     openai_compatible_model_name,
     preflight_dataflow_llm,
@@ -34,8 +32,8 @@ from openhands.tools.data_preparation.runner import (
     summarize_dataflow_env,
     validate_managed_image_pipeline,
 )
-from openhands.tools.data_preparation.sandbox_execution import sandbox_read_text
-from openhands.tools.utils.dataflow_config import (
+from pyromind_common.tools.data_preparation.sandbox_execution import sandbox_read_text
+from pyromind_common.tools.utils.dataflow_config import (
     DEFAULT_DATAFLOW_API_BASE_URL,
     DEFAULT_DATAFLOW_MODEL_NAME,
 )
@@ -1325,7 +1323,7 @@ class _FakePreflightResponse:
 
 def test_preflight_passes_on_200(monkeypatch) -> None:
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.runner.httpx.post",
+        "pyromind_common.tools.data_preparation.runner.httpx.post",
         lambda *args, **kwargs: _FakePreflightResponse(
             200, '{"choices": [{"message": {"content": "p"}}]}', "application/json"
         ),
@@ -1341,7 +1339,7 @@ def test_preflight_passes_on_200(monkeypatch) -> None:
 
 def test_preflight_rejects_unknown_model(monkeypatch) -> None:
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.runner.httpx.post",
+        "pyromind_common.tools.data_preparation.runner.httpx.post",
         lambda *args, **kwargs: _FakePreflightResponse(
             404,
             '{"error": {"message": "No endpoints found for router"}}',
@@ -1360,7 +1358,7 @@ def test_preflight_rejects_unknown_model(monkeypatch) -> None:
 
 def test_preflight_detects_html_endpoint_hit(monkeypatch) -> None:
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.runner.httpx.post",
+        "pyromind_common.tools.data_preparation.runner.httpx.post",
         lambda *args, **kwargs: _FakePreflightResponse(
             200, "<html><body>home</body></html>", "text/html; charset=utf-8"
         ),
@@ -1377,7 +1375,7 @@ def test_preflight_detects_html_endpoint_hit(monkeypatch) -> None:
 
 def test_preflight_reports_auth_failure(monkeypatch) -> None:
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.runner.httpx.post",
+        "pyromind_common.tools.data_preparation.runner.httpx.post",
         lambda *args, **kwargs: _FakePreflightResponse(
             401, '{"error": "unauthorized"}', "application/json"
         ),
@@ -1395,7 +1393,7 @@ def test_preflight_reports_auth_failure(monkeypatch) -> None:
 def test_preflight_can_be_skipped(monkeypatch) -> None:
     monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.runner.httpx.post",
+        "pyromind_common.tools.data_preparation.runner.httpx.post",
         lambda *args, **kwargs: pytest.fail("preflight should be skipped"),
     )
 
@@ -1413,7 +1411,9 @@ def test_preflight_reports_connection_failure(monkeypatch) -> None:
     def _raise(*args, **kwargs):
         raise _httpx.ConnectError("unreachable")
 
-    monkeypatch.setattr("openhands.tools.data_preparation.runner.httpx.post", _raise)
+    monkeypatch.setattr(
+        "pyromind_common.tools.data_preparation.runner.httpx.post", _raise
+    )
 
     with pytest.raises(ValueError, match="could not reach"):
         preflight_dataflow_llm(
@@ -1463,50 +1463,6 @@ def test_build_dataflow_env_text_profile_rejects_placeholder_llm_model(
         build_dataflow_env(conversation, "text")
 
 
-def test_build_dataflow_env_text_profile_uses_primary_router_provider(
-    monkeypatch,
-) -> None:
-    """A RouterLLM (no real ``model``) must resolve the primary provider's
-    model for DataFlow instead of failing on the ``router`` placeholder."""
-    for name in ("DF_API_KEY", "DF_MODEL_NAME", "DF_API_BASE_URL", "DF_API_URL"):
-        monkeypatch.delenv(name, raising=False)
-
-    router = FailoverRouter(
-        llms_for_routing={
-            "deepseek": LLM(
-                model="openai/deepseek-v4-flash-0731",
-                base_url="http://208.64.254.187:8000/v1",
-                api_key=SecretStr("first-key"),
-            ),
-            "openrouter": LLM(
-                model="openai/deepseek-v4-flash-0731",
-                base_url="https://openrouter.ai/api/v1",
-                api_key=SecretStr("second-key"),
-            ),
-        },
-    )
-    conversation = _conversation_with_llm()
-    conversation.state.agent.llm = router
-
-    env = build_dataflow_env(conversation, "text")
-
-    assert env["DF_MODEL_NAME"] == "deepseek-v4-flash-0731"
-    assert env["DF_API_BASE_URL"] == "http://208.64.254.187:8000/v1"
-    assert env["DF_API_KEY"] == "first-key"
-
-
-def test_concrete_llm_delegates_to_router_primary() -> None:
-    router = FailoverRouter(
-        llms_for_routing={
-            "deepseek": LLM(model="openai/deepseek-v4-flash-0731"),
-            "openrouter": LLM(model="openai/deepseek-v4-flash-0731"),
-        },
-    )
-    assert _concrete_llm(router).model == "openai/deepseek-v4-flash-0731"
-    plain = LLM(model="openai/gpt-x")
-    assert _concrete_llm(plain) is plain
-
-
 def test_df_run_pipeline_passes_the_user_gateway_to_the_subprocess(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1540,11 +1496,11 @@ def test_df_run_pipeline_passes_the_user_gateway_to_the_subprocess(
     conversation = cast(Any, _fake_conversation(tmp_path))
     conversation.state.agent = _conversation_with_llm().state.agent
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.definition.check_dataflow_installed",
+        "pyromind_common.tools.data_preparation.definition.check_dataflow_installed",
         lambda python: (True, ""),
     )
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.definition.check_dataflow_version",
+        "pyromind_common.tools.data_preparation.definition.check_dataflow_version",
         lambda python: (True, ""),
     )
 
@@ -2511,7 +2467,7 @@ def _run_vision_sandbox_sample(
     """
     monkeypatch.setenv("DF_SKIP_PREFLIGHT", "1")
     monkeypatch.setattr(
-        "openhands.tools.data_preparation.definition.build_dataflow_env",
+        "pyromind_common.tools.data_preparation.definition.build_dataflow_env",
         lambda conversation, model_profile: {
             "DF_API_KEY": "secret",
             "DF_API_URL": "http://example.test/v1/chat/completions",

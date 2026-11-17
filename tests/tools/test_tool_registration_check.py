@@ -3,14 +3,14 @@ from pathlib import Path
 from scripts.check_tool_registration import main
 
 
-def test_browser_definition_special_case_handles_platform_path_separator():
+def test_product_tool_registration_uses_current_package_root():
     repo_root = Path(__file__).parents[2]
     browser_definition = (
         repo_root
-        / "openhands-tools"
-        / "openhands"
+        / "pyromind-common"
+        / "pyromind_common"
         / "tools"
-        / "browser_use"
+        / "sandbox"
         / "definition.py"
     )
 

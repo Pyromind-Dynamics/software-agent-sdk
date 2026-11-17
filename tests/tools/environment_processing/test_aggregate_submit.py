@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openhands.tools.environment_processing.aggregate_submit import (
+from pyromind_common.tools.environment_processing.aggregate_submit import (
     AGGREGATE_TASK_KIND,
     EdpAggregateAction,
     EdpAggregateTool,
@@ -92,7 +92,7 @@ def _runtime_tmp(tmp_path: Path) -> Path:
 
 
 def _executor(runtime_dir: str | None = None) -> Any:
-    from openhands.tools.environment_processing.aggregate_submit import (
+    from pyromind_common.tools.environment_processing.aggregate_submit import (
         EdpAggregateExecutor,
     )
 
@@ -109,7 +109,9 @@ def _executor(runtime_dir: str | None = None) -> Any:
 
 
 def _patch_submission(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    module = sys.modules["openhands.tools.environment_processing.aggregate_submit"]
+    module = sys.modules[
+        "pyromind_common.tools.environment_processing.aggregate_submit"
+    ]
     upload = MagicMock()
     monkeypatch.setattr(module, "upload_local_file_to_pyromind", upload)
     response = SimpleNamespace(task_id="task-77", status="Pending")

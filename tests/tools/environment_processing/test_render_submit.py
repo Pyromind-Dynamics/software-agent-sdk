@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from openhands.tools.environment_processing.render_submit import (
+from pyromind_common.tools.environment_processing.render_submit import (
     EdpRenderAction,
     EdpRenderExecutor as RenderExecutor,
     EdpRenderTool,
@@ -75,7 +75,7 @@ def _render_runtime(tmp_path: Path) -> Path:
 
 
 def _patch_submission(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    module = sys.modules["openhands.tools.environment_processing.render_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.render_submit"]
     upload = MagicMock()
     monkeypatch.setattr(module, "upload_local_file_to_pyromind", upload)
     # preflight downloads fail open by default so existing tests never hit storage
@@ -237,7 +237,7 @@ def test_executor_missing_env_uses_production(
     _patch_submission(monkeypatch)
     monkeypatch.delenv("APP_ENV", raising=False)
     client_factory = MagicMock(return_value=MagicMock())
-    module = sys.modules["openhands.tools.environment_processing.render_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.render_submit"]
     monkeypatch.setattr(module, "create_workflow_api_client", client_factory)
     template = tmp_path / "render_template.json"
     template.write_text(json.dumps({"fields": {"task_id": "task_id"}}))
@@ -321,7 +321,7 @@ def _parquet_bytes() -> bytes:
 def _patch_preflight(
     monkeypatch: pytest.MonkeyPatch, parquet: bytes | None
 ) -> MagicMock:
-    module = sys.modules["openhands.tools.environment_processing.render_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.render_submit"]
 
     def fake_download(**kwargs: Any) -> tuple[bytes, int]:
         if parquet is None:
@@ -466,7 +466,7 @@ def test_preflight_parses_schema_through_sparse_gap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """大文件场景:tail 只含文件尾部,头部 magic 虚拟提供、中间为稀疏间隙。"""
-    from openhands.tools.environment_processing.render_submit import (
+    from pyromind_common.tools.environment_processing.render_submit import (
         _preflight_template,
     )
 
@@ -478,7 +478,7 @@ def test_preflight_parses_schema_through_sparse_gap(
         return small, total
 
     monkeypatch.setattr(
-        sys.modules["openhands.tools.environment_processing.render_submit"],
+        sys.modules["pyromind_common.tools.environment_processing.render_submit"],
         "download_tail_from_pyromind",
         MagicMock(side_effect=fake_download),
     )
@@ -536,7 +536,7 @@ def test_preflight_par1_check_survives_missing_pyarrow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """本地缺 pyarrow 时 PAR1 拦截仍生效；合法 parquet 则放行提交。"""
-    from openhands.tools.environment_processing.render_submit import (
+    from pyromind_common.tools.environment_processing.render_submit import (
         _preflight_template,
     )
 

@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from openhands.sdk.git.git_diff import get_closest_git_repo, get_git_diff
-from openhands.sdk.git.models import GitDiff
+from pyromind_common.sdk.git.git_diff import get_closest_git_repo, get_git_diff
+from pyromind_common.sdk.git.models import GitDiff
 
 
 def run_bash_command(command: str, cwd: str) -> subprocess.CompletedProcess:
@@ -99,7 +99,7 @@ def test_get_git_diff_deleted_file():
         os.remove(test_file)
 
         # The function will raise GitPathError for deleted files
-        from openhands.sdk.git.exceptions import GitPathError
+        from pyromind_common.sdk.git.exceptions import GitPathError
 
         with pytest.raises(GitPathError):
             run_in_directory(temp_dir, get_git_diff, "deleted_file.txt")
@@ -143,7 +143,7 @@ def test_get_git_diff_no_repository():
         test_file = Path(temp_dir) / "file.txt"
         test_file.write_text("Content")
 
-        from openhands.sdk.git.exceptions import GitRepositoryError
+        from pyromind_common.sdk.git.exceptions import GitRepositoryError
 
         with pytest.raises(GitRepositoryError):
             run_in_directory(temp_dir, get_git_diff, "file.txt")
@@ -154,7 +154,7 @@ def test_get_git_diff_nonexistent_file():
     with tempfile.TemporaryDirectory() as temp_dir:
         setup_git_repo(temp_dir)
 
-        from openhands.sdk.git.exceptions import GitPathError
+        from pyromind_common.sdk.git.exceptions import GitPathError
 
         with pytest.raises(GitPathError):
             run_in_directory(temp_dir, get_git_diff, "nonexistent.txt")
@@ -280,7 +280,7 @@ def test_git_diff_large_file_error():
         large_content = "x" * (1024 * 1024 + 1)  # 1MB + 1 byte
         test_file.write_text(large_content)
 
-        from openhands.sdk.git.exceptions import GitPathError
+        from pyromind_common.sdk.git.exceptions import GitPathError
 
         with pytest.raises(GitPathError):
             run_in_directory(temp_dir, get_git_diff, "large_file.txt")
@@ -317,7 +317,7 @@ def test_get_git_diff_ref_head_compares_against_latest_commit():
 
 def test_get_git_diff_invalid_ref_raises():
     """An explicit ref that does not resolve should raise."""
-    from openhands.sdk.git.exceptions import GitCommandError
+    from pyromind_common.sdk.git.exceptions import GitCommandError
 
     with tempfile.TemporaryDirectory() as temp_dir:
         setup_git_repo(temp_dir)

@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
+agent-server = "pyromind_agent_server.__main__:main"
 pyromind-agent-server = "pyromind_agent_server.__main__:main"
 pyromind-lineage = "pyromind_agent_server.lineage:main"
 

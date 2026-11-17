@@ -5,7 +5,7 @@ Journey at realistic scale — parallel sub-agents, many conversations,
 long-running commands, slow webhooks, websocket back-pressure, and so on —
 by driving the agent-server in-process via FastAPI's ASGI transport. No
 real binary, no real network, no real LLM: everything runs against
-``ConversationService`` + ``BashEventService`` instances backed by
+``ProductServiceContext`` + ``BashEventService`` instances backed by
 ``tmp_path``.
 
 The suite is excluded from default pytest runs via the ``stress`` marker
@@ -20,7 +20,7 @@ FDs (see ``probe.py``). Don't try to run this on Windows.
 
 Layout
 ------
-- ``conftest.py``    Per-test ``ConversationService``/``BashEventService``
+- ``conftest.py``    Per-test ``ProductServiceContext``/``BashEventService``
                      fixtures, the in-process FastAPI app, an
                      ``httpx.AsyncClient`` over ASGITransport, and the
                      ``ResourceProbe`` fixture.

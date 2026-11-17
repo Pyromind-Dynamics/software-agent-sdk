@@ -1,6 +1,6 @@
 """Tests for tolerant value resolution between data and config values."""
 
-from openhands.tools.label_studio.value_mapping import (
+from pyromind_common.tools.label_studio.value_mapping import (
     VERDICT_SYNONYMS,
     ControlValueIndex,
     normalize_value_key,

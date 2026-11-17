@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from openhands.sdk.utils.command import execute_command, sanitized_env
+from pyromind_common.sdk.utils.command import execute_command, sanitized_env
 
 
 def test_sanitized_env_returns_copy():
@@ -126,7 +126,7 @@ class TestExecuteCommandLoggingRedaction:
 
     def test_redacts_api_key_from_string_command(self):
         """API keys in string commands are properly redacted."""
-        from openhands.sdk.utils.redact import redact_text_secrets
+        from pyromind_common.sdk.utils.redact import redact_text_secrets
 
         # Test the redaction function directly
         # Valid Anthropic key format: sk-ant-api[2 digits]-[20+ chars]
@@ -142,7 +142,7 @@ class TestExecuteCommandLoggingRedaction:
 
     def test_redacts_key_value_env_format(self):
         """KEY=VALUE environment variable format is redacted."""
-        from openhands.sdk.utils.redact import redact_text_secrets
+        from pyromind_common.sdk.utils.redact import redact_text_secrets
 
         cmd_str = "docker run -e api_key='secretvalue123456789' -e DEBUG=true image"
         redacted = redact_text_secrets(cmd_str)

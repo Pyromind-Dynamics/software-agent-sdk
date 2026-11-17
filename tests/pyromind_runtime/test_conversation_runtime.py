@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime
 
 import pytest
+
 from pyromind_runtime.application import conversation_runtime
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
@@ -436,7 +437,9 @@ async def test_runtime_resumes_callback_through_owning_adapter(tmp_path) -> None
         )
     )
     adapter = FakeAdapter("openhands")
-    runtime = ConversationRuntime(conversations, {"openhands": adapter})
+    runtime = ConversationRuntime(
+        conversations, {"openhands": adapter}, default_harness_id="openhands"
+    )
 
     await runtime.deliver_external_task_status(
         "callback-conversation", task_id="task-1", status="Succeeded"
@@ -1587,7 +1590,7 @@ async def test_history_result_recovers_once_without_reexecuting(
             conversation_id="history", capabilities=HarnessCapabilities()
         ),
         user_id="42",
-        harness_id="openhands",
+        harness_id="pi",
     )
     adapter = FakeAdapter()
     runtime = ConversationRuntime(tmp_path, adapter)

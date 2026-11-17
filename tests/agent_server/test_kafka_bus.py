@@ -1,4 +1,4 @@
-"""Unit tests for openhands.agent_server.kafka_bus."""
+"""Unit tests for pyromind_agent_server.kafka_bus."""
 
 from __future__ import annotations
 
@@ -9,20 +9,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI
-from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
-from openhands.agent_server.api import api_lifespan
-from openhands.agent_server.config import Config
-from openhands.agent_server.kafka_bus.handlers.studio_workflow_notify_handler import (
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.http_app import api_lifespan
+from pyromind_agent_server.kafka_bus.handlers.studio_workflow_notify_handler import (
     StudioWorkflowNotifyHandler,
     TrainingTaskEventType,
     _parse_conversation_id_from_out_id,
     _parse_out_id,
 )
-from openhands.agent_server.kafka_bus.kafka_bus import KafkaMessageBus
-from openhands.agent_server.kafka_bus.kafka_topic import KafkaTopic
-from openhands.agent_server.kafka_bus.message_event import MessageEvent
-from openhands.agent_server.workflow_status import WorkflowCallbackResult
+from pyromind_agent_server.kafka_bus.kafka_bus import KafkaMessageBus
+from pyromind_agent_server.kafka_bus.kafka_topic import KafkaTopic
+from pyromind_agent_server.kafka_bus.message_event import MessageEvent
+from pyromind_agent_server.workflow_status import WorkflowCallbackResult
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
 
 @pytest.fixture
@@ -59,26 +59,26 @@ def test_message_event_round_trip_drops_none_fields():
 
 def test_kafka_topic_resolve_prod_and_pre(monkeypatch):
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_topic.env_util.get_env_value",
+        "pyromind_agent_server.kafka_bus.kafka_topic.env_util.get_env_value",
         lambda: "prod",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_topic.env_util.is_pre",
+        "pyromind_agent_server.kafka_bus.kafka_topic.env_util.is_pre",
         lambda: False,
     )
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_topic.env_util.get_cluster_region",
+        "pyromind_agent_server.kafka_bus.kafka_topic.env_util.get_cluster_region",
         lambda: "normal",
     )
     assert KafkaTopic.WORKFLOW_MONITOR.resolve() == "workflow_monitor_topic"
     assert KafkaTopic.DLQ.resolve() == "dead_letter_queue_topic"
 
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_topic.env_util.get_env_value",
+        "pyromind_agent_server.kafka_bus.kafka_topic.env_util.get_env_value",
         lambda: "pre",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_topic.env_util.is_pre",
+        "pyromind_agent_server.kafka_bus.kafka_topic.env_util.is_pre",
         lambda: True,
     )
     assert KafkaTopic.WORKFLOW_MONITOR.resolve() == "workflow_monitor_topic_pre"
@@ -129,12 +129,12 @@ def test_parse_out_id_detects_workflow_debug():
 def test_is_dev_delegates_to_env_util(monkeypatch):
     bus = KafkaMessageBus()
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.env_util.is_kafka_dev",
+        "pyromind_agent_server.kafka_bus.kafka_bus.env_util.is_kafka_dev",
         lambda: True,
     )
     assert bus._is_dev() is True
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.env_util.is_kafka_dev",
+        "pyromind_agent_server.kafka_bus.kafka_bus.env_util.is_kafka_dev",
         lambda: False,
     )
     assert bus._is_dev() is False
@@ -158,7 +158,7 @@ async def test_start_consumer_skips_in_dev(monkeypatch):
 async def test_start_consumer_skips_when_brokers_missing(non_dev_bus, monkeypatch):
     bus = non_dev_bus
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
+        "pyromind_agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
         lambda: None,
     )
 
@@ -172,7 +172,7 @@ async def test_start_consumer_skips_when_brokers_missing(non_dev_bus, monkeypatc
 async def test_start_consumer_creates_background_startup_task(non_dev_bus, monkeypatch):
     bus = non_dev_bus
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
+        "pyromind_agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
         lambda: "localhost:9092",
     )
 
@@ -187,7 +187,7 @@ async def test_start_consumer_creates_background_startup_task(non_dev_bus, monke
         return task
 
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.asyncio.create_task",
+        "pyromind_agent_server.kafka_bus.kafka_bus.asyncio.create_task",
         fake_create_task,
     )
 
@@ -207,11 +207,11 @@ async def test_create_consumer_success_starts_consume_loop(monkeypatch):
     consume_loop = AsyncMock()
 
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
+        "pyromind_agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
         lambda: "localhost:9092",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.AIOKafkaConsumer",
+        "pyromind_agent_server.kafka_bus.kafka_bus.AIOKafkaConsumer",
         lambda *args, **kwargs: consumer,
     )
     monkeypatch.setattr(bus, "_consume_loop", consume_loop)
@@ -224,7 +224,7 @@ async def test_create_consumer_success_starts_consume_loop(monkeypatch):
         return MagicMock()
 
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.asyncio.create_task",
+        "pyromind_agent_server.kafka_bus.kafka_bus.asyncio.create_task",
         fake_create_task,
     )
 
@@ -244,11 +244,11 @@ async def test_create_consumer_failure_stops_consumer(monkeypatch):
     consumer.start.side_effect = RuntimeError("boom")
 
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
+        "pyromind_agent_server.kafka_bus.kafka_bus.env_util.get_kafka_brokers",
         lambda: "localhost:9092",
     )
     monkeypatch.setattr(
-        "openhands.agent_server.kafka_bus.kafka_bus.AIOKafkaConsumer",
+        "pyromind_agent_server.kafka_bus.kafka_bus.AIOKafkaConsumer",
         lambda *args, **kwargs: consumer,
     )
 
@@ -421,7 +421,7 @@ async def test_studio_workflow_handler_ignores_non_terminal_and_wrong_type():
     deliver = AsyncMock()
 
     with patch(
-        "openhands.agent_server.kafka_bus.handlers."
+        "pyromind_agent_server.kafka_bus.handlers."
         "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
@@ -454,7 +454,7 @@ async def test_studio_workflow_handler_delivers_terminal_status():
     )
 
     with patch(
-        "openhands.agent_server.kafka_bus.handlers."
+        "pyromind_agent_server.kafka_bus.handlers."
         "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
@@ -496,7 +496,7 @@ async def test_studio_workflow_handler_delivers_debug_terminal_status():
     )
 
     with patch(
-        "openhands.agent_server.kafka_bus.handlers."
+        "pyromind_agent_server.kafka_bus.handlers."
         "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
@@ -539,7 +539,7 @@ async def test_studio_workflow_handler_skips_when_conversation_not_on_pod():
     )
 
     with patch(
-        "openhands.agent_server.kafka_bus.handlers."
+        "pyromind_agent_server.kafka_bus.handlers."
         "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
@@ -566,7 +566,7 @@ async def test_studio_workflow_handler_discards_missing_out_id():
     deliver = AsyncMock()
 
     with patch(
-        "openhands.agent_server.kafka_bus.handlers."
+        "pyromind_agent_server.kafka_bus.handlers."
         "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
@@ -599,7 +599,7 @@ async def test_studio_workflow_handler_discards_foreign_out_id():
     deliver = AsyncMock()
 
     with patch(
-        "openhands.agent_server.kafka_bus.handlers."
+        "pyromind_agent_server.kafka_bus.handlers."
         "studio_workflow_notify_handler.deliver_workflow_status",
         deliver,
     ):
@@ -628,27 +628,11 @@ async def test_studio_workflow_handler_discards_foreign_out_id():
 
 
 @pytest.mark.asyncio
-async def test_api_lifespan_starts_and_stops_kafka_consumer():
-    mock_conversation_service = AsyncMock()
+async def test_api_lifespan_starts_and_stops_kafka_consumer(tmp_path):
     mock_kafka = AsyncMock()
-
-    with (
-        patch(
-            "openhands.agent_server.api.get_default_conversation_service",
-            return_value=mock_conversation_service,
-        ),
-        patch("openhands.agent_server.api.get_vscode_service", return_value=None),
-        patch("openhands.agent_server.api.get_desktop_service", return_value=None),
-        patch(
-            "openhands.agent_server.api.get_tool_preload_service",
-            return_value=None,
-        ),
-        patch("openhands.agent_server.api.kafka_message_bus", mock_kafka),
-    ):
+    with patch("pyromind_agent_server.http_app.kafka_message_bus", mock_kafka):
         app = FastAPI()
-        app.state.config = Config()
-
+        app.state.config = Config(conversations_path=tmp_path)
         async with api_lifespan(app):
             mock_kafka.start_consumer.assert_awaited_once()
-
         mock_kafka.stop.assert_awaited_once()

@@ -23,13 +23,8 @@ USER ${USERNAME}
 WORKDIR /agent-server
 COPY --chown=${USERNAME}:${USERNAME} pyproject.toml uv.lock README.md LICENSE ./
 COPY --chown=${USERNAME}:${USERNAME} vendor ./vendor
-COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
-COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
-COPY --chown=${USERNAME}:${USERNAME} openhands-embodied-runtime ./openhands-embodied-runtime
-COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
-COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
-COPY --chown=${USERNAME}:${USERNAME} pyromind-common ./pyromind-common
 COPY --chown=${USERNAME}:${USERNAME} pyromind-embodied-runtime ./pyromind-embodied-runtime
+COPY --chown=${USERNAME}:${USERNAME} pyromind-common ./pyromind-common
 COPY --chown=${USERNAME}:${USERNAME} pyromind-runtime ./pyromind-runtime
 COPY --chown=${USERNAME}:${USERNAME} harness-adapter ./harness-adapter
 COPY --chown=${USERNAME}:${USERNAME} pyromind-agent-server ./pyromind-agent-server
@@ -37,10 +32,10 @@ COPY --chown=${USERNAME}:${USERNAME} .agents ./.agents
 COPY --chown=${USERNAME}:${USERNAME} requirements-terminal.txt ./
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
-    if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
+    if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS=""; fi; \
     uv python install 3.13 && \
     uv venv --python-preference only-managed --python 3.13 .venv && \
-    uv sync --frozen --no-editable --managed-python --extra boto3 $EXTRA_FLAGS && \
+    uv sync --frozen --no-editable --managed-python $EXTRA_FLAGS && \
     if [ "$ENABLE_TERMINAL_EXTRAS" = "1" ]; then \
         uv pip install --python .venv/bin/python -r requirements-terminal.txt; \
     fi; \
@@ -53,14 +48,13 @@ ARG USERNAME UID GID ENABLE_VERTEX
 # We need --dev for pyinstaller
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
     EXTRA_FLAGS=""; \
-    if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
-    uv sync --frozen --dev --no-editable --extra boto3 $EXTRA_FLAGS
+    if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS=""; fi; \
+    uv sync --frozen --dev --no-editable $EXTRA_FLAGS
 
 RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
-    uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec \
-    && cp /agent-server/dist/pyromind-agent-server /agent-server/dist/openhands-agent-server
+    uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec
 # Fail fast if the expected binary is missing
-RUN test -x /agent-server/dist/openhands-agent-server
+RUN test -x /agent-server/dist/pyromind-agent-server
 
 ####################################################################################
 # Pyromind knowledge base
@@ -174,7 +168,7 @@ RUN set -eux; \
 # works at runtime without CAP_MAC_ADMIN. Best-effort: if the host kernel does
 # not have the AppArmor LSM active (e.g. some container runtimes), the parser
 # exits non-zero but we do not fail the whole image build.
-COPY --from=builder /agent-server/openhands-tools/openhands/tools/terminal/apparmor/openhands-agent-terminal.profile \
+COPY --from=builder /agent-server/pyromind-common/pyromind_common/tools/terminal/apparmor/openhands-agent-terminal.profile \
     /etc/apparmor.d/openhands-agent-terminal
 RUN if command -v apparmor_parser >/dev/null 2>&1; then \
         apparmor_parser -r -W /etc/apparmor.d/openhands-agent-terminal \
@@ -183,65 +177,17 @@ RUN if command -v apparmor_parser >/dev/null 2>&1; then \
         echo "Warning: apparmor_parser not installed; skipping profile load" >&2; \
     fi
 
-# Pre-install ACP servers for ACPAgent support (Claude Code, Codex, Gemini CLI)
-# Install Node.js 22 to a dedicated prefix so ACP packages get a modern runtime
-# WITHOUT overwriting the repo-specific Node.js that test suites depend on.
-# SWE-bench images ship NVM/apt-managed Node 8-14 which cannot run ACP packages.
-#
-# This step is best-effort: SWE-Bench Pro base images come from many distros
-# and some have an old glibc (or use musl) that cannot run the upstream Node
-# 22 glibc tarball. When that happens we leave $ACP_NODE_DIR empty and skip
-# ACP setup so the rest of the build (and non-ACP agents) still work.
+COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
+ENV PATH="/opt/pyromind-terminal/bin:${PATH}"
+RUN if ! command -v python3 >/dev/null 2>&1; then \
+        UV_PYTHON_INSTALL_DIR=/opt/pyromind-python uv python install 3.12 && \
+        UV_PYTHON_INSTALL_DIR=/opt/pyromind-python uv venv --python 3.12 --managed-python /opt/pyromind-terminal; \
+    fi
 
-ENV ACP_NODE_DIR=/opt/acp-node
-RUN set -ux; \
-    mkdir -p "$ACP_NODE_DIR"; \
-    ARCH=$(uname -m); \
-    NARCH=""; \
-    NODE_SHA256=""; \
-    case "$ARCH" in \
-      x86_64|amd64) NARCH=x64; NODE_SHA256=69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec;; \
-      aarch64|arm64) NARCH=arm64; NODE_SHA256=08bfbf538bad0e8cbb0269f0173cca28d705874a67a22f60b57d99dc99e30050;; \
-    esac; \
-    NODE_TARBALL=""; \
-    if [ -z "$NARCH" ]; then \
-      echo "Skipping ACP Node install: unsupported architecture '$ARCH'" >&2; \
-    else \
-      NODE_TARBALL="/tmp/node-v22.14.0-linux-${NARCH}.tar.xz"; \
-      if curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused "https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-${NARCH}.tar.xz" -o "$NODE_TARBALL" \
-         && echo "$NODE_SHA256  $NODE_TARBALL" | sha256sum -c - \
-         && tar -xJ --strip-components=1 -C "$ACP_NODE_DIR" -f "$NODE_TARBALL" \
-         && "$ACP_NODE_DIR/bin/node" --version; then \
-        PATH="$ACP_NODE_DIR/bin:$PATH"; \
-        if "$ACP_NODE_DIR/bin/npm" install -g \
-            @agentclientprotocol/claude-agent-acp@0.44.0 \
-            @zed-industries/codex-acp@0.16.0 \
-            @google/gemini-cli@0.46.0; then \
-          # Create wrappers in /usr/local/bin that prepend ACP's Node 22 to PATH.
-          # This ensures the ACP binary's #!/usr/bin/env node shebang resolves
-          # to Node 22, while the repo's own node (NVM/system) stays untouched
-          # for tests.
-          for bin in claude-agent-acp codex-acp gemini; do \
-            if [ -e "$ACP_NODE_DIR/bin/$bin" ]; then \
-              printf '#!/bin/sh\nPATH="%s/bin:$PATH" exec "%s/bin/%s" "$@"\n' \
-                "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$bin" \
-                > /usr/local/bin/"$bin"; \
-              chmod +x /usr/local/bin/"$bin"; \
-            fi; \
-          done; \
-        else \
-          echo "Warning: ACP npm install failed; ACP agents will not be available on this image" >&2; \
-          rm -rf "$ACP_NODE_DIR"/*; \
-        fi; \
-      else \
-        echo "Warning: ACP Node 22 runtime is not compatible with this base image (likely older glibc or musl libc); ACP agents will not be available" >&2; \
-        rm -rf "$ACP_NODE_DIR"/*; \
-      fi; \
-    fi; \
-    rm -f "$NODE_TARBALL" 2>/dev/null || true
-
-RUN mkdir -p /etc/claude-code && \
-    echo '{"permissions":{"allow":["Edit","Read","Bash"]}}' > /etc/claude-code/managed-settings.json
+# Every product variant needs Node to execute the Pi runner.
+COPY --from=pi-runtime-builder /usr/local/bin/node /opt/pi-node/bin/node
+ENV PATH="/opt/pi-node/bin:${PATH}"
+RUN node --version
 
 # The runtime image does not carry the builder's /agent-server/.venv, and agent
 # terminals resolve `python` to the base image's system interpreter, so install
@@ -249,10 +195,8 @@ RUN mkdir -p /etc/claude-code && \
 ARG ENABLE_TERMINAL_EXTRAS
 COPY requirements-terminal.txt /tmp/requirements-terminal.txt
 RUN if [ "$ENABLE_TERMINAL_EXTRAS" = "1" ]; then \
-        python3 -m pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements-terminal.txt; \
+        uv pip install --python "$(command -v python3)" -r /tmp/requirements-terminal.txt; \
     fi
-
-COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
 
 USER ${USERNAME}
 WORKDIR /
@@ -285,7 +229,7 @@ EXPOSE ${PORT}
 
 FROM base-image-minimal AS binary-minimal
 ARG USERNAME
-COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/pyromind-agent-server /usr/local/bin/openhands-agent-server
 RUN chmod +x /usr/local/bin/openhands-agent-server
 # Same Pi runtime as the product stage: the binary image is the deployed
 # target, so PYROMIND_HARNESS_BACKEND=pi must work here too.
@@ -293,23 +237,6 @@ COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
 ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
 ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
-
-
-FROM builder AS pyromind-binary-builder
-ARG USERNAME UID GID ENABLE_VERTEX
-RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
-    uv sync --frozen --dev --no-editable --extra boto3
-RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
-    uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec
-RUN test -x /agent-server/dist/pyromind-agent-server
-
-FROM base-image-minimal AS pyromind-binary
-ARG USERNAME
-COPY --chown=${USERNAME}:${USERNAME} --from=pyromind-binary-builder /agent-server/dist/pyromind-agent-server /usr/local/bin/pyromind-agent-server
-COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
-ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
-ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
-ENTRYPOINT ["tini", "--", "/usr/local/bin/pyromind-agent-server"]
 
 
 FROM base-image-minimal AS product
@@ -320,3 +247,19 @@ COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
 ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
 ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
 ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "pyromind_agent_server"]
+
+FROM base-image-minimal AS pyromind-binary
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/pyromind-agent-server /usr/local/bin/pyromind-agent-server
+COPY --from=pi-runtime-builder /pi-runtime /agent-server/pi-runtime
+ENV PYROMIND_PI_RUNTIME=/agent-server/pi-runtime/dist/index.js
+ENV PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
+ENTRYPOINT ["tini", "--", "/usr/local/bin/pyromind-agent-server"]
+
+# Deployment target aliases retained while the implementation is Pi-only.
+FROM binary-minimal AS binary
+FROM base-image-minimal AS base-image
+FROM product AS source
+FROM product AS source-minimal
+
+FROM product AS default

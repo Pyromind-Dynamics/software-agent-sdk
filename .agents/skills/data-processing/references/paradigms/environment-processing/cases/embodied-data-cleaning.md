@@ -9,7 +9,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 
 ## 执行入口
 
-- 确定性 runtime：`openhands-embodied-runtime==1.29.5`。交付方式：wheel 随
+- 确定性 runtime：`pyromind-embodied-runtime==0.1.0`。交付方式：wheel 随
   `edp_submit` 冻结包自动分发（skill bundle `edp/wheels/` 随包暂存进 run 目录，
   exec 经 Storage 挂载安装，第三方依赖由公网 PyPI 解析）。agent 无需任何
   wheel 预置动作；skill bundle 缺 wheel 时 edp_submit 直接报错。若安装仍失败，
@@ -26,7 +26,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 - `edp_render` / `edp_submit` 是唯一的平台执行通道；**禁止**
   sandbox_create/sandbox_terminal 手工编排、禁止 Studio 工作流、禁止已弃用
   的 `run_embodied_cleaning_sandbox` 专用工具。
-- `openhands-embodied-runtime` 在平台沙箱内完成确定性处理；plan/full 与
+- `pyromind-embodied-runtime` 在平台沙箱内完成确定性处理；plan/full 与
   episode/merge 共用同一套 CLI（`--mode episode` 单条、`--mode merge` 聚合，
   均支持 `--config <json>` 读挂载配置，避免 shell 引号转义）。
 - rejected episode 只输出结构化错误报告（`rejection_diagnostics`），不自动

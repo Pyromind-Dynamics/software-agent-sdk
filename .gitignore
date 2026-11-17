@@ -221,8 +221,6 @@ tests/integration/api_compliance/outputs/
 
 # Agent-generated temp
 .agent_tmp/
-/openhands-tools/openhands/tools/workflow/skills/*.md
-/openhands-tools/openhands/tools/workflow_debug/*.md
 /tests/wangting/
 
 # Local tool configurations
@@ -237,7 +235,3 @@ tests/integration/api_compliance/outputs/
 # Pinned sandbox runtime wheels are intentional source artifacts, not builds
 !.agents/skills/data-processing/scripts/edp/wheels/
 !.agents/skills/data-processing/scripts/edp/wheels/*.whl
-
-# Independent Pyromind sandbox bundle retains its pinned runtime wheel.
-!.agents/skills/data-processing/scripts/pyromind-edp/wheels/
-!.agents/skills/data-processing/scripts/pyromind-edp/wheels/*.whl

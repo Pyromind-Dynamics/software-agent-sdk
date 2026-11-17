@@ -1,6 +1,6 @@
 """Tests for reconciling a label config template with the data it imports."""
 
-from openhands.tools.label_studio.skill_helpers import (
+from pyromind_common.tools.label_studio.skill_helpers import (
     extract_control_values,
     widen_label_config,
 )

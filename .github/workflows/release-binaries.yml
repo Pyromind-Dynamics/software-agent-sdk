@@ -112,7 +112,7 @@ jobs:
             - name: Build binary (Windows)
               if: runner.os == 'Windows'
               shell: bash
-              run: uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+              run: uv run pyinstaller pyromind-agent-server/pyromind_agent_server/agent-server.spec
 
             - name: Smoke-test binary
               shell: bash
@@ -120,9 +120,9 @@ jobs:
                   set -euo pipefail
 
                   if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      BIN=./dist/openhands-agent-server.exe
+                      BIN=./dist/pyromind-agent-server.exe
                   else
-                      BIN=./dist/openhands-agent-server
+                      BIN=./dist/pyromind-agent-server
                   fi
 
                   "$BIN" --help
@@ -171,9 +171,9 @@ jobs:
                   set -euo pipefail
                   mkdir -p release-assets
                   if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      cp dist/openhands-agent-server.exe "release-assets/${ASSET}.exe"
+                      cp dist/pyromind-agent-server.exe "release-assets/${ASSET}.exe"
                   else
-                      cp dist/openhands-agent-server "release-assets/${ASSET}"
+                      cp dist/pyromind-agent-server "release-assets/${ASSET}"
                   fi
                   ls -la release-assets/
 

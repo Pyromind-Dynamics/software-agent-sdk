@@ -8,14 +8,14 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
-from pyromind_runtime.domain.task_correlation import TaskOrigin
 
-from openhands.tools.workflow import task_submission
-from openhands.tools.workflow.task_submission import (
+from pyromind_common.tools.workflow import task_submission
+from pyromind_common.tools.workflow.task_submission import (
     _retry_transient,
     submit_workflow_task,
     workflow_submission_scope,
 )
+from pyromind_runtime.domain.task_correlation import TaskOrigin
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,7 @@ def test_retry_transient_recovers_after_transient_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "openhands.tools.workflow.task_submission.time.sleep", MagicMock()
+        "pyromind_common.tools.workflow.task_submission.time.sleep", MagicMock()
     )
     calls = []
 
@@ -69,7 +69,7 @@ def test_retry_transient_reraises_after_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "openhands.tools.workflow.task_submission.time.sleep", MagicMock()
+        "pyromind_common.tools.workflow.task_submission.time.sleep", MagicMock()
     )
     operation = MagicMock(side_effect=ConnectionResetError("reset"))
     with pytest.raises(ConnectionResetError):
@@ -88,7 +88,7 @@ def test_retry_transient_covers_httpx_request_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "openhands.tools.workflow.task_submission.time.sleep", MagicMock()
+        "pyromind_common.tools.workflow.task_submission.time.sleep", MagicMock()
     )
     calls = []
 
@@ -108,7 +108,7 @@ def test_submit_workflow_task_retries_ssl_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "openhands.tools.workflow.task_submission.time.sleep", MagicMock()
+        "pyromind_common.tools.workflow.task_submission.time.sleep", MagicMock()
     )
     client = MagicMock()
     response = SimpleNamespace(task_id="task-1", status="Pending")
@@ -183,12 +183,11 @@ def test_each_direct_task_checks_resources_before_create():
 async def test_concurrent_submission_scopes_keep_the_origin_and_task_kind():
     import asyncio
 
+    from pyromind_common.tools.workflow.task_submission import workflow_submission_scope
     from pyromind_runtime.domain.task_correlation import (
         TaskOrigin,
         parse_task_correlation,
     )
-
-    from openhands.tools.workflow.task_submission import workflow_submission_scope
 
     requests = {}
     admitted = []

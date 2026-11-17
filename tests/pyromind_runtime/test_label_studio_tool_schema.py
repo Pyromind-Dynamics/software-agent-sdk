@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,

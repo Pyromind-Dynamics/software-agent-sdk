@@ -9,11 +9,11 @@ from pathlib import Path
 import imageio_ffmpeg
 import numpy as np
 import pytest
-from openhands_embodied_runtime.adapters import S2_REFERENCE_JOINT_ORDER
-from openhands_embodied_runtime.lerobot_v21 import (
+from pyromind_embodied_runtime.adapters import S2_REFERENCE_JOINT_ORDER
+from pyromind_embodied_runtime.lerobot_v21 import (
     materialize_lerobot_v21_episode,
 )
-from openhands_embodied_runtime.planning import plan_episode_cleaning
+from pyromind_embodied_runtime.planning import plan_episode_cleaning
 
 
 @pytest.fixture

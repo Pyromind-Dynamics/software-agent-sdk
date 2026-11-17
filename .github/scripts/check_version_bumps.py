@@ -12,10 +12,11 @@ from pathlib import Path
 
 
 PACKAGE_PYPROJECTS: dict[str, Path] = {
-    "openhands-sdk": Path("openhands-sdk/pyproject.toml"),
-    "openhands-tools": Path("openhands-tools/pyproject.toml"),
-    "openhands-workspace": Path("openhands-workspace/pyproject.toml"),
-    "openhands-agent-server": Path("openhands-agent-server/pyproject.toml"),
+    "pyromind-embodied-runtime": Path("pyromind-embodied-runtime/pyproject.toml"),
+    "pyromind-common": Path("pyromind-common/pyproject.toml"),
+    "pyromind-runtime": Path("pyromind-runtime/pyproject.toml"),
+    "harness-adapter": Path("harness-adapter/pyproject.toml"),
+    "pyromind-agent-server": Path("pyromind-agent-server/pyproject.toml"),
 }
 
 _VERSION_PATTERN = r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?"
@@ -46,7 +47,9 @@ def _read_current_version(repo_root: Path, pyproject: Path) -> str:
     )
 
 
-def _read_version_from_git_ref(repo_root: Path, git_ref: str, pyproject: Path) -> str:
+def _read_version_from_git_ref(
+    repo_root: Path, git_ref: str, pyproject: Path
+) -> str | None:
     result = subprocess.run(
         ["git", "show", f"{git_ref}:{pyproject.as_posix()}"],
         cwd=repo_root,
@@ -55,10 +58,16 @@ def _read_version_from_git_ref(repo_root: Path, git_ref: str, pyproject: Path) -
         text=True,
     )
     if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "unknown git error"
-        raise SystemExit(
-            f"Unable to read {pyproject} from git ref {git_ref}: {message}"
+        reference = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{git_ref}^{{commit}}"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
         )
+        if reference.returncode != 0:
+            raise SystemExit(f"Unable to resolve git ref {git_ref}")
+        return None
     return _read_version_from_pyproject_text(result.stdout, f"{git_ref}:{pyproject}")
 
 
@@ -76,19 +85,23 @@ def find_version_changes(repo_root: Path, base_ref: str) -> list[VersionChange]:
         current_version = _read_current_version(repo_root, pyproject)
         previous_error: SystemExit | None = None
         previous_version: str | None = None
+        resolved_base = False
 
         for candidate in candidates:
             try:
                 previous_version = _read_version_from_git_ref(
                     repo_root, candidate, pyproject
                 )
+                resolved_base = True
                 break
             except SystemExit as exc:
                 previous_error = exc
 
-        if previous_version is None:
+        if not resolved_base:
             assert previous_error is not None
             raise previous_error
+        if previous_version is None:
+            continue
 
         if previous_version != current_version:
             changes.append(

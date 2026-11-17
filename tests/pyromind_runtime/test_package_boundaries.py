@@ -9,6 +9,7 @@ import pytest
 import yaml
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
+
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
@@ -249,6 +250,7 @@ def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
             or '"${server_python}" -m pyromind_agent_server' in script
         )
         assert "python -m openhands.agent_server" not in script
+        assert "from openhands." not in script
 
 
 def test_inference_start_defaults_to_platform_sandbox_for_pi_terminal() -> None:
@@ -499,6 +501,7 @@ def test_return_addresses_stay_in_the_product_contract_and_out_of_model_argument
 
 def test_preparation_policy_is_trusted_profile_configuration():
     from pydantic import ValidationError
+
     from pyromind_agent_server.api.schemas import CreateConversationRequest
     from pyromind_agent_server.profiles import (
         DEFAULT_PRODUCT_PROFILE,
@@ -598,6 +601,7 @@ def test_frozen_bundle_includes_preparation_and_role_skill_assets():
 
 def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied():
     from pydantic import ValidationError
+
     from pyromind_agent_server.profiles import (
         DEFAULT_PRODUCT_PROFILE,
         ECHOMIND_PRODUCT_PROFILE,

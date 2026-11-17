@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from openhands.tools.label_studio.paths import resolve_storage_input
+from pyromind_common.tools.label_studio.paths import resolve_storage_input
 
 
 @pytest.mark.parametrize(

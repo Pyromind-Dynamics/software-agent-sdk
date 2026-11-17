@@ -6,25 +6,23 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from openhands.agent_server.pyromind_router import (
-    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
-    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
-)
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.secret import StaticSecret
-from openhands.sdk.tool import Tool
-from openhands.sdk.tool.registry import resolve_tool
-from openhands.sdk.workspace.local import LocalWorkspace
-from openhands.tools.workflow import (
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.secret import StaticSecret
+from pyromind_common.sdk.tool import Tool
+from pyromind_common.sdk.tool.registry import resolve_tool
+from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_common.tools.workflow import (
     ValidateWorkflowDslAction,
     ValidateWorkflowDslExecutor,
     ValidateWorkflowDslObservation,
     ValidateWorkflowDslTool,
     WorkflowValidationIssue,
 )
-from openhands.tools.workflow.validate_workflow_dsl import (
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
     PRE_VALIDATE_URL,
     PROD_VALIDATE_URL,
+    PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
+    PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
 
 

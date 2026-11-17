@@ -1,8 +1,8 @@
-"""Tests for openhands.sdk.utils.visualize module."""
+"""Tests for pyromind_common.sdk.utils.visualize module."""
 
 from rich.text import Text
 
-from openhands.sdk.utils.visualize import display_json
+from pyromind_common.sdk.utils.visualize import display_json
 
 
 def test_display_json_with_dictionary():
