@@ -21,7 +21,9 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
   await credentials.modify(config.provider, async () => ({ type: "api_key", key: config.apiKey }));
   const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false });
   let model = resolveModel(modelRuntime, config);
-  model = { ...model, maxTokens: Math.min(model.maxTokens, outputLimit) };
+  if (outputLimit !== undefined) {
+    model = { ...model, maxTokens: Math.min(model.maxTokens, outputLimit) };
+  }
 
   if (config.baseUrl && !isOfficialOpenAIBaseUrl(config.baseUrl)) {
     const idleTimeoutMs = modelIdleTimeoutMs();
@@ -51,6 +53,7 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
     model = modelRuntime.getModel(config.provider, config.modelId) ?? model;
   }
   await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
+  if (outputLimit === undefined) return { modelRuntime, model };
   const stream = modelRuntime.streamSimple.bind(modelRuntime);
   modelRuntime.streamSimple = (requestModel, context, options) =>
     stream(requestModel, context, {
@@ -60,9 +63,10 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
   return { modelRuntime, model };
 }
 
-function maxOutputTokens(): number {
+function maxOutputTokens(): number | undefined {
   const raw = process.env.PYROMIND_PI_MAX_OUTPUT_TOKENS?.trim();
-  const value = raw ? Number(raw) : 4096;
+  if (!raw) return undefined;
+  const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error("PYROMIND_PI_MAX_OUTPUT_TOKENS must be a positive safe integer");
   }

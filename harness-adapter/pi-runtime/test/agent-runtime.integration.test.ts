@@ -163,7 +163,7 @@ test("AgentSession resolves an uncovered workflow node through the knowledge ind
   assert.equal(requests.length, 7);
   assert.deepEqual(requests.map((request) => request.url), Array(7).fill("/v1/chat/completions"));
   for (const request of requests) {
-    assert.equal(request.body.max_tokens ?? request.body.max_completion_tokens, 4096);
+    assert.equal(request.body.max_tokens ?? request.body.max_completion_tokens, undefined);
   }
   assert.equal(JSON.stringify(requests[1]!.body).includes("output_text"), false);
   const messages = requests[1]!.body.messages;
