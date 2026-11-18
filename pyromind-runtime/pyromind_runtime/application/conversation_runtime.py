@@ -31,6 +31,7 @@ from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
 )
+from pyromind_runtime.application.task_monitor import TaskMonitor
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
@@ -179,6 +180,8 @@ class ConversationRuntime:
         self._observer = observer
         self._resource_limits = resource_limits
         self._external_tasks = external_tasks
+        self.task_monitor: TaskMonitor | None = None
+        self._task_contexts: dict[str, RequestContext] = {}
         self._workflow_submission = workflow_submission
         self.versions = versions
         self._evaluation_storage_factory = evaluation_storage_factory
@@ -242,6 +245,7 @@ class ConversationRuntime:
         code: str | None,
         context: RequestContext,
         graph_run_id: str | None = None,
+        continue_after_completion: bool = False,
     ) -> dict[str, Any]:
         """Submit an already-authorized tool action through the durable product path."""
         store = self._store(conversation_id)
@@ -252,7 +256,10 @@ class ConversationRuntime:
         digest = fingerprint({"workflow": workflow, "code": code})
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
-            if previous.fingerprint != digest:
+            if (
+                previous.fingerprint != digest
+                or previous.continue_after_completion != continue_after_completion
+            ):
                 raise ValueError("request id already used with different execution")
             if previous.task_id:
                 if graph_run_id:
@@ -284,6 +291,7 @@ class ConversationRuntime:
             fingerprint=digest,
             workflow=effective,
             summary={"name": str(workflow.get("name", "workflow"))},
+            continue_after_completion=continue_after_completion,
             status="submitting",
         )
         store.save_workflow_execution_request(request, expected_revision=None)
@@ -313,6 +321,7 @@ class ConversationRuntime:
                 "kind": "graph_await" if graph_run_id else "workflow_run",
                 "run_id": graph_run_id or identity,
                 "graph_run_id": graph_run_id,
+                "resume_auto_run": bool(graph_run_id) or continue_after_completion,
                 "status": "pending",
                 "submitted_at": datetime.now().astimezone().isoformat(),
                 "updated_at": datetime.now().astimezone().isoformat(),
@@ -1185,6 +1194,7 @@ class ConversationRuntime:
     ) -> CommandReceipt:
         store = await self._ensure_active(conversation_id, context)
         store.authorize(context.user_id)
+        self._task_contexts[conversation_id] = context
         store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
@@ -1449,6 +1459,7 @@ class ConversationRuntime:
         context: RequestContext,
         *,
         request_id: str | None = None,
+        continue_after_completion: bool = False,
     ) -> dict[str, Any]:
         if self._workflow_submission is None:
             raise ValueError("workflow submission is unavailable")
@@ -1457,7 +1468,10 @@ class ConversationRuntime:
         identity = request_id or uuid4().hex
         previous = store.load_workflow_execution_requests().get(identity)
         if previous is not None:
-            if previous.workflow_path != workflow_path:
+            if (
+                previous.workflow_path != workflow_path
+                or previous.continue_after_completion != continue_after_completion
+            ):
                 raise ValueError("request id already belongs to another workflow")
             return {
                 "request_id": identity,
@@ -1496,6 +1510,7 @@ class ConversationRuntime:
             fingerprint=fingerprint,
             workflow=workflow,
             summary=summary,
+            continue_after_completion=continue_after_completion,
         )
         store.save_workflow_execution_request(request, expected_revision=None)
         event, _ = store.append(
@@ -1640,6 +1655,7 @@ class ConversationRuntime:
             "submitted_at": now,
             "updated_at": now,
             "resume_pending": False,
+            "resume_auto_run": request.continue_after_completion,
         }
         self.register_external_task(request.conversation_id, payload)
         store.save_workflow_execution_request(
@@ -1833,6 +1849,8 @@ class ConversationRuntime:
         if task is None:
             raise ValueError(f"unknown external task: {task_id}")
         normalized = _normalize_external_status(status)
+        if task.kind == "workflow_run":
+            auto_run = auto_run and task.resume_auto_run
         terminal = normalized in {"succeeded", "failed", "terminated", "stopped"}
         # A parked run is not finished, but the agent still has to act on it: the
         # human gate needs a person, and only the agent can tell the user what to do.
@@ -1848,7 +1866,8 @@ class ConversationRuntime:
             **task.model_dump(mode="json"),
             "status": normalized,
             "updated_at": datetime.now().astimezone().isoformat(),
-            "resume_pending": terminal or deferred or blocked,
+            "resume_pending": (terminal or deferred or blocked)
+            and (auto_run or task.kind != "workflow_run"),
             "resume_auto_run": auto_run,
             "completion_result": {**task.completion_result, **completion_result}
             if completion_result is not None
@@ -1867,6 +1886,12 @@ class ConversationRuntime:
         )
         before_seq = snapshot.through_seq
         persisted, updated_snapshot = store.append(event)
+        if updated_snapshot.through_seq != before_seq:
+            self._publish(persisted)
+        if terminal and task.kind == "workflow_run" and not auto_run:
+            persisted_status = persisted.payload.get("status")
+            if isinstance(persisted_status, str):
+                self._emit_task_completion_notice(store, task_id, persisted_status)
         task = next(
             (
                 item
@@ -1900,7 +1925,6 @@ class ConversationRuntime:
                 normalized,
             )
             return persisted
-        self._publish(persisted)
         # Use persisted policy at the decision point: cancellation may have been
         # persisted while this task was waiting, after the earlier blocked check.
         if notify and self._suspends_auto_execution(conversation_id):
@@ -1956,9 +1980,86 @@ class ConversationRuntime:
             return None
         return self._external_tasks.owner(task_id)
 
+    def task_monitor_context(self, conversation_id: str) -> RequestContext | None:
+        context = self._task_contexts.get(conversation_id)
+        if context is None or not (context.cookie or context.authorization):
+            return None
+        store = self._store(conversation_id)
+        store.authorize(context.user_id)
+        return replace(context, x_cluster=store.load_x_cluster())
+
+    def task_monitor_state(
+        self, conversation_id: str, task_id: str
+    ) -> ExternalTaskState | None:
+        store = self._store(conversation_id)
+        task = next(
+            (
+                task
+                for task in store.load_snapshot().external_tasks
+                if task.task_id == task_id
+            ),
+            None,
+        )
+        if task is not None and task.kind == "workflow_run":
+            requested = any(
+                request.task_id == task_id and request.continue_after_completion
+                for request in store.load_workflow_execution_requests().values()
+            )
+            return task.model_copy(
+                update={"resume_auto_run": task.resume_auto_run and requested}
+            )
+        return task
+
+    async def resume_monitored_task(self, conversation_id: str) -> None:
+        store = self._store(conversation_id)
+        if (
+            self._closing
+            or store.load_snapshot().automatic_turns_suspended
+            or not self._has_pending_external_work(store)
+        ):
+            return
+        context = self.task_monitor_context(conversation_id)
+        if context is not None:
+            await self._ensure_active(conversation_id, context)
+
+    def _monitor_external_task(self, conversation_id: str, task_id: str) -> None:
+        if self.task_monitor is not None:
+            task = self.task_monitor_state(conversation_id, task_id)
+            if task is not None:
+                self.task_monitor.register(conversation_id, task)
+
+    def _emit_task_completion_notice(
+        self, store: FileProductStore, task_id: str, status: str
+    ) -> None:
+        label = {
+            "succeeded": "已完成",
+            "failed": "失败",
+            "terminated": "已终止",
+            "stopped": "已停止",
+        }[status]
+        message_id = f"external-task:{task_id}:notice"
+        payload = {
+            "message_id": message_id,
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"工作流任务 {task_id} {label}。"}],
+        }
+        for kind in ("message.started", "message.completed"):
+            event, _ = store.append(
+                ProductEvent(
+                    event_id=f"{message_id}:{kind}",
+                    conversation_id=store.load_snapshot().conversation_id,
+                    type=kind,
+                    payload=payload,
+                )
+            )
+            self._publish(event)
+
     def register_external_task(
         self, conversation_id: str, payload: dict[str, Any]
     ) -> ProductEvent:
+        context = self._task_contexts.get(conversation_id)
+        if context is not None:
+            payload = {"x_cluster": context.x_cluster, **payload}
         store = self._store(conversation_id)
         snapshot = store.load_snapshot()
         task_id = str(payload.get("task_id") or "")
@@ -1989,6 +2090,7 @@ class ConversationRuntime:
                 logger.exception("Could not register external task %s", task_id)
         if updated.through_seq != snapshot.through_seq:
             self._publish(persisted)
+        self._monitor_external_task(conversation_id, task_id)
         registration = self._pending_task_registrations.get(task_id)
         if registration is not None:
             registration.set()
@@ -2034,6 +2136,7 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        self._task_contexts.clear()
         for wakeup in self._auto_execution_wakeups.values():
             wakeup.set()
         await asyncio.gather(*tuple(self._input_response_tasks), return_exceptions=True)
@@ -2123,6 +2226,7 @@ class ConversationRuntime:
         """
         store = self._store(conversation_id)
         store.authorize(context.user_id)
+        self._task_contexts[conversation_id] = context
         if conversation_id in self._active or self._has_pending_external_work(store):
             store = await self._ensure_active(conversation_id, context)
         else:
@@ -2455,6 +2559,7 @@ class ConversationRuntime:
         store: FileProductStore,
         context: RequestContext,
     ) -> _ActiveConversation:
+        self._task_contexts[handle.session_id] = context
         ready = asyncio.Event()
         task = asyncio.create_task(
             self._pump(handle, adapter, store, ready),
@@ -2529,6 +2634,17 @@ class ConversationRuntime:
                 )
                 if product_event is None:
                     continue
+                if product_event.type == "external_task.submitted":
+                    context = self._task_contexts.get(handle.session_id)
+                    if context is not None:
+                        product_event = product_event.model_copy(
+                            update={
+                                "payload": {
+                                    "x_cluster": context.x_cluster,
+                                    **product_event.payload,
+                                }
+                            }
+                        )
                 if product_event.type == "input.resolved":
                     await self._user_input.resolve_event(store, product_event)
                     continue
@@ -2553,6 +2669,10 @@ class ConversationRuntime:
                             handle.session_id,
                         )
                 self._publish(persisted)
+                if product_event.type == "external_task.submitted":
+                    self._monitor_external_task(
+                        handle.session_id, str(product_event.payload["task_id"])
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3119,30 +3239,20 @@ def _build_external_task_notification(
             if has_training_node:
                 instruction = (
                     f"Production workflow task {task.task_id} succeeded and includes "
-                    "training. Hand this task_id to the training-analysis skill "
-                    "and follow its analysis and reporting flow. Report the actual "
-                    "W&B run and metrics; do not claim all training stages were "
-                    "analyzed. Unless evaluation was explicitly excluded, continue "
-                    "with training_analysis(operation=artifacts) to discover saved "
-                    "checkpoint-n and eval_step_n.jsonl from the executed task. "
-                    "Inspect samples, establish the business scoring rule, then use "
-                    "inference-evaluation to score every saved eval with one frozen "
-                    "script through df_submit_pipeline evaluation. Compare only "
-                    "same-step complete checkpoints using validation only. With "
-                    "train + validation only, do not start extra GPU inference. "
-                    "If independent test exists, evaluate the validation-selected "
-                    "checkpoint on test; test never participates in selection. "
-                    "Present available label distributions and use the iteration "
-                    "context to decide the next action. For requested badcase "
-                    "annotation, use the label-studio skill and "
-                    "label_studio_project over existing samples; no profiling "
-                    "or rescoring job is required to open annotation. Report "
-                    "missing evidence without guessing. Do not rerun automatically."
+                    "training. Continue only the follow-up explicitly requested "
+                    "by the user. Use the training-analysis skill for requested "
+                    "run diagnostics, and inference-evaluation only for requested "
+                    "evaluation. Report missing evidence without guessing. "
+                    "Do not start additional training or evaluation merely because "
+                    "this task completed. Do not rerun automatically."
                 )
             else:
                 instruction = (
                     f"Production workflow task {task.task_id} succeeded without "
-                    "a training node. Report completion without W&B analysis."
+                    "a training node. Continue only the follow-up explicitly "
+                    "requested by the user. For dataset cleaning, use the "
+                    "submission tool's output directory to inspect report.json "
+                    "and output.jsonl. Do not rerun automatically."
                 )
         else:
             instruction = (

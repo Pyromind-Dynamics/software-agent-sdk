@@ -10,6 +10,7 @@ over opaque dependencies. Cleaning scripts should import them with:
 from __future__ import annotations
 
 import ast
+import copy
 import csv
 import hashlib
 import json
@@ -19,7 +20,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 
@@ -112,11 +113,14 @@ __all__ = [
     "normalize_content",
     "normalize_messages",
     "normalize_role",
+    "normalize_storage_reference",
+    "normalize_media_references",
     "normalize_text",
     "normalize_tool_call",
     "normalize_tool_calls",
     "parse_json_loose",
     "redact_sensitive_data",
+    "resolve_storage_reference",
     "run_cleaning",
     "stable_json_dumps",
     "to_messages_record",
@@ -711,7 +715,10 @@ def write_jsonl(path: str | Path, records: Iterable[dict[str, Any]]) -> int:
     count = 0
     with Path(path).open("w", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(
+                json.dumps(normalize_media_references(record), ensure_ascii=False)
+                + "\n"
+            )
             count += 1
     return count
 
@@ -835,6 +842,100 @@ def normalize_role(value: Any, *, fallback: str | None = None) -> str:
     return role
 
 
+def normalize_storage_reference(value: str) -> str:
+    """Remove an execution mount from a persistent Storage reference."""
+    for prefix in ("/target-workspace", "/workspace"):
+        if value == prefix:
+            raise ValueError("a file reference must not be the Storage root")
+        if value.startswith(prefix + "/"):
+            reference = value[len(prefix) :]
+            if reference == "/" or ".." in PurePosixPath(reference).parts:
+                raise ValueError("invalid Storage file reference")
+            return reference
+    return value
+
+
+def resolve_storage_reference(
+    value: str,
+    *,
+    mount: str | Path,
+    dataset_root: str | Path,
+) -> Path:
+    """Resolve a local reference for reading, without changing its stored form."""
+    reference = normalize_storage_reference(value)
+    path = PurePosixPath(reference)
+    if "://" in reference or reference.startswith("data:"):
+        raise ValueError("remote media references are not local files")
+    if ".." in path.parts:
+        raise ValueError("file references must not contain '..'")
+    if path.is_absolute():
+        return Path(mount) / reference.lstrip("/")
+    return Path(dataset_root) / reference
+
+
+def _media_reference_slots(
+    record: dict[str, Any],
+) -> Iterator[tuple[dict[str, Any] | list[Any], str | int, str]]:
+    for key in ("image_path", "video_path", "audio_path"):
+        if isinstance(record.get(key), str):
+            yield record, key, f"$.{key}"
+    for key in ("images", "image_paths", "videos", "audios"):
+        values = record.get(key)
+        if isinstance(values, list):
+            for index, value in enumerate(values):
+                if isinstance(value, str):
+                    yield values, index, f"$.{key}[{index}]"
+    sources = record.get("source_images")
+    if isinstance(sources, dict):
+        for key, value in sources.items():
+            if isinstance(value, str):
+                yield sources, key, f"$.source_images.{key}"
+    messages = record.get("messages")
+    if not isinstance(messages, list):
+        return
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") not in {
+                "image",
+                "image_url",
+                "video",
+                "video_url",
+                "audio",
+                "audio_url",
+            }:
+                continue
+            base = f"$.messages[{index}].content[{part_index}]"
+            for key in (
+                "url",
+                "path",
+                "value",
+                "image",
+                "video",
+                "audio",
+                "image_url",
+                "video_url",
+                "audio_url",
+            ):
+                value = part.get(key)
+                if isinstance(value, str):
+                    yield part, key, f"{base}.{key}"
+                elif isinstance(value, dict) and isinstance(value.get("url"), str):
+                    yield value, "url", f"{base}.{key}.url"
+
+
+def normalize_media_references(record: dict[str, Any]) -> dict[str, Any]:
+    """Copy a dataset row and normalize explicit media fields, preserving text."""
+    normalized = copy.deepcopy(record)
+    for parent, key, _ in _media_reference_slots(normalized):
+        parent[key] = normalize_storage_reference(parent[key])
+    return normalized
+
+
 def normalize_content(value: Any) -> str | list[dict[str, Any]]:
     """Normalize message content while preserving multimodal content parts."""
     if isinstance(value, dict) and "type" in value:
@@ -860,13 +961,20 @@ def normalize_content(value: Any) -> str | list[dict[str, Any]]:
                 normalized["text"] = normalize_text(part["content"])
             for key in ("url", "path", "image", "video", "audio"):
                 if key in part:
-                    normalized[key] = normalize_text(part[key])
+                    text = normalize_text(part[key])
+                    normalized[key] = (
+                        normalize_storage_reference(text)
+                        if part_type in {"image", "video", "audio"}
+                        else text
+                    )
             image_url = part.get("image_url")
             if part_type == "image" and "url" not in normalized:
                 if isinstance(image_url, dict):
                     image_url = image_url.get("url")
                 if image_url:
-                    normalized["url"] = normalize_text(image_url)
+                    normalized["url"] = normalize_storage_reference(
+                        normalize_text(image_url)
+                    )
             parts.append(normalized)
         return parts
     if isinstance(value, str) or value is None:
@@ -2019,7 +2127,22 @@ def validate_record(
     """Validate a normalized messages or text DPO output row."""
     output_format = detect_output_format(record)
     if output_format == "messages":
-        return validate_messages_record(record, line_number=line_number)
+        errors = validate_messages_record(record, line_number=line_number)
+        for parent, key, path in _media_reference_slots(record):
+            value = parent[key]
+            if value in {"/workspace", "/target-workspace"} or value.startswith(
+                ("/workspace/", "/target-workspace/")
+            ):
+                errors.append(
+                    ValidationError(
+                        ERROR_INVALID_FORMAT,
+                        "media references must use Storage paths "
+                        "without mount prefixes",
+                        path,
+                        line_number,
+                    )
+                )
+        return errors
     if output_format == "preference":
         return validate_preference_record(record, line_number=line_number)
     return [
@@ -2251,6 +2374,7 @@ def run_cleaning(
                                 "mapper must return an object or None",
                                 code=ERROR_TYPE,
                             )
+                        cleaned = normalize_media_references(cleaned)
                         validation_errors = validate_record(
                             cleaned,
                             line_number=parsed.line_number,

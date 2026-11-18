@@ -34,6 +34,7 @@ _SSE_HEARTBEAT_SECONDS = 15.0
 
 class PrepareWorkflowExecutionBody(BaseModel):
     workflow_path: str = Field(min_length=1)
+    continue_after_completion: bool = False
     request_id: str | None = None
 
 
@@ -76,6 +77,7 @@ def create_product_router() -> APIRouter:
                 body.workflow_path,
                 request_context(request),
                 request_id=body.request_id,
+                continue_after_completion=body.continue_after_completion,
             )
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc

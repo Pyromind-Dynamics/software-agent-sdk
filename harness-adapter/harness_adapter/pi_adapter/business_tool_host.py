@@ -63,7 +63,10 @@ from openhands.tools.label_studio import (
     LABEL_STUDIO_TOKEN_SECRET,
     LabelStudioProjectTool,
 )
-from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
+from openhands.tools.pyromind_cleaning import (
+    RunDatasetCleaningAction,
+    RunDatasetCleaningTool,
+)
 from openhands.tools.pyromind_dataset import (
     GetStorageUrlTool,
     UploadFileToPyromindTool,
@@ -496,7 +499,9 @@ class PyromindBusinessToolHost:
                     "Request formal execution of a validated Storage workflow. "
                     "This opens a user confirmation dialog. No platform task "
                     "is created until the user confirms. Call only when the "
-                    "user asks to run the workflow.",
+                    "user asks to run the workflow. After submission the host "
+                    "tracks status in the background and reports completion. "
+                    "Do not sleep or poll for completion.",
                     {
                         "type": "object",
                         "properties": {
@@ -506,7 +511,17 @@ class PyromindBusinessToolHost:
                                     "Existing Storage Python DSL path, such as "
                                     "/workspace/project/workflow.py"
                                 ),
-                            }
+                            },
+                            "continue_after_completion": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Set true only when the user explicitly asks "
+                                    "for result analysis or further work after "
+                                    "completion. The host resumes the agent then; "
+                                    "never wait or poll in this turn."
+                                ),
+                            },
                         },
                         "required": ["workflow_path"],
                         "additionalProperties": False,
@@ -604,12 +619,18 @@ class PyromindBusinessToolHost:
             workflow_path = arguments.get("workflow_path")
             if not isinstance(workflow_path, str) or not workflow_path.strip():
                 raise ValueError("workflow_path is required")
+            continue_after_completion = arguments.get(
+                "continue_after_completion", False
+            )
+            if not isinstance(continue_after_completion, bool):
+                raise ValueError("continue_after_completion must be a boolean")
             try:
                 prepared = await self._workflow_preparer(
                     context.conversation_id,
                     workflow_path,
                     context.request_context,
                     request_id=tool_call_id,
+                    continue_after_completion=continue_after_completion,
                 )
                 return BusinessToolResult(
                     is_error=False,
@@ -679,6 +700,13 @@ class PyromindBusinessToolHost:
         if factory is None:
             raise ValueError(f"unsupported business tool: {name}")
         tool = factory(context)
+        policy = resolve_tool_output_policy(tool.meta)
+        policy_source = (
+            "tool_meta"
+            if tool.meta is not None and "output_policy" in tool.meta
+            else "platform_default"
+        )
+        action = tool.action_type.model_validate(arguments)
         if (
             self.execution_call is not None
             and tool.executor is not None
@@ -698,18 +726,14 @@ class PyromindBusinessToolHost:
                     context.request_context,
                     asyncio.get_running_loop(),
                     graph_run_id=origin_run_id,
+                    continue_after_completion=(
+                        isinstance(action, RunDatasetCleaningAction)
+                        and action.continue_after_completion
+                    ),
                 ),
             )
 
-        policy = resolve_tool_output_policy(tool.meta)
-        policy_source = (
-            "tool_meta"
-            if tool.meta is not None and "output_policy" in tool.meta
-            else "platform_default"
-        )
-
         async def invoke() -> BusinessToolResult:
-            action = tool.action_type.model_validate(arguments)
             files = PiSessionFiles(context.workspace_root)
             facade = _ToolConversationFacade(context, files.load_business_state())
             key = (context.conversation_id, tool_call_id or name)

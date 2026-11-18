@@ -16,6 +16,7 @@ class WorkflowExecutionRequest(ContractModel):
     fingerprint: str = Field(min_length=1)
     workflow: JsonObject
     summary: JsonObject
+    continue_after_completion: bool = False
     status: Literal[
         "awaiting_confirmation",
         "cancelled",

@@ -15,6 +15,20 @@ license: MIT
 `--input` 直接接受 `/workspace/...`，不需要先物化到会话工作区。参数形态与 `--config`
 的使用条件见 `references/terminal-cli.md`。
 
+## 数据中的文件引用
+
+执行时用 `/workspace/...` 访问 Storage；持久化到数据文件中的媒体引用不带
+`/workspace` 或 `/target-workspace`。数据集内部引用保留 `images/001.jpg` 这样的
+相对路径，并明确以数据集目录为基准；跨目录引用使用 `/datasets/...` 这样的
+Storage 根路径。不要把脚本读取文件时的容器路径直接写进输出数据。
+
+确定性转换脚本使用 `scripts/cleaning/cleaning_utils.py` 的
+`normalize_media_references` 处理显式媒体字段，使用 `write_jsonl` 或
+`run_cleaning` 输出时会自动处理。读取 Storage 引用可用
+`resolve_storage_reference(value, mount=当前挂载目录, dataset_root=数据集目录)`；
+得到的执行路径只用于读文件，不写回数据。其他自写脚本也须采用相同规则并校验输出。
+只处理确定的文件引用，不全文替换正文、提示词、来源记录或日志，也不改动远程 URL。
+
 领域参考（如 PCB AVI/AOI）不内联在本文件：由对应 case 文档按需引入，并在那里
 给出运行时知识库逻辑路径的读取方式。本地试跑只用于验证链路是否打通；正式批量
 与正规化执行统一在平台侧用 `df_submit_pipeline` 完成。

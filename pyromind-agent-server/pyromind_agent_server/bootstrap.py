@@ -1,25 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
+import secrets
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.openhands_adapter import OpenHandsAdapter
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
+from harness_adapter.task_status_query import PlatformTaskStatusQuery
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.application.task_monitor import TaskMonitor
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.infrastructure.sqlite_task_monitor_store import (
+    SQLiteTaskMonitorStore,
+)
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
@@ -30,6 +38,7 @@ from openhands.agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.observability import build_execution_observer
+from pyromind_agent_server.task_monitor_worker import TOKEN_ENV
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
@@ -121,6 +130,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         code: str | None,
         context: RequestContext,
         graph_run_id: str | None,
+        continue_after_completion: bool,
     ):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.submit_versioned_workflow(
@@ -130,6 +140,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             code,
             context,
             graph_run_id=graph_run_id,
+            continue_after_completion=continue_after_completion,
         )
 
     openhands_adapter.set_version_handler(version_call, execution_call)
@@ -234,6 +245,15 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
     )
+    if os.getenv("PYROMIND_TASK_MONITOR_ENABLED", "1") == "1":
+        runtime.task_monitor = TaskMonitor(
+            SQLiteTaskMonitorStore(service.conversations_dir / ".task-monitor.sqlite3"),
+            PlatformTaskStatusQuery(),
+            runtime,
+            first_delay=float(os.getenv("PYROMIND_TASK_MONITOR_FIRST_DELAY", "60")),
+            interval=float(os.getenv("PYROMIND_TASK_MONITOR_INTERVAL", "180")),
+        )
+        runtime.task_monitor.recover(service.conversations_dir)
     if backend == "pi":
         adapter = adapters["pi"]
         assert isinstance(adapter, PiAdapter)
@@ -293,7 +313,42 @@ def install_product_api(app: FastAPI) -> FastAPI:
     from pyromind_agent_server.api.router import create_product_router
 
     app.state.product_runtime = None
+    app.state.task_monitor_token = os.getenv(TOKEN_ENV) or secrets.token_urlsafe(32)
     original_lifespan = app.router.lifespan_context
+
+    @app.post("/internal/task-monitor/check", include_in_schema=False)
+    async def check_background_tasks(request: Request) -> dict[str, int]:
+        supplied = request.headers.get("x-task-monitor-token", "")
+        if not secrets.compare_digest(supplied, app.state.task_monitor_token):
+            raise HTTPException(403, "Invalid task monitor credential")
+        runtime = ensure_product_runtime(app)
+        if runtime is None or runtime.task_monitor is None:
+            raise HTTPException(503, "Task monitoring is unavailable")
+        checked = await runtime.task_monitor.check_due(limit=1)
+        return {"checked": checked}
+
+    async def supervise_monitor() -> None:
+        while True:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "pyromind_agent_server.task_monitor_worker",
+                "--url",
+                os.getenv("OH_INTERNAL_SERVER_URL", "http://127.0.0.1:8000"),
+                env={**os.environ, TOKEN_ENV: app.state.task_monitor_token},
+            )
+            try:
+                await process.wait()
+                logger.warning("Task monitor worker exited; restarting")
+            finally:
+                if process.returncode is None:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=10)
+                    except TimeoutError:
+                        process.kill()
+                        await process.wait()
+            await asyncio.sleep(5)
 
     @asynccontextmanager
     async def product_lifespan(current_app: FastAPI):
@@ -301,9 +356,19 @@ def install_product_api(app: FastAPI) -> FastAPI:
             runtime = ensure_product_runtime(current_app)
             if runtime is not None:
                 await runtime.recover_version_metadata()
+            worker = None
+            if (
+                runtime is not None
+                and runtime.task_monitor is not None
+                and os.getenv("PYROMIND_TASK_MONITOR_AUTOSTART", "1") == "1"
+            ):
+                worker = asyncio.create_task(supervise_monitor())
             try:
                 yield
             finally:
+                if worker is not None:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
                 runtime = getattr(current_app.state, "product_runtime", None)
                 if isinstance(runtime, ConversationRuntime):
                     await runtime.close()

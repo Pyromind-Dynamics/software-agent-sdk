@@ -52,10 +52,7 @@ NATIVE_VLM_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CONVERTIBLE_VLM_SUFFIXES = {".gif", ".webp", ".bmp"}
 IMAGE_SUFFIXES = NATIVE_VLM_SUFFIXES | CONVERTIBLE_VLM_SUFFIXES
 
-# Platform pods mount user Storage here. Everything an agent or a downstream
-# tool reads back must be expressed without this prefix, so the object paths
-# written into structured rows are Storage paths rather than pod paths.
-STORAGE_MOUNT_PREFIX = "/target-workspace"
+STORAGE_MOUNT_PREFIXES = ("/target-workspace", "/workspace")
 
 # Run-level failure summary, read back by generate_report.py as ``runtime_failure``
 # and by the host tool as ``report.json.failure``.
@@ -1329,18 +1326,12 @@ def _validate_schema_subset(value: Any, schema: Any, *, path: str) -> None:
 
 
 def _storage_object_path(local_path: str) -> str:
-    """Return the agent-facing path for one source image.
-
-    A platform run materializes user Storage under :data:`STORAGE_MOUNT_PREFIX`,
-    so the object path is the local path without that mount. A local sample run
-    has no mount and keeps its local path, which is the path that run can read.
-    """
+    """Return a Storage reference, retaining paths outside Storage for local runs."""
     path = Path(local_path)
-    try:
-        relative = path.relative_to(STORAGE_MOUNT_PREFIX)
-    except ValueError:
-        return str(path)
-    return f"/{relative.as_posix()}"
+    for prefix in STORAGE_MOUNT_PREFIXES:
+        if path.is_relative_to(prefix):
+            return f"/{path.relative_to(prefix).as_posix()}"
+    return str(path)
 
 
 def _source_images(labels: list[str], local_paths: list[str]) -> dict[str, str]:

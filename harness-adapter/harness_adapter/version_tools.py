@@ -119,7 +119,7 @@ register_tool(ProductVersionsTool.name, ProductVersionsTool)
 
 
 type ExecutionCall = Callable[
-    [str, str, dict[str, Any], str | None, RequestContext, str | None],
+    [str, str, dict[str, Any], str | None, RequestContext, str | None, bool],
     Coroutine[Any, Any, dict[str, Any]],
 ]
 
@@ -131,13 +131,23 @@ def submission_bridge(
     context: RequestContext,
     loop: asyncio.AbstractEventLoop,
     graph_run_id: str | None = None,
+    *,
+    continue_after_completion: bool = False,
 ):
     from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
     def submit(workflow: dict, name: str, code: str | None):
         effective = {**workflow, "name": name}
         result = asyncio.run_coroutine_threadsafe(
-            callback(scope, request_id(), effective, code, context, graph_run_id),
+            callback(
+                scope,
+                request_id(),
+                effective,
+                code,
+                context,
+                graph_run_id,
+                continue_after_completion,
+            ),
             loop,
         ).result()
         return TrainingTaskCreateResponse.model_validate({"name": name, **result})
