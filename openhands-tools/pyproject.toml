@@ -19,7 +19,7 @@ dependencies = [
     "tom-swe>=1.0.3",
     "httpx>=0.27",
     "py-landlock>=0.1.1; sys_platform == 'linux'",
-    "pyromind-sdk>=0.1.9; python_full_version < '3.14'",
+    "pyromind-sdk>=0.1.17; python_full_version < '3.14'",
     "websockets>=12",
     "python-socks>=1.0.0",
     "huggingface_hub>=0.25",
