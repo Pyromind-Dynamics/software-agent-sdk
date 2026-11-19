@@ -14,9 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
-from pyromind_runtime.domain.storage_paths import normalize_workspace_path
-
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectNode,
@@ -26,11 +24,12 @@ from openhands.agent_server.echomind_projects import (
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_publication import (
+from pyromind_agent_server.echomind_publication import (
     ProjectPublicationService,
     build_runtime_contract_draft,
 )
-from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
+from pyromind_common.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
+from pyromind_runtime.domain.storage_paths import normalize_workspace_path
 
 
 SOURCE_PROJECT_ID = "6742edad-2fd1-419e-9e6c-979847463fe2"

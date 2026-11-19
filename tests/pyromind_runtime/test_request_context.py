@@ -1,9 +1,8 @@
 from harness_adapter.tool_context import current_user_from_context
 from pyromind_agent_server.auth_context import request_context
+from pyromind_common.platform.auth import CurrentLoginUser
 from pyromind_runtime.domain.context import RequestContext
 from starlette.requests import Request
-
-from openhands.agent_server.pyromind_auth import CurrentLoginUser
 
 
 def test_pi_tool_user_keeps_cookie_and_cluster_headers():

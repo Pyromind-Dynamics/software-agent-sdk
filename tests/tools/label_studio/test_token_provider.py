@@ -3,8 +3,8 @@
 import httpx
 import pytest
 
-from openhands.tools.label_studio.converter import ConversionError
-from openhands.tools.label_studio.token_provider import PortalTokenProvider
+from pyromind_common.tools.label_studio.converter import ConversionError
+from pyromind_common.tools.label_studio.token_provider import PortalTokenProvider
 
 
 class _Response:

@@ -1,12 +1,17 @@
-"""Tests for MCP schema generation in openhands.sdk.tool.schema."""
+"""Tests for MCP schema generation in pyromind_common.sdk.tool.schema."""
 
 import json
 from collections.abc import Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from openhands.sdk.llm import ImageContent, TextContent
-from openhands.sdk.tool.schema import Action, Observation, Schema, _process_schema_node
+from pyromind_common.sdk.llm import ImageContent, TextContent
+from pyromind_common.sdk.tool.schema import (
+    Action,
+    Observation,
+    Schema,
+    _process_schema_node,
+)
 
 
 class MCPSchemaTestAction(Action):

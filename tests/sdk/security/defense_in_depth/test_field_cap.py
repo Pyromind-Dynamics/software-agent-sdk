@@ -26,18 +26,18 @@ import json
 
 import pytest
 
-from openhands.sdk.event import ActionEvent
-from openhands.sdk.llm import MessageToolCall, TextContent
-from openhands.sdk.security.defense_in_depth.pattern import (
+from pyromind_common.sdk.event import ActionEvent
+from pyromind_common.sdk.llm import MessageToolCall, TextContent
+from pyromind_common.sdk.security.defense_in_depth.pattern import (
     PatternSecurityAnalyzer,
 )
-from openhands.sdk.security.defense_in_depth.utils import (
+from pyromind_common.sdk.security.defense_in_depth.utils import (
     _EXTRACT_HARD_CAP,
     _extract_content,
     _extract_exec_segments,
     _extract_text_segments,
 )
-from openhands.sdk.security.risk import SecurityRisk
+from pyromind_common.sdk.security.risk import SecurityRisk
 
 
 def _make_action(

@@ -6,22 +6,15 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
-from pyromind_runtime.application.pipeline_runs import PipelineRuns
-from pyromind_runtime.domain.content import JsonObject
-from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
-from pyromind_runtime.domain.errors import ProductRuntimeError
-from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
-from pyromind_runtime.domain.task_correlation import TaskOrigin
-from pyromind_runtime.domain.versions import VersionToolRequest
 
 from harness_adapter.pi_adapter.business_tools import (
+    ProjectRewardReader,
     execute_validation_tool,
     validation_tool_spec,
 )
@@ -43,37 +36,37 @@ from harness_adapter.version_tools import (
     submission_bridge,
 )
 from harness_adapter.workflow_validation import check_workflow_resources
-from openhands.agent_server.pyromind_auth import parse_auth_token_from_cookie_header
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.secret import StaticSecret
-from openhands.sdk.tool import ToolDefinition
-from openhands.sdk.workspace.base import BaseWorkspace
-from openhands.sdk.workspace.local import LocalWorkspace
-from openhands.tools.data_preparation import (
+from pyromind_common.platform.auth import parse_auth_token_from_cookie_header
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.secret import StaticSecret
+from pyromind_common.sdk.tool import ToolDefinition
+from pyromind_common.sdk.workspace.base import BaseWorkspace
+from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_common.tools.data_preparation import (
     DfCheckProgressTool,
     DfStopTaskTool,
     DfSubmitEvaluationTool,
     DfSubmitPipelineTool,
 )
-from openhands.tools.data_preparation.inference import InferencePipelineHandler
-from openhands.tools.data_preparation.sandbox_execution import (
+from pyromind_common.tools.data_preparation.inference import InferencePipelineHandler
+from pyromind_common.tools.data_preparation.sandbox_execution import (
     ENV_SANDBOX_DATAFLOW_PYTHON,
 )
-from openhands.tools.environment_processing import (
+from pyromind_common.tools.environment_processing import (
     EdpAggregateTool,
     EdpRenderTool,
     EdpSubmitTool,
 )
-from openhands.tools.label_studio import (
+from pyromind_common.tools.label_studio import (
     LABEL_STUDIO_TOKEN_SECRET,
     LabelStudioProjectTool,
 )
-from openhands.tools.pyromind_cleaning import RunDatasetCleaningTool
-from openhands.tools.pyromind_dataset import (
+from pyromind_common.tools.pyromind_cleaning import RunDatasetCleaningTool
+from pyromind_common.tools.pyromind_dataset import (
     GetStorageUrlTool,
     UploadFileToPyromindTool,
 )
-from openhands.tools.sandbox import (
+from pyromind_common.tools.sandbox import (
     SandboxCreateTool,
     SandboxDeleteFileTool,
     SandboxDeleteTool,
@@ -83,24 +76,33 @@ from openhands.tools.sandbox import (
     SandboxUploadTool,
     SandboxWriteFileTool,
 )
-from openhands.tools.training_analysis import TrainingAnalysisTool
-from openhands.tools.update_plan import UpdatePlanTool
-from openhands.tools.utils.platform_env import (
+from pyromind_common.tools.training_analysis import TrainingAnalysisTool
+from pyromind_common.tools.update_plan import UpdatePlanTool
+from pyromind_common.tools.utils.platform_env import (
     platform_cluster_route,
     platform_cluster_target,
 )
-from openhands.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
-from openhands.tools.workflow.task_submission import (
+from pyromind_common.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
+from pyromind_common.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
     workflow_submission_scope,
 )
-from openhands.tools.workflow.validate_workflow_dsl import (
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
     ValidateWorkflowDslExecutor,
 )
-from openhands.tools.workflow_debug import WorkflowDebugTool
-from openhands.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
+from pyromind_common.tools.workflow_debug import WorkflowDebugTool
+from pyromind_common.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
+from pyromind_runtime.domain.errors import ProductRuntimeError
+from pyromind_runtime.domain.reward_bundle import GET_PROJECT_REWARD
+from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
+from pyromind_runtime.domain.task_correlation import TaskOrigin
+from pyromind_runtime.domain.versions import VersionToolRequest
 
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
@@ -235,6 +237,7 @@ class ToolExecutionContext:
     model_configuration: dict[str, Any]
     extra: dict[str, Any] = field(default_factory=dict)
     workspace: BaseWorkspace | None = None
+    evaluation_reward: JsonObject | None = None
 
 
 def _workflow_storage_path(context: ToolExecutionContext, workflow_path: str) -> str:
@@ -287,7 +290,7 @@ def _llm_credential_secrets(context: ToolExecutionContext) -> dict[str, StaticSe
 
 
 class _ToolConversationFacade:
-    """The deliberately small OpenHands compatibility boundary used by Pi."""
+    """Conversation context supplied by Pi to shared product tools."""
 
     def __init__(
         self,
@@ -362,7 +365,7 @@ _RUNTIME_RESOURCE_PROPOSAL_TOOL = "propose_runtime_resources"
 
 
 class PyromindBusinessToolHost:
-    """Expose tested OpenHands business executors through Pi's JSONL bridge."""
+    """Expose Pyromind business executors through Pi's JSONL bridge."""
 
     def __init__(
         self,
@@ -398,6 +401,10 @@ class PyromindBusinessToolHost:
         self.version_call: VersionCall | None = None
         self.training_artifact_hook: Callable[..., Awaitable[int]] | None = None
         self.execution_call: ExecutionCall | None = None
+        self.project_reward: ProjectRewardReader | None = None
+        self.evaluation_reward: (
+            Callable[[str, RequestContext], Awaitable[JsonObject | None]] | None
+        ) = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
         self._runtime_resource_proposer: RuntimeResourceProposer | None = None
         for path in (
@@ -487,7 +494,9 @@ class PyromindBusinessToolHost:
         }
 
     def terminal_environment(self, context: ToolExecutionContext) -> dict[str, str]:
-        from openhands.tools.data_preparation.runner import terminal_model_environment
+        from pyromind_common.tools.data_preparation.runner import (
+            terminal_model_environment,
+        )
 
         environment = terminal_model_environment(
             _ToolConversationFacade(context).state.agent.llm
@@ -505,6 +514,14 @@ class PyromindBusinessToolHost:
         host-side presigned upload tool.
         """
         specs = [validation_tool_spec()]
+        if self.project_reward is not None:
+            specs.append(
+                BusinessToolSpec(
+                    GET_PROJECT_REWARD,
+                    "Get the Project's frozen Reward bundle and Studio entry.",
+                    {"type": "object", "properties": {}, "additionalProperties": False},
+                ).as_dict()
+            )
         if self.version_call is not None:
             specs.append(
                 BusinessToolSpec(
@@ -706,13 +723,38 @@ class PyromindBusinessToolHost:
                     content=[{"type": "text", "text": str(exc)}],
                     details={"error": str(exc)},
                 ).as_dict()
+        if name == GET_PROJECT_REWARD:
+            if self.project_reward is None:
+                raise ValueError("Project reward lookup is unavailable")
+            if arguments:
+                raise ValueError("Project reward lookup accepts no arguments")
+            reward = await self.project_reward(
+                context.conversation_id, context.request_context
+            )
+            details = {
+                "reward_bundle": reward.model_dump(mode="json") if reward else None,
+                "studio_entry": reward.studio_entry if reward else None,
+            }
+            return BusinessToolResult(
+                is_error=False,
+                content=[{"type": "text", "text": json.dumps(details)}],
+                details=details,
+            ).as_dict()
         if name == "validate_workflow_dsl":
             policy = ToolOutputPolicy()
             policy_source = "platform_default"
+            reward = (
+                await self.project_reward(
+                    context.conversation_id, context.request_context
+                )
+                if self.project_reward is not None
+                else None
+            )
             raw = await execute_validation_tool(
                 context.workspace or LocalWorkspace(working_dir=context.workspace_root),
                 arguments,
                 context.request_context,
+                **({"reward": reward} if reward is not None else {}),
             )
             response = await self._finalize_result(
                 BusinessToolResult(
@@ -757,6 +799,13 @@ class PyromindBusinessToolHost:
         factory = self._factories.get(name)
         if factory is None:
             raise ValueError(f"unsupported business tool: {name}")
+        if name == DfSubmitEvaluationTool.name and self.evaluation_reward is not None:
+            context = replace(
+                context,
+                evaluation_reward=await self.evaluation_reward(
+                    context.conversation_id, context.request_context
+                ),
+            )
         tool = factory(context)
         if (
             self.execution_call is not None
@@ -1180,6 +1229,7 @@ class PyromindBusinessToolHost:
                     if context.request_context.authorization
                     else None,
                 ),
+                evaluation_reward=context.evaluation_reward,
             )
         return params
 

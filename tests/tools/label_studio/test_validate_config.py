@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from openhands.tools.label_studio.converter import AVITrainToLabelStudioConverter
-from openhands.tools.label_studio.field_map import DEFAULT_FIELD_MAPS
-from openhands.tools.label_studio.skill_helpers import (
+from pyromind_common.tools.label_studio.converter import AVITrainToLabelStudioConverter
+from pyromind_common.tools.label_studio.field_map import DEFAULT_FIELD_MAPS
+from pyromind_common.tools.label_studio.skill_helpers import (
     REQUIRED_MEDIA_OBJECT,
     LabelConfigValidationError,
     extract_control_names,

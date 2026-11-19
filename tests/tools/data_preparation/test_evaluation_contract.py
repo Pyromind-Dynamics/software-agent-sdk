@@ -5,12 +5,12 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from openhands.tools.data_preparation.evaluation_submit import (
+from pyromind_common.tools.data_preparation.evaluation_submit import (
     DfSubmitEvaluationAction,
     DfSubmitEvaluationExecutor,
     DfSubmitEvaluationTool,
 )
-from openhands.tools.data_preparation.platform_submit import (
+from pyromind_common.tools.data_preparation.platform_submit import (
     DfSubmitPipelineAction,
     DfSubmitPipelineTool,
 )
@@ -39,14 +39,7 @@ def test_original_stuck_call_is_rejected_before_evaluation_execution():
                 "evaluation_config_path": "public_data/evaluation.json",
             },
         ),
-        (
-            "score",
-            {
-                "source_manifest_path": "public_data/source.json",
-                "scoring_spec_path": "public_data/spec.json",
-                "scoring_script_path": "public_data/score.py",
-            },
-        ),
+        ("score", {"source_manifest_path": "public_data/source.json"}),
         (
             "profile",
             {

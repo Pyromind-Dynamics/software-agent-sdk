@@ -5,7 +5,7 @@ from base64 import urlsafe_b64encode
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
-from openhands.sdk.utils.cipher import Cipher
+from pyromind_common.sdk.utils.cipher import Cipher
 
 
 def test_cipher_encrypt_decrypt():

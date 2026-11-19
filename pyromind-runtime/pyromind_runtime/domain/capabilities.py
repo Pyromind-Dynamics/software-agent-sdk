@@ -11,6 +11,7 @@ class ResourceLimits(ContractModel):
 
 
 class HarnessCapabilities(ContractModel):
+    read_only: bool = Field(default=False, exclude_if=lambda value: not value)
     resume: bool = False
     cancel: bool = False
     permission_reply: bool = False

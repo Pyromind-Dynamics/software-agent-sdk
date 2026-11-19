@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import pytest
 from deprecation import DeprecatedWarning
 
-from openhands.sdk.utils.deprecation import (
+from pyromind_common.sdk.utils.deprecation import (
     deprecated,
     warn_cleanup,
     warn_deprecated,

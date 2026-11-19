@@ -1,22 +1,22 @@
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
-from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
 
-from openhands.agent_server.echomind_projects import ProjectInfo
-from openhands.agent_server.echomind_publication import PublishedGraph
-from openhands.agent_server.echomind_runtime_slots import (
+from pyromind_agent_server.echomind_projects import ProjectInfo
+from pyromind_agent_server.echomind_publication import PublishedGraph
+from pyromind_agent_server.echomind_runtime_slots import (
     RuntimeSlotSetupRequest,
     ServingInferenceCreateConfig,
     TracerCreateConfig,
 )
-from openhands.agent_server.echomind_storage import (
+from pyromind_agent_server.echomind_storage import (
     canonical_sha256,
     canonical_uuid,
     project_directory,
     read_model,
     write_model,
 )
+from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
 
 
 class RuntimeResourceProposal(BaseModel):

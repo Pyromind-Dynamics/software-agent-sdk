@@ -9,6 +9,7 @@ import pytest
 import yaml
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
+
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
@@ -22,18 +23,23 @@ from pyromind_agent_server.api.evaluation_runs import (
     get_evaluation_storage,
 )
 from pyromind_agent_server.api.router import create_product_router
+from pyromind_agent_server.dependencies import check_session_api_key
+from pyromind_common.tools.data_preparation.evaluation_submit import (
+    DfSubmitEvaluationAction,
+)
+from pyromind_common.tools.data_preparation.inference import InferenceOptions
+from pyromind_common.tools.data_preparation.platform_submit import (
+    DfSubmitPipelineAction,
+)
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslAction,
+)
 from pyromind_runtime.application.event_projection import ProductEventProjector
 from pyromind_runtime.application.snapshot_projector import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
-
-from openhands.agent_server.dependencies import check_session_api_key
-from openhands.tools.data_preparation.evaluation_submit import DfSubmitEvaluationAction
-from openhands.tools.data_preparation.inference import InferenceOptions
-from openhands.tools.data_preparation.platform_submit import DfSubmitPipelineAction
-from openhands.tools.workflow.validate_workflow_dsl import ValidateWorkflowDslAction
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -260,6 +266,7 @@ def test_pyromind_start_scripts_use_composed_server_entrypoint() -> None:
             or '"${server_python}" -m pyromind_agent_server' in script
         )
         assert "python -m openhands.agent_server" not in script
+        assert "from openhands." not in script
 
 
 def test_inference_start_defaults_to_platform_sandbox_for_pi_terminal() -> None:
@@ -488,11 +495,10 @@ def test_generated_business_scoring_only_executes_in_cpu_worker():
 
 
 def test_return_addresses_stay_in_the_product_contract_and_out_of_model_arguments():
+    from pyromind_common.tools.workflow.submit_workflow import SubmitWorkflowAction
+    from pyromind_common.tools.workflow_debug.definition import WorkflowDebugAction
     from pyromind_runtime.domain.task_correlation import TaskCorrelation
     from pyromind_runtime.ports.harness import ExternalTaskNotification
-
-    from openhands.tools.workflow.submit_workflow import SubmitWorkflowAction
-    from openhands.tools.workflow_debug.definition import WorkflowDebugAction
 
     assert "correlation" in ExternalTaskNotification.model_fields
     assert set(TaskCorrelation.model_fields) == {
@@ -511,6 +517,7 @@ def test_return_addresses_stay_in_the_product_contract_and_out_of_model_argument
 
 def test_preparation_policy_is_trusted_profile_configuration():
     from pydantic import ValidationError
+
     from pyromind_agent_server.api.schemas import CreateConversationRequest
     from pyromind_agent_server.profiles import (
         DEFAULT_PRODUCT_PROFILE,
@@ -525,6 +532,19 @@ def test_preparation_policy_is_trusted_profile_configuration():
         role.name for role in roles
     }
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
+    review_tool = "request_reward_bundle_review"
+    assert review_tool in tools
+    assert "rubric-elicitation" in (ECHOMIND_PRODUCT_PROFILE.skill_allowlist or ())
+    assert review_tool not in (
+        ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()
+    )
+    assert review_tool not in (DEFAULT_PRODUCT_PROFILE.tool_allowlist or ())
+    assert all(review_tool not in role.tools for role in roles)
+    assert {role.name for role in roles if "get_project_reward" in role.tools} == {
+        "init",
+        "train",
+        "eval",
+    }
     assert "set_preparation_plan" in tools
     assert not {"get_preparation", "update_preparation", "inspect_resource"} & tools
     assert {"read", "write", "edit", "terminal"} <= tools
@@ -591,7 +611,7 @@ def test_preparation_checklist_resolves_from_source_bundle_or_configured_root(
 
 
 def test_frozen_bundle_includes_preparation_and_role_skill_assets():
-    spec = ROOT / "openhands-agent-server/openhands/agent_server/agent-server.spec"
+    spec = ROOT / "pyromind-agent-server/pyromind_agent_server/agent-server.spec"
     function = next(
         node
         for node in ast.parse(spec.read_text()).body
@@ -612,6 +632,7 @@ def test_frozen_bundle_includes_preparation_and_role_skill_assets():
 
 def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied():
     from pydantic import ValidationError
+
     from pyromind_agent_server.profiles import (
         DEFAULT_PRODUCT_PROFILE,
         ECHOMIND_PRODUCT_PROFILE,

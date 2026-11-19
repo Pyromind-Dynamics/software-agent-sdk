@@ -1,7 +1,7 @@
 import jwt
 import pytest
 
-from openhands.agent_server import pyromind_auth as auth
+from pyromind_common.platform import auth
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +25,9 @@ def test_prod_verifies_configured_key_and_rejects_dev_key(monkeypatch):
     )
     payload = {"sub": "tester", "email": "test@example.test", "user_id": 7}
     token = jwt.encode(payload, auth.find_secret_key(), algorithm=auth.ALGORITHM)
-    assert auth.verify_jwt_token(token).user_id == 7
+    user = auth.verify_jwt_token(token)
+    assert user is not None
+    assert user.user_id == 7
     dev_token = jwt.encode(payload, auth._DEV_SECRET_KEY, algorithm=auth.ALGORITHM)
     assert auth.verify_jwt_token(dev_token) is None
 
@@ -56,7 +58,9 @@ def test_prod_reuses_agent_request_secret(monkeypatch):
         key,
         algorithm=auth.ALGORITHM,
     )
-    assert auth.verify_jwt_token(token).user_id == 7
+    user = auth.verify_jwt_token(token)
+    assert user is not None
+    assert user.user_id == 7
 
 
 def test_explicit_web_key_takes_precedence(monkeypatch):

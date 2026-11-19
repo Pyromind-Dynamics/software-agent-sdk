@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
 from harness_adapter import (
     artifact_snapshots as platform,
     workflow_submission as platform_submission,
@@ -19,6 +20,10 @@ from harness_adapter.version_tools import (
     submission_bridge,
 )
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_common.tools.workflow.task_submission import (
+    submit_workflow_task,
+    workflow_submission_scope,
+)
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
@@ -37,11 +42,6 @@ from pyromind_runtime.infrastructure.file_artifact_snapshots import (
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import SessionSpec
-
-from openhands.tools.workflow.task_submission import (
-    submit_workflow_task,
-    workflow_submission_scope,
-)
 
 from .fake_adapter import FakeAdapter
 from .test_workflow_execution import FakeSubmission

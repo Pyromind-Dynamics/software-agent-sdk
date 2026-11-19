@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-from openhands.sdk.workspace.models import CommandResult
-from openhands.sdk.workspace.workspace import LocalWorkspace
-from openhands.tools.utils.workspace_staging import (
+from pyromind_common.sdk.workspace.models import CommandResult
+from pyromind_common.sdk.workspace.workspace import LocalWorkspace
+from pyromind_common.tools.utils.workspace_staging import (
     WorkspaceArchiveTruncatedError,
     WorkspaceStagingError,
     resolve_workspace_path,

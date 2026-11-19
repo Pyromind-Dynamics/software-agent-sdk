@@ -6,8 +6,8 @@ from uuid import uuid4
 
 import pytest
 
-from openhands.sdk.conversation.base import BaseConversation
-from openhands.tools.workflow import submit_workflow as module
+from pyromind_common.sdk.conversation.base import ToolConversation
+from pyromind_common.tools.workflow import submit_workflow as module
 
 
 def test_submit_workflow_tool_resolves_without_parameters():
@@ -52,7 +52,7 @@ def test_submit_workflow_tool_submits_directly_with_current_identity(monkeypatch
     )
     observation = module.SubmitWorkflowExecutor()(
         module.SubmitWorkflowAction(workflow_path="/workspace/project/workflow.py"),
-        cast(BaseConversation, conversation),
+        cast(ToolConversation, conversation),
     )
     assert observation.status == "submitted"
     assert observation.task_id == "task-123"

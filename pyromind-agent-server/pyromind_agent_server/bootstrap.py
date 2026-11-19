@@ -8,10 +8,45 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
+from pyromind_agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
+from pyromind_agent_server.echomind_acquisition_tasks import (
+    EchoMindAcquisitionTaskManager,
+)
+from pyromind_agent_server.echomind_projects import ProjectStore
+from pyromind_agent_server.echomind_publication import (
+    ProjectLifecycleError,
+    ProjectPublicationService,
+    PublicationValidationError,
+    RuntimeImplementationAdoptionError,
+)
+from pyromind_agent_server.echomind_resource_proposals import (
+    prepare_runtime_resources,
+)
+from pyromind_agent_server.echomind_runtime_access import build_runtime_credential_store
+from pyromind_agent_server.echomind_runtime_factory import (
+    GraphRuntimeCallbackService,
+    build_echomind_runtime_scheduler,
+)
+from pyromind_agent_server.echomind_runtime_scheduler import (
+    RuntimeGraphPoller,
+)
+from pyromind_agent_server.evaluation_storage import build_evaluation_storage
+from pyromind_agent_server.experiment_plan_projects import (
+    EchoMindExperimentPlanProjectBinder,
+)
+from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_agent_server.observability import build_execution_observer
+from pyromind_agent_server.plan_database import build_experiment_plan_store
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.resource_inspector import StorageResourceInspector
+from pyromind_agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.workflow_status import set_workflow_status_dispatcher
+from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
@@ -26,41 +61,6 @@ from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIn
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
 from pyromind_runtime.ports.workflows import WorkflowEventSink
-
-from openhands.agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
-from openhands.agent_server.echomind_projects import ProjectStore
-from openhands.agent_server.echomind_publication import (
-    ProjectLifecycleError,
-    ProjectPublicationService,
-    PublicationValidationError,
-    RuntimeImplementationAdoptionError,
-)
-from openhands.agent_server.echomind_runtime_scheduler import (
-    RuntimeGraphPoller,
-)
-from openhands.agent_server.storage_quota import ensure_conversation_quota
-from openhands.agent_server.workflow_status import set_workflow_status_dispatcher
-from pyromind_agent_server.echomind_acquisition_tasks import (
-    EchoMindAcquisitionTaskManager,
-)
-from pyromind_agent_server.echomind_resource_proposals import (
-    prepare_runtime_resources,
-)
-from pyromind_agent_server.echomind_runtime_access import build_runtime_credential_store
-from pyromind_agent_server.echomind_runtime_factory import (
-    GraphRuntimeCallbackService,
-    build_echomind_runtime_scheduler,
-)
-from pyromind_agent_server.evaluation_storage import build_evaluation_storage
-from pyromind_agent_server.experiment_plan_projects import (
-    EchoMindExperimentPlanProjectBinder,
-)
-from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
-from pyromind_agent_server.observability import build_execution_observer
-from pyromind_agent_server.plan_database import build_experiment_plan_store
-from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
-from pyromind_agent_server.resource_inspector import StorageResourceInspector
-from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 
 
 logger = logging.getLogger(__name__)
@@ -278,8 +278,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         evaluation_storage_factory=build_evaluation_storage,
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
+    pi_adapter.set_project_reward_reader(runtime.project_reward)
+    pi_adapter.set_evaluation_reward_reader(runtime.evaluation_reward)
     pi_adapter.set_preparation_handler(
-        runtime.preparation_call, runtime.preparation_revision
+        runtime.preparation_call,
+        runtime.preparation_revision,
+        runtime.preparation_review,
     )
 
     async def propose_runtime_resources(
@@ -383,7 +387,7 @@ def resource_limits_from_environment() -> ResourceLimits:
 
 
 def install_product_api(app: FastAPI) -> FastAPI:
-    """Compose Product API around the existing OpenHands application."""
+    """Install the product API and own its runtime lifecycle."""
     from pyromind_agent_server.api.echomind_projects import (
         router as echomind_projects_router,
     )
@@ -398,50 +402,11 @@ def install_product_api(app: FastAPI) -> FastAPI:
     @asynccontextmanager
     async def product_lifespan(current_app: FastAPI):
         async with original_lifespan(current_app):
-            runtime = ensure_product_runtime(current_app)
-            graph_poller: RuntimeGraphPoller | None = None
-            if runtime is not None:
-                await runtime.recover_version_metadata()
-                await runtime.start_execution_events()
-                conversation_service = getattr(
-                    current_app.state,
-                    "conversation_service",
-                    None,
-                )
-                if conversation_service is not None:
-                    projects_root = (
-                        Path(conversation_service.conversations_dir).parent / "projects"
-                    )
-                    graph_poller = RuntimeGraphPoller(
-                        build_echomind_runtime_scheduler(
-                            projects_root=projects_root,
-                            conversations_dir=conversation_service.conversations_dir,
-                            credential_store=build_runtime_credential_store(
-                                projects_root,
-                                getattr(current_app.state, "config", None),
-                            ),
-                        ),
-                        interval_seconds=_echomind_runtime_poll_seconds(),
-                    )
-                    await graph_poller.start()
             try:
+                await start_product_runtime(current_app)
                 yield
             finally:
-                if graph_poller is not None:
-                    await graph_poller.stop()
-                acquisition_tasks = getattr(
-                    current_app.state,
-                    "echomind_acquisition_tasks",
-                    None,
-                )
-                if isinstance(acquisition_tasks, EchoMindAcquisitionTaskManager):
-                    await acquisition_tasks.stop()
-                runtime = getattr(current_app.state, "product_runtime", None)
-                if isinstance(runtime, ConversationRuntime):
-                    await runtime.close()
-                set_workflow_status_dispatcher(None)
-                current_app.state.echomind_acquisition_tasks = None
-                current_app.state.product_runtime = None
+                await stop_product_runtime(current_app)
 
     app.router.lifespan_context = product_lifespan
     app.include_router(create_product_router())
@@ -458,3 +423,52 @@ def _echomind_runtime_poll_seconds() -> float:
     except ValueError:
         return 15
     return value if value > 0 else 15
+
+
+async def start_product_runtime(app: FastAPI) -> None:
+    runtime = ensure_product_runtime(app)
+    if runtime is not None:
+        await runtime.recover_version_metadata()
+        await runtime.start_execution_events()
+        conversation_service = getattr(
+            app.state,
+            "conversation_service",
+            None,
+        )
+        if conversation_service is not None:
+            projects_root = (
+                Path(conversation_service.conversations_dir).parent / "projects"
+            )
+            graph_poller = RuntimeGraphPoller(
+                build_echomind_runtime_scheduler(
+                    projects_root=projects_root,
+                    conversations_dir=conversation_service.conversations_dir,
+                    credential_store=build_runtime_credential_store(
+                        projects_root,
+                        getattr(app.state, "config", None),
+                    ),
+                ),
+                interval_seconds=_echomind_runtime_poll_seconds(),
+            )
+            app.state.echomind_graph_poller = graph_poller
+            await graph_poller.start()
+
+
+async def stop_product_runtime(app: FastAPI) -> None:
+    graph_poller = getattr(app.state, "echomind_graph_poller", None)
+    if graph_poller is not None:
+        await graph_poller.stop()
+        app.state.echomind_graph_poller = None
+    acquisition_tasks = getattr(
+        app.state,
+        "echomind_acquisition_tasks",
+        None,
+    )
+    if isinstance(acquisition_tasks, EchoMindAcquisitionTaskManager):
+        await acquisition_tasks.stop()
+    runtime = getattr(app.state, "product_runtime", None)
+    if isinstance(runtime, ConversationRuntime):
+        await runtime.close()
+    set_workflow_status_dispatcher(None)
+    app.state.echomind_acquisition_tasks = None
+    app.state.product_runtime = None

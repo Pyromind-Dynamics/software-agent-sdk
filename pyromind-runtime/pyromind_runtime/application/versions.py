@@ -320,6 +320,7 @@ class Versions:
         code: str | None = None,
         kind: str = "workflow",
         resolved_inputs: dict[str, str] | None = None,
+        fixed_inputs: dict[str, str] | None = None,
     ) -> VersionRun:
         check_persistable(definition)
         project = self.project(conversation_id, context)
@@ -342,6 +343,7 @@ class Versions:
             if resolved_inputs is not None
             else self.resolve_inputs(project, definition, inputs, context, key)
         )
+        inputs.update(fixed_inputs or {})
         config = self.save(
             project,
             key + ":config",

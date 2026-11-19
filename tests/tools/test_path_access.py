@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from openhands.tools.utils import (
+from pyromind_common.tools.utils import (
     PathAccessPolicy,
     PathRule,
     _dataflow_venv_read_roots,
@@ -16,8 +16,8 @@ def assert_conversation_policy_shape(
     """Assert the conversation-workspace permission matrix.
 
     Single source of truth for tool-integration tests. Keep this in sync with
-    :data:`openhands.tools.utils.CONVERSATION_READ_WRITE_SUBPATHS` /
-    :data:`openhands.tools.utils.CONVERSATION_READ_ONLY_SUBPATHS` and the
+    :data:`pyromind_common.tools.utils.CONVERSATION_READ_WRITE_SUBPATHS` /
+    :data:`pyromind_common.tools.utils.CONVERSATION_READ_ONLY_SUBPATHS` and the
     ``exclude_workspace_fallback=True`` semantics.
     """
     workflow_file = conversation_dir / "workflow" / "workflow.py"
@@ -80,7 +80,7 @@ def test_require_raises_for_denied_operation(tmp_path: Path) -> None:
 
 
 def test_conversation_workspace_restricts_to_subpaths(tmp_path: Path) -> None:
-    from openhands.tools.utils import (
+    from pyromind_common.tools.utils import (
         CONVERSATION_READ_ONLY_SUBPATHS,
         CONVERSATION_READ_WRITE_SUBPATHS,
         default_path_access_policy,

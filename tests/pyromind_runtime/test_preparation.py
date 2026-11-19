@@ -9,6 +9,8 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import event
+
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -31,7 +33,6 @@ from pyromind_runtime.infrastructure.sql_preparation import (
 )
 from pyromind_runtime.infrastructure.sql_project_store import metadata, projects
 from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
-from sqlalchemy import event
 
 from .fake_adapter import FakeAdapter
 from .test_product_api import _app
@@ -99,10 +100,16 @@ def ready_request():
     )
 
 
-def test_only_plan_submission_is_exposed():
+def test_plan_submission_schema():
     assert set(PREPARATION_TOOLS) == {"set_preparation_plan"}
     schema = SetPreparationPlan.model_json_schema()
-    assert set(schema["properties"]) == {"plan", "entry_task_id"}
+    assert set(schema["properties"]) == {
+        "plan",
+        "entry_task_id",
+        "training_method",
+        "reward_approval_id",
+    }
+    assert {"training_method", "reward_approval_id"}.isdisjoint(schema["required"])
     assert {"goal", "stages", "tasks"} <= set(
         schema["$defs"]["ExperimentContext"]["required"]
     )
@@ -480,14 +487,17 @@ async def test_http_prepare_create_and_cross_profile_denial(
     preparation_setup, tmp_path
 ):
     store, _, _ = preparation_setup
-    adapter = FakeAdapter()
+    adapter = FakeAdapter("pi")
     adapter.capabilities = adapter.capabilities.model_copy(
         update={"user_input_reply": True}
     )
     runtime = ConversationRuntime(
-        tmp_path / "conversations", adapter, preparation_store=store
+        tmp_path / "conversations",
+        adapter,
+        default_harness_id="pi",
+        preparation_store=store,
     )
-    profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="openhands")
+    profile = replace(ECHOMIND_PRODUCT_PROFILE, harness_id="pi")
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(profile))
     try:

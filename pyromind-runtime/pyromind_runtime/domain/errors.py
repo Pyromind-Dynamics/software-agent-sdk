@@ -4,6 +4,7 @@ from typing import Literal
 
 
 type ProductErrorCode = Literal[
+    "legacy_harness_retired",
     "plan_store_unavailable",
     "conversation_not_found",
     "checkpoint_not_found",
@@ -15,6 +16,7 @@ type ProductErrorCode = Literal[
     "harness_operation_failed",
     "input_not_pending",
     "input_pending",
+    "reward_review_unavailable",
 ]
 
 

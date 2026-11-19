@@ -2,20 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
-from fastapi import HTTPException
 
-from openhands.agent_server.event_service import EventService
-from openhands.agent_server.workflow_canvas_models import (
+from pyromind_common.workflow_canvas.models import (
     SaveWorkflowCanvasEventSnapshotRequest,
 )
-from openhands.agent_server.workflow_canvas_router import (
-    save_workflow_canvas_event_snapshot,
-)
-from openhands.agent_server.workflow_canvas_store import (
+from pyromind_common.workflow_canvas.store import (
     DuplicateWorkflowCanvasEventSnapshotError,
     FileWorkflowCanvasStore,
 )
@@ -114,40 +108,3 @@ class _StoredConversation:
 class _FakeEventService:
     conversation_dir: Path
     stored: _StoredConversation
-
-
-@pytest.mark.asyncio
-async def test_router_saves_event_snapshot_with_matching_session_id(tmp_path):
-    conversation_id = uuid4()
-    event_service = _FakeEventService(
-        conversation_dir=tmp_path,
-        stored=_StoredConversation(id=conversation_id),
-    )
-
-    result = await save_workflow_canvas_event_snapshot(
-        conversation_id,
-        _request(sessionId=conversation_id.hex),
-        event_service=cast(EventService, event_service),
-    )
-
-    assert result.event_id == "event-1"
-    assert result.snapshot_role == "in"
-    assert result.version_id == "v000001"
-
-
-@pytest.mark.asyncio
-async def test_router_rejects_mismatched_session_id(tmp_path):
-    conversation_id = uuid4()
-    event_service = _FakeEventService(
-        conversation_dir=tmp_path,
-        stored=_StoredConversation(id=conversation_id),
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        await save_workflow_canvas_event_snapshot(
-            conversation_id,
-            _request(sessionId="different-session"),
-            event_service=cast(EventService, event_service),
-        )
-
-    assert exc_info.value.status_code == 400

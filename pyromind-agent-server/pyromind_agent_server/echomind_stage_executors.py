@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+from typing import Any, Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from pyromind_agent_server.echomind_projects import (
+    ProjectInfo,
+    ProjectNode,
+)
+
+
+class StageArtifactPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str
+    format: Literal["json"] = "json"
+    content: dict[str, Any]
+
+
+class StageExecutionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    message: str
+    artifacts: list[StageArtifactPayload] = Field(default_factory=list)
+
+
+class ProjectNodeExecutor(Protocol):
+    def run(
+        self,
+        *,
+        project: ProjectInfo,
+        node: ProjectNode,
+    ) -> StageExecutionResult: ...
+
+
+class ContractProbeExecutor:
+    def run(
+        self,
+        *,
+        project: ProjectInfo,
+        node: ProjectNode,
+    ) -> StageExecutionResult:
+        return StageExecutionResult(
+            message=(
+                f"{node.title} contract probe completed. "
+                "No business stage was executed."
+            ),
+            artifacts=[
+                StageArtifactPayload(
+                    kind="stage_contract_probe",
+                    content={
+                        "probe_version": 1,
+                        "project_id": project.project.project_id,
+                        "graph_id": project.graph.graph_id,
+                        "node_id": node.id,
+                        "node_type": node.type,
+                        "executor": node.executor,
+                    },
+                )
+            ],
+        )
+
+
+class PublishedRuntimeOnlyExecutor:
+    def run(
+        self,
+        *,
+        project: ProjectInfo,
+        node: ProjectNode,
+    ) -> StageExecutionResult:
+        del project, node
+        raise RuntimeError("This executor is only available in published Runtime")
+
+
+_CONTRACT_PROBE_EXECUTOR = ContractProbeExecutor()
+_PUBLISHED_RUNTIME_ONLY_EXECUTOR = PublishedRuntimeOnlyExecutor()
+_EXECUTORS: dict[str, ProjectNodeExecutor] = {
+    "artifact_replay": _CONTRACT_PROBE_EXECUTOR,
+    "contract_probe": _CONTRACT_PROBE_EXECUTOR,
+    "dataset_runtime": _CONTRACT_PROBE_EXECUTOR,
+    "evaluator_runtime": _PUBLISHED_RUNTIME_ONLY_EXECUTOR,
+    "shell": _CONTRACT_PROBE_EXECUTOR,
+    "train_runtime": _PUBLISHED_RUNTIME_ONLY_EXECUTOR,
+}
+
+
+def get_project_node_executor(executor_name: str) -> ProjectNodeExecutor:
+    executor = _EXECUTORS.get(executor_name)
+    if executor is None:
+        raise ValueError(f"Unknown project node executor: {executor_name}")
+    return executor

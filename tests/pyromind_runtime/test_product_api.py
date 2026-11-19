@@ -8,21 +8,50 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
-import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import httpx
 from fastapi import FastAPI
-from harness_adapter.pi_adapter import PiAdapter
 from pydantic import SecretStr
+
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
+from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api import echomind_projects as echomind_project_api
 from pyromind_agent_server.api.echomind_projects import router as echomind_router
 from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.echomind_graph_runs import (
+    GraphRunStore,
+    RuntimeFailure,
+    TaskRun,
+)
+from pyromind_agent_server.echomind_projects import (
+    ProjectGraph,
+    ProjectInfo,
+    ProjectNode,
+    ProjectRecord,
+    ProjectStore,
+)
+from pyromind_agent_server.echomind_publication import (
+    ProjectPublicationService,
+    PromotionPolicy,
+    PublicationStore,
+    PublishedGraph,
+    RuntimeRequirements,
+)
 from pyromind_agent_server.echomind_resource_proposals import prepare_runtime_resources
+from pyromind_agent_server.echomind_runtime_slots import (
+    RuntimeSlot,
+    RuntimeSlotStore,
+    TracerBufferConfig,
+    TracerRuntime,
+)
+from pyromind_agent_server.echomind_stage_runs import ProjectRunStore
 from pyromind_agent_server.echomind_tracer_admin import load_tracer_admin_key
 from pyromind_agent_server.profiles import (
     ConversationProfile,
 )
+from pyromind_agent_server.service_context import ProductServiceContext
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
@@ -30,35 +59,6 @@ from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 from pyromind_runtime.ports.storage import EvaluationStorageMissingError
-
-from openhands.agent_server.config import Config
-from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.echomind_graph_runs import (
-    GraphRunStore,
-    RuntimeFailure,
-    TaskRun,
-)
-from openhands.agent_server.echomind_projects import (
-    ProjectGraph,
-    ProjectInfo,
-    ProjectNode,
-    ProjectRecord,
-    ProjectStore,
-)
-from openhands.agent_server.echomind_publication import (
-    ProjectPublicationService,
-    PromotionPolicy,
-    PublicationStore,
-    PublishedGraph,
-    RuntimeRequirements,
-)
-from openhands.agent_server.echomind_runtime_slots import (
-    RuntimeSlot,
-    RuntimeSlotStore,
-    TracerBufferConfig,
-    TracerRuntime,
-)
-from openhands.agent_server.echomind_stage_runs import ProjectRunStore
 
 from .fake_adapter import FakeAdapter
 
@@ -71,7 +71,7 @@ def _app(tmp_path, runtime: ConversationRuntime) -> FastAPI:
         enable_session_api_key_auth=False,
         enable_pyromind_jwt_auth=False,
     )
-    app.state.conversation_service = ConversationService(
+    app.state.conversation_service = ProductServiceContext(
         conversations_dir=tmp_path / "conversations"
     )
     app.state.product_runtime = runtime

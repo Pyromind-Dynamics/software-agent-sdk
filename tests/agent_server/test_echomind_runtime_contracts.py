@@ -4,13 +4,13 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from openhands.agent_server.echomind_graph_runs import (
+from pyromind_agent_server.echomind_graph_runs import (
     ActiveGraphRunExistsError,
     GraphRun,
     GraphRunStore,
     TaskRun,
 )
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_projects import (
     ProjectEdge,
     ProjectGraph,
     ProjectNode,
@@ -18,12 +18,12 @@ from openhands.agent_server.echomind_projects import (
     ProjectNodeInputBinding,
     ProjectNodeOutput,
 )
-from openhands.agent_server.echomind_publication import (
+from pyromind_agent_server.echomind_publication import (
     PromotionPolicy,
     PublishedGraph,
     RuntimeRequirements,
 )
-from openhands.agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_storage import canonical_sha256
 
 
 def test_graph_run_request_and_batch_idempotency_and_single_active_run(tmp_path):

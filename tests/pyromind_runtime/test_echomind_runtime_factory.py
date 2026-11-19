@@ -5,15 +5,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from pyromind_agent_server import echomind_runtime_factory as runtime_factory
-from pyromind_agent_server.echomind_runtime_factory import (
-    GraphRuntimeCallbackService,
-)
-
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectRecord,
     ProjectStore,
+)
+from pyromind_agent_server.echomind_runtime_factory import (
+    GraphRuntimeCallbackService,
 )
 
 

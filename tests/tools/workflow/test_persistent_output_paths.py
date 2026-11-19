@@ -1,6 +1,8 @@
 import pytest
 
-from openhands.tools.workflow.storage_paths import validate_persistent_output_paths
+from pyromind_common.tools.workflow.storage_paths import (
+    validate_persistent_output_paths,
+)
 
 
 @pytest.mark.parametrize(

@@ -11,25 +11,21 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+
 from pyromind_agent_server.api import echomind_projects as project_api
 from pyromind_agent_server.api.echomind_projects import router
-from pyromind_agent_server.echomind_platform_tracer import (
-    _HOOK,
-    is_platform_tracer_script,
-)
-from pyromind_agent_server.echomind_resource_proposals import prepare_runtime_resources
-from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
-from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
-
-from openhands.agent_server.config import Config
-from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.echomind_graph_runs import (
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.echomind_graph_runs import (
     ActiveGraphRunExistsError,
     GraphRunStore,
     RuntimeFailure,
     TaskRun,
 )
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_platform_tracer import (
+    _HOOK,
+    is_platform_tracer_script,
+)
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectNode,
@@ -38,7 +34,7 @@ from openhands.agent_server.echomind_projects import (
     ProjectNodeOutput,
     ProjectStore,
 )
-from openhands.agent_server.echomind_publication import (
+from pyromind_agent_server.echomind_publication import (
     RUNTIME_VALIDATION_GRAPH_TEMPLATE,
     ProjectLifecycleError,
     ProjectPublicationService,
@@ -53,7 +49,8 @@ from openhands.agent_server.echomind_publication import (
     build_runtime_contract_draft,
     compile_working_graph,
 )
-from openhands.agent_server.echomind_runtime_contracts import (
+from pyromind_agent_server.echomind_resource_proposals import prepare_runtime_resources
+from pyromind_agent_server.echomind_runtime_contracts import (
     ContractProbeRuntimeExecutor,
     ExternalTaskIntent,
     RuntimeArtifact,
@@ -63,8 +60,8 @@ from openhands.agent_server.echomind_runtime_contracts import (
     StagePreparationResult,
     StageSubmissionResult,
 )
-from openhands.agent_server.echomind_runtime_scheduler import RuntimeGraphScheduler
-from openhands.agent_server.echomind_runtime_slots import (
+from pyromind_agent_server.echomind_runtime_scheduler import RuntimeGraphScheduler
+from pyromind_agent_server.echomind_runtime_slots import (
     RuntimeHealth,
     RuntimeSlot,
     RuntimeSlotStore,
@@ -72,8 +69,11 @@ from openhands.agent_server.echomind_runtime_slots import (
     TracerBufferConfig,
     TracerRuntime,
 )
-from openhands.agent_server.echomind_stage_executors import StageArtifactPayload
-from openhands.agent_server.echomind_storage import project_directory
+from pyromind_agent_server.echomind_stage_executors import StageArtifactPayload
+from pyromind_agent_server.echomind_storage import project_directory
+from pyromind_agent_server.service_context import ProductServiceContext
+from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
+from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
 
 
 def test_6742_shape_can_upgrade_publish_and_execute_without_mutating_source(
@@ -193,7 +193,7 @@ async def test_runtime_validation_recipe_applies_to_copy_without_mutating_source
         enable_session_api_key_auth=False,
         enable_pyromind_jwt_auth=False,
     )
-    app.state.conversation_service = ConversationService(
+    app.state.conversation_service = ProductServiceContext(
         conversations_dir=tmp_path / "conversations"
     )
     app.include_router(router)
@@ -593,7 +593,7 @@ async def test_successful_debug_adoption_publishes_exact_snapshot_on_original_pr
         enable_session_api_key_auth=False,
         enable_pyromind_jwt_auth=False,
     )
-    app.state.conversation_service = ConversationService(
+    app.state.conversation_service = ProductServiceContext(
         conversations_dir=tmp_path / "conversations"
     )
     app.include_router(router)

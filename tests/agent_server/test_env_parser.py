@@ -21,9 +21,8 @@ from typing import Literal
 import pytest
 from pydantic import BaseModel, Field
 
-from openhands.agent_server.config import Config, load_config
-from openhands.agent_server.conversation_lease import DEFAULT_LEASE_TTL_SECONDS
-from openhands.agent_server.env_parser import (
+from pyromind_agent_server.config import DEFAULT_LEASE_TTL_SECONDS, Config, load_config
+from pyromind_agent_server.env_parser import (
     MISSING,
     BoolEnvParser,
     DelayedParser,
@@ -42,7 +41,7 @@ from openhands.agent_server.env_parser import (
     merge,
     to_env,
 )
-from openhands.sdk.security.risk import SecurityRisk
+from pyromind_common.sdk.security.risk import SecurityRisk
 from tests.sdk.utils.test_discriminated_union import Animal, Dog
 
 
@@ -872,7 +871,7 @@ def test_config_vnc_various_boolean_values(clean_env, env_value, expected):
 # ============================================================================
 
 
-class SampleEnum(str, Enum):
+class SampleEnum(str, Enum):  # noqa: UP042 - exercise legacy Enum parsing
     """Sample enum for parsing tests."""
 
     OPTION_A = "option_a"

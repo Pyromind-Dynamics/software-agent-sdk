@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from openhands.agent_server.echomind_acquisition import AcquisitionSimulation
-from openhands.agent_server.echomind_acquisition_runtime import (
+from pyromind_agent_server.echomind_acquisition import AcquisitionSimulation
+from pyromind_agent_server.echomind_acquisition_runtime import (
     AcquisitionSimulationRunner,
 )
 

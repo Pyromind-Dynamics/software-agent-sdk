@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
@@ -31,6 +32,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
     )
     adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     adapter.set_runtime_resource_proposer(AsyncMock())
+    adapter.set_project_reward_reader(runtime.project_reward)
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     try:

@@ -3,7 +3,12 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from openhands.sdk.tool import Action, Observation, ToolAnnotations, ToolDefinition
+from pyromind_common.sdk.tool import (
+    Action,
+    Observation,
+    ToolAnnotations,
+    ToolDefinition,
+)
 
 
 class TRTSAction(Action):

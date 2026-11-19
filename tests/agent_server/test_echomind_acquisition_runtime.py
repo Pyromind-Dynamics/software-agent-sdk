@@ -13,15 +13,14 @@ import httpx
 import pyarrow as pa
 import pyarrow.parquet as parquet
 import pytest
-from pyromind_runtime.ports.storage import EvaluationStorageMissingError
 
-from openhands.agent_server.echomind_acquisition import (
+from pyromind_agent_server.echomind_acquisition import (
     AcquisitionBatch,
     AcquisitionSimulation,
     AcquisitionSimulationStore,
     AcquisitionSource,
 )
-from openhands.agent_server.echomind_acquisition_runtime import (
+from pyromind_agent_server.echomind_acquisition_runtime import (
     AcquisitionPaused,
     AcquisitionRuntimeError,
     AcquisitionSimulationRunner,
@@ -32,13 +31,13 @@ from openhands.agent_server.echomind_acquisition_runtime import (
     _platform_task_id,
     _task_id,
 )
-from openhands.agent_server.echomind_dataset_runtime import (
+from pyromind_agent_server.echomind_dataset_runtime import (
     DatasetRuntimeExecutor,
     DatasetWorkflowSpec,
     PlatformDatasetRuntimeExecutor,
 )
-from openhands.agent_server.echomind_graph_runs import GraphRunStore
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_graph_runs import GraphRunStore
+from pyromind_agent_server.echomind_projects import (
     ProjectEdge,
     ProjectGraph,
     ProjectInfo,
@@ -49,17 +48,17 @@ from openhands.agent_server.echomind_projects import (
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_publication import (
+from pyromind_agent_server.echomind_publication import (
     PromotionPolicy,
     PublicationStore,
     PublishedGraph,
     RuntimeRequirements,
 )
-from openhands.agent_server.echomind_runtime_scheduler import (
+from pyromind_agent_server.echomind_runtime_scheduler import (
     ReadyBatch,
     RuntimeGraphScheduler,
 )
-from openhands.agent_server.echomind_runtime_slots import (
+from pyromind_agent_server.echomind_runtime_slots import (
     RuntimeHealth,
     RuntimeSlot,
     RuntimeSlotStore,
@@ -67,7 +66,8 @@ from openhands.agent_server.echomind_runtime_slots import (
     TracerBufferConfig,
     TracerRuntime,
 )
-from openhands.agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_runtime.ports.storage import EvaluationStorageMissingError
 
 
 def test_runner_feeds_two_rounds_and_dispatches_each_batch(tmp_path, monkeypatch):

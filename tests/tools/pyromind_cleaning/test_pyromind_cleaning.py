@@ -1,4 +1,3 @@
-import asyncio
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -9,18 +8,11 @@ import pytest
 from pyromind_sdk import PyroMindAPIError
 from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
-from openhands.sdk import LocalConversation
-from openhands.sdk.agent import Agent
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.conversation.state import (
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.conversation.state import (
     ActiveLongTask,
-    ConversationExecutionStatus,
 )
-from openhands.sdk.event.llm_convertible import MessageEvent
-from openhands.sdk.llm import Message, MessageToolCall, TextContent
-from openhands.sdk.testing import TestLLM
-from openhands.sdk.tool.spec import Tool
-from openhands.tools.pyromind_cleaning import (
+from pyromind_common.tools.pyromind_cleaning import (
     DatasetCleaningTaskAssociation,
     DatasetCleaningTaskStore,
     RunDatasetCleaningAction,
@@ -83,7 +75,7 @@ def _fake_conversation(tmp_path: Path):
 def _patch_valid_script_preflight(monkeypatch) -> MagicMock:
     download = MagicMock(return_value=b"def main():\n    return 0\n")
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.download_file_from_pyromind",
+        "pyromind_common.tools.pyromind_cleaning.definition.download_file_from_pyromind",
         download,
     )
     return download
@@ -114,7 +106,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     )
     client_factory = MagicMock(return_value=mock_client)
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_cleaning.definition.create_workflow_api_client",
         client_factory,
     )
     download_script = _patch_valid_script_preflight(monkeypatch)
@@ -124,7 +116,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
         )
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        "pyromind_common.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
         upload_runtime,
     )
     task_store_dir = tmp_path / "tasks"
@@ -242,7 +234,7 @@ def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
         status="Pending",
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_cleaning.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
     run_id = UUID("10000000-0000-0000-0000-000000000001")
@@ -309,12 +301,12 @@ def test_run_dataset_cleaning_submit_failure_omits_progress_fields(
     mock_client.studio.create.side_effect = RuntimeError("boom")
     client_factory = MagicMock(return_value=mock_client)
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_cleaning.definition.create_workflow_api_client",
         client_factory,
     )
     _patch_valid_script_preflight(monkeypatch)
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        "pyromind_common.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
         MagicMock(
             side_effect=lambda **kwargs: (
                 f"{kwargs['target_dir']}/{kwargs['local_path'].name}"
@@ -360,12 +352,12 @@ def test_run_dataset_cleaning_submit_failure_includes_platform_response(
         },
     )
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_cleaning.definition.create_workflow_api_client",
         MagicMock(return_value=mock_client),
     )
     _patch_valid_script_preflight(monkeypatch)
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        "pyromind_common.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
         MagicMock(
             side_effect=lambda **kwargs: (
                 f"{kwargs['target_dir']}/{kwargs['local_path'].name}"
@@ -451,7 +443,7 @@ def test_run_dataset_cleaning_reports_runtime_storage_auth_failure(
     (runtime_dir / "validate_format.py").write_text("# validator\n")
     _patch_valid_script_preflight(monkeypatch)
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
+        "pyromind_common.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
         MagicMock(side_effect=ValueError("login required")),
     )
 
@@ -504,12 +496,12 @@ def test_run_dataset_cleaning_preflights_script_before_submission(
     )
     (runtime_dir / "validate_format.py").write_text("# validator\n")
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.download_file_from_pyromind",
+        "pyromind_common.tools.pyromind_cleaning.definition.download_file_from_pyromind",
         MagicMock(return_value=script),
     )
     submit = MagicMock()
     monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
+        "pyromind_common.tools.pyromind_cleaning.definition.create_workflow_api_client",
         submit,
     )
 
@@ -527,116 +519,3 @@ def test_run_dataset_cleaning_preflights_script_before_submission(
     assert observation.is_error
     assert expected in observation.text
     submit.assert_not_called()
-
-
-def test_run_dataset_cleaning_during_arun_does_not_deadlock(monkeypatch, tmp_path):
-    """Regression for the #3485 lock pattern: the tool runs on a worker
-    thread while ``arun()`` holds the conversation state lock across the
-    agent step. Registering the task and sending the submission
-    notification used to re-acquire that lock from the worker thread and
-    deadlock against the run loop — no observation was emitted, the
-    conversation hung in ``running``, and the terminal callback could not
-    remove the task either.
-    """
-    mock_client = MagicMock()
-    mock_client.studio.create.return_value = TrainingTaskCreateResponse(
-        task_id="9876",
-        name="agent-data-clean",
-        status="Pending",
-    )
-    client_factory = MagicMock(return_value=mock_client)
-    monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.create_workflow_api_client",
-        client_factory,
-    )
-    _patch_valid_script_preflight(monkeypatch)
-    monkeypatch.setattr(
-        "openhands.tools.pyromind_cleaning.definition.upload_local_file_to_pyromind",
-        MagicMock(
-            side_effect=lambda **kwargs: (
-                f"{kwargs['target_dir']}/{kwargs['local_path'].name}"
-            )
-        ),
-    )
-
-    task_store_dir = tmp_path / "tasks"
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    (runtime_dir / "cleaning_utils.py").write_text("__all__ = []\n")
-    (runtime_dir / "validate_format.py").write_text("# validator\n")
-
-    llm = TestLLM.from_messages(
-        [
-            Message(
-                role="assistant",
-                content=[TextContent(text="")],
-                tool_calls=[
-                    MessageToolCall(
-                        id="clean_1",
-                        name="run_dataset_cleaning",
-                        arguments=json.dumps(
-                            {
-                                "input_path": "datasets/source.jsonl",
-                                "script_path": "/agentTest/clean.py",
-                                "limit": 25,
-                            }
-                        ),
-                        origin="completion",
-                    ),
-                    MessageToolCall(
-                        id="finish_1",
-                        name="finish",
-                        arguments='{"message": "submitted"}',
-                        origin="completion",
-                    ),
-                ],
-            ),
-        ],
-        model="default-model",
-        usage_id="test-llm",
-    )
-    agent = Agent(
-        llm=llm,
-        tools=[
-            Tool(
-                name="run_dataset_cleaning",
-                params={
-                    "env": "pre",
-                    "cluster": "us-west-1",
-                    "headers": {
-                        "x-cluster": "us-west-1#pre",
-                        "request-app": "openhands",
-                    },
-                    "runtime_dir": str(runtime_dir),
-                    "task_store_dir": str(task_store_dir),
-                    "timeout": 5,
-                },
-            )
-        ],
-        include_default_tools=["FinishTool"],
-    )
-    conv = LocalConversation(
-        agent=agent,
-        workspace=tmp_path,
-        secrets={"auth_token": "session-token"},
-        visualizer=None,
-    )
-    conv.send_message("提交清洗任务")
-
-    # Bounded so a regression surfaces as a fast test failure rather than a
-    # hung suite. On the fixed path arun() completes near-instantly.
-    asyncio.run(asyncio.wait_for(conv.arun(), timeout=10))
-
-    assert conv.state.execution_status == ConversationExecutionStatus.FINISHED
-    assert conv.state.active_long_tasks == [
-        ActiveLongTask(task_id="9876", kind="data_cleaning", status="Pending")
-    ]
-    notifications = [
-        event
-        for event in conv.state.events
-        if isinstance(event, MessageEvent) and event.source == "agent"
-    ]
-    assert len(notifications) == 1
-    content = notifications[0].llm_message.content[0]
-    assert isinstance(content, TextContent)
-    assert "已提交数据清洗任务（task_id=9876" in content.text

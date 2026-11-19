@@ -11,21 +11,21 @@ import imageio_ffmpeg
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
-from openhands_embodied_runtime import batch as batch_module, lerobot_v21, planning
-from openhands_embodied_runtime.adapters import (
+from pyromind_embodied_runtime import batch as batch_module, lerobot_v21, planning
+from pyromind_embodied_runtime.adapters import (
     S2_REFERENCE_JOINT_ORDER,
     S2_REFERENCE_STATE_ORDER,
     build_episode_plan,
     detect_source_type,
     inspect_dataset,
 )
-from openhands_embodied_runtime.batch import batch_clean_lerobot_v21_dataset
-from openhands_embodied_runtime.lerobot_v21 import (
+from pyromind_embodied_runtime.batch import batch_clean_lerobot_v21_dataset
+from pyromind_embodied_runtime.lerobot_v21 import (
     materialize_lerobot_v21_episode,
     merge_lerobot_v21_datasets,
     validate_lerobot_v21_dataset,
 )
-from openhands_embodied_runtime.models import (
+from pyromind_embodied_runtime.models import (
     ActionDerivationMode,
     ActionProvenanceMode,
     FrameInterval,
@@ -33,7 +33,7 @@ from openhands_embodied_runtime.models import (
     SourceType,
     StreamStatus,
 )
-from openhands_embodied_runtime.planning import (
+from pyromind_embodied_runtime.planning import (
     finalize_episode_plan,
     plan_episode_cleaning,
 )
@@ -1040,7 +1040,7 @@ def test_episode_worker_emits_reward_and_result(
 ) -> None:
     """One EDP record = one episode; accepted maps to reward 1.0 and a
     result json lands in the shared work root."""
-    from openhands_embodied_runtime.worker import run_episode
+    from pyromind_embodied_runtime.worker import run_episode
 
     work_root = tmp_path / "work"
     reward_path = tmp_path / "logs" / "verifier" / "reward.txt"
@@ -1067,7 +1067,7 @@ def test_episode_worker_is_idempotent_across_retries(
     lerobot_v21_online_path: Path,
     tmp_path: Path,
 ) -> None:
-    from openhands_embodied_runtime.worker import run_episode
+    from pyromind_embodied_runtime.worker import run_episode
 
     work_root = tmp_path / "work"
     first = run_episode(
@@ -1095,7 +1095,7 @@ def test_merge_only_merges_accepted_episodes(
     lerobot_v21_online_path: Path, tmp_path: Path
 ) -> None:
     """Rejected/failed fragments must never leak into the published dataset."""
-    from openhands_embodied_runtime.worker import run_episode, run_merge
+    from pyromind_embodied_runtime.worker import run_episode, run_merge
 
     work_root = tmp_path / "work"
     results = work_root / "results"
@@ -1145,7 +1145,7 @@ def test_merge_only_merges_accepted_episodes(
 
 
 def test_merge_all_rejected_is_terminal(tmp_path: Path) -> None:
-    from openhands_embodied_runtime.worker import run_merge
+    from pyromind_embodied_runtime.worker import run_merge
 
     work_root = tmp_path / "work"
     results = work_root / "results"
@@ -1169,7 +1169,7 @@ def test_merge_all_rejected_is_terminal(tmp_path: Path) -> None:
 
 
 def test_merge_missing_episode_results_raise(tmp_path: Path) -> None:
-    from openhands_embodied_runtime.worker import run_merge
+    from pyromind_embodied_runtime.worker import run_merge
 
     work_root = tmp_path / "work"
     (work_root / "results").mkdir(parents=True)

@@ -8,11 +8,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any, Literal, Protocol, Self
 
 from pydantic import Field
-from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.task_correlation import TaskCorrelation
-from pyromind_runtime.domain.versions import VersionToolRequest
-
-from openhands.sdk.tool import (
+from pyromind_common.sdk.tool import (
     Action,
     Observation,
     ToolAnnotations,
@@ -20,6 +16,9 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
+from pyromind_runtime.domain.versions import VersionToolRequest
 
 
 type VersionCall = Callable[
@@ -140,9 +139,8 @@ def submission_bridge(
     loop: asyncio.AbstractEventLoop,
     graph_run_id: str | None = None,
 ):
+    from pyromind_common.tools.workflow.task_submission import current_task_correlation
     from pyromind_sdk.client.models import TrainingTaskCreateResponse
-
-    from openhands.tools.workflow.task_submission import current_task_correlation
 
     def submit(workflow: dict, name: str, code: str | None):
         effective = {**workflow, "name": name}

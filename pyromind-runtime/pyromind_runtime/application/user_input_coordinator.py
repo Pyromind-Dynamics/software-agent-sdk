@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -92,6 +93,8 @@ class UserInputCoordinator:
         conversation_id: str,
         command: InputResponseCommand,
         receipt: CommandReceipt,
+        *,
+        before_resolve: Callable[[PendingUserInput], Awaitable[None]] | None = None,
     ) -> CommandReceipt:
         """Validate, persist the resolution, then the receipt.
 
@@ -108,6 +111,8 @@ class UserInputCoordinator:
             )
             async with self._lock(conversation_id):
                 pending = self._validate(store, command)
+                if before_resolve is not None:
+                    await before_resolve(pending)
                 if command.status == "cancelled" and pending.task_run_id is None:
                     # Persist suspension before resolution. Readers then see a pending
                     # question under suspension and reject messages, rather than briefly

@@ -3,14 +3,13 @@ from __future__ import annotations
 import re
 from hashlib import sha256
 
+from pyromind_agent_server.echomind_runtime_slots import RuntimeSlotSetupRequest
+from pyromind_agent_server.echomind_storage import canonical_uuid
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
 )
-
-from openhands.agent_server.echomind_runtime_slots import RuntimeSlotSetupRequest
-from openhands.agent_server.echomind_storage import canonical_uuid
 
 
 _HOOK = b"""#!/bin/sh

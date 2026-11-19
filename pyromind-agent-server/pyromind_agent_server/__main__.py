@@ -3,16 +3,14 @@ from __future__ import annotations
 import argparse
 
 import uvicorn
+from pyromind_common.sdk.logger import DEBUG
 
-from openhands.agent_server.logging_config import LOGGING_CONFIG
-from openhands.agent_server.storage_quota import enforce_storage_quota_preflight
-from openhands.sdk.logger import DEBUG
+from pyromind_agent_server.logging_config import LOGGING_CONFIG
+from pyromind_agent_server.storage_quota import enforce_storage_quota_preflight
 
 
 RELOAD_DIRS = [
-    "openhands-agent-server",
-    "openhands-sdk",
-    "openhands-tools",
+    "pyromind-common",
     "harness-adapter",
     "pyromind-agent-server",
     "pyromind-runtime",

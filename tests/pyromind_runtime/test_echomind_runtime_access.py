@@ -5,24 +5,24 @@ from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
-from pyromind_agent_server import echomind_runtime_access, echomind_train_backend
-from pyromind_agent_server.echomind_runtime_access import (
-    build_runtime_credential_store,
-    refresh_runtime_access,
-)
-from pyromind_agent_server.echomind_train_backend import PlatformTrainWorkflowBackend
-from pyromind_runtime.domain.context import RequestContext
 
-from openhands.agent_server.config import Config
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server import echomind_runtime_access, echomind_train_backend
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectRecord,
 )
-from openhands.agent_server.echomind_runtime_contracts import (
+from pyromind_agent_server.echomind_runtime_access import (
+    build_runtime_credential_store,
+    refresh_runtime_access,
+)
+from pyromind_agent_server.echomind_runtime_contracts import (
     RuntimeCredentialUnavailableError,
 )
-from openhands.agent_server.echomind_train_runtime import TrainWorkflowSpec
+from pyromind_agent_server.echomind_train_backend import PlatformTrainWorkflowBackend
+from pyromind_agent_server.echomind_train_runtime import TrainWorkflowSpec
+from pyromind_runtime.domain.context import RequestContext
 
 
 def _project() -> ProjectInfo:

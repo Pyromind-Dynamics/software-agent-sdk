@@ -5,12 +5,12 @@ from uuid import UUID
 import httpx
 from pydantic import SecretStr
 
-from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.secret import StaticSecret
-from openhands.tools.pyromind_archive.definition import (
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.secret import StaticSecret
+from pyromind_common.tools.pyromind_archive.definition import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
 )
-from openhands.tools.pyromind_dataset.definition import (
+from pyromind_common.tools.pyromind_dataset.definition import (
     PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
     PYROMIND_STORAGE_HEADERS_STATE_KEY,
     GetStorageUrlAction,

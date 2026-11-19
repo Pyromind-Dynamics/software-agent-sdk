@@ -36,7 +36,7 @@
     {
       "name": "exec",
       "params": {
-        "command": "python3.10 -c \"import openhands_embodied_runtime\" 2>/dev/null || python3.10 -m pip install --quiet '{edp_run_dir}/wheels/openhands_embodied_runtime-1.29.5-py3-none-any.whl'; python3.10 -m openhands_embodied_runtime.sandbox_runner --mode merge --config /workspace/.agents-embodied-config/{task_id}-merge.json",
+        "command": "python3.10 -c \"import pyromind_embodied_runtime\" 2>/dev/null || python3.10 -m pip install --quiet '{edp_run_dir}/wheels/pyromind_embodied_runtime-0.1.0-py3-none-any.whl'; python3.10 -m pyromind_embodied_runtime.sandbox_runner --mode merge --config /workspace/.agents-embodied-config/{task_id}-merge.json",
         "timeout": 590
       }
     }

@@ -19,47 +19,13 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from pyromind_runtime.application.pipeline_runs import PipelineRuns
-from pyromind_runtime.domain.capabilities import HarnessCapabilities
-from pyromind_runtime.domain.commands import (
-    CancelCommand,
-    InputResponseCommand,
-    PermissionResponseCommand,
-    ProductCommand,
-    RollbackWorkflowCommand,
-    UserMessageCommand,
-)
-from pyromind_runtime.domain.content import JsonObject, TextContent
-from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.errors import ProductRuntimeError
-from pyromind_runtime.domain.events import HarnessEvent
-from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.snapshot import (
-    ConversationSnapshot,
-    OperationActivity,
-    WorkflowState,
-)
-from pyromind_runtime.domain.task_correlation import TaskOrigin
-from pyromind_runtime.domain.user_input import UserInputRequest
-from pyromind_runtime.ports.harness import (
-    AttachRecovery,
-    ExternalTaskNotification,
-    ForkSpec,
-    InterruptedInputRecord,
-    ProductCheckpoint,
-    RestoreWorkflowResult,
-    RestoreWorkflowSpec,
-    SessionHandle,
-    SessionSpec,
-)
-from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
-
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     RuntimeResourceProposer,
     ToolExecutionContext,
     _forward_headers,
 )
+from harness_adapter.pi_adapter.business_tools import ProjectRewardReader
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
@@ -79,26 +45,65 @@ from harness_adapter.pi_adapter.tool_output import (
     parse_business_tool_output_filename,
 )
 from harness_adapter.version_tools import ExecutionCall, VersionCall
-from openhands.agent_server.workflow_canvas_models import (
-    SaveWorkflowCanvasEventSnapshotRequest,
-)
-from openhands.agent_server.workflow_canvas_store import FileWorkflowCanvasStore
-from openhands.sdk.workspace.base import BaseWorkspace
-from openhands.sdk.workspace.local import LocalWorkspace
-from openhands.tools.pyromind_dataset.definition import (
+from pyromind_common.sdk.workspace.base import BaseWorkspace
+from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_common.tools.pyromind_dataset.definition import (
     StorageFileNotFoundError,
     StorageReadError,
     _default_storage_base_url,
     download_file_from_pyromind,
 )
-from openhands.tools.utils.workspace_files import (
+from pyromind_common.tools.utils.workspace_files import (
     WorkspaceFileNotFoundError,
     read_workspace_text as read_workspace_text_file,
 )
-from openhands.tools.workflow.dsl_to_xyflow import (
+from pyromind_common.tools.workflow.dsl_to_xyflow import (
     convert_dsl_to_xyflow,
     convert_xyflow_to_dsl,
 )
+from pyromind_common.workflow_canvas.models import (
+    SaveWorkflowCanvasEventSnapshotRequest,
+)
+from pyromind_common.workflow_canvas.store import FileWorkflowCanvasStore
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.commands import (
+    CancelCommand,
+    InputResponseCommand,
+    PermissionResponseCommand,
+    ProductCommand,
+    RollbackWorkflowCommand,
+    UserMessageCommand,
+)
+from pyromind_runtime.domain.content import JsonObject, TextContent
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.errors import ProductRuntimeError
+from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.preparation import (
+    PREPARATION_REVIEW_TOOLS,
+    PREPARATION_TOOLS,
+)
+from pyromind_runtime.domain.reward_bundle import GET_PROJECT_REWARD
+from pyromind_runtime.domain.session_policy import SessionPolicy
+from pyromind_runtime.domain.snapshot import (
+    ConversationSnapshot,
+    OperationActivity,
+    WorkflowState,
+)
+from pyromind_runtime.domain.task_correlation import TaskOrigin
+from pyromind_runtime.domain.user_input import PreparedUserInput, UserInputRequest
+from pyromind_runtime.ports.harness import (
+    AttachRecovery,
+    ExternalTaskNotification,
+    ForkSpec,
+    InterruptedInputRecord,
+    ProductCheckpoint,
+    RestoreWorkflowResult,
+    RestoreWorkflowSpec,
+    SessionHandle,
+    SessionSpec,
+)
+from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
 
 
 logger = logging.getLogger(__name__)
@@ -234,6 +239,7 @@ class _PiSession:
     last_workflow_signature: str | None = None
     # -- user-input execution state (product state stays in the store) --
     user_input_enabled: bool = False
+    preparing_input_requests: set[str] = field(default_factory=set)
     pending_user_inputs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict
     )
@@ -266,6 +272,13 @@ class PiAdapter:
         self._workflow_call = workflow_call
         self._preparation_call: Any = None
         self._preparation_revision: Any = None
+        self._preparation_review: (
+            Callable[
+                [str, str, JsonObject, str, RequestContext],
+                Awaitable[PreparedUserInput],
+            ]
+            | None
+        ) = None
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
         self._conversation_root = Path(conversation_root).resolve()
@@ -366,9 +379,18 @@ class PiAdapter:
     ) -> None:
         self._business_tools.training_artifact_hook = callback
 
-    def set_preparation_handler(self, callback: Any, revision: Any) -> None:
+    def set_preparation_handler(
+        self,
+        callback: Any,
+        revision: Any,
+        review: Callable[
+            [str, str, JsonObject, str, RequestContext], Awaitable[PreparedUserInput]
+        ]
+        | None = None,
+    ) -> None:
         self._preparation_call = callback
         self._preparation_revision = revision
+        self._preparation_review = review
 
     async def read_submission_receipt(
         self,
@@ -387,7 +409,7 @@ class PiAdapter:
             return None
         from uuid import NAMESPACE_URL, uuid5
 
-        from openhands.tools.data_preparation.platform_submit import (
+        from pyromind_common.tools.data_preparation.platform_submit import (
             TASK_ASSOCIATION_DIRNAME,
             DataPreparationTaskStore,
         )
@@ -432,11 +454,18 @@ class PiAdapter:
         return allowed is None or name in allowed
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
-        from pyromind_runtime.domain.preparation import PREPARATION_TOOLS
-
-        tools = PREPARATION_TOOLS
-
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
+        if self._preparation_review is not None and session.user_input_enabled:
+            specs += [
+                {
+                    "name": name,
+                    "description": (model.__doc__ or "").strip(),
+                    "input_schema": model.model_json_schema(),
+                    "interactive": True,
+                }
+                for name, model in PREPARATION_REVIEW_TOOLS.items()
+                if name in (session.config.get("tool_allowlist") or ())
+            ]
         if self._preparation_call is not None:
             descriptions = {
                 "set_preparation_plan": (
@@ -457,11 +486,27 @@ class PiAdapter:
                     ),
                     "input_schema": model.model_json_schema(),
                 }
-                for name, model in tools.items()
+                for name, model in PREPARATION_TOOLS.items()
                 if session.config.get("tool_allowlist") is not None
                 and self._tool_allowed(session, name)
             ]
-        return [spec for spec in specs if self._tool_allowed(session, spec["name"])]
+        return [
+            spec
+            for spec in specs
+            if self._tool_allowed(session, spec["name"])
+            and (
+                spec["name"] != GET_PROJECT_REWARD
+                or GET_PROJECT_REWARD in (session.config.get("tool_allowlist") or ())
+            )
+        ]
+
+    def set_project_reward_reader(self, reader: ProjectRewardReader) -> None:
+        self._business_tools.project_reward = reader
+
+    def set_evaluation_reward_reader(
+        self, reader: Callable[[str, RequestContext], Awaitable[JsonObject | None]]
+    ) -> None:
+        self._business_tools.evaluation_reward = reader
 
     def set_workflow_preparer(self, callback: Any) -> None:
         self._business_tools.set_workflow_preparer(callback)
@@ -1123,8 +1168,58 @@ class PiAdapter:
         records, so the event log keeps exactly one durable resolution even
         when the runtime later coordinates the same leftovers.
         """
+        session.preparing_input_requests.clear()
         for request_id in tuple(session.pending_user_inputs):
             self._end_input_wait(session, request_id)
+
+    async def _handle_prepared_input(
+        self, session: _PiSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        tool_name, arguments = params.get("preparation_tool"), params.get("arguments")
+        request_id, call_id = params.get("request_id"), params.get("tool_call_id")
+        if (
+            not session.user_input_enabled
+            or self._preparation_review is None
+            or not isinstance(tool_name, str)
+            or tool_name not in PREPARATION_REVIEW_TOOLS
+            or not self._tool_allowed(session, tool_name)
+        ):
+            raise PermissionError("preparation review tool is not enabled")
+        if (
+            not isinstance(arguments, dict)
+            or not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(call_id, str)
+            or not call_id
+            or request_id in session.preparing_input_requests
+            or request_id in session.pending_user_inputs
+        ):
+            raise ValueError("invalid preparation review request")
+        session.preparing_input_requests.add(request_id)
+        try:
+            result = await self._preparation_review(
+                session.session_id, tool_name, arguments, request_id, session.context
+            )
+            if request_id not in session.preparing_input_requests:
+                return {"status": "cancelled"}
+        finally:
+            session.preparing_input_requests.discard(request_id)
+        if result.request is None:
+            return {"status": "approved", **result.accepted_result}
+        outcome = await self._handle_input_request(
+            session,
+            {
+                "request_id": request_id,
+                "tool_call_id": call_id,
+                **result.request.model_dump(mode="json"),
+            },
+        )
+        if any(
+            answer.get("option_id") == result.accept_option_id
+            for answer in outcome.get("answers", [])
+        ):
+            return {"status": "approved", **result.accepted_result}
+        return outcome
 
     async def _handle_input_request(
         self, session: _PiSession, params: dict[str, Any]
@@ -1808,13 +1903,15 @@ class PiAdapter:
             tool_name = params.get("tool_name")
             if not isinstance(tool_name, str):
                 raise ValueError("tool_name must be a string")
-            if not self._tool_allowed(session, tool_name):
+            if not self._tool_allowed(session, tool_name) or (
+                tool_name == GET_PROJECT_REWARD
+                and GET_PROJECT_REWARD
+                not in (session.config.get("tool_allowlist") or ())
+            ):
                 raise PermissionError("tool is not enabled for this conversation")
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
-            from pyromind_runtime.domain.preparation import PREPARATION_TOOLS
-
             if tool_name in PREPARATION_TOOLS:
                 if self._preparation_call is None:
                     raise ValueError("plan tools are not configured")
@@ -1876,13 +1973,14 @@ class PiAdapter:
                 tool_call_id,
             )
         if method == "input.request":
+            if "preparation_tool" in params:
+                return await self._handle_prepared_input(session, params)
             return await self._handle_input_request(session, params)
         if method == "input.cancel":
             request_id = params.get("request_id")
             if not isinstance(request_id, str) or not request_id:
                 raise ValueError("input cancel request_id must be a non-empty string")
-            # Ordered JSONL dispatch registers input.request before its first await,
-            # so an unknown or completed request needs no cancellation marker.
+            session.preparing_input_requests.discard(request_id)
             self._end_input_wait(session, request_id, cancelled=True)
             return {"cancelled": True}
         if method == "permission.cancel":

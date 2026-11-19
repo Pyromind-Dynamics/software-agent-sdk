@@ -7,13 +7,13 @@ from uuid import uuid4
 
 import pytest
 
-from openhands.agent_server.echomind_dataset_runtime import DatasetRuntimeExecutor
-from openhands.agent_server.echomind_evaluator_runtime import (
+from pyromind_agent_server.echomind_dataset_runtime import DatasetRuntimeExecutor
+from pyromind_agent_server.echomind_evaluator_runtime import (
     EvaluatorRuntimeExecutor,
     EvaluatorTaskState,
 )
-from openhands.agent_server.echomind_graph_runs import RuntimeFailure
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_graph_runs import RuntimeFailure
+from pyromind_agent_server.echomind_projects import (
     ProjectEdge,
     ProjectGraph,
     ProjectInfo,
@@ -24,25 +24,25 @@ from openhands.agent_server.echomind_projects import (
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_publication import (
+from pyromind_agent_server.echomind_publication import (
     PromotionPolicy,
     PublicationStore,
     PublishedGraph,
     RuntimeRequirements,
 )
-from openhands.agent_server.echomind_runtime_contracts import (
+from pyromind_agent_server.echomind_runtime_contracts import (
     ExternalTaskIntent,
     RuntimeCredentialUnavailableError,
     StageCancellationResult,
     StagePreparationResult,
     StageSubmissionResult,
 )
-from openhands.agent_server.echomind_runtime_scheduler import (
+from pyromind_agent_server.echomind_runtime_scheduler import (
     ReadyBatch,
     RuntimeGraphScheduler,
     RuntimeSchedulerError,
 )
-from openhands.agent_server.echomind_runtime_slots import (
+from pyromind_agent_server.echomind_runtime_slots import (
     RuntimeHealth,
     RuntimeSlot,
     RuntimeSlotStore,
@@ -50,8 +50,8 @@ from openhands.agent_server.echomind_runtime_slots import (
     TracerBufferConfig,
     TracerRuntime,
 )
-from openhands.agent_server.echomind_storage import canonical_sha256
-from openhands.agent_server.echomind_train_runtime import (
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeExecutor,
     TrainTaskState,
 )

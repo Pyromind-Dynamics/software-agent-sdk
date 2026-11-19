@@ -8,15 +8,13 @@ from pyromind_agent_server import echomind_train_backend as backend_module
 from pyromind_agent_server.echomind_evaluator_backend import (
     PlatformEvaluatorWorkflowBackend,
 )
-from pyromind_runtime.domain.context import RequestContext
-
-from openhands.agent_server.echomind_evaluator_runtime import (
+from pyromind_agent_server.echomind_evaluator_runtime import (
     EvaluatorRuntimeExecutor,
     EvaluatorTaskState,
     EvaluatorWorkflowSpec,
 )
-from openhands.agent_server.echomind_graph_runs import TaskRun
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_graph_runs import TaskRun
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectNode,
@@ -24,8 +22,9 @@ from openhands.agent_server.echomind_projects import (
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_runtime_contracts import RuntimeStageContext
-from openhands.agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_runtime_contracts import RuntimeStageContext
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_runtime.domain.context import RequestContext
 
 
 def test_evaluator_executor_submits_polls_and_emits_report(tmp_path):

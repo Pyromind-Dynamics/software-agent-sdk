@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createPiModelRuntime } from "../src/pi-model.js";
 
-for (const reasoning of [undefined, "high"] as const) {
-  test(`custom endpoint preserves mandatory reasoning (${reasoning ?? "default"}) in greeting requests`, async () => {
+for (const maxTokens of [undefined, 2048, 8192]) {
+  const reasoning = maxTokens === undefined ? undefined : "high";
+  test(`custom endpoint preserves mandatory reasoning (${reasoning ?? "default"}) with output limit ${maxTokens ?? "unset"}`, async () => {
     const { modelRuntime, model } = await createPiModelRuntime({
       provider: "openrouter",
       modelId: "z-ai/glm-5.3-flash",
@@ -15,7 +16,7 @@ for (const reasoning of [undefined, "high"] as const) {
       messages: [{ role: "user", content: "你好", timestamp: Date.now() }],
     }, {
       reasoning,
-      ...(reasoning ? { maxTokens: 2048 } : {}),
+      maxTokens,
       fetch: async (_url, init) => {
         payload = JSON.parse(String(init?.body));
         if ((payload?.reasoning as { effort?: string } | undefined)?.effort === "none") {
@@ -30,7 +31,7 @@ for (const reasoning of [undefined, "high"] as const) {
     assert.deepEqual(answer.content, [{ type: "text", text: "你好！" }]);
     assert.equal(model.thinkingLevelMap?.off, null);
     assert.deepEqual(payload?.reasoning, reasoning ? { effort: "high" } : undefined);
-    assert.equal(payload?.max_tokens ?? payload?.max_completion_tokens, reasoning ? 2048 : 4096);
+    assert.equal(payload?.max_tokens ?? payload?.max_completion_tokens, maxTokens);
   });
 }
 

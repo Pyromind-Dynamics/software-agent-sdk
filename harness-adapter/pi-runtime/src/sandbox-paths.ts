@@ -183,10 +183,11 @@ export class SandboxPathPolicy {
       }
     }
     const storageRoots = this.storageRoot ? [this.storageRoot] : [];
+    const preparedRoot = posix.join(this.conversationRoot, "prepared");
     const allowedRoots =
       operation === "write"
         ? [...storageRoots, this.publicDataPath]
-        : [...storageRoots, this.publicDataPath, ...this.readOnlyRoots];
+        : [...storageRoots, this.publicDataPath, preparedRoot, ...this.readOnlyRoots];
     if (!allowedRoots.some((root) => insideSandboxPath(target, root))) {
       throw pathScopeError(operation, this.storageRoot);
     }
@@ -209,6 +210,9 @@ export class SandboxPathPolicy {
   private agentAreaRefusal(target: string): string | undefined {
     if (!insideSandboxPath(target, this.conversationRoot)) {
       return "inside another conversation's workspace";
+    }
+    if (insideSandboxPath(target, posix.join(this.conversationRoot, "prepared"))) {
+      return undefined;
     }
     if (!insideSandboxPath(target, this.workspacePath)) {
       return "outside this task's workspace";

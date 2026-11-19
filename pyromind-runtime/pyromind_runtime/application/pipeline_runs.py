@@ -95,6 +95,22 @@ class PipelineRuns:
             )
             return saved_workflow, saved_dsl
         inputs: dict[str, str] = {}
+        if reward := run.definition.get("frozen_reward"):
+            assert isinstance(reward, dict)
+            version_id = reward.get("version_id")
+            if not isinstance(version_id, str):
+                raise ValueError("frozen Reward requires a Project version ID")
+            version = self._versions.store.get_version(project.id, version_id)
+            if (
+                version.state != "ready"
+                or version.logical_key != "reward_bundle"
+                or version.manifest.summary.get("manifest_digest")
+                != reward.get("manifest_sha256")
+                or version.manifest.storage_ref != reward.get("directory")
+            ):
+                raise ValueError("evaluation Reward does not match the Project version")
+            self._versions.snapshots.verify(snapshot_result(version), self._context)
+            inputs["reward_bundle"] = version_id
         input_definition = run.definition
         evaluation = run.definition.get("evaluation_config", {})
         assert isinstance(evaluation, dict)
@@ -191,6 +207,28 @@ class PipelineRuns:
                 canonical(effective_definition["evaluation_config"]),
                 "config",
             ),
+            *(
+                (
+                    (
+                        "frozen_reward_config",
+                        "frozen_reward.json",
+                        canonical(
+                            {
+                                **cast(dict, effective_definition["frozen_reward"]),
+                                **(
+                                    {"test_source": effective_definition["test_source"]}
+                                    if effective_definition.get("test_source")
+                                    else {}
+                                ),
+                            }
+                        ),
+                        "config",
+                    ),
+                )
+                if effective_definition.get("frozen_reward")
+                and effective_definition.get("kind") != "prediction_evaluation"
+                else ()
+            ),
             ("runtime_script", "evaluate_inference.py", script, "code"),
             *(
                 (
@@ -215,6 +253,7 @@ class PipelineRuns:
                     ),
                 )
                 if effective_definition.get("kind") == "prediction_evaluation"
+                and not effective_definition.get("frozen_reward")
                 else ()
             ),
             *(
@@ -392,7 +431,7 @@ class PipelineRuns:
 
             check_persistable(definition)
             CheckpointSelectionPolicy.model_validate(
-                definition["scoring_spec"].get("selection", {})
+                definition.get("scoring_spec", {}).get("selection", {})
             )
         fingerprint = hashlib.sha256(
             json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()

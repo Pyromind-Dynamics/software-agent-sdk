@@ -5,12 +5,10 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from pyromind_agent_server import echomind_train_backend as backend_module
-from pyromind_agent_server.echomind_train_backend import PlatformTrainWorkflowBackend
-from pyromind_runtime.domain.context import RequestContext
 
-from openhands.agent_server.echomind_graph_runs import TaskRun
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server import echomind_train_backend as backend_module
+from pyromind_agent_server.echomind_graph_runs import TaskRun
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectNode,
@@ -18,12 +16,13 @@ from openhands.agent_server.echomind_projects import (
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_runtime_contracts import (
+from pyromind_agent_server.echomind_runtime_contracts import (
     RuntimeCredentialUnavailableError,
     RuntimeStageContext,
 )
-from openhands.agent_server.echomind_storage import canonical_sha256
-from openhands.agent_server.echomind_train_runtime import (
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_train_backend import PlatformTrainWorkflowBackend
+from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeExecutor,
     TrainTaskState,
     TrainWorkflowSpec,
@@ -31,6 +30,7 @@ from openhands.agent_server.echomind_train_runtime import (
     bind_workflow_output,
     prepare_workflow_for_submission,
 )
+from pyromind_runtime.domain.context import RequestContext
 
 
 def test_bind_workflow_inputs_resolves_artifact_uris():

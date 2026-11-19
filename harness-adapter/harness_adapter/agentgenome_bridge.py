@@ -27,11 +27,11 @@ from core.ports import (
     ToolCancellation,
     ToolResult,
 )
+from pyromind_common.tools.utils.storage_paths import REMOVED_ALIAS
 from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 from harness_adapter.pi_adapter.runner import PiRunnerError
-from openhands.tools.utils.storage_paths import REMOVED_ALIAS
 
 
 logger = logging.getLogger(__name__)

@@ -65,6 +65,8 @@ def business_reward(
 - 返回长度必须与 completions 一致；处理嵌套 completion 前先规范化结构。
 - `entry` 使用上传返回路径；`kwargs` 非空时代表 factory 参数 YAML。
 - 多个 reward 通过 `RewardConfigBuilderNode.reward_item_1...reward_item_5` 组合。
+- 任务已提供冻结评分入口时，直接用原 `entry`，将其以 `weight=1`、空 `kwargs` 接入
+  `RewardConfigBuilderNode`，保持 `normalize=False` 并连接到 GRPO 的 `reward_config`。
 
 ## DSL 回填
 

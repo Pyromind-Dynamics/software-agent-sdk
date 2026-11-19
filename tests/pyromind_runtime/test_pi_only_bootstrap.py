@@ -4,13 +4,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
+
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server import bootstrap
 from pyromind_agent_server.app import create_app
+from pyromind_agent_server.config import Config
 from pyromind_runtime.domain.context import RequestContext
-
-from openhands.agent_server.api import create_app as create_sdk_app
-from openhands.agent_server.config import Config
 
 
 def test_removed_openhands_adapter_cannot_be_imported():
@@ -75,9 +74,3 @@ def test_pi_service_exposes_product_routes_without_legacy_execution_routes():
     assert "/api/conversations/{conversation_id}/workspace/{file_path}" in paths
     assert not any(p.endswith("/chat/completions") for p in paths)
     assert not any(getattr(r, "path", "").startswith("/sockets") for r in app.routes)
-
-
-def test_retained_sdk_service_keeps_its_own_routes():
-    app = create_sdk_app(Config(static_files_path=None))
-    paths = set(app.openapi()["paths"])
-    assert "/api/conversations" in paths

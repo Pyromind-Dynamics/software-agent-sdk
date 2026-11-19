@@ -45,6 +45,7 @@ export class PiAgentRuntime {
   private terminalBackend: string | undefined;
   private hasDelegatedRoles = false;
   private normalizer: PiEventNormalizer | undefined;
+  private readonly storageUrls = new Map<string, string>();
   /** Blocks automatic scheduling (notifications, stages) until a user prompt. */
   private executionSuspended = false;
   private suspensionRevision = 0;
@@ -126,7 +127,12 @@ export class PiAgentRuntime {
     const { session, sessionId, execution, subagents, recorder } = await createPiSession(
       params,
       this.peer,
-      { ...this.sessionOptions, ...(askUserTool ? { askUserTool } : {}),
+      { ...this.sessionOptions, ...(askUserTool ? {
+          askUserTool,
+          createInteractiveTool: (tool) => createAskUserTool(
+            this.peer, tool, this.userInput, () => !this.stageRunning(), undefined, tool.name,
+          ),
+        } : {}),
         onRepetitionDetected: () => this.suspendRepetitiveGeneration(),
         automaticTurnsSuspended: () => this.executionSuspended || this.cancelling,
         onSubagentWake: (text) => this.subagentWakeTexts.add(text),
@@ -139,7 +145,7 @@ export class PiAgentRuntime {
       if (event.type === "agent_start" && !this.normalizer) {
         this.autonomousRunId = `extension:${randomUUID()}`;
         this.activeRunId = this.autonomousRunId;
-        this.normalizer = new PiEventNormalizer(sessionId, this.autonomousRunId, this.pendingCommandIds);
+        this.normalizer = new PiEventNormalizer(sessionId, this.autonomousRunId, this.pendingCommandIds, this.storageUrls);
         this.outcome.reset();
       }
       this.outcome.observe(event);
@@ -316,7 +322,7 @@ export class PiAgentRuntime {
         return { accepted: true, steered: true };
       }
       if (this.normalizer) throw new Error("Pi agent is already running");
-      this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds);
+      this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds, this.storageUrls);
       this.activeRunId = runId;
       this.executionSuspended = false;
       this.outcome.reset();
@@ -502,7 +508,7 @@ export class PiAgentRuntime {
     message: { customType: string; content: string; display: boolean; details: JsonObject },
   ): void {
     const executionRunId = `${runId}:${randomUUID()}`;
-    this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds);
+    this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds, this.storageUrls);
     this.activeRunId = executionRunId;
     this.outcome.reset();
     setImmediate(() => void this.runNotification(executionRunId, message, runId));
@@ -601,7 +607,7 @@ export class PiAgentRuntime {
     for (const [id, stage] of this.stages) {
       if (stage.state !== "queued") continue;
       stage.state = "running";
-      this.normalizer = new PiEventNormalizer(this.sessionId!, stage.executionId, this.pendingCommandIds);
+      this.normalizer = new PiEventNormalizer(this.sessionId!, stage.executionId, this.pendingCommandIds, this.storageUrls);
       this.activeRunId = stage.executionId;
       this.outcome.reset();
       setImmediate(() => void this.runStage(id));

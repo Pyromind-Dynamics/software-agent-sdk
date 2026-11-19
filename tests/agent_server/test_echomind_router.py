@@ -2,6 +2,16 @@ import json
 from uuid import uuid4
 
 import pytest
+from pyromind_agent_server.agent_profiles.echomind_manager import (
+    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
+    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
+    ECHOMIND_MANAGER_PROFILE,
+)
+from pyromind_agent_server.echomind_projects import (
+    ProjectClusterMismatchError,
+    ProjectNotFoundError,
+    ProjectStore,
+)
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
 )
@@ -14,17 +24,6 @@ from pyromind_runtime.domain.experiment_plans import (
     WorkflowPlan,
 )
 from pyromind_runtime.domain.preparation import ProjectView
-
-from openhands.agent_server.agent_profiles.echomind_manager import (
-    ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
-    ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
-    ECHOMIND_MANAGER_PROFILE,
-)
-from openhands.agent_server.echomind_projects import (
-    ProjectClusterMismatchError,
-    ProjectNotFoundError,
-    ProjectStore,
-)
 
 
 def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
@@ -64,8 +63,12 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "terminal",
         "ask_user",
         "set_preparation_plan",
+        "request_reward_bundle_review",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ("model-evaluation-preparation",)
+    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == (
+        "model-evaluation-preparation",
+        "rubric-elicitation",
+    )
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
     assert set(ECHOMIND_MANAGER_DEVELOPMENT_TOOLS) == {
         "read",

@@ -39,7 +39,7 @@ from harness_adapter.pi_adapter.business_tool_host import (
 )
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
-from openhands.tools.sandbox import (
+from pyromind_common.tools.sandbox import (
     create_sandbox_api_client,
     default_sandbox_image,
     run_terminal_command,
@@ -67,7 +67,8 @@ LEGACY_STORAGE_ALIAS = "storage"
 # Bumped when the workspace layout changes, so an existing sandbox re-runs the
 # prepare script. 5: Pi mounts Storage at the same /workspace path exposed to
 # users and platform tasks.
-_WORKSPACE_LAYOUT_VERSION = 5
+_WORKSPACE_LAYOUT_VERSION = 6
+_READONLY_PREPARED_MOUNT_VERSION = 6
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"
@@ -521,9 +522,14 @@ class SandboxExecutionManager:
         # The Storage mount is fixed when the container is created, so a
         # container recorded under a different mount layout cannot be repaired
         # in place.
+        record_version = record.get("workspace_version")
         record_layout_matches = (
             record.get("mount_path") == mount_path
             and record.get("storage_host_path") == settings.host_path
+            and (
+                not isinstance(record_version, int)
+                or record_version >= _READONLY_PREPARED_MOUNT_VERSION
+            )
         )
         sandbox = await self._lookup(
             client, recorded_id if isinstance(recorded_id, str) else None
@@ -714,6 +720,7 @@ class SandboxExecutionManager:
     async def _create(
         self, client: SandboxClientLike, settings: SandboxSettings, conversation_id: str
     ) -> SandboxResponse:
+        prepared = f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation_id}/prepared"
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
             image=settings.image or default_sandbox_image(client.cluster),
@@ -729,7 +736,12 @@ class SandboxExecutionManager:
                     host_path=settings.host_path,
                     mount_path=settings.mount_path,
                     read_only=False,
-                )
+                ),
+                VolumeMount(
+                    host_path=settings.host_path + prepared,
+                    mount_path=settings.mount_path + prepared,
+                    read_only=True,
+                ),
             ],
         )
         try:

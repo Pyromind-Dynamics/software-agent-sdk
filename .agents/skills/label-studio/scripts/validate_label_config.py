@@ -19,7 +19,7 @@ Exit codes: 0 valid, 1 invalid, 2 usage error.
 Prints a JSON summary with the extracted object and control tags.
 
 Keep the rules here in step with
-openhands-tools/openhands/tools/label_studio/skill_helpers.py, which runs the
+pyromind-common/pyromind_common/tools/label_studio/skill_helpers.py, which runs the
 same checks server-side; tests/tools/label_studio/test_validate_config.py pins the
 two implementations together.
 """
@@ -49,7 +49,7 @@ ROOT_TAG = "View"
 MEDIA_TAGS = {"Image", "Video"}
 
 # Mirrors the built-in bindings in
-# openhands-tools/openhands/tools/label_studio/field_map.py. Only what the checks
+# pyromind-common/pyromind_common/tools/label_studio/field_map.py. Only what the checks
 # below read is kept: which controls an adapter binds, and which of them a config
 # has to declare. Synonyms and unit handling live in the converter, not here.
 DEFAULT_FIELD_MAPS = {

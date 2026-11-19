@@ -5,7 +5,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from openhands.agent_server.echomind_dataset_runtime import (
+from pyromind_agent_server.echomind_dataset_runtime import (
     DatasetExport,
     DatasetRuntimeError,
     DatasetRuntimeExecutor,
@@ -15,8 +15,8 @@ from openhands.agent_server.echomind_dataset_runtime import (
     TracerBatchReference,
     TracerBatchSourceProvider,
 )
-from openhands.agent_server.echomind_graph_runs import TaskRun
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_graph_runs import TaskRun
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectNode,
@@ -26,9 +26,9 @@ from openhands.agent_server.echomind_projects import (
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_runtime_contracts import RuntimeStageContext
-from openhands.agent_server.echomind_storage import canonical_sha256
-from openhands.agent_server.echomind_train_runtime import (
+from pyromind_agent_server.echomind_runtime_contracts import RuntimeStageContext
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_train_runtime import (
     TrainTaskState,
     TrainWorkflowBackend,
 )

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openhands.tools.environment_processing.platform_submit import (
+from pyromind_common.tools.environment_processing.platform_submit import (
     EdpSubmitAction,
     EdpSubmitTool,
     build_edp_command,
@@ -231,7 +231,7 @@ def test_build_edp_workflow_uses_custom_command_cpu_node() -> None:
 
 
 def _executor(runtime_dir: str | None = None) -> Any:
-    from openhands.tools.environment_processing.platform_submit import (
+    from pyromind_common.tools.environment_processing.platform_submit import (
         EdpSubmitExecutor,
     )
 
@@ -253,22 +253,22 @@ def _runtime_tmp(tmp_path: Path, with_pod_runtime: bool = True) -> Path:
     (scripts / "sandbox_runner.py").write_text("print('runner')\n")
     if with_pod_runtime:
         pod = scripts / "pod_runtime"
-        (pod / "openhands" / "sdk" / "profiles").mkdir(parents=True)
-        (pod / "openhands" / "tools" / "utils").mkdir(parents=True)
-        (pod / "openhands" / "tools" / "sandbox").mkdir(parents=True)
+        (pod / "pyromind_common" / "sdk" / "profiles").mkdir(parents=True)
+        (pod / "pyromind_common" / "tools" / "utils").mkdir(parents=True)
+        (pod / "pyromind_common" / "tools" / "sandbox").mkdir(parents=True)
         (pod / "pod_requirements.txt").write_text("pyromind-sdk>=0.1.9\n")
-        (pod / "openhands" / "__init__.py").write_text("")
-        (pod / "openhands" / "sdk" / "__init__.py").write_text("")
-        (pod / "openhands" / "sdk" / "profiles" / "__init__.py").write_text("")
-        (pod / "openhands" / "sdk" / "profiles" / "processing_profile.py").write_text(
-            ""
-        )
-        (pod / "openhands" / "tools" / "__init__.py").write_text("")
-        (pod / "openhands" / "tools" / "utils" / "__init__.py").write_text("")
-        (pod / "openhands" / "tools" / "utils" / "pyromind_api_client.py").write_text(
-            ""
-        )
-        (pod / "openhands" / "tools" / "sandbox" / "__init__.py").write_text("")
+        (pod / "pyromind_common" / "__init__.py").write_text("")
+        (pod / "pyromind_common" / "sdk" / "__init__.py").write_text("")
+        (pod / "pyromind_common" / "sdk" / "profiles" / "__init__.py").write_text("")
+        (
+            pod / "pyromind_common" / "sdk" / "profiles" / "processing_profile.py"
+        ).write_text("")
+        (pod / "pyromind_common" / "tools" / "__init__.py").write_text("")
+        (pod / "pyromind_common" / "tools" / "utils" / "__init__.py").write_text("")
+        (
+            pod / "pyromind_common" / "tools" / "utils" / "pyromind_api_client.py"
+        ).write_text("")
+        (pod / "pyromind_common" / "tools" / "sandbox" / "__init__.py").write_text("")
     profiles = scripts / "profiles"
     profiles.mkdir()
     (profiles / "tmax-validation.json").write_text('{"name": "tmax-validation"}\n')
@@ -282,7 +282,7 @@ def _pod_runtime_file_count() -> int:
 def _patch_submission(
     monkeypatch: pytest.MonkeyPatch, task_ids: tuple[str, ...] = ("task-99",)
 ) -> SimpleNamespace:
-    module = sys.modules["openhands.tools.environment_processing.platform_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.platform_submit"]
     upload = MagicMock()
     monkeypatch.setattr(module, "upload_local_file_to_pyromind", upload)
     responses = [SimpleNamespace(task_id=tid, status="Pending") for tid in task_ids]
@@ -363,7 +363,7 @@ def test_executor_shards_index_download_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mocks = _patch_submission(monkeypatch)
-    module = sys.modules["openhands.tools.environment_processing.platform_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.platform_submit"]
     download = MagicMock(
         side_effect=ValueError("Pyromind storage get_url API: file not found")
     )
@@ -443,7 +443,7 @@ def test_edp_submit_action_limits_concurrent_shards() -> None:
 def _patch_shards_index(
     monkeypatch: pytest.MonkeyPatch, shards: list[str]
 ) -> MagicMock:
-    module = sys.modules["openhands.tools.environment_processing.platform_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.platform_submit"]
     download = MagicMock(return_value=json.dumps({"shards": shards}).encode("utf-8"))
     monkeypatch.setattr(module, "download_file_from_pyromind", download)
     return download
@@ -547,7 +547,7 @@ def test_executor_shard_batch_stops_on_first_failure(
 def test_executor_stages_runtime_wheel_and_rewrites_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    module = sys.modules["openhands.tools.environment_processing.platform_submit"]
+    module = sys.modules["pyromind_common.tools.environment_processing.platform_submit"]
     captured: dict[str, bytes] = {}
 
     def _capture_upload(*args: Any, **kwargs: Any) -> MagicMock:
@@ -575,7 +575,7 @@ def test_executor_stages_runtime_wheel_and_rewrites_profile(
         }
     )
     scripts = _runtime_tmp(tmp_path)
-    wheel_name = "openhands_embodied_runtime-1.29.5-py3-none-any.whl"
+    wheel_name = "pyromind_embodied_runtime-0.1.0-py3-none-any.whl"
     (scripts / "profiles" / "tmax-validation.json").write_text(
         json.dumps(
             {

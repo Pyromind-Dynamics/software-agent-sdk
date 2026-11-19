@@ -108,12 +108,18 @@ class Preparations:
                 expected_outputs=tuple(output.name for output in task.outputs),
             ),
         )
+        training_method = request.training_method or current.training_method
+        if request.reward_approval_id is not None and training_method != "rubric_rl":
+            raise ValueError("reward_approval_id requires training_method rubric_rl")
         updated = current.model_copy(
             update={
                 "plan": request.plan,
                 "entry_task": entry,
                 "phase": "ready",
                 "review_pending": False,
+                "training_method": training_method,
+                "reward_approval_id": request.reward_approval_id,
             }
         )
+        updated.reward_for_plan()
         return self.store.save(owner, updated, expected_revision)

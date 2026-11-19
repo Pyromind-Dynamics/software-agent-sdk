@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 from PIL import Image
 
-from openhands.tools.data_preparation.runner import (
+from pyromind_common.tools.data_preparation.runner import (
     runtime_public_names,
     validate_managed_image_pipeline,
 )

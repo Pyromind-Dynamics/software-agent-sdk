@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import Field, model_serializer, model_validator
 
 from pyromind_runtime.domain.base import ContractModel
-from pyromind_runtime.domain.content import ContentBlock
+from pyromind_runtime.domain.content import ContentBlock, JsonObject
 from pyromind_runtime.domain.execution_policy import CheckpointRef
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 
@@ -86,6 +86,14 @@ class UserInputRequest(ContractModel):
         schema = cls.model_json_schema()
         schema.pop("title", None)
         return schema
+
+
+class PreparedUserInput(ContractModel):
+    """A host-generated question and the result released upon acceptance."""
+
+    request: UserInputRequest | None = None
+    accept_option_id: str
+    accepted_result: JsonObject
 
 
 class UserInputAnswer(ContractModel):

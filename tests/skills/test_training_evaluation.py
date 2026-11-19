@@ -4,10 +4,10 @@ import importlib.util
 import json
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+
 from pyromind_runtime.application.training_evaluations import TrainingEvaluations
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.pipeline import PipelineRun
@@ -541,6 +541,7 @@ def test_review_runtime_and_api_reuse_annotation_protocol_and_refresh_context(
     products = importlib.import_module("evaluation_products")
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+
     from pyromind_agent_server.api.evaluation_runs import (
         create_evaluation_runs_router,
         get_evaluation_storage,
@@ -788,21 +789,15 @@ def test_empty_predictions_are_failures_and_remain_reviewable(saved_batch):
     assert not (output / "steps/20/evaluation_annotations.r0.jsonl").exists()
 
 
-def test_real_agent_replay_transport_smoke(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
+def test_saved_prediction_replay_transport_smoke(tmp_path):
 
-    from openhands.tools.data_preparation.evaluation_submit import (
+    from pyromind_common.tools.data_preparation.evaluation_submit import (
         DfSubmitEvaluationAction,
     )
-    from tests.integration.tests import b09_saved_prediction_flywheel as replay
+    from tests.fixtures import saved_prediction_replay as replay
 
-    test = replay.SavedPredictionFlywheelTest.__new__(
-        replay.SavedPredictionFlywheelTest
-    )
+    test = replay.SavedPredictionReplay.__new__(replay.SavedPredictionReplay)
     test.workspace = str(tmp_path)
-    test.agent = cast(Any, SimpleNamespace(tools=[], model_copy=Mock()))
-    monkeypatch.setattr(replay, "LocalConversation", Mock())
     test.setup()
     artifact = replay.ReplayTraining(test)(
         replay.TrainingAnalysisAction(operation="artifacts", task_id="1051")
@@ -873,7 +868,6 @@ def test_human_feedback_updates_iteration_context_without_replacing_machine_scor
     from pyromind_runtime.application.conversation_runtime import ConversationRuntime
     from pyromind_runtime.domain.context import RequestContext
     from pyromind_runtime.domain.evaluation import EvaluationCommitState
-
     from tests.pyromind_runtime.fake_adapter import FakeAdapter
 
     worker, manifest, spec, script, run_id, mount, output, output_ref = saved_batch

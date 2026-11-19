@@ -216,11 +216,18 @@ def evaluate_batch(
     output: Path,
     run_id: str,
     mount: Path = Path("/workspace"),
+    frozen_reward: dict | None = None,
 ) -> dict:
     from training_artifacts import inspect_checkpoint
 
     output.mkdir(parents=True, exist_ok=True)
-    script_hash = _file_digest(script)
+    if frozen_reward is not None:
+        from frozen_reward import load_reward
+
+        module, spec, _ = load_reward(frozen_reward, mount)
+        script_hash = module.script_sha256
+    else:
+        script_hash = _file_digest(script)
     spec_hash = _config_digest(spec)
     frozen = {
         "schema_version": 1,
@@ -228,15 +235,20 @@ def evaluate_batch(
         "source_manifest_sha256": _config_digest(manifest),
         "evaluation_config_sha256": spec_hash,
         "script_sha256": script_hash,
+        **(
+            {"reward_manifest_sha256": frozen_reward["manifest_sha256"]}
+            if frozen_reward is not None
+            else {}
+        ),
     }
     manifest_file = output / "run_manifest.json"
     if manifest_file.exists() and json.loads(manifest_file.read_text()) != frozen:
         raise ValueError("frozen inputs changed; create a new full run")
     _atomic_json(manifest_file, frozen)
-    module = types.ModuleType("frozen_business_scoring")
-    # Execute precisely the hashed source, never timestamp-based .pyc caches.
-    exec(compile(script.read_bytes(), str(script), "exec"), module.__dict__)
-    validate_script(module, spec)
+    if frozen_reward is None:
+        module = types.ModuleType("frozen_business_scoring")
+        exec(compile(script.read_bytes(), str(script), "exec"), module.__dict__)
+        validate_script(module, spec)
     distribution, expected, evidence_warnings = dataset_evidence(
         manifest, module, mount, spec
     )
@@ -281,6 +293,8 @@ def evaluate_batch(
                 try:
                     result = score(case, module, spec)
                 except Exception as exc:
+                    if frozen_reward is not None:
+                        raise
                     result = {
                         "id": case["id"],
                         "passed": False,
@@ -300,6 +314,8 @@ def evaluate_batch(
                     issues.append(f"scoring_error:{case['id']}")
                 results.append(result)
         except Exception as exc:
+            if frozen_reward is not None:
+                raise
             issues.append(f"source_unavailable:{type(exc).__name__}:{exc}")
         dataset_role = entry.get("dataset_role", "validation")
         if dataset_role != "validation":
@@ -317,6 +333,11 @@ def evaluate_batch(
                 "scoring": spec_hash,
                 "script": script_hash,
                 "generation": generation,
+                **(
+                    {"reward_manifest_sha256": frozen_reward["manifest_sha256"]}
+                    if frozen_reward is not None
+                    else {}
+                ),
             }
         )
         checkpoint = None
@@ -488,6 +509,11 @@ def evaluate_batch(
         "scoring_spec_sha256": spec_hash,
         "script_sha256": script_hash,
         "source_manifest_sha256": frozen["source_manifest_sha256"],
+        **(
+            {"reward_manifest_sha256": frozen_reward["manifest_sha256"]}
+            if frozen_reward is not None
+            else {}
+        ),
     }
     _atomic_json(output / "batch_result.json", batch)
     _atomic_json(output / "metrics.json", {"request_count": 0, "steps": len(steps)})
@@ -514,10 +540,11 @@ def main():
     definition = json.loads((output / "prediction_evaluation.json").read_text())
     evaluate_batch(
         definition["source_manifest"],
-        definition["scoring_spec"],
+        definition.get("scoring_spec", {}),
         output / "score_eval.py",
         output,
         args.run_id,
+        frozen_reward=definition.get("frozen_reward"),
     )
 
 

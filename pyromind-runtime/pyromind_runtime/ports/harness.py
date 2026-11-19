@@ -54,7 +54,7 @@ class SessionSpec(ContractModel):
 class SessionHandle(ContractModel):
     session_id: str = Field(min_length=1)
     adapter_session_ref: str = Field(min_length=1)
-    harness_id: str = Field(default="openhands", min_length=1)
+    harness_id: str = Field(default="pi", min_length=1)
     capabilities: HarnessCapabilities
     adapter_delivers_delegated_results: bool = False
 

@@ -622,7 +622,7 @@ def test_bundle_contains_reference_module_and_review_matches_managed_contract(
     runtime: Any,
     tmp_path: Path,
 ) -> None:
-    from openhands.tools.data_preparation.runner import (
+    from pyromind_common.tools.data_preparation.runner import (
         runtime_public_names,
         validate_managed_image_pipeline,
     )

@@ -73,3 +73,42 @@ test("steered identical messages keep command identity separate from callback ru
   }
   assert.notEqual(ids[0], ids[1]);
 });
+
+test("artifact delivery preserves the exact signed URL returned by the tool", () => {
+  const normalizer = new PiEventNormalizer("s1", "r1");
+  const url = "https://storage.example/reports/eval.md?X-Amz-Date=20261117T035531Z&X-Amz-Signature=" + "a".repeat(64);
+  normalizer.translate({
+    type: "tool_execution_end", toolCallId: "storage-1", toolName: "get_storage_url",
+    result: { content: [{ type: "text", text: `markdown: [eval.md](${url})` }] }, isError: false,
+  } as unknown as AgentSessionEvent);
+  const message = { role: "assistant", content: [{ type: "text", text: `[report](${url.slice(0, -1)})` }], usage: { input: 0, output: 0, cacheRead: 0, cost: { total: 0 } } };
+  const events = normalizer.translate({ type: "message_end", message } as unknown as AgentSessionEvent);
+  assert.deepEqual(events[0]!.payload.content, [{ type: "text", text: `[report](${url})` }]);
+});
+
+test("signed URL restoration is scoped to successful tool results and the same resource/query", () => {
+  const registry = new Map<string, string>();
+  const first = new PiEventNormalizer("s1", "r1", [], registry);
+  const url = "https://storage.example/report.md?X-Amz-Date=20261117&versionId=1&X-Amz-Signature=" + "b".repeat(64);
+  const observe = (normalizer: PiEventNormalizer, isError: boolean) => normalizer.translate({
+    type: "tool_execution_end", toolCallId: "storage", toolName: "get_storage_url",
+    result: { content: [{ type: "text", text: `url: ${url}` }] }, isError,
+  } as unknown as AgentSessionEvent);
+  const completed = (normalizer: PiEventNormalizer, text: string, role = "assistant") => normalizer.translate({
+    type: "message_end", message: { role, content: text, usage: { input: 0, output: 0, cacheRead: 0, cost: { total: 0 } } },
+  } as unknown as AgentSessionEvent)[0]!.payload.content;
+  const shortened = url.slice(0, -1);
+  const link = (value: string) => `[report](${value})`;
+  observe(first, true);
+  assert.deepEqual(completed(first, link(shortened)), [{ type: "text", text: link(shortened) }]);
+  observe(first, false);
+  assert.deepEqual(completed(first, shortened), [{ type: "text", text: shortened }]);
+  const resumed = new PiEventNormalizer("s1", "r2", [], registry);
+  assert.deepEqual(completed(resumed, link(shortened)), [{ type: "text", text: link(url) }]);
+  assert.deepEqual(completed(resumed, link(url)), [{ type: "text", text: link(url) }]);
+  assert.deepEqual(completed(resumed, link(shortened), "user"), [{ type: "text", text: link(shortened) }]);
+  for (const other of [shortened.replace("versionId=1", "versionId=2"), shortened.replace("storage.example", "other.example")]) {
+    assert.deepEqual(completed(resumed, link(other)), [{ type: "text", text: link(other) }]);
+  }
+  assert.deepEqual(completed(new PiEventNormalizer("s2", "r1"), link(shortened)), [{ type: "text", text: link(shortened) }]);
+});

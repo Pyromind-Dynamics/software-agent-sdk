@@ -13,7 +13,7 @@ cache is correct in scenarios that could easily break:
 import threading
 from abc import ABC
 
-from openhands.sdk.utils.models import (
+from pyromind_common.sdk.utils.models import (
     DiscriminatedUnionMixin,
     _get_checked_concrete_subclasses,
     get_known_concrete_subclasses,

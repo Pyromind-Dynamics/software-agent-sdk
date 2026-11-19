@@ -5,12 +5,12 @@ import time
 
 import httpx
 from fastapi import FastAPI
+
 from pyromind_agent_server.api.router import create_product_router
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.service_context import ProductServiceContext
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
-
-from openhands.agent_server.config import Config
-from openhands.agent_server.conversation_service import ConversationService
 
 from .fake_adapter import FakeAdapter
 
@@ -51,7 +51,7 @@ def _app(tmp_path, runtime: ConversationRuntime) -> FastAPI:
         enable_session_api_key_auth=False,
         enable_pyromind_jwt_auth=False,
     )
-    app.state.conversation_service = ConversationService(
+    app.state.conversation_service = ProductServiceContext(
         conversations_dir=tmp_path / "conversations"
     )
     app.state.product_runtime = runtime

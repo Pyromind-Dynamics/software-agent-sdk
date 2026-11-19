@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Literal, cast
 
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
@@ -21,7 +22,7 @@ def finalize_inference(
     store: ProductStore,
     storage: EvaluationStorage,
     run: PipelineRun,
-    checkpoint: CheckpointArtifact,
+    checkpoint: CheckpointArtifact | None,
     *,
     succeeded: bool,
 ) -> None:
@@ -58,12 +59,21 @@ def finalize_inference(
 
     manifest = json.loads(storage.read(root + "/run_manifest.json"))
     metrics = json.loads(storage.read(root + "/metrics.json"))
+    if not isinstance(manifest, dict) or not isinstance(metrics, dict):
+        raise ValueError("inference manifest and metrics must be objects")
+    reference = manifest.get("model_reference")
+    inference = run.definition.get("inference", {})
+    assert isinstance(inference, dict)
+    model_matches = (
+        isinstance(reference, str)
+        and to_storage_api_path(reference) == to_storage_api_path(checkpoint.path)
+        if checkpoint is not None
+        else reference == inference.get("model_path")
+    )
     if (
-        not all(isinstance(value, dict) for value in (manifest, metrics))
+        not model_matches
         or report.get("status") not in {"succeeded", "failed"}
         or manifest.get("run_id") != str(run.run_id)
-        or to_storage_api_path(manifest.get("model_reference") or "")
-        != to_storage_api_path(checkpoint.path)
         or metrics != report.get("metrics")
         or not isinstance(manifest.get("dataset_sha256"), str)
         or not re.fullmatch(r"[a-f0-9]{64}", manifest["dataset_sha256"])
@@ -71,26 +81,40 @@ def finalize_inference(
         or not isinstance(manifest.get("evaluation_config_sha256"), str)
     ):
         raise ValueError("inference report does not match the run manifest and metrics")
+    reward = run.definition.get("frozen_reward")
+    if isinstance(reward, dict) and manifest.get(
+        "reward_manifest_sha256"
+    ) != reward.get("manifest_sha256"):
+        raise ValueError("inference worker did not attest the frozen Reward")
     references = report.get("artifacts", {})
     if not isinstance(references, dict) or any(
         references.get(name) != f"{root}/{name}"
         for name in ("metrics.json", "predictions.jsonl")
     ):
         raise ValueError("inference outputs do not belong to the run directory")
-    dataset_role = run.definition.get("dataset_role", "validation")
+    dataset_role = cast(
+        Literal["validation", "test", "train"],
+        run.definition.get("dataset_role", "validation"),
+    )
     delivery = {
         "report_path": root + "/report.json",
         "metrics_path": root + "/metrics.json",
         "predictions_path": root + "/predictions.jsonl",
         "evaluation_status": report.get("evaluation_status"),
         "report_status": report.get("report_status"),
+        **(
+            {"reward_manifest_sha256": manifest["reward_manifest_sha256"]}
+            if isinstance(reward, dict)
+            else {}
+        ),
     }
     check_persistable(delivery)
     check_persistable(metrics)
     # JSON accepts nonfinite constants by default. The ledger uses strict JSON.
     json.dumps(metrics, allow_nan=False)
     step = StepEvaluation(
-        step=checkpoint.step,
+        role="checkpoint" if checkpoint is not None else "baseline",
+        step=checkpoint.step if checkpoint is not None else 0,
         run_id=f"{run.run_id}:{run.execution_revision}",
         output_dir=root,
         dataset_role=dataset_role,
@@ -107,6 +131,11 @@ def finalize_inference(
                 manifest["evaluation_config_sha256"],
                 manifest["generation"],
                 manifest.get("runtime_sha256"),
+                *(
+                    [manifest["reward_manifest_sha256"]]
+                    if isinstance(reward, dict)
+                    else []
+                ),
             ]
         ),
     )

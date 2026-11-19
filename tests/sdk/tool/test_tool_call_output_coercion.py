@@ -3,8 +3,8 @@ from collections.abc import Sequence
 import pytest
 from pydantic import Field
 
-from openhands.sdk.tool import Observation, ToolDefinition, ToolExecutor
-from openhands.sdk.tool.schema import Action
+from pyromind_common.sdk.tool import Observation, ToolDefinition, ToolExecutor
+from pyromind_common.sdk.tool.schema import Action
 
 
 class OCAAction(Action):
@@ -16,7 +16,7 @@ class OCAObs(Observation):
 
     @property
     def to_llm_content(self):  # type: ignore[override]
-        from openhands.sdk.llm import TextContent
+        from pyromind_common.sdk.llm import TextContent
 
         return [TextContent(text=str(self.value))]
 
@@ -31,7 +31,7 @@ class CoercionTestObs(Observation):
 
     @property
     def to_llm_content(self):  # type: ignore[override]
-        from openhands.sdk.llm import TextContent
+        from pyromind_common.sdk.llm import TextContent
 
         return [TextContent(text=str(self.value))]
 

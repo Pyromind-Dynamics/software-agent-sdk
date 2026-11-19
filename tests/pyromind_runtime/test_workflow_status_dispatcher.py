@@ -5,6 +5,16 @@ from datetime import UTC, datetime
 
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
+from pyromind_common.tools.data_preparation.platform_submit import (
+    TASK_ASSOCIATION_DIRNAME as PREPARATION_TASK_DIR,
+    DataPreparationTaskAssociation,
+    DataPreparationTaskStore,
+)
+from pyromind_common.tools.pyromind_cleaning.task_store import (
+    TASK_ASSOCIATION_DIRNAME as CLEANING_TASK_DIR,
+    DatasetCleaningTaskAssociation,
+    DatasetCleaningTaskStore,
+)
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
@@ -12,17 +22,6 @@ from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
-
-from openhands.tools.data_preparation.platform_submit import (
-    TASK_ASSOCIATION_DIRNAME as PREPARATION_TASK_DIR,
-    DataPreparationTaskAssociation,
-    DataPreparationTaskStore,
-)
-from openhands.tools.pyromind_cleaning.task_store import (
-    TASK_ASSOCIATION_DIRNAME as CLEANING_TASK_DIR,
-    DatasetCleaningTaskAssociation,
-    DatasetCleaningTaskStore,
-)
 
 from .fake_adapter import FakeAdapter
 
@@ -123,7 +122,7 @@ async def test_dispatcher_resolves_uuid_preparation_owner_without_callback_id(
             capabilities=HarnessCapabilities(cancel=True),
         ),
         user_id="42",
-        harness_id="openhands",
+        harness_id="pi",
     )
     task_store = DataPreparationTaskStore(root / PREPARATION_TASK_DIR)
     task_store.save(
@@ -140,7 +139,8 @@ async def test_dispatcher_resolves_uuid_preparation_owner_without_callback_id(
     registry = WorkflowExternalTaskRegistry(root)
     runtime = ConversationRuntime(
         root,
-        {"openhands": FakeAdapter("openhands")},
+        {"pi": FakeAdapter("pi")},
+        default_harness_id="pi",
         external_tasks=registry,
     )
 
@@ -211,7 +211,7 @@ async def test_dispatcher_routes_pi_callback_and_store_dedupes(tmp_path) -> None
     ]
 
 
-async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -> None:
+async def test_dispatcher_routes_pi_through_same_runtime_path(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversation = conversations / "conversation-2"
     conversation.mkdir(parents=True)
@@ -222,13 +222,14 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
             capabilities=HarnessCapabilities(cancel=True),
         ),
         user_id="42",
-        harness_id="openhands",
+        harness_id="pi",
     )
-    adapter = FakeAdapter("openhands")
+    adapter = FakeAdapter("pi")
     external_tasks = _ExternalTasks()
     runtime = ConversationRuntime(
         conversations,
-        {"openhands": adapter},
+        {"pi": adapter},
+        default_harness_id="pi",
         external_tasks=external_tasks,
     )
     result = await WorkflowStatusDispatcher(runtime).dispatch(
@@ -267,10 +268,7 @@ async def test_dispatcher_routes_openhands_through_same_runtime_path(tmp_path) -
 async def test_dispatcher_routes_graph_task_before_conversation_runtime(
     tmp_path,
 ) -> None:
-    runtime = ConversationRuntime(
-        tmp_path / "conversations",
-        {"openhands": FakeAdapter("openhands")},
-    )
+    runtime = ConversationRuntime(tmp_path / "conversations", FakeAdapter())
     calls: list[tuple[str, str, str, str | None]] = []
 
     async def graph_task_handler(
@@ -318,11 +316,12 @@ async def test_dispatcher_rejects_callback_for_conflicting_owner(tmp_path) -> No
             capabilities=HarnessCapabilities(cancel=True),
         ),
         user_id="42",
-        harness_id="openhands",
+        harness_id="pi",
     )
     runtime = ConversationRuntime(
         conversations,
-        {"openhands": FakeAdapter("openhands")},
+        {"pi": FakeAdapter("pi")},
+        default_harness_id="pi",
         external_tasks=_ExternalTasks(),
     )
 
@@ -369,7 +368,9 @@ def test_external_task_registry_cannot_transfer_ownership_or_change_the_recipien
 
 async def test_unknown_product_callback_never_falls_back_to_legacy_session(tmp_path):
     runtime = ConversationRuntime(
-        tmp_path, {"pi": FakeAdapter("pi")}, default_harness_id="pi"
+        tmp_path,
+        {"pi": FakeAdapter("pi")},
+        default_harness_id="pi",
     )
     try:
         result = await WorkflowStatusDispatcher(runtime).dispatch(
@@ -387,9 +388,8 @@ def test_retired_production_workflow_tool_cannot_be_resolved():
     from typing import Any, cast
 
     import pytest
-
-    from openhands.sdk.tool import Tool
-    from openhands.sdk.tool.registry import resolve_tool
+    from pyromind_common.sdk.tool import Tool
+    from pyromind_common.sdk.tool.registry import resolve_tool
 
     with pytest.raises(KeyError, match="run_workflow"):
         resolve_tool(Tool(name="run_workflow"), cast(Any, None))

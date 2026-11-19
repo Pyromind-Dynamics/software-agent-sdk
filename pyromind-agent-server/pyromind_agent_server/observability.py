@@ -12,6 +12,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult
 from opentelemetry.trace import Span, format_span_id, format_trace_id
+
 from pyromind_runtime.domain.context import ExecutionTrace
 
 

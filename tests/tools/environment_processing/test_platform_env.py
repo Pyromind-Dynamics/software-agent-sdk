@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from openhands.tools.utils.platform_env import (
+from pyromind_common.tools.utils.platform_env import (
     platform_cluster_target,
     platform_headers,
     platform_portal_url,

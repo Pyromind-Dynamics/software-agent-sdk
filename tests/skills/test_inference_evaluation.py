@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import importlib.util
 import json
+import runpy
 import shutil
 import struct
 import subprocess
@@ -15,8 +17,11 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
+
+from pyromind_runtime.domain.reward_bundle import StartRewardReview, freeze_reward_files
 
 
 MODULE_PATH = (
@@ -2240,3 +2245,160 @@ assert.equal(parse('<think>unfinished').text, '<think>unfinished');
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_frozen_reward_scores_match_studio_init_and_saved_eval(
+    tmp_path,
+    monkeypatch,
+    evaluation_module,
+    evaluation_inputs,
+    inference_server,
+    capsys,
+):
+    monkeypatch.syspath_prepend(str(MODULE_PATH.parent))
+    monkeypatch.syspath_prepend(str(SKILL_ROOT.parent / "training-analysis/scripts"))
+    evaluate_predictions = importlib.import_module("evaluate_predictions")
+    frozen_reward = importlib.import_module("frozen_reward")
+
+    inputs = ["alpha", "beta"]
+    predictions = ["supports alpha", "unrelated"]
+    script = """
+def parse_record(row):
+    return {"id": row["id"], "input": row["input"]}
+
+def score_case(case, response):
+    return 0.75 if case["input"] in response else 0.25
+
+def studio_reward(completions, *, cases):
+    return [score_case(parse_record(row), response)
+            for row, response in zip(cases, completions, strict=True)]
+"""
+    files, _, _, _ = freeze_reward_files(
+        StartRewardReview(
+            candidate_directory="v1", judge_kind="code", requirements="Python"
+        ),
+        {
+            "task_prompt.md": "Summarize only the supplied feedback.",
+            "rubric.json": json.dumps(
+                {
+                    "items": [{"criterion": "Reflects the supplied input"}],
+                    "aggregation": "Give partial credit for supported claims.",
+                }
+            ),
+            "reward.py": script,
+            "calibration_review.json": json.dumps(
+                [{"case_id": "a", "score": 0.75, "summary": "reviewed"}]
+            ),
+        },
+    )
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    for name, content in files.items():
+        (bundle / name).write_bytes(content.encode())
+    binding = {
+        "directory": "/bundle",
+        "manifest_sha256": hashlib.sha256(files["manifest.json"].encode()).hexdigest(),
+        "version_id": "v1",
+    }
+    cases = [
+        {
+            "id": str(i),
+            "input": query,
+            "messages": [
+                {"role": "system", "content": "discard this draft prompt"},
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": "hidden answer"},
+            ],
+        }
+        for i, query in enumerate(inputs)
+    ]
+    studio = runpy.run_path(str(bundle / "studio_entry.py"))
+    train_scores = studio["studio_reward"](predictions, cases=cases)
+    assert train_scores == [0.75, 0.25]
+    assert binding["manifest_sha256"] in capsys.readouterr().out
+
+    load = frozen_reward.load_reward
+    monkeypatch.setattr(
+        frozen_reward, "load_reward", lambda reward, mount=tmp_path: load(reward, mount)
+    )
+    endpoint, state = inference_server
+    state["replies"] = predictions.copy()
+    source = Path(evaluation_inputs["dataset_path"])
+    source.write_text("".join(json.dumps(row) + "\n" for row in cases))
+    evaluation_inputs.update(
+        endpoint=endpoint,
+        workers=1,
+        dataset_config_json='{"messages_field":"messages"}',
+        evaluation_config_json='{"mode":"agent_rubric"}',
+        frozen_reward=binding,
+    )
+    evaluation_module.evaluate_inference(**evaluation_inputs)
+    out = Path(evaluation_inputs["output_dir"])
+    init_rows = [
+        json.loads(line)
+        for line in (out / "predictions.jsonl").read_text().splitlines()
+    ]
+    assert [row["overall_score"] for row in init_rows] == train_scores
+    assert all(
+        request["messages"]
+        == [
+            {"role": "system", "content": files["task_prompt.md"]},
+            {"role": "user", "content": query},
+        ]
+        for query, request in zip(inputs, state["requests"], strict=True)
+    )
+    digest = binding["manifest_sha256"]
+    assert (
+        json.loads((out / "run_manifest.json").read_text())["reward_manifest_sha256"]
+        == digest
+    )
+
+    saved = tmp_path / "eval_step_1.jsonl"
+    saved.write_text(
+        "".join(
+            json.dumps({**row, "response": reply}) + "\n"
+            for row, reply in zip(cases, predictions, strict=True)
+        )
+    )
+    manifest = {
+        "evaluations": [
+            {
+                "step": 1,
+                "path": "/" + saved.name,
+                "sha256": hashlib.sha256(saved.read_bytes()).hexdigest(),
+            }
+        ],
+        "render_reports": False,
+    }
+    batch = evaluate_predictions.evaluate_batch(
+        manifest,
+        {},
+        tmp_path / "unused.py",
+        tmp_path / "eval",
+        str(uuid4()),
+        tmp_path,
+        frozen_reward=binding,
+    )
+    assert batch["reward_manifest_sha256"] == digest
+    eval_rows = [
+        json.loads(line)
+        for line in (tmp_path / "eval/steps/1/predictions.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [row["overall_score"] for row in eval_rows] == train_scores
+    (bundle / "reward.py").write_text("# changed after approval")
+    with pytest.raises(ValueError, match="digest changed"):
+        runpy.run_path(str(bundle / "studio_entry.py"))
+    with pytest.raises(ValueError, match="digest changed"):
+        evaluation_module.evaluate_inference(**evaluation_inputs)
+    with pytest.raises(ValueError, match="digest changed"):
+        evaluate_predictions.evaluate_batch(
+            manifest,
+            {},
+            tmp_path / "unused.py",
+            tmp_path / "eval",
+            str(uuid4()),
+            tmp_path,
+            frozen_reward=binding,
+        )

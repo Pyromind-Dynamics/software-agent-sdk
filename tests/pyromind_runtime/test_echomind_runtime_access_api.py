@@ -10,24 +10,27 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
-from pyromind_agent_server import echomind_runtime_access, echomind_train_backend
-from pyromind_agent_server.api.echomind_projects import router
-from pyromind_agent_server.echomind_runtime_access import build_runtime_credential_store
-from pyromind_agent_server.echomind_train_backend import PlatformTrainWorkflowBackend
 
-from openhands.agent_server import dependencies
-from openhands.agent_server.config import Config
-from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.echomind_graph_runs import GraphRunStore
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server import (
+    dependencies,
+    echomind_runtime_access,
+    echomind_train_backend,
+)
+from pyromind_agent_server.api.echomind_projects import router
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.echomind_graph_runs import GraphRunStore
+from pyromind_agent_server.echomind_projects import (
     ProjectGraph,
     ProjectInfo,
     ProjectRecord,
     ProjectStore,
 )
-from openhands.agent_server.echomind_storage import canonical_sha256
-from openhands.agent_server.echomind_train_runtime import TrainWorkflowSpec
-from openhands.agent_server.pyromind_auth import CurrentLoginUser
+from pyromind_agent_server.echomind_runtime_access import build_runtime_credential_store
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_train_backend import PlatformTrainWorkflowBackend
+from pyromind_agent_server.echomind_train_runtime import TrainWorkflowSpec
+from pyromind_agent_server.service_context import ProductServiceContext
+from pyromind_common.platform.auth import CurrentLoginUser
 
 
 async def test_active_graph_run_detail_refreshes_owner_access_for_background_polling(
@@ -63,7 +66,7 @@ async def test_active_graph_run_detail_refreshes_owner_access_for_background_pol
     )
     app = FastAPI()
     app.state.config = config
-    app.state.conversation_service = ConversationService(
+    app.state.conversation_service = ProductServiceContext(
         conversations_dir=conversations_dir
     )
     app.include_router(router)

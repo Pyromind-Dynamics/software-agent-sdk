@@ -3,13 +3,13 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
+
 from pyromind_agent_server.echomind_runtime_credentials import (
     RuntimeCredentialIdentityMismatchError,
     RuntimeCredentialStore,
     RuntimeCredentialStoreError,
 )
-
-from openhands.sdk.utils.cipher import Cipher
+from pyromind_common.sdk.utils.cipher import Cipher
 
 
 def test_credential_upsert_is_encrypted_scoped_and_restorable(tmp_path: Path) -> None:

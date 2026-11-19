@@ -1,9 +1,8 @@
 from uuid import uuid4
 
 import pytest
-from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
 
-from openhands.agent_server.echomind_projects import (
+from pyromind_agent_server.echomind_projects import (
     ProjectEdge,
     ProjectGraph,
     ProjectInfo,
@@ -13,12 +12,13 @@ from openhands.agent_server.echomind_projects import (
     ProjectNodeOutput,
     ProjectStore,
 )
-from openhands.agent_server.echomind_publication import (
+from pyromind_agent_server.echomind_publication import (
     PublicationValidationError,
     build_publication_preflight,
     compile_working_graph,
 )
-from openhands.agent_server.echomind_storage import canonical_sha256
+from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
 from scripts.echomind_prepare_runtime_validation import (
     _replace_wandb_credentials_with_references,
 )

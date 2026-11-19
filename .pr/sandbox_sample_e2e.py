@@ -28,6 +28,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from pyromind_common.tools.data_preparation.sandbox_execution import _parse_envelope
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_SCRIPTS = REPO_ROOT / ".agents/skills/data-processing/scripts/preparation"
@@ -43,12 +45,6 @@ RUNTIME_FILENAMES = (
 )
 RUNNER_FILENAME = "sandbox_sample.py"
 DATAFLOW_VERSION = "1.0.11"
-
-sys.path.insert(0, str(REPO_ROOT / "openhands-tools"))
-
-from openhands.tools.data_preparation.sandbox_execution import (  # noqa: E402
-    _parse_envelope,
-)
 
 
 SUCCESS_PIPELINE = '''\

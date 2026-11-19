@@ -1,8 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from openhands.sdk.workspace.workspace import LocalWorkspace
-from openhands.tools.utils.conversation_dirs import conversation_state_dir
+from pyromind_common.sdk.workspace.workspace import LocalWorkspace
+from pyromind_common.tools.utils.conversation_dirs import conversation_state_dir
 
 
 def test_conversation_state_dir_prefers_host_conversation_root(tmp_path: Path) -> None:

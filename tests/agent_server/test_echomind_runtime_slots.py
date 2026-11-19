@@ -14,7 +14,7 @@ from pyromind_sdk.client.models import (
     InferenceJobResponse,
 )
 
-from openhands.agent_server.echomind_runtime_slots import (
+from pyromind_agent_server.echomind_runtime_slots import (
     EchoMindTracerProvider,
     RuntimeHealth,
     RuntimeSlot,

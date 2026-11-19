@@ -2,14 +2,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, SecretStr
 
-from openhands.agent_server.config import Config
-from openhands.agent_server.echomind_storage import (
+from pyromind_agent_server.config import Config
+from pyromind_agent_server.echomind_storage import (
     canonical_uuid,
     project_directory,
     read_model,
     write_model,
 )
-from openhands.sdk.utils.cipher import Cipher
+from pyromind_common.sdk.utils.cipher import Cipher
 
 
 class _TracerAdminSecret(BaseModel):

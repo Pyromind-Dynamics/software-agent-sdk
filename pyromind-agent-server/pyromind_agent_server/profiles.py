@@ -4,13 +4,16 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
-from pyromind_runtime.domain.preparation import PreparationPolicy
-from pyromind_runtime.ports.harness import DelegatedRole
-
-from openhands.agent_server.agent_profiles.echomind_manager import (
+from pyromind_agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_PROFILE,
 )
+from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
+from pyromind_runtime.domain.preparation import PreparationPolicy
+from pyromind_runtime.domain.reward_bundle import (
+    GET_PROJECT_REWARD,
+    START_REWARD_REVIEW,
+)
+from pyromind_runtime.ports.harness import DelegatedRole
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +57,7 @@ DEFAULT_PRODUCT_PROFILE = ConversationProfile(
     instructions=DATA_FLYWHEEL_INSTRUCTIONS + "\n" + _PRODUCT_ROUTING_INSTRUCTIONS,
 )
 
-_PREPARATION_SKILLS = ("model-evaluation-preparation",)
+_PREPARATION_SKILLS = ("model-evaluation-preparation", "rubric-elicitation")
 _PREPARATION_TOOLS = (
     "read",
     "write",
@@ -62,15 +65,21 @@ _PREPARATION_TOOLS = (
     "terminal",
     "ask_user",
     "set_preparation_plan",
+    START_REWARD_REVIEW,
 )
 _CHILD_WORKSPACE_TOOLS = ("read", "write", "edit", "terminal")
 _EVALUATION_TOOLS = _CHILD_WORKSPACE_TOOLS + (
+    GET_PROJECT_REWARD,
     "df_submit_evaluation",
     "df_check_progress",
     "get_storage_url",
     "df_stop_task",
 )
-_EVALUATION_SKILLS = ("inference-evaluation", "avi-baseline-evaluation")
+_EVALUATION_SKILLS = (
+    "inference-evaluation",
+    "avi-baseline-evaluation",
+    "frozen-reward-evaluation",
+)
 
 
 def _load_preparation_policy() -> PreparationPolicy:
@@ -96,13 +105,15 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=24,
+    configuration_version=27,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
     instructions="""Before Project creation only, read model-evaluation-preparation.
 Use the Skill to determine the information needed for the user's task. Read
-data and knowledge with the available workspace tools; ask_user only for
+data and knowledge with the available workspace tools. For training without a
+programmatically verifiable answer, consult rubric-elicitation to choose and
+confirm the scoring method. Use ask_user only for
 essential information or decisions that cannot be established. Once ready,
 submit a compact review plan with set_preparation_plan(plan, entry_task_id).
 Include confirmed inputs and constraints in the plan, not a separate Checklist.
@@ -111,8 +122,12 @@ Use the Sandbox to inspect data and prepare files. Start business tasks only aft
 the user creates the Project.
 After creation, preparation is finished. Use the accepted plan supplied in the
 Project notification to create public_data/workflowPLAN.json with write, then
-delegate the entry task through native subagent. Do not register stages, revisions
-or business run IDs for delegation.
+delegate the entry task through native subagent. If the Project has an approved
+Reward bundle, tell Init, Train, and Eval to use get_project_reward to resolve it.
+Train must use that Studio entry with weight 1 and no additional reward items.
+For Init and Eval tasks with a bound Reward, direct the role to the
+frozen-reward-evaluation Skill.
+Do not register stages, revisions or business run IDs for delegation.
 """
     + (ECHOMIND_MANAGER_PROFILE.system_prompt or ""),
     tool_allowlist=_PREPARATION_TOOLS,
@@ -134,6 +149,7 @@ or business run IDs for delegation.
             name="train",
             tools=_CHILD_WORKSPACE_TOOLS
             + (
+                GET_PROJECT_REWARD,
                 "get_storage_url",
                 "validate_workflow_dsl",
                 "submit_workflow",

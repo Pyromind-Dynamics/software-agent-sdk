@@ -12,6 +12,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+
 from harness_adapter.pi_adapter import business_tool_host
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
@@ -19,45 +20,47 @@ from harness_adapter.pi_adapter.business_tool_host import (
     _ToolConversationFacade,
 )
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
+from pyromind_common.tools.data_preparation import (
+    inference as inference_module,
+    prediction_evaluation,
+    submission as submission_module,
+)
+from pyromind_common.tools.data_preparation.evaluation_submit import (
+    DfSubmitEvaluationAction,
+    DfSubmitEvaluationExecutor,
+)
+from pyromind_common.tools.data_preparation.inference import (
+    InferencePipelineHandler,
+    validate_pipeline_topology,
+)
+from pyromind_common.tools.data_preparation.stop_task import (
+    DfStopTaskAction,
+    DfStopTaskExecutor,
+    DfStopTaskObservation,
+    DfStopTaskTool,
+)
+from pyromind_common.tools.data_preparation.submission import SubmissionConfig
+from pyromind_common.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
+from pyromind_common.tools.workflow.task_submission import (
+    WorkflowResourceValidationError,
+)
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslExecutor,
+    ValidateWorkflowDslObservation,
+    WorkflowValidationIssue,
+)
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.versions import SaveVersion, SnapshotSource
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
-
-from openhands.tools.data_preparation import (
-    inference as inference_module,
-    prediction_evaluation,
-    submission as submission_module,
-)
-from openhands.tools.data_preparation.evaluation_submit import (
-    DfSubmitEvaluationAction,
-    DfSubmitEvaluationExecutor,
-)
-from openhands.tools.data_preparation.inference import (
-    InferencePipelineHandler,
-    validate_pipeline_topology,
-)
-from openhands.tools.data_preparation.stop_task import (
-    DfStopTaskAction,
-    DfStopTaskExecutor,
-    DfStopTaskObservation,
-    DfStopTaskTool,
-)
-from openhands.tools.data_preparation.submission import SubmissionConfig
-from openhands.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
-from openhands.tools.workflow.task_submission import WorkflowResourceValidationError
-from openhands.tools.workflow.validate_workflow_dsl import (
-    ValidateWorkflowDslExecutor,
-    ValidateWorkflowDslObservation,
-    WorkflowValidationIssue,
-)
 
 
 @pytest.fixture
@@ -1271,3 +1274,85 @@ def test_checkpoint_versioning_never_rebinds_to_default_model(
     assert default.manifest.storage_ref not in canvas
     record = versions.store.list_runs(project.id)[0]
     assert {"selected_checkpoint", "base_model"} <= set(record.spec.inputs)
+
+
+def test_project_reward_is_injected_into_inference_and_prediction_submission(
+    inference_submission, tmp_path
+):
+    ctx = inference_submission
+    context = RequestContext(user_id="test")
+    snapshots = FileArtifactSnapshots(tmp_path / "storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.sqlite3"), snapshots)
+    for reference in ("/datasets/cases.jsonl", "/models/v1"):
+        path = snapshots.path(reference, context)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("source")
+    ledger = versions.project(ctx.conversation.id, context)
+    assert ledger is not None
+    snapshot = snapshots.save(
+        SnapshotSource(files={"manifest.json": "{}"}), "/test/reward", context
+    )
+    version = versions.store.reserve_version(
+        ledger,
+        "prepared:fake:" + "a" * 64,
+        SaveVersion(
+            kind="config",
+            logical_key="reward_bundle",
+            source=SnapshotSource(storage_ref=snapshot.storage_ref),
+            summary={"manifest_digest": "a" * 64},
+        ),
+        published=snapshot,
+    )
+    ctx.handler.runs = PipelineRuns(
+        ctx.conversation.id, ctx.store, ctx.registry, versions, context
+    )
+    reward = {
+        "directory": snapshot.storage_ref,
+        "manifest_sha256": "a" * 64,
+        "version_id": version.id,
+    }
+    ctx.handler._evaluation_reward = reward
+    public = ctx.workspace / "public_data"
+    (public / "evaluation.json").write_text('{"mode":"agent_rubric"}')
+    (public / "dataset.json").write_text('{"user_prompt_field":"prompt"}')
+    init = ctx.executor(ctx.action, ctx.conversation)
+    assert not init.is_error, init.text
+    assert ctx.runs.resolve(init.run_id)["definition"]["frozen_reward"] == reward
+    assert (
+        "--frozen-reward"
+        in ctx.submit.call_args.kwargs["workflow"]["nodes"][1]["data"]["config"][
+            "command"
+        ]
+    )
+
+    (public / "source.json").write_text(
+        json.dumps(
+            {
+                "evaluations": [
+                    {"step": 1, "path": "/train/eval_step_1.jsonl", "sha256": "b" * 64}
+                ]
+            }
+        )
+    )
+    score = DfSubmitEvaluationAction(
+        operation="score",
+        input_path="/train",
+        source_manifest_path="public_data/source.json",
+    )
+    blocked = ctx.executor(
+        score.model_copy(update={"scoring_script_path": "other.py"}), ctx.conversation
+    )
+    assert blocked.is_error and "frozen Reward" in blocked.text
+    result = ctx.executor(score, ctx.conversation)
+    assert not result.is_error, result.text
+    definition = ctx.runs.resolve(result.run_id)["definition"]
+    assert definition["frozen_reward"] == reward
+    assert "scoring_script" not in definition
+    assert all(
+        run.spec.inputs["reward_bundle"] == version.id
+        for run in versions.store.list_runs(ledger.id)
+    )
+    assert [
+        node["data"]["nodeType"]
+        for node in ctx.submit.call_args.kwargs["workflow"]["nodes"]
+    ] == ["CustomCommandCPUNode"]

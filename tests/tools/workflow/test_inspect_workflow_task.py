@@ -8,14 +8,14 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from openhands.sdk.tool import Tool
-from openhands.sdk.tool.registry import resolve_tool
-from openhands.tools.workflow import (
+from pyromind_common.sdk.tool import Tool
+from pyromind_common.sdk.tool.registry import resolve_tool
+from pyromind_common.tools.workflow import (
     InspectWorkflowTaskAction,
     InspectWorkflowTaskExecutor,
     InspectWorkflowTaskTool,
 )
-from openhands.tools.workflow.inspect_workflow_task import (
+from pyromind_common.tools.workflow.inspect_workflow_task import (
     PROD_API_BASE,
     workflow_execution_state,
 )

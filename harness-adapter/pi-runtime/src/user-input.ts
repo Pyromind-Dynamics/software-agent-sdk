@@ -83,14 +83,15 @@ export function createAskUserTool(
   waits: InputWaitRegistry,
   isAvailable: () => boolean,
   delegated?: { role: string; origin: JsonObject },
+  preparationTool?: string,
 ): AgentTool<TSchema, unknown> {
   return {
-    name: "ask_user",
-    label: "ask_user",
+    name: preparationTool ?? "ask_user",
+    label: preparationTool ?? "ask_user",
     description: spec.description,
     parameters: spec.inputSchema as TSchema,
     prepareArguments(args: unknown) {
-      if (!isRecord(args) || typeof args.presentation !== "string" || args.presentation.length > 262144) return args;
+      if (preparationTool || !isRecord(args) || typeof args.presentation !== "string" || args.presentation.length > 262144) return args;
       try {
         const presentation: unknown = JSON.parse(args.presentation);
         if (isRecord(presentation)) return { ...args, presentation };
@@ -104,10 +105,11 @@ export function createAskUserTool(
       if (!isAvailable()) {
         throw new Error("ask_user is not available in this execution context");
       }
-      if (!isRecord(params) || !Array.isArray(params.questions)) {
+      if (!isRecord(params)) throw new Error("arguments must be an object");
+      const questions = params.questions;
+      if (!preparationTool && !Array.isArray(questions)) {
         throw new Error("questions must be an array");
       }
-      const questions = params.questions;
       const requestId = `input:${randomUUID()}`;
       if (!await waits.beginAfterAdmission(requestId, signal)) {
         return answeredResult({ status: "cancelled" });
@@ -118,17 +120,21 @@ export function createAskUserTool(
           {
             request_id: requestId,
             tool_call_id: callId,
-            questions,
-            ...(params.presentation !== undefined ? { presentation: params.presentation as JsonObject } : {}),
-            ...(delegated ? { delegated } : {}),
-            ...(!delegated && params.checkpoint !== undefined ? { checkpoint: params.checkpoint as JsonObject } : {}),
+            ...(preparationTool
+              ? { preparation_tool: preparationTool, arguments: params as JsonObject }
+              : {
+                  questions: questions as JsonObject[],
+                  ...(params.presentation !== undefined ? { presentation: params.presentation as JsonObject } : {}),
+                  ...(delegated ? { delegated } : {}),
+                  ...(!delegated && params.checkpoint !== undefined ? { checkpoint: params.checkpoint as JsonObject } : {}),
+                }),
           },
           signal,
         );
         if (!isRecord(answer) || typeof answer.status !== "string") {
           throw new Error("invalid input response");
         }
-        if (answer.status === "answered" && Array.isArray(answer.answers)) {
+        if (Array.isArray(questions) && answer.status === "answered" && Array.isArray(answer.answers)) {
           const labeledAnswers = answer.answers.map((item) => {
             if (!isRecord(item) || typeof item.option_id !== "string") return item;
             const question = questions.find((question: unknown) =>

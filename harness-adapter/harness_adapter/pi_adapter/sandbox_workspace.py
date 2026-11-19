@@ -9,11 +9,11 @@ from typing import Any, Protocol
 
 from pydantic import PrivateAttr
 
-from openhands.sdk.git.models import GitChange, GitDiff
-from openhands.sdk.utils.path import to_posix_path
-from openhands.sdk.workspace.base import BaseWorkspace
-from openhands.sdk.workspace.models import CommandResult, FileOperationResult
-from openhands.tools.sandbox import run_terminal_command, write_sandbox_file
+from pyromind_common.sdk.git.models import GitChange, GitDiff
+from pyromind_common.sdk.utils.path import to_posix_path
+from pyromind_common.sdk.workspace.base import BaseWorkspace
+from pyromind_common.sdk.workspace.models import CommandResult, FileOperationResult
+from pyromind_common.tools.sandbox import run_terminal_command, write_sandbox_file
 
 
 class SandboxClientLike(Protocol):
@@ -163,12 +163,12 @@ class SandboxWorkspace(BaseWorkspace):
 
     def git_changes(self, path: str | Path) -> list[GitChange]:
         raise NotImplementedError(
-            "SandboxWorkspace does not expose OpenHands git workspace operations"
+            "SandboxWorkspace does not expose git workspace operations"
         )
 
     def git_diff(self, path: str | Path) -> GitDiff:
         raise NotImplementedError(
-            "SandboxWorkspace does not expose OpenHands git workspace operations"
+            "SandboxWorkspace does not expose git workspace operations"
         )
 
     def pause(self) -> None:

@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import statistics
+import sys
 import threading
 import time
 import urllib.error
@@ -205,6 +206,20 @@ def _normalize_content(content: Any, dataset_file: Path, config: dict[str, Any])
                 continue
         normalized.append(part)
     return normalized
+
+
+def _generation_input(sample: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    field = config.get("messages_field")
+    if not isinstance(field, str) or not isinstance(sample.get(field), list):
+        return sample
+    return {
+        **sample,
+        field: [
+            message
+            for message in sample[field]
+            if isinstance(message, dict) and message.get("role") == "user"
+        ],
+    }
 
 
 def _default_request(
@@ -660,12 +675,18 @@ def _evaluate_case(
     timeout_seconds: int,
     max_retries: int,
     on_request: Callable[[], None],
+    generate_only: bool = False,
 ) -> dict[str, Any]:
     case_id = _case_id(sample, dataset_config, index)
     try:
-        reference = _required_field(sample, dataset_config, "reference_field")
-        media = _input_media(sample, dataset_config)
-        payload = builder(sample, dataset_file, model, dataset_config)
+        reference = (
+            None
+            if generate_only
+            else _required_field(sample, dataset_config, "reference_field")
+        )
+        source = _generation_input(sample, dataset_config) if generate_only else sample
+        media = _input_media(source, dataset_config)
+        payload = builder(source, dataset_file, model, dataset_config)
     except (OSError, TypeError, ValueError, KeyError) as exc:
         return _error_result(case_id, sample, None, None, [], exc)
     payload.setdefault("model", model)
@@ -694,7 +715,9 @@ def _evaluate_case(
     try:
         evaluation_latency = 0.0
         evaluation = _validate_evaluation(
-            _agent_rubric_evaluation(reference, prediction, evaluation_config)
+            {"passed": False, "overall_score": 0, "rubric_results": []}
+            if generate_only
+            else _agent_rubric_evaluation(reference, prediction, evaluation_config)
         )
     except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
         return _error_result(
@@ -1662,6 +1685,7 @@ def evaluate_inference(
     max_retries: int = 3,
     limit: int = 0,
     business_scoring: dict[str, Any] | None = None,
+    frozen_reward: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute frozen rubrics, preserving predictions across identical runs."""
     if not run_id:
@@ -1675,7 +1699,8 @@ def evaluate_inference(
     evaluation = _json_object(evaluation_config_json, "evaluation config")
     if evaluation.get("mode") != _AGENT_RUBRIC_MODE:
         raise ValueError("only agent_rubric evaluation is supported")
-    _configured_rubrics(evaluation)
+    if frozen_reward is None:
+        _configured_rubrics(evaluation)
     rows = _load_jsonl(dataset_file)
     if limit:
         rows = rows[:limit]
@@ -1686,6 +1711,42 @@ def evaluate_inference(
         raise ValueError("dataset case IDs must be unique")
     business_cases = {}
     business_module = None
+    scoring_spec = {}
+    builder = _default_request
+    if frozen_reward is not None:
+        from evaluate_predictions import stable_case
+        from frozen_reward import load_reward
+
+        if business_scoring is not None:
+            raise ValueError("multiple scorers configured")
+        if test_source := frozen_reward.get("test_source"):
+            if limit or _file_digest(dataset_file) != test_source["sha256"]:
+                raise ValueError("final test must use the complete frozen test dataset")
+        business_module, scoring_spec, task_prompt = load_reward(frozen_reward)
+
+        def builder(sample, dataset, model_name, mapping):
+            request = _default_request(sample, dataset, model_name, mapping)
+            request["messages"] = [
+                {"role": "system", "content": task_prompt},
+                *(
+                    {"role": "user", "content": message["content"]}
+                    for message in request["messages"]
+                    if message["role"] == "user"
+                ),
+            ]
+            if len(request["messages"]) == 1:
+                raise ValueError("Reward generation requires user input")
+            return request
+
+        for identity, raw in zip(ids, rows, strict=True):
+            case = stable_case(
+                raw,
+                business_module,
+                {"source": "test" if test_source else "evaluation"},
+            )
+            if case["id"] != identity:
+                raise ValueError("dataset mapping and frozen Reward disagree on IDs")
+            business_cases[identity] = case
     if business_scoring is not None:
         import types
 
@@ -1702,7 +1763,8 @@ def evaluate_inference(
             compile(business_scoring["script"], "score_eval.py", "exec"),
             business_module.__dict__,
         )
-        validate_script(business_module, business_scoring["spec"])
+        scoring_spec = business_scoring["spec"]
+        validate_script(business_module, scoring_spec)
         for identity, raw in zip(ids, rows, strict=True):
             case = stable_case(raw, business_module, {"source": "test"})
             if case["id"] != identity:
@@ -1712,7 +1774,9 @@ def evaluate_inference(
             business_cases[identity] = case
     media_digests = {}
     for row in rows:
-        for value in _input_media(row, config):
+        for value in _input_media(
+            _generation_input(row, config) if frozen_reward is not None else row, config
+        ):
             if value.startswith(("http://", "https://")):
                 raise ValueError("evaluation media must be frozen Storage files")
             if not value.startswith("data:"):
@@ -1722,7 +1786,11 @@ def evaluate_inference(
         "schema_version": 1,
         "run_id": run_id,
         "evaluation_config_sha256": _config_digest(
-            business_scoring["spec"] if business_scoring else evaluation
+            frozen_reward["manifest_sha256"]
+            if frozen_reward is not None
+            else business_scoring["spec"]
+            if business_scoring
+            else evaluation
         ),
         "dataset_sha256": _file_digest(dataset_file),
         "media_sha256": media_digests,
@@ -1741,6 +1809,16 @@ def evaluate_inference(
             "max_retries": max_retries,
             "limit": limit,
         },
+        **(
+            {
+                "reward_manifest_sha256": frozen_reward["manifest_sha256"],
+                "dataset_role": "test"
+                if frozen_reward.get("test_source")
+                else "validation",
+            }
+            if frozen_reward is not None
+            else {}
+        ),
         **(
             {"business_scoring": business_scoring, "dataset_role": "test"}
             if business_scoring is not None
@@ -1762,7 +1840,9 @@ def evaluate_inference(
         else {}
     )
     reused = {
-        key: _rescore(completed[key], evaluation)
+        key: completed[key]
+        if frozen_reward is not None
+        else _rescore(completed[key], evaluation)
         for key in ids
         if _has_reusable_prediction(completed.get(key))
     }
@@ -1814,7 +1894,6 @@ def evaluate_inference(
 
     _write_jsonl(output / "processed.jsonl", list(reused.values()))
     write_progress()
-    builder = _default_request
     endpoint_url = _chat_completions_endpoint(endpoint)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
@@ -1834,6 +1913,7 @@ def evaluate_inference(
                 timeout_seconds,
                 max_retries,
                 record_request,
+                **({"generate_only": True} if frozen_reward is not None else {}),
             )
             for index, row in pending
         ]
@@ -1847,18 +1927,21 @@ def evaluate_inference(
                     os.fsync(stream.fileno())
             write_progress()
     results = [completed[key] for key in ids]
-    if business_module is not None and business_scoring is not None:
+    if business_module is not None:
         from evaluate_predictions import score
 
         rescored = []
         for row in results:
+            if frozen_reward is not None and row.get("error"):
+                rescored.append(row)
+                continue
             case = {
                 **business_cases[row["id"]],
                 "prediction": None if row.get("error") else row["prediction"],
                 "media": row.get("media", []),
                 "sample": row.get("sample", {}),
             }
-            result = score(case, business_module, business_scoring["spec"])
+            result = score(case, business_module, scoring_spec)
             rescored.append(
                 {
                     **row,
@@ -1877,7 +1960,7 @@ def evaluate_inference(
             "dataset_path": str(dataset_file),
             "evaluation_mode": "agent_rubric",
         },
-        [] if business_scoring else _configured_rubrics(evaluation),
+        [] if business_module is not None else _configured_rubrics(evaluation),
     )
     metrics.update(
         {
@@ -1911,7 +1994,7 @@ def evaluate_inference(
         output,
         run_id,
         manifest["evaluation_config_sha256"],
-        [] if business_scoring else _configured_rubrics(evaluation),
+        [] if business_module is not None else _configured_rubrics(evaluation),
         report_spec_json,
         report_assets_dir,
     )
@@ -2032,9 +2115,12 @@ def main() -> None:
     parser.add_argument("--report-spec")
     parser.add_argument("--report-assets-dir")
     parser.add_argument("--business-scoring")
+    parser.add_argument("--frozen-reward")
     args = parser.parse_args()
     output = Path(args.output_dir)
     try:
+        if args.report_assets_dir and (args.frozen_reward or args.business_scoring):
+            sys.path.insert(0, args.report_assets_dir)
         config = json.loads(Path(args.evaluation_config).read_text())
         result = evaluate_inference(
             endpoint=args.endpoint,
@@ -2046,6 +2132,11 @@ def main() -> None:
             evaluation_config_json=json.dumps(config),
             run_id=args.run_id,
             report_assets_dir=args.report_assets_dir,
+            frozen_reward=(
+                json.loads(Path(args.frozen_reward).read_text())
+                if args.frozen_reward
+                else None
+            ),
             business_scoring=(
                 json.loads(Path(args.business_scoring).read_text())
                 if args.business_scoring
