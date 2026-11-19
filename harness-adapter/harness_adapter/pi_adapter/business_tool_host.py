@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from harness_adapter.pi_adapter.business_tools import (
+    ProjectRewardReader,
     execute_validation_tool,
     validation_tool_spec,
 )
@@ -94,7 +95,9 @@ from pyromind_common.tools.workflow.validate_workflow_dsl import (
 from pyromind_common.tools.workflow_debug import WorkflowDebugTool
 from pyromind_common.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.reward_bundle import GET_PROJECT_REWARD
 from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskOrigin
 from pyromind_runtime.domain.versions import VersionToolRequest
@@ -232,6 +235,7 @@ class ToolExecutionContext:
     model_configuration: dict[str, Any]
     extra: dict[str, Any] = field(default_factory=dict)
     workspace: BaseWorkspace | None = None
+    evaluation_reward: JsonObject | None = None
 
 
 def _workflow_storage_path(context: ToolExecutionContext, workflow_path: str) -> str:
@@ -390,6 +394,10 @@ class PyromindBusinessToolHost:
         self.version_call: VersionCall | None = None
         self.training_artifact_hook: Callable[..., Awaitable[int]] | None = None
         self.execution_call: ExecutionCall | None = None
+        self.project_reward: ProjectRewardReader | None = None
+        self.evaluation_reward: (
+            Callable[[str, RequestContext], Awaitable[JsonObject | None]] | None
+        ) = None
         self._workflow_preparer: Callable[..., Awaitable[dict[str, Any]]] | None = None
         for path in (
             self._cleaning_runtime,
@@ -498,6 +506,14 @@ class PyromindBusinessToolHost:
         host-side presigned upload tool.
         """
         specs = [validation_tool_spec()]
+        if self.project_reward is not None:
+            specs.append(
+                BusinessToolSpec(
+                    GET_PROJECT_REWARD,
+                    "Get the Project's frozen Reward bundle and Studio entry.",
+                    {"type": "object", "properties": {}, "additionalProperties": False},
+                ).as_dict()
+            )
         if self.version_call is not None:
             specs.append(
                 BusinessToolSpec(
@@ -650,13 +666,38 @@ class PyromindBusinessToolHost:
                     content=[{"type": "text", "text": str(exc)}],
                     details={"error": str(exc)},
                 ).as_dict()
+        if name == GET_PROJECT_REWARD:
+            if self.project_reward is None:
+                raise ValueError("Project reward lookup is unavailable")
+            if arguments:
+                raise ValueError("Project reward lookup accepts no arguments")
+            reward = await self.project_reward(
+                context.conversation_id, context.request_context
+            )
+            details = {
+                "reward_bundle": reward.model_dump(mode="json") if reward else None,
+                "studio_entry": reward.studio_entry if reward else None,
+            }
+            return BusinessToolResult(
+                is_error=False,
+                content=[{"type": "text", "text": json.dumps(details)}],
+                details=details,
+            ).as_dict()
         if name == "validate_workflow_dsl":
             policy = ToolOutputPolicy()
             policy_source = "platform_default"
+            reward = (
+                await self.project_reward(
+                    context.conversation_id, context.request_context
+                )
+                if self.project_reward is not None
+                else None
+            )
             raw = await execute_validation_tool(
                 context.workspace or LocalWorkspace(working_dir=context.workspace_root),
                 arguments,
                 context.request_context,
+                **({"reward": reward} if reward is not None else {}),
             )
             response = await self._finalize_result(
                 BusinessToolResult(
@@ -701,6 +742,13 @@ class PyromindBusinessToolHost:
         factory = self._factories.get(name)
         if factory is None:
             raise ValueError(f"unsupported business tool: {name}")
+        if name == DfSubmitEvaluationTool.name and self.evaluation_reward is not None:
+            context = replace(
+                context,
+                evaluation_reward=await self.evaluation_reward(
+                    context.conversation_id, context.request_context
+                ),
+            )
         tool = factory(context)
         if (
             self.execution_call is not None
@@ -1124,6 +1172,7 @@ class PyromindBusinessToolHost:
                     if context.request_context.authorization
                     else None,
                 ),
+                evaluation_reward=context.evaluation_reward,
             )
         return params
 

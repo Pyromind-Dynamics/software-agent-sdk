@@ -73,8 +73,8 @@ def preflight_scoring(workspace: Any, runtime_dir: Path, definition: dict) -> No
 class PredictionEvaluationOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_manifest_path: str = Field(min_length=1)
-    scoring_spec_path: str = Field(min_length=1)
-    scoring_script_path: str = Field(min_length=1)
+    scoring_spec_path: str | None = Field(default=None, min_length=1)
+    scoring_script_path: str | None = Field(default=None, min_length=1)
 
 
 def prepare_definition(
@@ -85,31 +85,42 @@ def prepare_definition(
     input_path: str,
     cpu: int,
     memory: int,
+    evaluation_reward: dict | None = None,
 ) -> dict[str, Any]:
     from pyromind_common.tools.data_preparation.inference import storage_path
 
     manifest = json.loads(files.read_text(options.source_manifest_path))
-    spec = json.loads(files.read_text(options.scoring_spec_path))
-    script = files.read_text(options.scoring_script_path)
-    if not isinstance(manifest, dict) or not isinstance(spec, dict):
-        raise ValueError("manifest and scoring spec must be JSON objects")
-    if (
-        not isinstance(spec.get("business_rule"), str)
-        or not spec["business_rule"].strip()
-    ):
-        raise ValueError("scoring_spec.business_rule must state the confirmed rule")
-    if (
-        not isinstance(spec.get("validation_examples"), list)
-        or not spec["validation_examples"]
-    ):
-        raise ValueError("scoring_spec.validation_examples is required")
-    functions = {
-        node.name
-        for node in ast.parse(script).body
-        if isinstance(node, ast.FunctionDef)
-    }
-    if not {"parse_record", "score_case"} <= functions:
-        raise ValueError("script must define parse_record and score_case")
+    if not isinstance(manifest, dict):
+        raise ValueError("source manifest must be a JSON object")
+    scoring = {}
+    if evaluation_reward is not None:
+        if options.scoring_spec_path or options.scoring_script_path:
+            raise ValueError("this Project uses its frozen Reward for scoring")
+        scoring = {"frozen_reward": evaluation_reward}
+    else:
+        if not options.scoring_spec_path or not options.scoring_script_path:
+            raise ValueError("score requires scoring_spec_path and scoring_script_path")
+        spec = json.loads(files.read_text(options.scoring_spec_path))
+        script = files.read_text(options.scoring_script_path)
+        if (
+            not isinstance(spec, dict)
+            or not isinstance(spec.get("business_rule"), str)
+            or not spec["business_rule"].strip()
+        ):
+            raise ValueError("scoring_spec.business_rule must state the confirmed rule")
+        if (
+            not isinstance(spec.get("validation_examples"), list)
+            or not spec["validation_examples"]
+        ):
+            raise ValueError("scoring_spec.validation_examples is required")
+        functions = {
+            node.name
+            for node in ast.parse(script).body
+            if isinstance(node, ast.FunctionDef)
+        }
+        if not {"parse_record", "score_case"} <= functions:
+            raise ValueError("script must define parse_record and score_case")
+        scoring = {"scoring_spec": spec, "scoring_script": script}
     entries = manifest.get("evaluations", [])
     if not entries or not isinstance(entries, list):
         raise ValueError("source manifest requires evaluations")
@@ -132,6 +143,10 @@ def prepare_definition(
             # Explicit baseline entries are independently identifiable sources.
             if entry.get("role") != "baseline":
                 raise ValueError("evaluation filename must match its step")
+        if evaluation_reward is not None and entry.get("dataset_role") == "test":
+            raise ValueError(
+                "held-out evaluation requires the validation-selected checkpoint"
+            )
         if entry.get("dataset_role", "validation") not in {
             "validation",
             "test",
@@ -151,8 +166,7 @@ def prepare_definition(
     return {
         "kind": "prediction_evaluation",
         "source_manifest": manifest,
-        "scoring_spec": spec,
-        "scoring_script": script,
+        **scoring,
         "input_path": storage_path(input_path),
         "dataset_config": {},
         "evaluation_config": {},

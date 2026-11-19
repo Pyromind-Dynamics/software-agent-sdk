@@ -54,6 +54,7 @@ export interface BusinessToolConfig {
   name: string;
   description: string;
   inputSchema: JsonObject;
+  interactive?: boolean;
 }
 
 export interface SkillRootConfig {
@@ -307,7 +308,11 @@ function createSandboxLaneTools(
   const terminal = createTerminalTool(sandboxCwd, {
     operations: access.operations,
     exposeSessionEnvironment: false,
-    spawnHook: ({ command }) => ({ command, cwd: sandboxCwd, env: options.terminalEnvironment ?? {} }),
+    spawnHook: ({ command }) => ({
+      command,
+      cwd: sandboxCwd,
+      env: { ...options.terminalEnvironment, PYTHONDONTWRITEBYTECODE: "1" },
+    }),
   });
   return [
     bindPathTool(

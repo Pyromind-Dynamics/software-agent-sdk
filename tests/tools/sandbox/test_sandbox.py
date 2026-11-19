@@ -307,16 +307,18 @@ def test_sandbox_create_uses_default_image_for_regional_cluster(
     assert client.sandboxes.create.call_args[0][0].image == expected_image
 
 
+@pytest.mark.parametrize("route", ["us-west-1#pre", "us-west-2"])
 def test_sandbox_create_other_cluster_default_image(
     monkeypatch: pytest.MonkeyPatch,
+    route: str,
 ) -> None:
     client = MagicMock()
     client.sandboxes.create.return_value = _sandbox(status="creating")
     _patch_client(monkeypatch, client)
 
-    observation = SandboxCreateExecutor(**_executor_kwargs(cluster="us-west-1"))(
-        SandboxCreateAction(wait_timeout=0), _fake_conversation()
-    )
+    observation = SandboxCreateExecutor(
+        **_executor_kwargs(headers={"x-cluster": route})
+    )(SandboxCreateAction(wait_timeout=0), _fake_conversation())
 
     assert not observation.is_error
     assert (

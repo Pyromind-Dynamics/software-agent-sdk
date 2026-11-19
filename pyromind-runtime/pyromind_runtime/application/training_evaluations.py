@@ -46,16 +46,25 @@ class TrainingEvaluations:
         if definition.get("kind") != "prediction_evaluation":
             raise ValueError("not a prediction evaluation batch")
         manifest = cast(dict[str, Any], definition["source_manifest"])
-        spec = cast(dict[str, Any], definition["scoring_spec"])
-        assert isinstance(manifest, dict) and isinstance(spec, dict)
+        reward = definition.get("frozen_reward")
         batch = json.loads(self.storage.read(parent.output_dir + "/batch_result.json"))
-        if (
-            batch.get("run_id") != run_id
-            or batch.get("source_manifest_sha256") != digest(manifest)
-            or batch.get("scoring_spec_sha256") != digest(spec)
-            or batch.get("script_sha256")
-            != hashlib.sha256(str(definition["scoring_script"]).encode()).hexdigest()
-        ):
+        if isinstance(reward, dict):
+            spec = {"business_rule": "Project Reward " + str(reward["manifest_sha256"])}
+            if batch.get("reward_manifest_sha256") != reward["manifest_sha256"]:
+                raise ValueError("scoring worker did not attest the frozen Reward")
+        else:
+            spec = cast(dict[str, Any], definition["scoring_spec"])
+            if (
+                batch.get("scoring_spec_sha256") != digest(spec)
+                or batch.get("script_sha256")
+                != hashlib.sha256(
+                    str(definition["scoring_script"]).encode()
+                ).hexdigest()
+            ):
+                raise ValueError("batch scoring does not match the frozen run")
+        if batch.get("run_id") != run_id or batch.get(
+            "source_manifest_sha256"
+        ) != digest(manifest):
             raise ValueError("batch provenance does not match the frozen run")
         steps = [StepEvaluation.model_validate(value) for value in batch["steps"]]
         expected_steps = [entry["step"] for entry in manifest["evaluations"]]
@@ -142,10 +151,17 @@ class TrainingEvaluations:
                     "selection": run.result,
                     "iteration_context_path": run.output_dir
                     + "/iteration_context.json",
-                    "same_scoring_spec": digest(run.definition.get("scoring_spec"))
-                    == digest(spec),
-                    "same_scoring_script": run.definition.get("scoring_script")
-                    == definition["scoring_script"],
+                    "same_scoring_spec": (
+                        run.definition.get("frozen_reward") == reward
+                        if reward
+                        else digest(run.definition.get("scoring_spec")) == digest(spec)
+                    ),
+                    "same_scoring_script": (
+                        run.definition.get("frozen_reward") == reward
+                        if reward
+                        else run.definition.get("scoring_script")
+                        == definition.get("scoring_script")
+                    ),
                 }
                 for run in runs.values()
                 if run.definition.get("kind") == "prediction_evaluation"

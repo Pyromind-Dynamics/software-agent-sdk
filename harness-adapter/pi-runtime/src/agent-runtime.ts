@@ -127,7 +127,12 @@ export class PiAgentRuntime {
     const { session, sessionId, execution, subagents, recorder } = await createPiSession(
       params,
       this.peer,
-      { ...this.sessionOptions, ...(askUserTool ? { askUserTool } : {}),
+      { ...this.sessionOptions, ...(askUserTool ? {
+          askUserTool,
+          createInteractiveTool: (tool) => createAskUserTool(
+            this.peer, tool, this.userInput, () => !this.stageRunning(), undefined, tool.name,
+          ),
+        } : {}),
         onRepetitionDetected: () => this.suspendRepetitiveGeneration(),
         automaticTurnsSuspended: () => this.executionSuspended || this.cancelling,
         onSubagentWake: (text) => this.subagentWakeTexts.add(text),

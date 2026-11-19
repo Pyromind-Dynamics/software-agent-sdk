@@ -33,7 +33,12 @@ class VersionStore(Protocol):
     def get_version(self, project_id: str, version_id: str) -> ArtifactVersion: ...
 
     def reserve_version(
-        self, project: VersionProject, key: str, request: SaveVersion
+        self,
+        project: VersionProject,
+        key: str,
+        request: SaveVersion,
+        *,
+        published: SnapshotResult | None = None,
     ) -> ArtifactVersion: ...
 
     def complete_version(

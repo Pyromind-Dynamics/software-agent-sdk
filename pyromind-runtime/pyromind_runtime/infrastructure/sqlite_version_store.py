@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -217,9 +217,16 @@ class SQLiteVersionStore:
             ]
 
     def reserve_version(
-        self, project: VersionProject, key: str, request: SaveVersion
+        self,
+        project: VersionProject,
+        key: str,
+        request: SaveVersion,
+        *,
+        published: SnapshotResult | None = None,
     ) -> ArtifactVersion:
         value = request.model_dump(mode="json")
+        if published is not None:
+            value["published"] = published.model_dump(mode="json")
         check_persistable(value)
         digest = fingerprint(value)
         with self.connection(write=True) as db:
@@ -258,6 +265,20 @@ class SQLiteVersionStore:
                 (project.id, request.kind, request.logical_key),
             ).fetchone()[0]
             identity = self._next_id(db, "v")
+            target = (
+                f"/.pyromind-agent/{project.conversation_id}/versions/"
+                f"{identity}/{new_id()}"
+            )
+            if published is not None:
+                if (
+                    published.reference_only
+                    or not published.digest
+                    or not published.manifest_ref
+                ):
+                    raise ValueError("registration requires a published snapshot")
+                target = str(PurePosixPath(published.manifest_ref).parent)
+                if not published.storage_ref.startswith(target + "/"):
+                    raise ValueError("published snapshot content is outside its target")
             version = ArtifactVersion(
                 id=identity,
                 project_id=project.id,
@@ -266,15 +287,16 @@ class SQLiteVersionStore:
                 logical_key=request.logical_key,
                 version_no=number,
                 registration_key=key,
+                state="ready" if published else "pending",
                 manifest=VersionManifest(
+                    storage_ref=published.storage_ref if published else None,
+                    manifest_ref=published.manifest_ref if published else None,
+                    digest=published.digest if published else None,
                     parents=request.parents,
                     output_role=request.output_role,
                     summary=request.summary,
                     source=request.source,
-                    target=(
-                        f"/.pyromind-agent/{project.conversation_id}/versions/"
-                        f"{identity}/{new_id()}"
-                    ),
+                    target=target,
                     request_digest=digest,
                 ),
             )
@@ -324,7 +346,11 @@ class SQLiteVersionStore:
                     "digest": result.digest,
                     "error": None,
                     "source": version.manifest.source.model_copy(
-                        update={"text": None, "storage_ref": result.storage_ref}
+                        update={
+                            "text": None,
+                            "files": None,
+                            "storage_ref": result.storage_ref,
+                        }
                     ),
                 }
             )

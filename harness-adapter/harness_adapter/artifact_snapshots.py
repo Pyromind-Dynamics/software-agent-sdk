@@ -60,7 +60,7 @@ class PlatformArtifactSnapshots:
         if receipt.exists():
             result = SnapshotResult.model_validate_json(receipt.read_text())
             self.staging.verify(result, context)
-        elif source.text is not None:
+        elif source.text is not None or source.files is not None:
             result = self.staging.save(source, target, context)
         else:
             assert source.storage_ref is not None

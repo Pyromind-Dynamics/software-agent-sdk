@@ -132,6 +132,20 @@ test("this conversation's own tool staging stays readable under the mount", () =
   );
 });
 
+test("delegated lanes can read their conversation's prepared artifacts", () => {
+  const delegated = policy({
+    conversationRoot: WORKSPACE,
+    workspacePath: `${WORKSPACE}/public_data/experiment-runs/run-1`,
+  });
+  const entry = `${WORKSPACE}/prepared/receipt/content/reward.py`;
+  assert.equal(delegated.resolvePath(entry, "read"), entry);
+  assert.throws(() => delegated.resolvePath(entry, "write"), /PATH_SCOPE_ERROR/);
+  assert.throws(
+    () => delegated.resolvePath("/workspace/.pyromind-agent/conv-2/prepared/reward.py", "read"),
+    /another conversation/,
+  );
+});
+
 test("sandbox paths reject writes outside public_data", () => {
   for (const target of [
     "product/report.json",

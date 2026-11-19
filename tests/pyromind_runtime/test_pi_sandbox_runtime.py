@@ -10,6 +10,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pyromind_sdk.client.models import (
+    ResourceConfig,
+    SandboxRequest,
+    SandboxResponse,
+    SandboxType,
+    VolumeMount,
+)
+
 from harness_adapter.pi_adapter.adapter import PiAdapter, _PiSession
 from harness_adapter.pi_adapter.business_tool_host import ToolExecutionContext
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
@@ -28,13 +36,6 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
 )
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_sdk.client.models import (
-    ResourceConfig,
-    SandboxRequest,
-    SandboxResponse,
-    SandboxType,
-    VolumeMount,
-)
 
 
 class _FakeSandboxClient:
@@ -320,9 +321,12 @@ def test_create_uses_cluster_default_or_explicit_image(cluster: str, image: str 
 
 
 def test_ensure_creates_and_prepares_a_sandbox(
-    tmp_path: Path, files: PiSessionFiles, monkeypatch
+    tmp_path: Path,
+    files: PiSessionFiles,
+    monkeypatch,
 ) -> None:
     client = _FakeSandboxClient()
+    monkeypatch.setenv("PYROMIND_SANDBOX_IMAGE", "registry.test/configured:latest")
     commands: list[str] = []
     monkeypatch.setattr(
         "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
@@ -338,13 +342,19 @@ def test_ensure_creates_and_prepares_a_sandbox(
 
     assert client.lifecycle_calls == ["create:running"]
     assert client.requests[0].sandbox_type is SandboxType.CUSTOM
+    assert client.requests[0].image == "registry.test/configured:latest"
     assert client.requests[0].resources == ResourceConfig(cpu="4", memory="8Gi")
     assert client.requests[0].volume_mounts == [
         VolumeMount(
             host_path=STORAGE_HOST_PATH,
             mount_path=DEFAULT_MOUNT_PATH,
             read_only=False,
-        )
+        ),
+        VolumeMount(
+            host_path=f"{STORAGE_HOST_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1/prepared",
+            mount_path=f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1/prepared",
+            read_only=True,
+        ),
     ]
     assert endpoint == {
         "base_url": "https://pre-api.pyromind.ai/api/v1",
@@ -353,7 +363,7 @@ def test_ensure_creates_and_prepares_a_sandbox(
         "api_key": "access-key",
         "workspace_path": f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1",
         "storage_path": DEFAULT_MOUNT_PATH,
-        "cluster": "us-west-1",
+        "cluster": client.cluster,
     }
     # The TTY bridge echoes the command line, so the script must be shipped as a
     # file and the command itself must stay free of markers.
@@ -731,7 +741,12 @@ def test_ensure_recreates_a_sandbox_recorded_without_the_storage_mount(
             host_path=STORAGE_HOST_PATH,
             mount_path=DEFAULT_MOUNT_PATH,
             read_only=False,
-        )
+        ),
+        VolumeMount(
+            host_path=f"{STORAGE_HOST_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1/prepared",
+            mount_path=f"{DEFAULT_MOUNT_PATH}{PYROMIND_AGENT_STORAGE_ROOT}/conv-1/prepared",
+            read_only=True,
+        ),
     ]
 
 

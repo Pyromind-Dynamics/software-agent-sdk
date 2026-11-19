@@ -98,10 +98,16 @@ def ready_request():
     )
 
 
-def test_only_plan_submission_is_exposed():
+def test_plan_submission_schema():
     assert set(PREPARATION_TOOLS) == {"set_preparation_plan"}
     schema = SetPreparationPlan.model_json_schema()
-    assert set(schema["properties"]) == {"plan", "entry_task_id"}
+    assert set(schema["properties"]) == {
+        "plan",
+        "entry_task_id",
+        "training_method",
+        "reward_approval_id",
+    }
+    assert {"training_method", "reward_approval_id"}.isdisjoint(schema["required"])
     assert {"goal", "stages", "tasks"} <= set(
         schema["$defs"]["ExperimentContext"]["required"]
     )

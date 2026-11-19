@@ -88,6 +88,7 @@ export interface PiSessionOptions {
   terminalConnect?: SandboxTerminalConnector;
   /** The runner-local ask_user tool, present only for input-enabled sessions. */
   askUserTool?: AgentTool;
+  createInteractiveTool?: (tool: BusinessToolConfig) => AgentTool;
 }
 
 const DEFAULT_MODEL_MAX_RETRIES = 2;
@@ -297,10 +298,15 @@ export async function createPiSession(
     config.skillRoots,
     config.knowledgeRoot,
     config.resourceLimits,
-    config.tools,
+    config.tools.filter(tool => !tool.interactive),
     options,
   );
   if (sessionOptions.askUserTool) rawTools.push(sessionOptions.askUserTool);
+  for (const tool of config.tools.filter(tool => tool.interactive)) {
+    if (sessionOptions.createInteractiveTool) {
+      rawTools.push(sessionOptions.createInteractiveTool(tool));
+    }
+  }
   if (!executionAccess) throw new Error("execution environment was not initialized");
   const coordinator = new ToolCoordinator();
   const mainTerminal = new ToolCoordinator();
@@ -670,6 +676,7 @@ function parseTools(value: JsonValue | undefined): BusinessToolConfig[] {
       name: requiredString(item, "name"),
       description: requiredString(item, "description"),
       inputSchema: record(item, "input_schema") as JsonObject,
+      ...(item.interactive === true ? { interactive: true } : {}),
     };
   });
 }

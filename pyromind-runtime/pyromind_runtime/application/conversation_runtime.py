@@ -42,6 +42,17 @@ from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
 )
+from pyromind_runtime.application.reward_reviews import (
+    load_reward_candidate,
+    new_approval_id,
+    prepare_reward_snapshot,
+    reward_target,
+    same_reward,
+)
+from pyromind_runtime.application.reward_workflows import (
+    training_workflow,
+    validate_reward_workflow,
+)
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
 from pyromind_runtime.application.versions import Versions
@@ -79,10 +90,21 @@ from pyromind_runtime.domain.experiment_plans import (
 from pyromind_runtime.domain.experiments import ExperimentCatalog, ExperimentMetric
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import (
+    PREPARATION_REVIEW_TOOLS,
     PREPARATION_TOOLS,
     PreparationView,
     ProjectView,
     SetPreparationPlan,
+)
+from pyromind_runtime.domain.reward_bundle import (
+    APPROVE_REWARD,
+    MAX_REWARD_FILE_BYTES,
+    REWARD_BUNDLE_KEY,
+    REWARD_QUESTION_ID,
+    START_REWARD_REVIEW,
+    RewardBundle,
+    RewardReview,
+    StartRewardReview,
 )
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
@@ -95,8 +117,10 @@ from pyromind_runtime.domain.snapshot import (
 )
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.training_evaluation import CheckpointArtifact
+from pyromind_runtime.domain.user_input import PendingUserInput, PreparedUserInput
 from pyromind_runtime.domain.versions import (
     RunSource,
+    RunSpec,
     SaveVersion,
     SnapshotSource,
     VersionToolRequest,
@@ -508,6 +532,182 @@ class ConversationRuntime:
             conversation_id, tool_name, arguments, context
         )
 
+    async def preparation_review(
+        self,
+        conversation_id: str,
+        tool_name: str,
+        arguments: JsonObject,
+        request_id: str,
+        context: RequestContext,
+    ) -> PreparedUserInput:
+        owner = self._preparation_owner(conversation_id, context)
+        store = self._store(conversation_id)
+        if tool_name not in PREPARATION_REVIEW_TOOLS or not store.permits_tool(
+            tool_name
+        ):
+            raise PermissionError("preparation review tool is not enabled")
+        assert self._preparations is not None
+        current = await self._plan_io(self._preparations.store.get, owner)
+        if current.project_id:
+            raise ValueError("preparation is already activated")
+        if self.versions is None:
+            raise ValueError("Reward snapshot storage is unavailable")
+        cluster = self._project_cluster(context)
+
+        async def read(path: str) -> str | None:
+            return await self.read_workspace_text(
+                conversation_id, path, context, max_bytes=MAX_REWARD_FILE_BYTES
+            )
+
+        request = StartRewardReview.model_validate(arguments)
+        files = await load_reward_candidate(request, read)
+        for text in (*files.values(), request.requirements):
+            for credential in (context.cookie, context.authorization):
+                if credential and credential in text:
+                    raise ValueError(
+                        "request credentials cannot be included in a Reward bundle"
+                    )
+        source, digest, card = prepare_reward_snapshot(request, files)
+        if same_reward(current.approved_reward, cluster, digest):
+            assert current.approved_reward is not None
+            await asyncio.to_thread(
+                self.versions.snapshots.verify,
+                current.approved_reward.snapshot,
+                context,
+            )
+            return PreparedUserInput(
+                accept_option_id=APPROVE_REWARD,
+                accepted_result={"approval_id": current.approved_reward.approval_id},
+            )
+        if (
+            current.reward_review is not None
+            and current.reward_review.request_id == request_id
+        ):
+            candidate = current.reward_review.bundle
+            if not same_reward(candidate, cluster, digest):
+                raise ValueError(
+                    "review request already used for a different Reward candidate"
+                )
+            await asyncio.to_thread(
+                self.versions.snapshots.verify, candidate.snapshot, context
+            )
+            return PreparedUserInput(
+                request=card,
+                accept_option_id=APPROVE_REWARD,
+                accepted_result={"approval_id": candidate.approval_id},
+            )
+        snapshot = await asyncio.to_thread(
+            self.versions.snapshots.save,
+            source,
+            reward_target(conversation_id, cluster, digest),
+            context,
+        )
+        bundle = RewardBundle(
+            approval_id=new_approval_id(),
+            manifest_digest=digest,
+            snapshot=snapshot,
+            cluster=cluster,
+            verified_studio_entry=True,
+        )
+        updated = current.model_copy(
+            update={
+                "training_method": "rubric_rl",
+                "reward_review": RewardReview(request_id=request_id, bundle=bundle),
+                "approved_reward": None,
+                "reward_approval_id": None,
+                "phase": "planning" if current.plan else "collecting",
+                "review_pending": True,
+            }
+        )
+        await self._plan_io(
+            self._preparations.store.save, owner, updated, current.revision
+        )
+        self._notify_preparation(conversation_id, "preparation.changed")
+        return PreparedUserInput(
+            request=card,
+            accept_option_id=APPROVE_REWARD,
+            accepted_result={"approval_id": bundle.approval_id},
+        )
+
+    async def _approve_reward_review(
+        self,
+        conversation_id: str,
+        command: InputResponseCommand,
+        pending: PendingUserInput,
+        context: RequestContext,
+    ) -> None:
+        if not any(
+            answer.question_id == REWARD_QUESTION_ID
+            and answer.option_id == APPROVE_REWARD
+            for answer in command.answers
+        ) or not self._store(conversation_id).permits_tool(START_REWARD_REVIEW):
+            return
+        owner = self._preparation_owner(conversation_id, context)
+        assert self._preparations is not None
+        state = await self._plan_io(self._preparations.store.get, owner)
+        review = state.reward_review
+        if review is None or review.request_id != pending.request_id:
+            return
+        if review.bundle.cluster != context.x_cluster:
+            raise UserInputValidationError("Reward review belongs to another cluster.")
+        if self.versions is None:
+            raise ProductRuntimeError(
+                "reward_review_unavailable", "Reward storage is unavailable."
+            )
+        try:
+            await asyncio.to_thread(
+                self.versions.snapshots.verify, review.bundle.snapshot, context
+            )
+        except Exception as exc:
+            raise ProductRuntimeError(
+                "reward_review_unavailable",
+                "Could not verify the frozen Reward bundle.",
+            ) from exc
+        if not await self._plan_io(
+            self._preparations.store.approve_reward,
+            owner,
+            pending.request_id,
+            review.bundle,
+        ):
+            raise ProductRuntimeError("input_not_pending", "The Reward review changed.")
+
+    def _register_project_reward(
+        self, project: ProjectView, context: RequestContext
+    ) -> None:
+        bundle = project.reward_bundle
+        if bundle is None:
+            return
+        if bundle.cluster != context.x_cluster:
+            raise PermissionError("Reward bundle belongs to another cluster")
+        if self.versions is None:
+            raise ValueError("Reward version storage is unavailable")
+        self.versions.snapshots.verify(bundle.snapshot, context)
+        version_project = self.versions.project(project.conversation_id, context)
+        assert version_project is not None
+        key = f"prepared:{project.project_id}:{bundle.manifest_digest}"
+        run = self.versions.store.reserve_run(
+            version_project.id,
+            key,
+            RunSpec(
+                kind="rubric_calibration",
+                iteration_id=version_project.context.iterations[0].id,
+                parameters={"manifest_digest": bundle.manifest_digest},
+            ),
+            RunSource(kind="preparation", source_id=project.project_id),
+        )
+        self.versions.store.reserve_version(
+            version_project,
+            key,
+            SaveVersion(
+                kind="config",
+                logical_key=REWARD_BUNDLE_KEY,
+                source=SnapshotSource(storage_ref=bundle.snapshot.storage_ref),
+                summary={"manifest_digest": bundle.manifest_digest},
+                producer_run_id=run.id,
+            ),
+            published=bundle.snapshot,
+        )
+
     async def preparation_revision(
         self, conversation_id: str, context: RequestContext
     ) -> int:
@@ -647,6 +847,8 @@ class ConversationRuntime:
                 command.command_id,
                 cluster=cluster,
             )
+            if project.reward_bundle is not None:
+                await asyncio.to_thread(self._register_project_reward, project, context)
             if self._experiment_plan_project_binder is not None:
                 await self._plan_io(
                     self._experiment_plan_project_binder.bind_preparation,
@@ -663,6 +865,15 @@ class ConversationRuntime:
             if store.permits_tool("subagent"):
                 preparation = await self.get_preparation(conversation_id, context)
                 active = self._active[conversation_id]
+                reward = project.reward_bundle
+                reward_context = (
+                    {
+                        "reward_bundle": reward.model_dump(mode="json"),
+                        "reward_studio_entry": reward.studio_entry,
+                    }
+                    if reward is not None
+                    else {}
+                )
                 response = await active.adapter.notify_external_task(
                     active.handle,
                     ExternalTaskNotification(
@@ -684,6 +895,7 @@ class ConversationRuntime:
                                     )
                                     if preparation.entry_task
                                     else None,
+                                    **reward_context,
                                 },
                                 ensure_ascii=False,
                             )
@@ -876,6 +1088,81 @@ class ConversationRuntime:
             archives=archives,
         )
 
+    async def project_reward(
+        self, conversation_id: str, context: RequestContext
+    ) -> RewardBundle | None:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if store.preparation_policy() is None:
+            return None
+        project = await self.get_project(conversation_id, context)
+        bundle = project.reward_bundle if project else None
+        if bundle is not None and bundle.cluster != context.x_cluster:
+            raise PermissionError("Reward bundle belongs to another cluster")
+        return bundle
+
+    async def validate_training_reward(
+        self, conversation_id: str, workflow: JsonObject, context: RequestContext
+    ) -> dict[str, str]:
+        if not training_workflow(workflow):
+            return {}
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if store.preparation_policy() is None:
+            return {}
+        project = await self.get_project(conversation_id, context)
+        if project is None or project.reward_bundle is None:
+            return {}
+        bundle = project.reward_bundle
+        if bundle.cluster != context.x_cluster:
+            raise PermissionError("Reward bundle belongs to another cluster")
+        validate_reward_workflow(workflow, bundle)
+        return {
+            REWARD_BUNDLE_KEY: await self._verified_reward_version(
+                project, bundle, context
+            )
+        }
+
+    async def evaluation_reward(
+        self, conversation_id: str, context: RequestContext
+    ) -> JsonObject | None:
+        bundle = await self.project_reward(conversation_id, context)
+        if bundle is None:
+            return None
+        project = await self.get_project(conversation_id, context)
+        assert project is not None
+        return {
+            "directory": bundle.snapshot.storage_ref,
+            "manifest_sha256": bundle.manifest_digest,
+            "version_id": await self._verified_reward_version(project, bundle, context),
+        }
+
+    async def _verified_reward_version(
+        self, project: ProjectView, bundle: RewardBundle, context: RequestContext
+    ) -> str:
+        if self.versions is None:
+            raise ValueError("Reward version storage is unavailable")
+        ledger = await asyncio.to_thread(
+            self.versions.project, project.conversation_id, context, create=False
+        )
+        if ledger is not None:
+            key = f"prepared:{project.project_id}:{bundle.manifest_digest}"
+            for version in await asyncio.to_thread(
+                self.versions.store.list_versions, ledger.id
+            ):
+                if (
+                    version.registration_key == key
+                    and version.state == "ready"
+                    and version.logical_key == REWARD_BUNDLE_KEY
+                    and version.manifest.storage_ref == bundle.snapshot.storage_ref
+                    and version.manifest.digest == bundle.snapshot.digest
+                ):
+                    await asyncio.to_thread(
+                        self.versions.snapshots.verify, bundle.snapshot, context
+                    )
+                    return version.id
+        raise ValueError("Project Reward version registration is incomplete")
+
     async def submit_versioned_workflow(
         self,
         conversation_id: str,
@@ -929,6 +1216,9 @@ class ConversationRuntime:
             context,
             workflow,
         )
+        reward_inputs = await self.validate_training_reward(
+            conversation_id, effective, context
+        )
         await self._workflow_submission.validate_resources(effective, context)
         record = await asyncio.to_thread(
             self.versions.prepare_run,
@@ -939,6 +1229,7 @@ class ConversationRuntime:
             effective,
             code=code,
             resolved_inputs=resolved_inputs,
+            fixed_inputs=reward_inputs,
         )
         effective = record.spec.parameters["definition"]
         assert isinstance(effective, dict)
@@ -1083,7 +1374,9 @@ class ConversationRuntime:
                                         "complete": True,
                                     }
                                 )
-                        if checkpoint is not None:
+                        if checkpoint is not None or run.definition.get(
+                            "frozen_reward"
+                        ):
                             finalize_inference(
                                 store,
                                 storage_factory(context),
@@ -2313,8 +2606,12 @@ class ConversationRuntime:
             if (
                 current["tool_allowlist"] != development.tool_allowlist
                 or current["skill_allowlist"] != development.skill_allowlist
-            ) and await self.get_project(conversation_id, context) is not None:
-                await self._activate_development_policy(conversation_id, store, context)
+            ):
+                project = await self.get_project(conversation_id, context)
+                if project is not None and project.reward_bundle is None:
+                    await self._activate_development_policy(
+                        conversation_id, store, context
+                    )
         if isinstance(command, CreateProjectCommand):
             if conversation_id not in self._active:
                 await self._user_input.coordinate_recovery(store, conversation_id)
@@ -2513,9 +2810,15 @@ class ConversationRuntime:
             None,
         )
         delegated = pending is not None and pending.task_run_id is not None
+
+        async def before_resolve(validated: PendingUserInput) -> None:
+            await self._approve_reward_review(
+                conversation_id, command, validated, context
+            )
+
         try:
             completed = await self._user_input.submit_response(
-                store, conversation_id, command, receipt
+                store, conversation_id, command, receipt, before_resolve=before_resolve
             )
         except (ProductRuntimeError, UserInputValidationError):
             raise
@@ -2651,6 +2954,9 @@ class ConversationRuntime:
                 context,
                 workflow,
             )
+        reward_inputs = await self.validate_training_reward(
+            conversation_id, workflow, context
+        )
         # 资源通过后才创建正式请求并冻结版本，拒绝不应占用重试标识。
         await self._workflow_submission.validate_resources(workflow, context)
         identity = request_id or uuid4().hex
@@ -2665,6 +2971,7 @@ class ConversationRuntime:
                 workflow,
                 code=source_text if isinstance(source_text, str) else None,
                 resolved_inputs=resolved_inputs,
+                fixed_inputs=reward_inputs,
             )
             effective = version_run.spec.parameters["definition"]
             assert isinstance(effective, dict)

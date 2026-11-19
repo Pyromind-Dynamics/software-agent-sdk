@@ -7,24 +7,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
-from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.application.pipeline_runs import PipelineRuns
-from pyromind_runtime.application.versions import Versions
-from pyromind_runtime.domain.capabilities import ResourceLimits
-from pyromind_runtime.domain.content import JsonObject
-from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.task_correlation import TaskCorrelation
-from pyromind_runtime.domain.versions import VersionToolRequest
-from pyromind_runtime.infrastructure.file_product_store import FileProductStore
-from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIndex
-from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
-from pyromind_runtime.ports.harness import HarnessAdapter
-from pyromind_runtime.ports.workflows import WorkflowEventSink
-
 from pyromind_agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.experiment_plan_projects import (
@@ -38,6 +25,19 @@ from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.workflow_status import set_workflow_status_dispatcher
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.domain.capabilities import ResourceLimits
+from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
+from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
+from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIndex
+from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
+from pyromind_runtime.ports.harness import HarnessAdapter
+from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 
 logger = logging.getLogger(__name__)
@@ -255,8 +255,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         evaluation_storage_factory=build_evaluation_storage,
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
+    pi_adapter.set_project_reward_reader(runtime.project_reward)
+    pi_adapter.set_evaluation_reward_reader(runtime.evaluation_reward)
     pi_adapter.set_preparation_handler(
-        runtime.preparation_call, runtime.preparation_revision
+        runtime.preparation_call,
+        runtime.preparation_revision,
+        runtime.preparation_review,
     )
     logger.info(
         "Pyromind product runtime ready: default_harness=%s "

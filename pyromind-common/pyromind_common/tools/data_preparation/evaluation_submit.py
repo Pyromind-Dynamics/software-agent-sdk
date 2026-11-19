@@ -49,7 +49,7 @@ _PRODUCT_FIELDS = frozenset({"manifest_path", "extraction_script_path"})
 _COMMON_FIELDS = frozenset({"operation", "input_path", "cpu", "memory"})
 _REQUIRED_FIELDS = {
     "inference": ("model_path", "dataset_config_path", "evaluation_config_path"),
-    "score": ("source_manifest_path", "scoring_spec_path", "scoring_script_path"),
+    "score": ("source_manifest_path",),
     "profile": ("manifest_path", "extraction_script_path"),
     "review": ("manifest_path",),
     "report": ("manifest_path",),

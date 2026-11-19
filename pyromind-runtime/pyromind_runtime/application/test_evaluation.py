@@ -49,13 +49,23 @@ def final_test_definition(
         raise ValueError("final test must use the validation-selected checkpoint")
     if definition["evaluation_config"].get("generation", {}).get("limit", 0):
         raise ValueError("final test requires the complete test dataset")
+    parent_reward = parent.definition.get("frozen_reward")
+    if parent_reward != definition.get("frozen_reward"):
+        raise ValueError("final test must use the validation run's frozen Reward")
+    scoring = (
+        {}
+        if parent_reward is not None
+        else {
+            "business_scoring": {
+                "script": parent.definition["scoring_script"],
+                "spec": parent.definition["scoring_spec"],
+                "selection_run_id": selection_id,
+            }
+        }
+    )
     return {
         **definition,
         "dataset_role": "test",
         "test_source": test,
-        "business_scoring": {
-            "script": parent.definition["scoring_script"],
-            "spec": parent.definition["scoring_spec"],
-            "selection_run_id": selection_id,
-        },
+        **scoring,
     }

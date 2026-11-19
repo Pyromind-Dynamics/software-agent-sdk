@@ -15,6 +15,7 @@ from pyromind_runtime.domain.preparation import (
     PreparationState,
     ProjectView,
 )
+from pyromind_runtime.domain.reward_bundle import RewardBundle
 from pyromind_runtime.infrastructure.sql_database import (
     configure_engine,
     insert_if_absent,
@@ -94,6 +95,33 @@ class SQLPreparationStore:
             )
         return PreparationState.model_validate(payload)
 
+    def approve_reward(
+        self, owner: PlanOwner, request_id: str, bundle: RewardBundle
+    ) -> bool:
+        with write_transaction(self.engine) as conn:
+            row = self._row(conn, owner)
+            view = PreparationState.model_validate(row["document"])
+            if (
+                row["project_id"]
+                or view.reward_review is None
+                or view.reward_review.request_id != request_id
+                or view.reward_review.bundle != bundle
+            ):
+                return False
+            if view.approved_reward != bundle:
+                updated = view.model_copy(
+                    update={"approved_reward": bundle, "revision": view.revision + 1}
+                )
+                conn.execute(
+                    preparations.update()
+                    .where(preparations.c.owner_key == owner_key(owner))
+                    .values(
+                        revision=updated.revision,
+                        document=updated.model_dump(mode="json"),
+                    )
+                )
+            return True
+
     def invalidate(self, owner: PlanOwner, command_id: str) -> int | None:
         with write_transaction(self.engine) as conn:
             row = self._row(conn, owner)
@@ -130,6 +158,7 @@ class SQLPreparationStore:
             plan_sequence=state.revision,
             plan=state.plan,
             creation_command_id=row["creation_command_id"],
+            reward_bundle=state.reward_for_plan(),
         )
 
     def project(self, owner: PlanOwner) -> ProjectView | None:
@@ -182,6 +211,9 @@ class SQLPreparationStore:
                 or view.entry_task is None
             ):
                 raise ValueError("preparation is not ready")
+            reward_bundle = view.reward_for_plan()
+            if reward_bundle and reward_bundle.cluster != cluster:
+                raise PermissionError("Reward bundle was approved in another cluster")
             identity = uuid4().hex
             conn.execute(
                 projects.insert().values(
@@ -210,4 +242,5 @@ class SQLPreparationStore:
                 plan_sequence=expected_revision,
                 plan=view.plan,
                 creation_command_id=command_id,
+                reward_bundle=reward_bundle,
             )

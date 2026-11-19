@@ -114,7 +114,7 @@ class InferenceOptions(BaseModel):
 
 class DatasetMapping(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    reference_field: str = Field(min_length=1)
+    reference_field: str | None = Field(default=None, min_length=1)
     user_prompt_field: str | None = Field(default=None, min_length=1)
     messages_field: str | None = Field(default=None, min_length=1)
     system_prompt_field: str | None = Field(default=None, min_length=1)
@@ -222,7 +222,7 @@ ModelSource = Annotated[
 class EvaluationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     mode: Literal["agent_rubric"]
-    rubrics: list[Rubric] = Field(min_length=1, max_length=20)
+    rubrics: list[Rubric] = Field(default_factory=list, max_length=20)
     pass_threshold: float = Field(default=0.7, ge=0, le=1)
     rubric_pass_threshold: float = Field(default=0.7, ge=0, le=1)
     generation: GenerationOptions = Field(default_factory=GenerationOptions)
@@ -322,6 +322,11 @@ def build_inference_dsl(
             "--report-assets-dir",
             shlex.quote(output),
             *(
+                ["--frozen-reward", shlex.quote(output + "/frozen_reward.json")]
+                if definition.get("frozen_reward")
+                else []
+            ),
+            *(
                 ["--business-scoring", shlex.quote(output + "/business_scoring.json")]
                 if definition.get("business_scoring")
                 else []
@@ -380,7 +385,9 @@ class EvaluationConfigurationError(ValueError):
     pass
 
 
-def read_evaluation_config(files, path: str) -> EvaluationConfig:
+def read_evaluation_config(
+    files, path: str, *, frozen_reward: bool = False
+) -> EvaluationConfig:
     try:
         raw = json.loads(files.read_text(path))
     except json.JSONDecodeError as exc:
@@ -410,7 +417,16 @@ def read_evaluation_config(files, path: str) -> EvaluationConfig:
                 f"{', '.join(sorted(allowed[kind]))}"
             )
     try:
-        return EvaluationConfig.model_validate(raw)
+        config = EvaluationConfig.model_validate(raw)
+        if frozen_reward and config.rubrics:
+            raise EvaluationConfigurationError(
+                "omit rubrics for the Project's frozen Reward"
+            )
+        if not frozen_reward and not config.rubrics:
+            raise EvaluationConfigurationError(
+                "agent_rubric requires a nonempty rubrics list"
+            )
+        return config
     except ValidationError as exc:
         raise EvaluationConfigurationError(
             f"{path}: {exc.errors(include_url=False)}"
@@ -430,11 +446,14 @@ class InferencePipelineHandler:
         runs: PipelineRunBackend,
         validator: ValidateWorkflowDslExecutor,
         submission_guard: Callable[[], None] | None = None,
+        *,
+        evaluation_reward: dict | None = None,
     ) -> None:
         self.runtime_dir = runtime_dir
         self.runs = runs
         self.validator = validator
         self._submission_guard = submission_guard
+        self._evaluation_reward = evaluation_reward
 
     def _validate(
         self,
@@ -503,6 +522,13 @@ class InferencePipelineHandler:
             in {"badcase_review", "evaluation_products"}
         )
         cpu_only = saved_predictions or products
+        reward = None if products else self._evaluation_reward
+        if (
+            prior
+            and not products
+            and prior["definition"].get("frozen_reward") != reward
+        ):
+            raise ValueError("evaluation Reward changed; use a new full run")
         final_test = bool(
             inference_options
             and inference_options.selection_run_id
@@ -512,7 +538,7 @@ class InferencePipelineHandler:
         if cpu_only and inference_options is not None:
             raise ValueError("cannot change evaluation kind on resume")
         assets = {name: self.runtime_dir / name for name in INFERENCE_RUNTIME_FILENAMES}
-        if cpu_only or final_test:
+        if cpu_only or final_test or reward is not None:
             assets["evaluate_predictions.py"] = (
                 self.runtime_dir / "evaluate_predictions.py"
             )
@@ -524,11 +550,13 @@ class InferencePipelineHandler:
             assets["evaluation_products.py"] = (
                 self.runtime_dir / "evaluation_products.py"
             )
+        if reward is not None:
+            assets["frozen_reward.py"] = self.runtime_dir / "frozen_reward.py"
         _validate_report_ui_bundle(self.runtime_dir)
         runtime_hash = runtime_bundle_fingerprint(
             self.runtime_dir, INFERENCE_RUNTIME_FILENAMES
         )
-        if cpu_only or final_test:
+        if cpu_only or final_test or reward is not None:
             runtime_hash = hashlib.sha256(
                 "".join(
                     name + hashlib.sha256(path.read_bytes()).hexdigest()
@@ -561,17 +589,21 @@ class InferencePipelineHandler:
                 input_path=request.input_path,
                 cpu=request.cpu,
                 memory=request.memory,
+                evaluation_reward=reward,
             )
-            preflight_scoring(
-                cast(Any, conversation).workspace, self.runtime_dir, definition
-            )
+            if reward is None:
+                preflight_scoring(
+                    cast(Any, conversation).workspace, self.runtime_dir, definition
+                )
         elif inference_options:
             options = inference_options
             dataset = DatasetMapping.model_validate_json(
                 files.read_text(options.dataset_config_path)
             ).model_dump(exclude_none=True)
+            if reward is None and not dataset.get("reference_field"):
+                raise ValueError("dataset config requires reference_field")
             evaluation_options = read_evaluation_config(
-                files, options.evaluation_config_path
+                files, options.evaluation_config_path, frozen_reward=reward is not None
             )
             evaluation = evaluation_options.model_dump(exclude_none=True)
             if "model_source" not in evaluation_options.model_fields_set:
@@ -607,6 +639,7 @@ class InferencePipelineHandler:
                 "cpu": request.cpu,
                 "memory": request.memory,
                 "runtime_sha256": runtime_hash,
+                **({"frozen_reward": reward} if reward is not None else {}),
             }
         elif prior:
             definition = dict(prior["definition"])
@@ -685,6 +718,23 @@ class InferencePipelineHandler:
                     *(
                         (
                             (
+                                "frozen_reward.json",
+                                {
+                                    **definition["frozen_reward"],
+                                    **(
+                                        {"test_source": definition["test_source"]}
+                                        if definition.get("test_source")
+                                        else {}
+                                    ),
+                                },
+                            ),
+                        )
+                        if definition.get("frozen_reward")
+                        else ()
+                    ),
+                    *(
+                        (
+                            (
                                 "business_scoring.json",
                                 {
                                     **definition["business_scoring"],
@@ -706,19 +756,23 @@ class InferencePipelineHandler:
                         frozen_script_name=name,
                     )
                 if saved_predictions:
-                    for name, content in (
-                        (
-                            "prediction_evaluation.json",
-                            json.dumps(
-                                {
-                                    "source_manifest": definition["source_manifest"],
-                                    "scoring_spec": definition["scoring_spec"],
-                                },
-                                ensure_ascii=False,
-                            ),
-                        ),
-                        ("score_eval.py", definition["scoring_script"]),
-                    ):
+                    scoring = (
+                        {"frozen_reward": definition["frozen_reward"]}
+                        if definition.get("frozen_reward")
+                        else {"scoring_spec": definition["scoring_spec"]}
+                    )
+                    artifacts = {
+                        "prediction_evaluation.json": json.dumps(
+                            {
+                                "source_manifest": definition["source_manifest"],
+                                **scoring,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                    if not definition.get("frozen_reward"):
+                        artifacts["score_eval.py"] = definition["scoring_script"]
+                    for name, content in artifacts.items():
                         path = Path(directory) / name
                         path.write_text(content)
                         stage_submission_file(

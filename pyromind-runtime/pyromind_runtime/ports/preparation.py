@@ -8,6 +8,7 @@ from pyromind_runtime.domain.preparation import (
     PreparationState,
     ProjectView,
 )
+from pyromind_runtime.domain.reward_bundle import RewardBundle
 
 
 class PreparationStore(Protocol):
@@ -18,6 +19,10 @@ class PreparationStore(Protocol):
     def save(
         self, owner: PlanOwner, view: PreparationState, expected_revision: int
     ) -> PreparationState: ...
+
+    def approve_reward(
+        self, owner: PlanOwner, request_id: str, bundle: RewardBundle
+    ) -> bool: ...
 
     def invalidate(self, owner: PlanOwner, command_id: str) -> int | None: ...
 

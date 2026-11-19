@@ -16,6 +16,7 @@ type ProductErrorCode = Literal[
     "harness_operation_failed",
     "input_not_pending",
     "input_pending",
+    "reward_review_unavailable",
 ]
 
 

@@ -20,6 +20,8 @@ Storage 路径使用 /workspace/<path>，不把 knowledge/ 拼成 Storage 挂载
 信息或业务选择用 ask_user 确认。presentation 是对象，不是 JSON 字符串。
 缺少依据时不猜测，不把历史产物当作本轮确认或执行授权。
 
+训练任务需要人工定义多维评分标准时，使用 rubric-elicitation 完成范式确认、校准及 Reward 包冻结。
+
 ## 可审阅计划
 
 信息足够后调用 set_preparation_plan(plan, entry_task_id)；无需保存 Checklist、

@@ -516,6 +516,19 @@ def test_preparation_policy_is_trusted_profile_configuration():
         role.name for role in roles
     }
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
+    review_tool = "request_reward_bundle_review"
+    assert review_tool in tools
+    assert "rubric-elicitation" in (ECHOMIND_PRODUCT_PROFILE.skill_allowlist or ())
+    assert review_tool not in (
+        ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()
+    )
+    assert review_tool not in (DEFAULT_PRODUCT_PROFILE.tool_allowlist or ())
+    assert all(review_tool not in role.tools for role in roles)
+    assert {role.name for role in roles if "get_project_reward" in role.tools} == {
+        "init",
+        "train",
+        "eval",
+    }
     assert "set_preparation_plan" in tools
     assert not {"get_preparation", "update_preparation", "inspect_resource"} & tools
     assert {"read", "write", "edit", "terminal"} <= tools

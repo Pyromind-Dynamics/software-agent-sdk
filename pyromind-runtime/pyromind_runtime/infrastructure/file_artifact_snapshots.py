@@ -86,7 +86,11 @@ class FileArtifactSnapshots:
                 staging = Path(directory) / "snapshot"
                 content = staging / "content"
                 content.mkdir(parents=True)
-                if source.text is not None:
+                if source.files is not None:
+                    for name, text in source.files.items():
+                        (content / name).write_bytes(text.encode("utf-8"))
+                    content_ref = target + "/content"
+                elif source.text is not None:
                     (content / source.filename).write_text(
                         source.text, encoding="utf-8"
                     )

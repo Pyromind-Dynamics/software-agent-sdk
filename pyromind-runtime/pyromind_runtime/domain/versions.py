@@ -141,21 +141,36 @@ class SnapshotSource(ContractModel):
     storage_ref: str | None = None
     text: str | None = None
     filename: str = "content.txt"
+    files: dict[str, str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=16,
+        exclude_if=lambda value: value is None,
+    )
     # Dataset manifests may reference media outside their directory. Such inputs
     # remain references until a backend can prove a complete dependency snapshot.
     reference_only: bool = False
 
     @model_validator(mode="after")
     def one_source(self) -> SnapshotSource:
-        if (self.storage_ref is None) == (self.text is None):
-            raise ValueError("provide exactly one of storage_ref or text")
         if (
-            not self.filename
-            or "/" in self.filename
-            or "\\" in self.filename
-            or self.filename in {".", ".."}
+            sum(
+                value is not None for value in (self.storage_ref, self.text, self.files)
+            )
+            != 1
         ):
-            raise ValueError("filename must be a basename")
+            raise ValueError("provide exactly one of storage_ref, text or files")
+        names = (self.filename, *(self.files or {}))
+        if any(
+            not name or "/" in name or "\\" in name or name in {".", ".."}
+            for name in names
+        ):
+            raise ValueError("snapshot file names must be basenames")
+        if self.files is not None:
+            if self.reference_only:
+                raise ValueError("file collections require a snapshot")
+            if sum(len(value.encode()) for value in self.files.values()) > 512 * 1024:
+                raise ValueError("snapshot file collection exceeds 512 KiB")
         if self.storage_ref is not None:
             check_persistable(self.storage_ref)
         return self
