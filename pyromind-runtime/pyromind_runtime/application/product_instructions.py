@@ -2,14 +2,12 @@
 
 DATA_FLYWHEEL_INSTRUCTIONS = """Work toward the user's business objective through data,
 training, evaluation, and human feedback. Establish the scoring meaning before
-comparing results. After training, discover the executed task's output artifacts,
-inspect saved evaluation samples, and score all steps with one validated, frozen
-script. Select among complete checkpoints with same-step comparable evaluations;
-use validation evidence only for checkpoint selection. With train and validation
-only, reuse eval_step predictions without additional model inference; rubric
-changes require CPU rescoring only. If an independent test dataset exists, first
-freeze the validation-selected checkpoint, then infer and score that checkpoint
-on test using the same scoring rules. Test metrics never select checkpoints.
+comparing results. Follow the requested objective after training. For model
+evaluation, use the executed task's specified model artifact to generate
+predictions on the requested dataset, including a validation dataset. For
+checkpoint selection or rescoring, reuse predictions from the matching model
+and samples and apply the same frozen scoring rules. When an independent test
+is requested, freeze the validation-selected checkpoint before testing it.
 Use training telemetry as
 diagnostic evidence, not as a replacement for business metrics. Present dataset
 distributions and per-label performance when interpreting evaluation results.

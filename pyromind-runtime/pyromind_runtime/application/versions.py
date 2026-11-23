@@ -403,6 +403,8 @@ class Versions:
         inputs: dict[str, str],
         context: RequestContext,
         key: str,
+        *,
+        respect_explicit_paths: bool = False,
     ) -> JsonObject:
         roles = {
             "input_path": "training_data",
@@ -423,7 +425,7 @@ class Versions:
             slot = (
                 value.removeprefix("version://")
                 if isinstance(value, str) and value.startswith("version://")
-                else roles.get(field)
+                else (None if respect_explicit_paths else roles.get(field))
             )
             if slot and slot in project.context.selected_versions:
                 selected = self.store.get_version(

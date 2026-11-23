@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import PurePosixPath
 
+from pyromind_runtime.application.model_evaluation_plan import check_inference_receipt
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
 from pyromind_runtime.domain.versions import ArtifactVersion
@@ -24,37 +26,70 @@ _BUSINESS_STATES = {
 }
 
 
+def _plan_run_id(
+    prefix: str, row: dict, runs: list[ExperimentExecutionView]
+) -> str | None:
+    attempts = [row[key] for key in ("plan_attempt", "attempt") if key in row]
+    if any(type(n) is not int or n < 1 or n != attempts[0] for n in attempts):
+        return None
+    explicit = f"{prefix}:{attempts[0]}" if attempts else None
+
+    # A plan can cite an existing receipt, but only a submission can bind one.
+    receipts = [
+        row[key]
+        for key in ("platform_task_id", "actual_platform_task_id")
+        if row.get(key) is not None
+    ]
+    if receipts:
+        if any(not isinstance(ref, str) or ref != receipts[0] for ref in receipts):
+            return None
+        matches = [run.run_id for run in runs if run.platform_task_id == receipts[0]]
+        if explicit is not None:
+            return explicit if explicit in matches else None
+        return matches[0] if len(matches) == 1 else None
+    if explicit is not None:
+        return explicit
+    first = f"{prefix}:1"
+    return first if all(run.run_id == first for run in runs) else None
+
+
 def plan_executions(
     project: ProjectView,
     rows: list,
     versions: Iterable[ArtifactVersion] = (),
-) -> Iterable[ExperimentExecutionView]:
+    *,
+    registered: Iterable[ExperimentExecutionView] = (),
+) -> Iterator[ExperimentExecutionView]:
     tasks = {task.id: task for task in project.plan.tasks}
     stages = {stage.id: stage for stage in project.plan.stages}
     reports = {v.id: v for v in versions if v.kind == "report" and v.state == "ready"}
+    history: dict[str, list[ExperimentExecutionView]] = {}
+    for run in registered:
+        if run.project_id == project.project_id and run.role_id == "main":
+            history.setdefault(run.task_id, []).append(run)
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("id"), str):
             continue
         task = tasks.get(row["id"])
         if not task or row.get("stage_id") != task.stage_id:
             continue
-        attempt = row.get("attempt", 1)
+        run_id = _plan_run_id(
+            f"{project.project_id}:{task.id}", row, history.get(task.id, [])
+        )
         status = row.get("business_status")
         if (
-            type(attempt) is not int
-            or attempt < 1
+            run_id is None
             or not isinstance(status, str)
             or status not in _BUSINESS_STATES
         ):
             continue
-        platform = row.get("platform_task_id")
         report_id = row.get("report_version_id")
         report = reports.get(report_id) if isinstance(report_id, str) else None
         stage = stages[task.stage_id]
         if not stage.enabled or stage.placeholder:
             continue
         run = ExperimentExecutionView(
-            run_id=f"{project.project_id}:{task.id}:{attempt}",
+            run_id=run_id,
             project_id=project.project_id,
             plan_sequence=project.plan_sequence,
             stage_id=task.stage_id,
@@ -78,9 +113,6 @@ def plan_executions(
             else (),
             waiting_reason=row.get("next_action")
             if status == "blocked" and isinstance(row.get("next_action"), str)
-            else None,
-            platform_task_id=platform
-            if isinstance(platform, str) and platform
             else None,
         )
         validate_persisted_payload(run.model_dump(mode="json"))
@@ -114,7 +146,14 @@ def read_plan_tasks(text: str) -> list:
     return plan["tasks"]
 
 
-def with_platform_states(snapshot: ConversationSnapshot) -> ConversationSnapshot:
+def with_platform_states(
+    snapshot: ConversationSnapshot,
+    model_evals: set[str] | None = None,
+    pipelines: Iterable[PipelineRun] = (),
+) -> ConversationSnapshot:
+    receipts = {
+        pipeline.task_id: pipeline for pipeline in pipelines if pipeline.task_id
+    }
     tasks = {item.task_id: item for item in snapshot.external_tasks}
     runs = []
     for run in snapshot.experiment_executions or ():
@@ -131,6 +170,8 @@ def with_platform_states(snapshot: ConversationSnapshot) -> ConversationSnapshot
                 )
             elif run.state in {"preparing", "queued"}:
                 run = run.model_copy(update={"state": "waiting_analysis"})
+        if run.role_id == "main" and model_evals and run.task_id in model_evals:
+            run = check_inference_receipt(run, receipts)
         runs.append(run)
     return (
         snapshot.model_copy(update={"experiment_executions": tuple(runs)})

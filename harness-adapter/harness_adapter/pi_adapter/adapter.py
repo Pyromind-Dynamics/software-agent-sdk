@@ -1920,7 +1920,7 @@ class PiAdapter:
                     request_context=replace(session.context, task_origin=origin),
                 )
 
-            async def execute() -> JsonObject:
+            async def execute(arguments: dict[str, Any]) -> JsonObject:
                 return await self._business_tools.execute(
                     tool_name,
                     arguments,
@@ -1941,7 +1941,7 @@ class PiAdapter:
                 not self._tracks_submission(session, tool_name)
                 or "plan_task_id" not in arguments
             ):
-                result = await execute()
+                result = await execute(arguments)
                 self._emit_tool_signals(session, tool_name, result)
                 return result
 
@@ -1950,7 +1950,11 @@ class PiAdapter:
             assert self._plan_submission is not None
             async with session.submission_lock:
                 previous = await self._plan_submission(
-                    session.session_id, *binding, session.context
+                    session.session_id,
+                    *binding,
+                    session.context,
+                    tool_name=tool_name,
+                    arguments=arguments,
                 )
                 if previous:
                     receipt = {"task_id": previous, "already_submitted": True}
@@ -1959,15 +1963,25 @@ class PiAdapter:
                         "is_error": False,
                         "content": [{"type": "text", "text": json.dumps(receipt)}],
                     }
-                result = await execute()
+                tool_context = replace(
+                    tool_context,
+                    request_context=replace(
+                        tool_context.request_context, plan_task_id=binding[0]
+                    ),
+                )
+                result = await execute(arguments)
                 self._emit_tool_signals(session, tool_name, result)
-                details = result.get("details") or {}
-                platform_id = details.get("task_id")
+                details = result.get("details")
+                platform_id = (
+                    details.get("task_id") if isinstance(details, dict) else None
+                )
                 assert self._plan_submission is not None
                 await self._plan_submission(
                     session.session_id,
                     *binding,
                     session.context,
+                    tool_name=tool_name,
+                    arguments=arguments,
                     platform_task_id=platform_id
                     if isinstance(platform_id, str)
                     else None,

@@ -17,16 +17,41 @@
 
 1. 查看用户给出的 Storage 路径：直接读 `/workspace/<path>`。目录包含多个候选文件时，
    先让用户确认输入；确认字段语义、对话分组、过滤规则、system prompt 和有损转换。
-2. 只使用 [target-formats.md](target-formats.md) 定义的格式。完整的
+2. 做标准格式转换时使用 [target-formats.md](target-formats.md)：完整的
    prompt/chosen/rejected 自动按 DPO 清洗，不丢弃任一分支；其他数据输出 messages。
+   筛选已有平铺 Vision 数据供对应 Builder 使用时，保留原图片列和监督列。
 3. 用 `write` 写转换脚本，用 `terminal` 执行；路径统一相对工作区根目录，输入用
    `/workspace/<path>`，输出写到目标 Storage 目录。脚本只依赖标准库，保持确定性，
    不引入平台专用 import。
-4. 先跑小样或全量并打印保留/丢弃计数，再按 [target-formats.md](target-formats.md)
+4. 先跑小样或全量并打印保留/丢弃计数，再按交付格式
    校验输出：顶层字段、messages 角色与 content、DPO 三分支都要检查。校验失败
    修改脚本重跑，不要把未校验的产物交给用户。
 5. 校验通过后展示最多三条结果并等待用户明确确认；未通过的试跑迭代不向用户展示。
 6. 用户确认后再跑全量，产物落在 `/workspace` 下并报告路径与统计。
+
+### 平铺 Vision 训练清单
+
+默认 Vision collator 直接打开图片列中的路径。生成数据准备脚本时，在序列化每条样本前将相对引用按**源图片目录**解析为训练挂载绝对路径。两个 split 共用同一个写入函数。示例中的 `image_root` 是源数据声明的 `/workspace/...` 目录；多个来源混合时使用每条样本对应的根。
+
+```python
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(".agents/skills/data-processing/scripts/preparation").resolve()))
+from training_image_paths import training_image_record
+
+def write_split(output, rows, image_root):
+    with output.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            record = training_image_record(row, "images", source_root=image_root)
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+write_split(output_dir / "train.jsonl", train_rows, train_image_root)
+write_split(output_dir / "val.jsonl", val_rows, val_image_root)
+```
+
+`training_image_record` 检查写入的路径可读，保留原有绝对引用、多图顺序及其他字段。已有清单可用同一脚本的 CLI 只读核对：`python3 .agents/skills/data-processing/scripts/preparation/training_image_paths.py <清单> --image-field images`。自定义 collator 与 messages 格式遵循各自的媒体解析契约。
 
 ## 平台路径
 

@@ -46,8 +46,8 @@ Maintain public_data/workflowPLAN.json with the accepted stage and task IDs.
 Pass plan_task_id when submitting a planned job.
 For each task record business_status (pending, in_progress, blocked, completed,
 or failed), actual platform_task_id after submission, decision, next_action and
-verified outputs. Pass plan_attempt and increment attempt (starting at 1) for an
-authorized rerun. Runtime tracks platform facts.
+verified outputs. Use the same plan_attempt in the plan task and its submission,
+starting at 1 and incrementing for an authorized rerun. Runtime tracks platform facts.
 Save reports with product_versions and record the returned report_version_id.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence

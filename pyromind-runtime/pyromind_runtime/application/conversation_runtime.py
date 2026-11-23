@@ -35,6 +35,13 @@ from pyromind_runtime.application.lineage_deliveries import (
     register_eval_deliveries,
     register_training_artifacts,
 )
+from pyromind_runtime.application.model_evaluation_plan import (
+    check_inference_receipt,
+    inference_paths,
+    model_evaluation_tasks,
+    submission_paths,
+    validate_evaluation_inputs,
+)
 from pyromind_runtime.application.plan_execution import (
     PLAN_PATH,
     completed_plan_write,
@@ -905,7 +912,7 @@ class ConversationRuntime:
                 entry = preparation.entry_task
                 if not preparation.policy.allowed_roles:
                     entry = entry.model_copy(update={"role_id": "main"})
-                data = {
+                data: JsonObject = {
                     "plan": project.plan.model_dump(mode="json"),
                     "entry_task": entry.model_dump(mode="json"),
                 }
@@ -965,7 +972,11 @@ class ConversationRuntime:
         kind: str,
         instruction: str,
     ) -> None:
-        payload = {"task_id": task_id, "kind": kind, "instruction": instruction}
+        payload: JsonObject = {
+            "task_id": task_id,
+            "kind": kind,
+            "instruction": instruction,
+        }
         validate_persisted_payload(payload)
         event, _ = store.append(
             ProductEvent(
@@ -1024,6 +1035,8 @@ class ConversationRuntime:
         attempt: int,
         context: RequestContext,
         *,
+        tool_name: str | None = None,
+        arguments: JsonObject | None = None,
         platform_task_id: str | None = None,
         failed: bool = False,
     ) -> str | None:
@@ -1038,19 +1051,55 @@ class ConversationRuntime:
         row = {
             "id": task.id,
             "stage_id": task.stage_id,
-            "attempt": attempt,
+            "plan_attempt": attempt,
             "business_status": "failed" if failed else "in_progress",
-            "platform_task_id": platform_task_id,
         }
         run = next(iter(plan_executions(project, [row])), None)
         if run is None:
             raise ValueError("cannot submit work for a disabled stage")
         store = self._store(scope)
         if platform_task_id is None and not failed:
+            model_eval = task.id in model_evaluation_tasks(
+                project, store.preparation_policy()
+            )
+            pipelines = {}
+            rows = []
+            if model_eval:
+                pipelines = await asyncio.to_thread(store.load_pipeline_runs)
+                paths = submission_paths(tool_name, arguments or {}, pipelines)
+                if any(item.task_id for item in task.inputs):
+                    active = self._active.get(scope)
+                    if active is None:
+                        raise ValueError(
+                            "model evaluation requires the active Project workspace"
+                        )
+                    text = await active.adapter.read_workspace_text(
+                        active.handle, PLAN_PATH, context, max_bytes=1024 * 1024
+                    )
+                    rows = read_plan_tasks(text) if text else []
+                validate_evaluation_inputs(project, task, rows, *paths)
             for previous in store.load_snapshot().experiment_executions or ():
                 if previous.run_id == run.run_id and previous.platform_task_id:
+                    if model_eval:
+                        prior = next(
+                            (
+                                p
+                                for p in pipelines.values()
+                                if p.task_id == previous.platform_task_id
+                            ),
+                            None,
+                        )
+                        saved_paths = inference_paths(prior)
+                        if saved_paths is None:
+                            raise ValueError(
+                                f"Attempt {attempt} has no model inference receipt; "
+                                "use a new plan_attempt for model inference"
+                            )
+                        validate_evaluation_inputs(project, task, rows, *saved_paths)
                     return previous.platform_task_id
-        self._record_execution(store, run)
+        self._record_execution(
+            store, run.model_copy(update={"platform_task_id": platform_task_id})
+        )
         return platform_task_id
 
     def _record_execution(
@@ -1094,11 +1143,19 @@ class ConversationRuntime:
             artifacts = await asyncio.to_thread(
                 self._artifact_versions, scope, active.context
             )
-            # Only the submission handler can bind a platform ID.
-            for row in rows:
-                if isinstance(row, dict):
-                    row.pop("platform_task_id", None)
-            for run in plan_executions(project, rows, artifacts):
+            registered = store.load_snapshot().experiment_executions or ()
+            required = model_evaluation_tasks(project, policy)
+            pipelines = (
+                await asyncio.to_thread(store.load_pipeline_runs) if required else {}
+            )
+            receipts = {p.task_id: p for p in pipelines.values() if p.task_id}
+            previous_ids = {r.run_id: r.platform_task_id for r in registered}
+            for run in plan_executions(project, rows, artifacts, registered=registered):
+                if run.task_id in required:
+                    run = run.model_copy(
+                        update={"platform_task_id": previous_ids.get(run.run_id)}
+                    )
+                    run = check_inference_receipt(run, receipts)
                 if run.state != "queued":
                     self._record_execution(store, run)
         except Exception as exc:
@@ -1123,9 +1180,10 @@ class ConversationRuntime:
             return
         artifacts = await asyncio.to_thread(self._artifact_versions, scope, context)
         published = {
-            event.payload.get("artifact_id")
+            artifact_id
             for event in await asyncio.to_thread(store.replay)
             if event.type == "artifact.registered"
+            and isinstance(artifact_id := event.payload.get("artifact_id"), str)
         }
         for artifact in artifacts:
             if artifact.id in published or artifact.state not in {
@@ -2650,13 +2708,20 @@ class ConversationRuntime:
         try:
             store = await self._authorized_store(conversation_id, context)
             snapshot = await self._load_saved_snapshot(conversation_id, store, context)
-            if snapshot.project:
-                if snapshot.project.cluster:
-                    context = replace(context, x_cluster=snapshot.project.cluster)
+            project = snapshot.project
+            if project:
+                if project.cluster:
+                    context = replace(context, x_cluster=project.cluster)
                 policy = snapshot.preparation.policy if snapshot.preparation else None
                 if policy is not None and policy.allowed_roles:
                     snapshot = project_stage_activity(snapshot, policy)
-                snapshot = with_platform_states(snapshot)
+                required = model_evaluation_tasks(project, policy)
+                pipelines = (
+                    await asyncio.to_thread(store.load_pipeline_runs)
+                    if required
+                    else {}
+                )
+                snapshot = with_platform_states(snapshot, required, pipelines.values())
             if not snapshot.capabilities.read_only:
                 await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
             self._schedule_read_recovery(conversation_id, store, context)
@@ -2939,7 +3004,9 @@ class ConversationRuntime:
             and all(part.type == "text" for part in command.content)
             and await self.get_project(conversation_id, context) is not None
         )
-        if isinstance(command, EnqueueTaskCommand) or queued_message:
+        if isinstance(command, EnqueueTaskCommand) or (
+            isinstance(command, UserMessageCommand) and queued_message
+        ):
             if not queue_enabled:
                 raise PermissionError("task queue is not enabled")
             if (
@@ -5260,25 +5327,13 @@ def _build_external_task_notification(
             if has_training_node:
                 instruction = (
                     f"Production workflow task {task.task_id} succeeded and includes "
-                    "training. Hand this task_id to the training-analysis skill "
-                    "and follow its analysis and reporting flow. Report the actual "
-                    "W&B run and metrics; do not claim all training stages were "
-                    "analyzed. Unless evaluation was explicitly excluded, continue "
-                    "with training_analysis(operation=artifacts) to discover saved "
-                    "checkpoint-n and eval_step_n.jsonl from the executed task. "
-                    "Inspect samples, establish the business scoring rule, then use "
-                    "inference-evaluation to score every saved eval with one frozen "
-                    "script through df_submit_pipeline evaluation. Compare only "
-                    "same-step complete checkpoints using validation only. With "
-                    "train + validation only, do not start extra GPU inference. "
-                    "If independent test exists, evaluate the validation-selected "
-                    "checkpoint on test; test never participates in selection. "
-                    "Present available label distributions and use the iteration "
-                    "context to decide the next action. For requested badcase "
-                    "annotation, use the label-studio skill and "
-                    "label_studio_project over existing samples; no profiling "
-                    "or rescoring job is required to open annotation. Report "
-                    "missing evidence without guessing. Do not rerun automatically."
+                    "training. Continue the follow-up requested by the user or "
+                    "included in the accepted plan. Use the training-analysis skill "
+                    "for run diagnostics and inference-evaluation for evaluation. "
+                    "For model evaluation, run inference with the specified training "
+                    "output on the requested dataset. For checkpoint selection, "
+                    "score saved validation predictions for the corresponding steps. "
+                    "Report missing evidence. Do not rerun automatically."
                 )
             else:
                 instruction = (

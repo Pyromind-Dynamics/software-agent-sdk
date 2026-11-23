@@ -22,6 +22,9 @@ class WorkflowTaskDefinition(ContractModel):
     id: str = Field(min_length=1)
     description: str = ""
     display_name: str | None = None
+    evaluation_target: Literal["model", "model_or_predictions"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class WorkflowNodeDefinition(ContractModel):

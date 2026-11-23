@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
@@ -302,9 +303,13 @@ async def test_workflow_submits_directly_once_and_resumes_followup(
     if training:
         assert "training-analysis skill" in notification.hidden_text
         assert "inference-evaluation" in notification.hidden_text
-        assert "evaluation was explicitly excluded" in notification.hidden_text
-        assert "same-step complete checkpoints" in notification.hidden_text
-        assert "do not start extra GPU inference" in notification.hidden_text
+        assert "follow-up requested by the user or included in the accepted plan" in (
+            notification.hidden_text
+        )
+        assert "run inference with the specified training output" in (
+            notification.hidden_text
+        )
+        assert "score saved validation predictions" in notification.hidden_text
         assert "Do not rerun automatically" in notification.hidden_text
     else:
         assert "inference-evaluation" not in notification.hidden_text
