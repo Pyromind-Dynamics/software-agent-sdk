@@ -261,6 +261,38 @@ class SnapshotProjector:
             }
         )
 
+    def _on_task_queued(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        queue = snapshot.experiment_queue or ()
+        if any(item.get("task_id") == event.payload["task_id"] for item in queue):
+            return snapshot
+        return snapshot.model_copy(update={"experiment_queue": (*queue, event.payload)})
+
+    def _on_task_dispatched(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        queue = tuple(
+            item
+            for item in snapshot.experiment_queue or ()
+            if item.get("task_id") != event.payload["task_id"]
+        )
+        return snapshot.model_copy(update={"experiment_queue": queue})
+
+    def _on_experiment_execution_changed(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        # Older events also use this type as a refresh hint.
+        value = event.payload.get("execution")
+        if not isinstance(value, dict):
+            return snapshot
+        execution = ExperimentExecutionView.model_validate(value)
+        runs = {run.run_id: run for run in snapshot.experiment_executions or ()}
+        runs[execution.run_id] = execution
+        return snapshot.model_copy(
+            update={"experiment_executions": tuple(runs.values())}
+        )
+
     def _on_conversation_created(
         self, snapshot: ConversationSnapshot, _event: ProductEvent
     ) -> ConversationSnapshot:

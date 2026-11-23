@@ -255,6 +255,13 @@ class FileProductStore:
             updated = metadata.model_copy(
                 update={
                     "configuration_version": policy.configuration_version,
+                    "preparation_policy": policy.preparation_policy
+                    or metadata.preparation_policy,
+                    "delegated_roles": tuple(
+                        role["name"] for role in policy.delegated_roles
+                    )
+                    if policy.delegated_roles is not None
+                    else metadata.delegated_roles,
                     "tool_allowlist": policy.tool_allowlist,
                     "skill_allowlist": policy.skill_allowlist,
                     "command_allowlist": policy.command_allowlist,
@@ -577,6 +584,9 @@ class FileProductStore:
             for task in snapshot.external_tasks
         ):
             # A delayed callback can follow a terminal poll beyond the tail window.
+            return self._append_from_full_log(metadata, event)
+        if event.type in {"task.queued", "task.dispatched", "artifact.registered"}:
+            # Redelivery after a restart can fall outside the tail deduplication window.
             return self._append_from_full_log(metadata, event)
         return self._commit(metadata, snapshot, event, metadata.last_sequence + 1)
 

@@ -34,7 +34,7 @@ class WorkflowNodeDefinition(ContractModel):
 
 
 class PreparationPolicy(ContractModel):
-    allowed_roles: tuple[str, ...] = Field(min_length=1)
+    allowed_roles: tuple[str, ...] = ()
     workflow_nodes: tuple[WorkflowNodeDefinition, ...] = Field(min_length=1)
 
     @model_validator(mode="after")

@@ -1,3 +1,4 @@
+import { writeFileSync, mkdirSync } from "node:fs";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -49,6 +50,12 @@ test("native business roles need no product task lease and callbacks resume thei
       return { is_error: false, content: [{ type: "text", text: "PLATFORM_RECEIPT_ONLY" }], details: {} };
     },
   } as unknown as JsonlRpcPeer;
+  // Existing conversations retain their materialized role contracts across upgrades.
+  const retained = join(root, "pi", "agent", "agents");
+  mkdirSync(retained, {recursive:true});
+  for (const name of ["init", "dataset", "train", "eval"]) {
+    writeFileSync(join(retained, name + ".md"), `---\nname: ${name}\ndescription: Retained role\n---\nLegacy ${name} instructions.\n`);
+  }
   const config = {
     session_id: "native-roles", workspace_root: root, terminal_backend: "os-sandbox",
     session_path: join(root, "pi", "session.jsonl"), system_prompt: "Manager decides completion.",
@@ -83,8 +90,8 @@ test("native business roles need no product task lease and callbacks resume thei
     assert.match(JSON.stringify(result), /Manager decides business completion/);
   }
   assert.equal(calls.length, 4);
-  for (const role of ["Init", "Dataset", "Train", "Eval"]) {
-    assert.ok(prompts.some(prompt => prompt.includes(`You are the EchoMind ${role} agent.`)));
+  for (const role of ["init", "dataset", "train", "eval"]) {
+    assert.ok(prompts.some(prompt => prompt.includes(`Legacy ${role} instructions.`)));
   }
   await close();
   ({ session, subagents } = await createPiSession(config, peer));

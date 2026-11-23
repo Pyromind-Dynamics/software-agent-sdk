@@ -1,18 +1,11 @@
 {
-  "allowed_roles": [
-    "init",
-    "dataset",
-    "train",
-    "eval"
-  ],
+  "allowed_roles": [],
   "workflow_nodes": [
     {
       "id": "init",
       "name": "Init",
       "description": "基模评测与基线解读，同一 Init Stage 内完成。",
-      "roles": [
-        "init"
-      ],
+      "roles": [],
       "max_instances": 1,
       "tasks": [
         {
@@ -35,9 +28,7 @@
           "description": "生成可核验的数据版本与统计。"
         }
       ],
-      "roles": [
-        "dataset"
-      ]
+      "roles": []
     },
     {
       "id": "train",
@@ -49,17 +40,13 @@
           "description": "训练并登记模型与 checkpoint 产物。"
         }
       ],
-      "roles": [
-        "train"
-      ]
+      "roles": []
     },
     {
       "id": "eval",
       "name": "Eval",
       "description": "训练后候选模型评测与对应结果分析。",
-      "roles": [
-        "eval"
-      ],
+      "roles": [],
       "tasks": [
         {
           "id": "checkpoint_eval",
@@ -74,17 +61,20 @@
     {
       "id": "inference",
       "name": "Inference",
-      "description": "常驻推理服务；当前为未实现占位。"
+      "description": "常驻推理服务；当前为未实现占位。",
+      "roles": []
     },
     {
       "id": "tracer",
       "name": "Tracer",
-      "description": "线上采集；当前为未实现占位。"
+      "description": "线上采集；当前为未实现占位。",
+      "roles": []
     },
     {
       "id": "rawdata",
       "name": "RawData",
-      "description": "原始数据来源，无执行角色；当前不启用单独节点。"
+      "description": "原始数据来源，无执行角色；当前不启用单独节点。",
+      "roles": []
     }
   ]
 }

@@ -35,6 +35,13 @@ from pyromind_runtime.application.lineage_deliveries import (
     register_eval_deliveries,
     register_training_artifacts,
 )
+from pyromind_runtime.application.plan_execution import (
+    PLAN_PATH,
+    completed_plan_write,
+    plan_executions,
+    read_plan_tasks,
+    with_platform_states,
+)
 from pyromind_runtime.application.preparation import (
     Preparations,
 )
@@ -62,6 +69,7 @@ from pyromind_runtime.domain.commands import (
     CancelCommand,
     CommandReceipt,
     CreateProjectCommand,
+    EnqueueTaskCommand,
     InputResponseCommand,
     ProductCommand,
     RollbackWorkflowCommand,
@@ -88,6 +96,7 @@ from pyromind_runtime.domain.experiment_plans import (
     PlanOwner,
 )
 from pyromind_runtime.domain.experiments import ExperimentCatalog, ExperimentMetric
+from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import (
     PREPARATION_REVIEW_TOOLS,
@@ -119,6 +128,7 @@ from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.training_evaluation import CheckpointArtifact
 from pyromind_runtime.domain.user_input import PendingUserInput, PreparedUserInput
 from pyromind_runtime.domain.versions import (
+    ArtifactVersion,
     RunSource,
     RunSpec,
     SaveVersion,
@@ -334,7 +344,21 @@ class ConversationRuntime:
             if policy.configuration_version <= store.configuration_version():
                 return True
             snapshot = await asyncio.to_thread(store.load_snapshot)
-            if snapshot.status == "running" or _has_active_subagents(snapshot):
+            if (
+                snapshot.status == "running"
+                or snapshot.pending_inputs
+                or snapshot.pending_permissions
+                or _has_active_subagents(snapshot)
+                or any(
+                    task.correlation
+                    and task.correlation.type == "subagent"
+                    and (
+                        task.status in {"pending", "running", "waiting"}
+                        or task.resume_pending
+                    )
+                    for task in snapshot.external_tasks
+                )
+            ):
                 return False
             if prepared:
                 # Refresh profile prompts and tools within the saved role boundary.
@@ -353,6 +377,17 @@ class ConversationRuntime:
                     if saved_roles and saved_roles <= roles.keys()
                     else None
                 )
+                retire_roles = policy.delegated_roles == ()
+                if retire_roles and active and saved_roles:
+                    legacy = await self._load_saved_snapshot(
+                        conversation_id, store, context
+                    )
+                    if legacy.preparation:
+                        history = project_stage_activity(
+                            legacy, legacy.preparation.policy
+                        )
+                        for run in history.experiment_executions or ():
+                            self._record_execution(store, run)
                 policy = policy.model_copy(
                     update={
                         "tool_allowlist": policy.development_tool_allowlist
@@ -362,9 +397,9 @@ class ConversationRuntime:
                         if active and policy.development_skill_allowlist is not None
                         else policy.skill_allowlist,
                         "product_instructions": policy.product_instructions
-                        if refreshed_roles
+                        if refreshed_roles or retire_roles
                         else None,
-                        "delegated_roles": refreshed_roles or None,
+                        "delegated_roles": () if retire_roles else refreshed_roles,
                     }
                 )
             handle = SessionHandle(
@@ -844,6 +879,10 @@ class ConversationRuntime:
             receipt, _ = store.claim_command(command)
             if receipt.status == "completed":
                 return receipt
+            already_started = project is not None and any(
+                e.event_id == f"queued:project-start:{project.project_id}"
+                for e in store.replay()
+            )
             project = await self._plan_io(
                 self._preparations.store.activate,
                 owner,
@@ -865,50 +904,53 @@ class ConversationRuntime:
                 != store.development_policy().tool_allowlist
             ):
                 await self._activate_development_policy(conversation_id, store, context)
-            await self._ensure_active(conversation_id, context)
-            if store.permits_tool("subagent"):
-                preparation = await self.get_preparation(conversation_id, context)
-                active = self._active[conversation_id]
-                reward = project.reward_bundle
-                reward_context = (
-                    {
-                        "reward_bundle": reward.model_dump(mode="json"),
-                        "reward_studio_entry": reward.studio_entry,
-                    }
-                    if reward is not None
-                    else {}
-                )
-                response = await active.adapter.notify_external_task(
-                    active.handle,
-                    ExternalTaskNotification(
-                        task_id="project-start:" + project.project_id,
-                        kind="project_start",
-                        status="succeeded",
-                        hidden_text=(
-                            "The user created this Project. Write the accepted plan "
-                            "to public_data/workflowPLAN.json, then use native "
-                            "subagent to launch its entry task within the accepted "
-                            "scope. Do not launch it again if already started. "
-                            "Update business judgments in that ordinary JSON file; "
-                            "platform facts remain in Runtime.\n"
-                            + json.dumps(
-                                {
-                                    "plan": project.plan.model_dump(mode="json"),
-                                    "entry_task": preparation.entry_task.model_dump(
-                                        mode="json"
-                                    )
-                                    if preparation.entry_task
-                                    else None,
-                                    **reward_context,
-                                },
-                                ensure_ascii=False,
+            preparation = await self.get_preparation(conversation_id, context)
+            if preparation.entry_task is not None and not already_started:
+                entry = preparation.entry_task
+                if not preparation.policy.allowed_roles:
+                    entry = entry.model_copy(update={"role_id": "main"})
+                data = {
+                    "plan": project.plan.model_dump(mode="json"),
+                    "entry_task": entry.model_dump(mode="json"),
+                }
+                if project.reward_bundle:
+                    data["reward_studio_entry"] = project.reward_bundle.studio_entry
+                    data["reward_bundle"] = project.reward_bundle.model_dump(
+                        mode="json"
+                    )
+                if not preparation.policy.allowed_roles:
+                    self._record_execution(
+                        store,
+                        next(
+                            plan_executions(
+                                project,
+                                [
+                                    {
+                                        "id": entry.request_id,
+                                        "stage_id": entry.stage_id,
+                                        "business_status": "pending",
+                                    }
+                                ],
                             )
                         ),
-                    ),
-                    context,
+                    )
+                action = (
+                    "Delegate the entry task to its assigned role"
+                    if preparation.policy.allowed_roles
+                    else "Execute the entry task directly"
                 )
-                if response.get("accepted") is False:
-                    raise ValueError("Project start notification was not accepted")
+                self._queue_task(
+                    store,
+                    conversation_id,
+                    "project-start:" + project.project_id,
+                    "project_start",
+                    "The user created this Project. Write the accepted plan to "
+                    "public_data/workflowPLAN.json. "
+                    f"{action} within the approved scope. "
+                    "Reuse existing submissions on recovery.\n"
+                    + json.dumps(data, ensure_ascii=False),
+                )
+            await self._ensure_active(conversation_id, context)
             self._notify_preparation(conversation_id, "project.changed")
             return store.complete_command(
                 receipt.model_copy(
@@ -918,6 +960,264 @@ class ConversationRuntime:
                     }
                 )
             )
+
+    def _queue_task(
+        self,
+        store: FileProductStore,
+        conversation_id: str,
+        task_id: str,
+        kind: str,
+        instruction: str,
+    ) -> None:
+        payload = {"task_id": task_id, "kind": kind, "instruction": instruction}
+        validate_persisted_payload(payload)
+        event, _ = store.append(
+            ProductEvent(
+                conversation_id=conversation_id,
+                event_id=f"queued:{task_id}",
+                type="task.queued",
+                payload=payload,
+            )
+        )
+        self._publish(event)
+
+    async def _dispatch_queued_tasks(
+        self, active: _ActiveConversation, store: FileProductStore
+    ) -> None:
+        snapshot = store.load_snapshot()
+        if (
+            snapshot.status == "running"
+            or snapshot.pending_inputs
+            or snapshot.pending_permissions
+            or snapshot.automatic_turns_suspended
+        ):
+            return
+        for item in snapshot.experiment_queue or ():
+            if item.get("kind") not in {"project_start", "requirement"}:
+                continue
+            task_id = str(item["task_id"])
+            result = await active.adapter.notify_external_task(
+                active.handle,
+                ExternalTaskNotification(
+                    task_id=task_id,
+                    kind=str(item["kind"]),
+                    status="succeeded",
+                    hidden_text=str(item["instruction"]),
+                    resume_interrupted=True,
+                ),
+                active.context,
+            )
+            if result.get("accepted") is False:
+                return
+            event, _ = store.append(
+                ProductEvent(
+                    conversation_id=snapshot.conversation_id,
+                    event_id=f"dispatched:{task_id}",
+                    type="task.dispatched",
+                    payload={"task_id": task_id},
+                )
+            )
+            self._publish(event)
+            # The next decision belongs to a later idle boundary.
+            return
+
+    async def bind_plan_submission(
+        self,
+        scope: str,
+        task_id: str,
+        attempt: int,
+        context: RequestContext,
+        *,
+        platform_task_id: str | None = None,
+        failed: bool = False,
+    ) -> str | None:
+        project = await self.get_project(scope, context)
+        task = (
+            next((item for item in project.plan.tasks if item.id == task_id), None)
+            if project
+            else None
+        )
+        if not project or not task or type(attempt) is not int or attempt < 1:
+            raise ValueError("submission requires a valid Project task and attempt")
+        row = {
+            "id": task.id,
+            "stage_id": task.stage_id,
+            "attempt": attempt,
+            "business_status": "failed" if failed else "in_progress",
+            "platform_task_id": platform_task_id,
+        }
+        run = next(iter(plan_executions(project, [row])), None)
+        if run is None:
+            raise ValueError("cannot submit work for a disabled stage")
+        store = self._store(scope)
+        if platform_task_id is None and not failed:
+            for previous in store.load_snapshot().experiment_executions or ():
+                if previous.run_id == run.run_id and previous.platform_task_id:
+                    return previous.platform_task_id
+        self._record_execution(store, run)
+        return platform_task_id
+
+    def _record_execution(
+        self, store: FileProductStore, run: ExperimentExecutionView
+    ) -> None:
+        snapshot = store.load_snapshot()
+        previous = next(
+            (r for r in snapshot.experiment_executions or () if r.run_id == run.run_id),
+            None,
+        )
+        if previous and previous.platform_task_id and not run.platform_task_id:
+            run = run.model_copy(update={"platform_task_id": previous.platform_task_id})
+        if run == previous:
+            return
+        event, _ = store.append(
+            ProductEvent(
+                conversation_id=snapshot.conversation_id,
+                type="experiment_execution.changed",
+                payload={"execution": run.model_dump(mode="json")},
+            )
+        )
+        self._publish(event)
+
+    async def _capture_plan_progress(
+        self, active: _ActiveConversation, store: FileProductStore
+    ) -> None:
+        policy = store.preparation_policy()
+        if policy is None or policy.allowed_roles:
+            return
+        scope = active.handle.session_id
+        try:
+            project = await self.get_project(scope, active.context)
+            if project is None:
+                return
+            text = await active.adapter.read_workspace_text(
+                active.handle, PLAN_PATH, active.context, max_bytes=1024 * 1024
+            )
+            if not text:
+                return
+            rows = read_plan_tasks(text)
+            artifacts = await asyncio.to_thread(
+                self._artifact_versions, scope, active.context
+            )
+            # Only the submission handler can bind a platform ID.
+            for row in rows:
+                if isinstance(row, dict):
+                    row.pop("platform_task_id", None)
+            for run in plan_executions(project, rows, artifacts):
+                if run.state != "queued":
+                    self._record_execution(store, run)
+        except Exception as exc:
+            # Drafts can be incomplete when a turn ends.
+            logger.warning(
+                "Plan projection pending: conversation=%s error=%s",
+                scope,
+                type(exc).__name__,
+            )
+
+    def _artifact_versions(
+        self, scope: str, context: RequestContext
+    ) -> tuple[ArtifactVersion, ...]:
+        if self.versions is None:
+            return ()
+        project = self.versions.project(scope, context, create=False)
+        return tuple(self.versions.store.list_versions(project.id)) if project else ()
+
+    async def _publish_artifacts(self, scope: str, context: RequestContext) -> None:
+        store = self._store(scope)
+        if "enqueue_task" not in (store.access_policy()["command_allowlist"] or ()):
+            return
+        artifacts = await asyncio.to_thread(self._artifact_versions, scope, context)
+        published = {
+            event.payload.get("artifact_id")
+            for event in await asyncio.to_thread(store.replay)
+            if event.type == "artifact.registered"
+        }
+        for artifact in artifacts:
+            if artifact.id in published or artifact.state not in {
+                "ready",
+                "reference_only",
+            }:
+                continue
+            event, _ = store.append(
+                ProductEvent(
+                    conversation_id=scope,
+                    type="artifact.registered",
+                    event_id=f"artifact:{artifact.id}",
+                    payload={
+                        "artifact_id": artifact.id,
+                        "kind": artifact.kind,
+                        "producer_run_id": artifact.producer_run_id,
+                    },
+                )
+            )
+            self._publish(event)
+
+    @staticmethod
+    def _registry_only_update(store: FileProductStore, task: ExternalTaskState) -> bool:
+        return (
+            "enqueue_task" in (store.access_policy()["command_allowlist"] or ())
+            and not task.graph_run_id
+            and task.kind != "historical_experience"
+            and (task.correlation is None or task.correlation.type == "main")
+        )
+
+    async def _task_notification(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        task: ExternalTaskState,
+        *,
+        status: str,
+        error_summary: str | None,
+        auto_run: bool,
+    ) -> ExternalTaskNotification:
+        if not self._registry_only_update(store, task):
+            return _build_external_task_notification(
+                task,
+                status=status,
+                error_summary=error_summary,
+                auto_run=auto_run,
+                has_training_node=_workflow_has_training_node(store, task),
+            )
+
+        def references() -> list[str]:
+            versions = self.versions
+            if versions is None:
+                return []
+            project = versions.project(
+                active.handle.session_id, active.context, create=False
+            )
+            if project is None:
+                return []
+            runs = {
+                run.id
+                for run in versions.store.list_runs(project.id)
+                if run.source.task_id == task.task_id
+            }
+            return [
+                v.id
+                for v in versions.store.list_versions(project.id)
+                if v.producer_run_id in runs and v.state in {"ready", "reference_only"}
+            ]
+
+        facts = {
+            "task_id": task.task_id,
+            "status": status,
+            "output_dir": task.output_dir,
+            "error_summary": error_summary,
+            "artifact_ids": await asyncio.to_thread(references),
+        }
+        return ExternalTaskNotification(
+            task_id=task.task_id,
+            kind=task.kind,
+            correlation=task.correlation,
+            run_id=task.run_id,
+            status=status,
+            error_summary=error_summary,
+            output_dir=task.output_dir,
+            trigger_turn=auto_run,
+            resume_interrupted=auto_run,
+            hidden_text=json.dumps(facts, ensure_ascii=False),
+        )
 
     async def version_call(
         self,
@@ -929,9 +1229,12 @@ class ConversationRuntime:
         self._store(conversation_id).authorize(context.user_id, context.profile_id)
         if self.versions is None:
             raise ValueError("version management is unavailable")
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             self.versions.call, conversation_id, request, command_id, context
         )
+        if request.action in {"save", "recover"}:
+            await self._publish_artifacts(conversation_id, context)
+        return result
 
     async def get_experiments(
         self, conversation_id: str, context: RequestContext
@@ -994,6 +1297,7 @@ class ConversationRuntime:
 
         count = await asyncio.to_thread(register)
         if count:
+            await self._publish_artifacts(conversation_id, context)
             await self._archive_version_runs(conversation_id, context)
         return count
 
@@ -1591,6 +1895,7 @@ class ConversationRuntime:
             )
         if context is not None:
             await self._reconcile_eval_deliveries(conversation_id, context)
+            await self._publish_artifacts(conversation_id, context)
         return await self._archive_version_runs(conversation_id, context) and complete
 
     async def _archive_version_runs(
@@ -2353,9 +2658,9 @@ class ConversationRuntime:
                 if snapshot.project.cluster:
                     context = replace(context, x_cluster=snapshot.project.cluster)
                 policy = snapshot.preparation.policy if snapshot.preparation else None
-                tools = await asyncio.to_thread(store.development_policy)
-                if policy is not None and "subagent" in (tools.tool_allowlist or ()):
+                if policy is not None and policy.allowed_roles:
                     snapshot = project_stage_activity(snapshot, policy)
+                snapshot = with_platform_states(snapshot)
             if not snapshot.capabilities.read_only:
                 await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
             self._schedule_read_recovery(conversation_id, store, context)
@@ -2647,6 +2952,74 @@ class ConversationRuntime:
                     await self._activate_development_policy(
                         conversation_id, store, context
                     )
+        queue_enabled = "enqueue_task" in (
+            store.access_policy()["command_allowlist"] or ()
+        )
+        snapshot = (
+            store.load_snapshot()
+            if queue_enabled and isinstance(command, UserMessageCommand)
+            else None
+        )
+        queued_message = (
+            isinstance(command, UserMessageCommand)
+            and snapshot is not None
+            and (
+                snapshot.status == "running"
+                or snapshot.pending_inputs
+                or snapshot.pending_permissions
+                or snapshot.experiment_queue
+            )
+            and not snapshot.automatic_turns_suspended
+            and command.workflow_xyflow is None
+            and all(part.type == "text" for part in command.content)
+            and await self.get_project(conversation_id, context) is not None
+        )
+        if isinstance(command, EnqueueTaskCommand) or queued_message:
+            if not queue_enabled:
+                raise PermissionError("task queue is not enabled")
+            if (
+                not queued_message
+                and await self.get_project(conversation_id, context) is None
+            ):
+                raise ValueError("create the Project before adding tasks")
+            instruction = (
+                command.instruction
+                if isinstance(command, EnqueueTaskCommand)
+                else "\n".join(
+                    block.text for block in command.content if block.type == "text"
+                )
+            )
+            validate_persisted_payload(instruction)
+            receipt, _ = store.claim_command(command)
+            if receipt.status == "completed":
+                return receipt
+            task_id = "requirement:" + command.command_id
+            self._queue_task(
+                store, conversation_id, task_id, "requirement", instruction
+            )
+            if isinstance(command, UserMessageCommand):
+                message, _ = store.append(
+                    ProductEvent(
+                        conversation_id=conversation_id,
+                        type="message.completed",
+                        event_id=f"message:{task_id}",
+                        payload={
+                            "message_id": task_id,
+                            "command_id": command.command_id,
+                            "role": "user",
+                            "content": [
+                                part.model_dump(mode="json") for part in command.content
+                            ],
+                        },
+                    )
+                )
+                self._publish(message)
+            await self._ensure_active(conversation_id, context)
+            return store.complete_command(
+                receipt.model_copy(
+                    update={"status": "completed", "response": {"task_id": task_id}}
+                )
+            )
         if isinstance(command, CreateProjectCommand):
             if conversation_id not in self._active:
                 await self._user_input.coordinate_recovery(store, conversation_id)
@@ -2745,7 +3118,11 @@ class ConversationRuntime:
                     logger.exception("Execution observation start failed")
             try:
                 if isinstance(command, CancelCommand):
-                    if active.handle.adapter_delivers_delegated_results:
+                    if (
+                        active.handle.adapter_delivers_delegated_results
+                        or "enqueue_task"
+                        in (store.access_policy()["command_allowlist"] or ())
+                    ):
                         await self._user_input.suspend(
                             store, conversation_id, "run_cancelled"
                         )
@@ -3476,7 +3853,9 @@ class ConversationRuntime:
                     if not (task.graph_run_id and self._workflows is not None):
                         response = await active.adapter.notify_external_task(
                             active.handle,
-                            _build_external_task_notification(
+                            await self._task_notification(
+                                active,
+                                store,
                                 ExternalTaskState.model_validate(
                                     {
                                         **task.model_dump(mode="json"),
@@ -3486,9 +3865,6 @@ class ConversationRuntime:
                                 status=normalized,
                                 error_summary=_controlled_error(error_summary),
                                 auto_run=auto_run,
-                                has_training_node=_workflow_has_training_node(
-                                    store, task
-                                ),
                             ),
                             active.context,
                         )
@@ -3535,7 +3911,9 @@ class ConversationRuntime:
                     snapshot = store.load_snapshot()
                     if active is None or snapshot.automatic_turns_suspended:
                         return
-                    if not any(task.resume_pending for task in snapshot.external_tasks):
+                    if not snapshot.experiment_queue and not any(
+                        task.resume_pending for task in snapshot.external_tasks
+                    ):
                         return
                     async with self._notification_resume_lock:
                         try:
@@ -3887,7 +4265,9 @@ class ConversationRuntime:
         can_poll = self._external_task_query is not None and bool(
             context.cookie or context.authorization
         )
-        return any(
+        return bool(
+            snapshot.experiment_queue and not snapshot.automatic_turns_suspended
+        ) or any(
             (task.resume_pending and not snapshot.automatic_turns_suspended)
             or (can_poll and _pollable_external_task(task))
             or (
@@ -3993,6 +4373,7 @@ class ConversationRuntime:
             active = self._start_pump(handle, adapter, store, context)
             self._active[conversation_id] = active
             await active.ready.wait()
+            await self._capture_plan_progress(active, store)
             await self._resume_pending_external_tasks(active, store)
             return store
 
@@ -4011,7 +4392,13 @@ class ConversationRuntime:
         """
         handle = await active.adapter.attach_session(active.handle.session_id, context)
         active.context = context
-        if handle != active.handle:
+        if (
+            handle.adapter_session_ref == active.handle.adapter_session_ref
+            and handle.session_id == active.handle.session_id
+            and handle.harness_id == active.handle.harness_id
+        ):
+            active.handle = handle
+        else:
             logger.warning(
                 "Harness returned a different handle for conversation %s; "
                 "the product pump may no longer observe it",
@@ -4088,6 +4475,8 @@ class ConversationRuntime:
     async def _sync_workflow_task_context(
         self, active: _ActiveConversation, store: FileProductStore
     ) -> None:
+        if "enqueue_task" in (store.access_policy()["command_allowlist"] or ()):
+            return
         tasks = {task.task_id: task for task in store.load_snapshot().external_tasks}
         for request in store.load_workflow_execution_requests().values():
             if (
@@ -4135,6 +4524,8 @@ class ConversationRuntime:
         # user must explicitly resume execution.
         if store.load_snapshot().automatic_turns_suspended:
             return
+        if store.load_snapshot().experiment_queue:
+            await self._dispatch_queued_tasks(active, store)
         if self._workflows and not self._workflows.busy(active.handle.session_id):
             for task in store.load_snapshot().external_tasks:
                 if task.kind != "historical_experience" or task.status not in {
@@ -4192,12 +4583,13 @@ class ConversationRuntime:
                 try:
                     response = await active.adapter.notify_external_task(
                         active.handle,
-                        _build_external_task_notification(
+                        await self._task_notification(
+                            active,
+                            store,
                             task,
                             status=task.status,
                             error_summary=task.error_summary,
                             auto_run=task.resume_auto_run,
-                            has_training_node=_workflow_has_training_node(store, task),
                         ),
                         active.context,
                     )
@@ -4271,6 +4663,10 @@ class ConversationRuntime:
                             if isinstance(outcome, dict)
                             else "unknown"
                         )
+                        if (active := self._active.get(handle.session_id)) is not None:
+                            await self._capture_plan_progress(active, store)
+                            if store.load_snapshot().experiment_queue:
+                                self._schedule_notification_retry(handle.session_id)
                         self._finish_observation(
                             handle.session_id, harness_event.run_id, str(status)
                         )
@@ -4311,7 +4707,9 @@ class ConversationRuntime:
                 # Persisting an event rewrites state on disk. Left inline it blocks
                 # the single event loop for every subscriber in the process, so hand
                 # it to a worker thread and keep the loop free to serve them.
-                persisted, _ = await asyncio.to_thread(store.append, product_event)
+                persisted, snapshot = await asyncio.to_thread(
+                    store.append, product_event
+                )
                 if product_event.type == "input.requested":
                     # A new pending question invalidates the recovery result.
                     self._user_input.invalidate(handle.session_id)
@@ -4329,6 +4727,10 @@ class ConversationRuntime:
                             handle.session_id,
                         )
                 self._publish(persisted)
+                if completed_plan_write(persisted, snapshot):
+                    active = self._active.get(handle.session_id)
+                    if active is not None:
+                        await self._capture_plan_progress(active, store)
                 if (
                     product_event.type == "operation.completed"
                     and product_event.payload.get("category") == "subagent"

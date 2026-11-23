@@ -145,6 +145,7 @@ ASK_USER_TOOL_DESCRIPTION = (
     "you can determine yourself with tools or context first. The tool waits "
     "until the user answers or cancels; their answers arrive as the tool result."
 )
+_PLANNED_SUBMISSIONS = {"df_submit_evaluation", "df_submit_pipeline", "submit_workflow"}
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _MAX_WORKFLOW_DSL_BYTES = 2 * 1024 * 1024
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
@@ -247,6 +248,7 @@ class _PiSession:
     input_calls: dict[str, tuple[str | None, str]] = field(default_factory=dict)
     delegated_input_ids: set[str] = field(default_factory=set)
     message_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    submission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class PiAdapter:
@@ -270,6 +272,7 @@ class PiAdapter:
         else:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
+        self._plan_submission: Callable[..., Awaitable[str | None]] | None = None
         self._preparation_call: Any = None
         self._preparation_revision: Any = None
         self._preparation_review: (
@@ -379,6 +382,24 @@ class PiAdapter:
     ) -> None:
         self._business_tools.training_artifact_hook = callback
 
+    def set_plan_submission_handler(
+        self, callback: Callable[..., Awaitable[str | None]]
+    ) -> None:
+        self._plan_submission = callback
+
+    @staticmethod
+    def _queues_messages(session: _PiSession) -> bool:
+        return "enqueue_task" in (
+            session.config.get("command_allowlist") or ()
+        ) and "set_preparation_plan" not in (session.config.get("tool_allowlist") or ())
+
+    def _tracks_submission(self, session: _PiSession, name: str) -> bool:
+        return (
+            self._plan_submission is not None
+            and name in _PLANNED_SUBMISSIONS
+            and "enqueue_task" in (session.config.get("command_allowlist") or ())
+        )
+
     def set_preparation_handler(
         self,
         callback: Any,
@@ -474,7 +495,7 @@ class PiAdapter:
                     "start work. Select kinds from the Skill's workflow catalog. "
                     "Tasks use stage_id; edges connect stage IDs. entry_task_id "
                     "selects the first task with concrete resource inputs. "
-                    "Runtime derives its role and manages review versions."
+                    "Runtime manages review versions."
                 ),
             }
             specs += [
@@ -490,6 +511,21 @@ class PiAdapter:
                 if session.config.get("tool_allowlist") is not None
                 and self._tool_allowed(session, name)
             ]
+        for spec in specs:
+            if self._tracks_submission(session, spec["name"]):
+                schema = spec["input_schema"]
+                schema["properties"] = {
+                    **schema["properties"],
+                    "plan_task_id": {
+                        "type": "string",
+                        "description": "Approved Project task ID for planned work.",
+                    },
+                    "plan_attempt": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Authorized attempt (default 1).",
+                    },
+                }
         return [
             spec
             for spec in specs
@@ -950,6 +986,7 @@ class PiAdapter:
         }
         for name in (
             "product_instructions",
+            "command_allowlist",
             "delegated_roles",
         ):
             value = getattr(policy, name)
@@ -1000,7 +1037,9 @@ class PiAdapter:
         if isinstance(command, UserMessageCommand):
             return await self._send_user_message(session, command)
         if isinstance(command, CancelCommand):
-            if handle.adapter_delivers_delegated_results:
+            if handle.adapter_delivers_delegated_results or self._queues_messages(
+                session
+            ):
                 self._suspend_inputs(session)
             self._business_tools.cancel(session.session_id)
             self._cancel_permissions(session, "Cancelled by user")
@@ -1467,6 +1506,15 @@ class PiAdapter:
         status = _external_task_status(notification.status)
         if status in {"succeeded", "failed", "terminated", "stopped"}:
             session.active_external_tasks.pop(notification.task_id, None)
+        if (
+            not notification.trigger_turn
+            and self._queues_messages(session)
+            and (
+                notification.correlation is None
+                or notification.correlation.type == "main"
+            )
+        ):
+            return {"accepted": True}
         await self._ensure_runner(session)
         assert session.runner is not None
         task_id = notification.task_id
@@ -1502,9 +1550,11 @@ class PiAdapter:
         return stream()
 
     async def has_pending_session_work(self, handle: SessionHandle) -> bool:
-        if not handle.adapter_delivers_delegated_results:
-            return False
         session = self._sessions.get(handle.session_id)
+        if not handle.adapter_delivers_delegated_results and not (
+            session and self._queues_messages(session)
+        ):
+            return False
         runner = session.runner if session else None
         if runner is None or not runner.running:
             return False
@@ -1699,6 +1749,7 @@ class PiAdapter:
             {
                 "session_id": session.session_id,
                 "workflows_enabled": self._workflow_call is not None,
+                "queue_user_messages": self._queues_messages(session),
                 "execution_policy": {
                     "automatic_turns_suspended": bool(
                         recovery and recovery.automatic_turns_suspended
@@ -1936,8 +1987,12 @@ class PiAdapter:
             tool_context = await self._tool_context(session)
             if params.get("origin") is not None:
                 origin = TaskOrigin.model_validate(params["origin"])
-                if origin.type != "subagent":
-                    raise PermissionError("only child calls can carry an origin")
+                if origin.type != "subagent" or not self._tool_allowed(
+                    session, "subagent"
+                ):
+                    raise PermissionError(
+                        "only authorized child calls can carry an origin"
+                    )
                 tool_context = replace(
                     tool_context,
                     request_context=replace(session.context, task_origin=origin),
@@ -1947,22 +2002,62 @@ class PiAdapter:
                 tool_name,
                 arguments,
             )
-            result = await self._business_tools.execute(
-                tool_name,
-                arguments,
-                tool_context,
-                tool_call_id=(
-                    params.get("tool_call_id")
-                    if isinstance(params.get("tool_call_id"), str)
-                    else None
-                ),
-                origin_run_id=(
-                    params.get("origin_run_id")
-                    if isinstance(params.get("origin_run_id"), str)
-                    else None
-                ),
-            )
-            self._emit_tool_signals(session, tool_name, result)
+
+            async def execute(call_arguments: dict[str, Any]) -> JsonObject:
+                return await self._business_tools.execute(
+                    tool_name,
+                    call_arguments,
+                    tool_context,
+                    tool_call_id=(
+                        params.get("tool_call_id")
+                        if isinstance(params.get("tool_call_id"), str)
+                        else None
+                    ),
+                    origin_run_id=(
+                        params.get("origin_run_id")
+                        if isinstance(params.get("origin_run_id"), str)
+                        else None
+                    ),
+                )
+
+            if (
+                not self._tracks_submission(session, tool_name)
+                or "plan_task_id" not in arguments
+            ):
+                result = await execute(arguments)
+                self._emit_tool_signals(session, tool_name, result)
+                return result
+
+            arguments = dict(arguments)
+            binding = (arguments.pop("plan_task_id"), arguments.pop("plan_attempt", 1))
+            assert self._plan_submission is not None
+            async with session.submission_lock:
+                previous = await self._plan_submission(
+                    session.session_id, *binding, session.context
+                )
+                if previous:
+                    receipt = {"task_id": previous, "already_submitted": True}
+                    return {
+                        "details": receipt,
+                        "is_error": False,
+                        "content": [{"type": "text", "text": json.dumps(receipt)}],
+                    }
+                result = await execute(arguments)
+                self._emit_tool_signals(session, tool_name, result)
+                details = result.get("details")
+                platform_id = (
+                    details.get("task_id") if isinstance(details, dict) else None
+                )
+                assert self._plan_submission is not None
+                await self._plan_submission(
+                    session.session_id,
+                    *binding,
+                    session.context,
+                    platform_task_id=platform_id
+                    if isinstance(platform_id, str)
+                    else None,
+                    failed=bool(result.get("is_error")),
+                )
             return result
         if method == "tool.cancel":
             tool_call_id = params.get("tool_call_id")
@@ -2623,6 +2718,7 @@ def _session_config(spec: SessionSpec) -> dict[str, Any]:
         "session_id": spec.conversation_id,
         "product_instructions": spec.product_instructions,
         "profile_id": spec.profile_id,
+        "command_allowlist": spec.command_allowlist,
         "tool_allowlist": spec.tool_allowlist,
         "skill_allowlist": spec.skill_allowlist,
         "delegated_roles": [

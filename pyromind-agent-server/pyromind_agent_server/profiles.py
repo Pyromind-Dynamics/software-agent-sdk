@@ -10,7 +10,6 @@ from pyromind_agent_server.agent_profiles.echomind_manager import (
 from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.reward_bundle import (
-    GET_PROJECT_REWARD,
     START_REWARD_REVIEW,
 )
 from pyromind_runtime.ports.harness import DelegatedRole
@@ -67,19 +66,6 @@ _PREPARATION_TOOLS = (
     "set_preparation_plan",
     START_REWARD_REVIEW,
 )
-_CHILD_WORKSPACE_TOOLS = ("read", "write", "edit", "terminal")
-_EVALUATION_TOOLS = _CHILD_WORKSPACE_TOOLS + (
-    GET_PROJECT_REWARD,
-    "df_submit_evaluation",
-    "df_check_progress",
-    "get_storage_url",
-    "df_stop_task",
-)
-_EVALUATION_SKILLS = (
-    "inference-evaluation",
-    "avi-baseline-evaluation",
-    "frozen-reward-evaluation",
-)
 
 
 def _load_preparation_policy() -> PreparationPolicy:
@@ -105,7 +91,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=27,
+    configuration_version=29,
     route_prefix="/api/v2/echomind/conversations",
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
@@ -122,45 +108,12 @@ Use the Sandbox to inspect data and prepare files. Start business tasks only aft
 the user creates the Project.
 After creation, preparation is finished. Use the accepted plan supplied in the
 Project notification to create public_data/workflowPLAN.json with write, then
-delegate the entry task through native subagent. If the Project has an approved
-Reward bundle, tell Init, Train, and Eval to use get_project_reward to resolve it.
-Train must use that Studio entry with weight 1 and no additional reward items.
-For Init and Eval tasks with a bound Reward, direct the role to the
-frozen-reward-evaluation Skill.
-Do not register stages, revisions or business run IDs for delegation.
+execute the accepted entry task directly.
 """
     + (ECHOMIND_MANAGER_PROFILE.system_prompt or ""),
     tool_allowlist=_PREPARATION_TOOLS,
     skill_allowlist=_PREPARATION_SKILLS,
-    delegated_roles=(
-        DelegatedRole(name="init", tools=_EVALUATION_TOOLS, skills=_EVALUATION_SKILLS),
-        DelegatedRole(
-            name="dataset",
-            tools=_CHILD_WORKSPACE_TOOLS
-            + (
-                "get_storage_url",
-                "df_submit_pipeline",
-                "df_check_progress",
-                "df_stop_task",
-            ),
-            skills=("data-processing",),
-        ),
-        DelegatedRole(
-            name="train",
-            tools=_CHILD_WORKSPACE_TOOLS
-            + (
-                GET_PROJECT_REWARD,
-                "get_storage_url",
-                "validate_workflow_dsl",
-                "submit_workflow",
-                "training_analysis",
-                "inspect_workflow_task",
-                "df_stop_task",
-            ),
-            skills=("generate-workflow-dsl", "workflow-execution", "training-analysis"),
-        ),
-        DelegatedRole(name="eval", tools=_EVALUATION_TOOLS, skills=_EVALUATION_SKILLS),
-    ),
+    delegated_roles=(),
     development_tool_allowlist=ECHOMIND_MANAGER_PROFILE.tool_allowlist,
     development_skill_allowlist=ECHOMIND_MANAGER_PROFILE.skill_allowlist,
     command_allowlist=(
@@ -168,6 +121,7 @@ Do not register stages, revisions or business run IDs for delegation.
         "input_response",
         "cancel",
         "create_project",
+        "enqueue_task",
         "permission_response",
         "workflow_execution",
     ),

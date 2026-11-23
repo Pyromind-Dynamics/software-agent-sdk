@@ -278,6 +278,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         evaluation_storage_factory=build_evaluation_storage,
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
+    pi_adapter.set_plan_submission_handler(runtime.bind_plan_submission)
     pi_adapter.set_project_reward_reader(runtime.project_reward)
     pi_adapter.set_evaluation_reward_reader(runtime.evaluation_reward)
     pi_adapter.set_preparation_handler(

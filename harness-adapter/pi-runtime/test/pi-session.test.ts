@@ -52,6 +52,7 @@ test("manager retrieval uses resource mirrors and the sandbox, never the host wo
   } as unknown as JsonlRpcPeer;
   const { session, subagents } = await createPiSession({
     session_id: "manager-retrieval", workspace_root: root, terminal_backend: "sandbox",
+    workflows_enabled: true,
     session_path: join(root, "pi", "session.jsonl"), system_prompt: "Inspect resources",
     skills_directory: skills, skill_roots: [], skill_allowlist: ["allowed"], tools: [],
     tool_allowlist: ["read", "write", "edit", "terminal", "grep", "find", "ls"],
@@ -61,8 +62,9 @@ test("manager retrieval uses resource mirrors and the sandbox, never the host wo
   t.after(async () => {
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
-    await subagents.close();
   });
+  assert.equal(subagents, undefined);
+  assert.equal(session.getToolDefinition("subagent"), undefined);
   const context = session.extensionRunner.createContext();
   for (const name of ["grep", "find", "ls"]) {
     const tool = session.getToolDefinition(name)!;
