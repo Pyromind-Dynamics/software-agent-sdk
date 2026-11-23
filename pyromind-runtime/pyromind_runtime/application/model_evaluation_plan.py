@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
-from pyromind_runtime.domain.experiment_plans import ExperimentTask
+from pyromind_runtime.domain.experiment_plans import ExperimentTask, PlanInput
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy, ProjectView
-from pyromind_runtime.domain.storage_paths import to_storage_api_path
+from pyromind_runtime.domain.storage_paths import StoragePathError, to_storage_api_path
 
 
 _MODEL_INPUTS = {"model", "merged_model", "checkpoint"}
@@ -48,6 +50,23 @@ def inference_paths(pipeline: PipelineRun | None) -> tuple[str, str] | None:
     return None
 
 
+def verified_input_path(item: PlanInput, outputs: dict) -> str | None:
+    value = outputs.get(item.output_name)
+    if not isinstance(value, str) or not value:
+        return None
+    if item.name in _MODEL_INPUTS and item.output_name == "model_output":
+        selected = outputs.get("selected_checkpoint")
+        if isinstance(selected, str) and selected:
+            try:
+                root = PurePosixPath(to_storage_api_path(value))
+                checkpoint = PurePosixPath(to_storage_api_path(selected))
+            except StoragePathError:
+                return value
+            if root in checkpoint.parents:
+                return selected
+    return value
+
+
 def validate_evaluation_inputs(
     project: ProjectView, task: ExperimentTask, rows: list, model: str, dataset: str
 ) -> None:
@@ -68,8 +87,20 @@ def validate_evaluation_inputs(
         if item.task_id:
             verified = outputs.get(item.task_id)
             expected = (
+                verified_input_path(item, verified)
+                if isinstance(verified, dict)
+                else None
+            )
+            declared = (
                 verified.get(item.output_name) if isinstance(verified, dict) else None
             )
+            if (
+                isinstance(declared, str)
+                and declared
+                and actual.startswith("/")
+                and (to_storage_api_path(actual) == to_storage_api_path(declared))
+            ):
+                continue
             if not isinstance(expected, str) or not expected:
                 raise ValueError(
                     f"Verify {item.task_id}.{item.output_name} in workflowPLAN before "

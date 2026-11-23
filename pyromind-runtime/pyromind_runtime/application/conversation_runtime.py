@@ -46,6 +46,7 @@ from pyromind_runtime.application.model_evaluation_plan import (
 )
 from pyromind_runtime.application.plan_execution import (
     PLAN_PATH,
+    completed_callback_task,
     completed_plan_write,
     next_approved_task,
     plan_executions,
@@ -92,6 +93,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
     CHAT_PROFILE,
     CHAT_REQUIREMENT_COMMAND_PREFIX,
+    MANAGER_PROFILE,
 )
 from pyromind_runtime.domain.errors import (
     EvaluationRunNotFoundError,
@@ -104,7 +106,7 @@ from pyromind_runtime.domain.evaluation import (
     AnnotationSaveResult,
     AnnotationSummaryResult,
 )
-from pyromind_runtime.domain.events import HarnessEvent, ProductEvent
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import (
     ExperimentExecutionView,
 )
@@ -164,6 +166,7 @@ from pyromind_runtime.ports.experiment_plans import (
 )
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.harness import (
+    BackgroundExecutionContext,
     ExternalTaskNotification,
     ForkSpec,
     HarnessAdapter,
@@ -355,6 +358,7 @@ class ConversationRuntime:
         self._notification_retries: dict[str, asyncio.Task[None]] = {}
         self._read_recoveries: dict[str, asyncio.Task[None]] = {}
         self._version_recovery_completed: set[str] = set()
+        self._plan_recovery_checks: dict[str, tuple[int, float]] = {}
 
     async def apply_session_configuration(
         self, conversation_id: str, policy: SessionPolicy, context: RequestContext
@@ -974,6 +978,9 @@ class ConversationRuntime:
                     "The user created this Project. Write the accepted plan to "
                     "public_data/workflowPLAN.json. "
                     f"{action} within the approved scope. "
+                    "Record runtime status per plan task ID in workflowPLAN.json. "
+                    "Store verified_outputs as a mapping from each exact declared "
+                    "output name to its verified absolute workspace path. "
                     "Reuse existing submissions on recovery.\n"
                     + json.dumps(data, ensure_ascii=False),
                     origin_turn_id=latest_origin(snapshot),
@@ -1421,11 +1428,10 @@ class ConversationRuntime:
         self,
         active: _ActiveConversation,
         store: FileProductStore,
-        completion: HarnessEvent,
+        run_id: str | None,
+        task_id: str | None,
         rows: list,
     ) -> None:
-        if completion.payload.get("status") not in ("idle", "finished"):
-            return
         conversation_id = active.handle.session_id
         snapshot = store.load_snapshot()
         if (
@@ -1434,24 +1440,18 @@ class ConversationRuntime:
             or snapshot.automatic_turns_suspended
         ):
             return
-        if snapshot.active_run_id and snapshot.active_run_id != completion.run_id:
+        if snapshot.active_run_id and snapshot.active_run_id != run_id:
             return
-        task_id = completion.task_id
-        if (
-            not task_id
-            and completion.run_id
-            and (run := (snapshot.task_runs or {}).get(completion.run_id))
-        ):
+        if not task_id and run_id and (run := (snapshot.task_runs or {}).get(run_id)):
             task_id = run.task_id
-        if not task_id or not task_id.startswith(
-            ("project-start:", "project-continue:")
-        ):
+        if not task_id:
             return
         project = await self.get_project(conversation_id, active.context)
         if project is None:
             return
         start_id = f"project-start:{project.project_id}"
         prefix = f"project-continue:{project.project_id}:"
+        completed_platform_id = None
         if task_id == start_id:
             entry = (
                 await self.get_preparation(conversation_id, active.context)
@@ -1460,8 +1460,19 @@ class ConversationRuntime:
         elif task_id.startswith(prefix):
             completed_task_id = task_id.removeprefix(prefix)
         else:
-            return
-        next_step = next_approved_task(project, rows, completed_task_id)
+            callback_task = completed_callback_task(
+                snapshot, task_id, project.project_id
+            )
+            if callback_task is None:
+                return
+            completed_task_id = callback_task
+            completed_platform_id = task_id
+        next_step = next_approved_task(
+            project,
+            rows,
+            completed_task_id,
+            completed_platform_id=completed_platform_id,
+        )
         if next_step is None:
             return
         task, inputs = next_step
@@ -1479,7 +1490,9 @@ class ConversationRuntime:
             "project_continue",
             "Continue the already confirmed Project with this task only. "
             "Use its inputs and accepted scope. Check existing platform receipts "
-            "before submitting. Pause if additional authorization is required.\n"
+            "before submitting. Record verified_outputs by declared output name "
+            "and absolute workspace path in workflowPLAN.json after verification. "
+            "Pause if additional authorization is required.\n"
             + json.dumps(payload, ensure_ascii=False),
             origin_turn_id=snapshot.task_origins.get(start_id),
         )
@@ -3140,6 +3153,13 @@ class ConversationRuntime:
     ) -> None:
         if self._closing or store.harness_id() not in self.adapters:
             return
+        adapter = self._adapter(store.harness_id())
+        if (
+            context.profile_id == MANAGER_PROFILE
+            and isinstance(adapter, BackgroundExecutionContext)
+            and not adapter.can_recover_on_read(context)
+        ):
+            return
         active = self._active.get(conversation_id)
         if recover_execution and active is not None and not active.stopping:
             active.touch()
@@ -3147,6 +3167,8 @@ class ConversationRuntime:
                 active.context = replace(
                     context, x_cluster=context.x_cluster or active.context.x_cluster
                 )
+                if isinstance(adapter, BackgroundExecutionContext):
+                    adapter.refresh_execution_context(active.handle, active.context)
         if conversation_id in self._read_recoveries:
             return
 
@@ -3161,6 +3183,14 @@ class ConversationRuntime:
                         context, x_cluster=await asyncio.to_thread(store.load_x_cluster)
                     )
                 active = self._active.get(conversation_id)
+                if (
+                    recover_execution
+                    and recovery_context.profile_id == MANAGER_PROFILE
+                    and (recovery_context.cookie or recovery_context.authorization)
+                ):
+                    await self._recover_saved_project_step(
+                        store, snapshot, recovery_context
+                    )
                 if recover_execution and self._has_pending_external_work(
                     snapshot, context
                 ):
@@ -3216,6 +3246,70 @@ class ConversationRuntime:
                 )
 
         self._read_recoveries[conversation_id] = asyncio.create_task(recover())
+
+    async def _recover_saved_project_step(
+        self,
+        store: FileProductStore,
+        snapshot: ConversationSnapshot,
+        context: RequestContext,
+    ) -> None:
+        # A completed manager turn may have committed the local outputs before
+        # its plan projection or continuation was recorded.
+        if (
+            snapshot.status not in ("idle", "finished")
+            or snapshot.active_run_id
+            or snapshot.experiment_queue
+            or snapshot.automatic_turns_suspended
+            or snapshot.pending_inputs
+            or snapshot.pending_permissions
+            or not snapshot.task_runs
+        ):
+            return
+        run_id, run = max(snapshot.task_runs.items(), key=lambda item: item[1].seq)
+        if run.status not in ("idle", "finished"):
+            return
+        if run.task_id.startswith(("project-start:", "project-continue:")):
+            if not any(
+                r.role_id == "main"
+                and r.state in ("queued", "preparing")
+                and not r.platform_task_id
+                for r in snapshot.experiment_executions or ()
+            ):
+                return
+        elif (
+            completed_callback_task(snapshot, run.task_id, allow_pending_analysis=True)
+            is None
+        ):
+            return
+        cid = snapshot.conversation_id
+        checked = self._plan_recovery_checks.get(cid)
+        if checked and checked[0] == run.seq and checked[1] > time.monotonic():
+            return
+        self._plan_recovery_checks[cid] = (run.seq, time.monotonic() + 60)
+        await self._ensure_active(cid, context)
+        active = self._active.get(cid)
+        if not active or active.stopping:
+            return
+        current = await asyncio.to_thread(store.load_snapshot)
+        if (
+            current.active_run_id
+            or current.experiment_queue
+            or current.task_runs != snapshot.task_runs
+        ):
+            return
+        rows = await self._capture_plan_progress(active, store)
+        if rows is not None:
+            await self._continue_approved_project(
+                active, store, run_id, run.task_id, rows
+            )
+            # An early read can still see the pre-analysis workspace revision.
+            # Keep recovery eligible until the callback projection is durable.
+            latest = await asyncio.to_thread(store.load_snapshot)
+            if run.task_id.startswith(("project-start:", "project-continue:")) or (
+                completed_callback_task(latest, run.task_id) is not None
+            ):
+                self._plan_recovery_checks[cid] = (run.seq, float("inf"))
+            await self._resume_pending_external_tasks(active, store)
 
     async def _recover_operation_activity(
         self,
@@ -4592,6 +4686,13 @@ class ConversationRuntime:
         store.authorize(context.user_id, context.profile_id)
         if store.harness_id() not in self.adapters:
             return store
+        adapter = self._adapter(store.harness_id())
+        if (
+            context.profile_id == MANAGER_PROFILE
+            and isinstance(adapter, BackgroundExecutionContext)
+            and not adapter.can_recover_on_read(context)
+        ):
+            return store
         if conversation_id in self._active or self._has_pending_external_work(
             await asyncio.to_thread(store.load_snapshot), context
         ):
@@ -5012,9 +5113,15 @@ class ConversationRuntime:
                     if harness_event.type == "run.finished" and active is not None:
                         try:
                             rows = await self._capture_plan_progress(active, store)
-                            if rows is not None:
+                            if rows is not None and harness_event.payload.get(
+                                "status"
+                            ) in ("idle", "finished"):
                                 await self._continue_approved_project(
-                                    active, store, harness_event, rows
+                                    active,
+                                    store,
+                                    harness_event.run_id,
+                                    harness_event.task_id,
+                                    rows,
                                 )
                         except Exception as exc:
                             logger.warning(

@@ -21,6 +21,41 @@ from pyromind_runtime.domain.snapshot import (
 from .fake_adapter import FakeAdapter
 
 
+def test_wrapped_plan_joins_status_by_task_id_and_named_outputs_by_filename():
+    tasks = [{"id": "data", "outputs": [{"name": "val"}, {"name": "train"}]}]
+    states = {
+        "data": {
+            "business_status": "completed",
+            "verified_outputs": [
+                "/workspace/a/train.jsonl",
+                "/workspace/a/val.jsonl",
+                "/workspace/b/val.jsonl",
+                "/workspace/unrelated.txt",
+            ],
+        }
+    }
+    (row,) = read_plan_tasks(
+        json.dumps({"plan": {"tasks": tasks}, "task_states": states})
+    )
+    assert row["business_status"] == "completed"
+    assert row["verified_outputs"] == {"train": "/workspace/a/train.jsonl"}
+
+
+def test_verified_baseline_report_uses_the_single_canonical_platform_report():
+    task = {"id": "baseline", "outputs": [{"name": "baseline_report"}]}
+    state = {
+        "verified_outputs": [
+            "/workspace/metrics.json",
+            "/workspace/report.json",
+            "/workspace/evaluation_report.html",
+        ]
+    }
+    rows = read_plan_tasks(
+        json.dumps({"plan": {"tasks": [task]}, "task_states": {"baseline": state}})
+    )
+    assert rows[0]["verified_outputs"] == {"baseline_report": "/workspace/report.json"}
+
+
 def test_nested_plan_restores_saved_local_data_completion():
     task = {"id": "data_task", "stage_id": "data", "name": "Prepare data"}
     project = ProjectView.model_validate(

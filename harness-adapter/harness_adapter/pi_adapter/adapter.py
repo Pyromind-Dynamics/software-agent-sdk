@@ -22,6 +22,7 @@ from uuid import uuid4
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
+    _auth_token,
     _forward_headers,
 )
 from harness_adapter.pi_adapter.business_tools import ProjectRewardReader
@@ -744,11 +745,17 @@ class PiAdapter:
                 require_api_key=False,
             )
         else:
-            session.context = context
-        if self._terminal_backend == "sandbox" and not self._has_execution_workspace(
-            session
-        ):
-            return await self._read_stored_workspace_text(session, path, max_bytes)
+            # An observational read must not replace the live runner's login.
+            session = replace(session, context=context)
+        if self._terminal_backend == "sandbox":
+            # The sandbox file API can serve an old byte length for a replaced
+            # file, even cutting a UTF-8 character in half. Read the durable
+            # control document through Storage instead of projecting that prefix.
+            if not self._has_execution_workspace(session) or (
+                PurePosixPath(path) == PurePosixPath("public_data/workflowPLAN.json")
+                and (context.cookie or context.authorization)
+            ):
+                return await self._read_stored_workspace_text(session, path, max_bytes)
         workspace = await self._workspace(session)
         try:
             return await asyncio.to_thread(
@@ -896,6 +903,26 @@ class PiAdapter:
             else:
                 _remove_created_workspace(root, self._conversation_root)
             raise
+
+    def can_recover_on_read(self, context: RequestContext) -> bool:
+        return self._terminal_backend != "sandbox" or bool(_auth_token(context))
+
+    def refresh_execution_context(
+        self, handle: SessionHandle, context: RequestContext
+    ) -> None:
+        session = self._sessions.get(handle.session_id)
+        if (
+            session
+            and session.context.user_id == context.user_id
+            and session.context.profile_id == context.profile_id
+            and _auth_token(context)
+        ):
+            session.context = replace(
+                session.context,
+                authorization=context.authorization,
+                cookie=context.cookie,
+                x_cluster=context.x_cluster or session.context.x_cluster,
+            )
 
     async def attach_session(
         self,

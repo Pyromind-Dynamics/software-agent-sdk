@@ -87,6 +87,40 @@ def test_legacy_model_eval_and_local_analysis_have_distinct_completion_evidence(
             validate_evaluation_inputs(project, task, rows, model, data)
     with pytest.raises(ValueError, match="Verify train.merged_model"):
         validate_evaluation_inputs(project, task, [], "/models/merged", dataset)
+    selected_task = task.model_copy(
+        update={
+            "inputs": tuple(
+                item.model_copy(update={"output_name": "model_output"})
+                if item.task_id
+                else item
+                for item in task.inputs
+            )
+        }
+    )
+    selected = "/workspace/models/sft/checkpoint-6"
+    training = {
+        **rows[0],
+        "verified_outputs": {
+            "model_output": "/workspace/models/sft",
+            "selected_checkpoint": selected,
+        },
+    }
+    validate_evaluation_inputs(project, selected_task, [training], selected, dataset)
+    validate_evaluation_inputs(
+        project, selected_task, [training], "/models/sft", dataset
+    )
+    for wrong in (
+        "/workspace/models/sft/checkpoint-5",
+        "/workspace/models/other/checkpoint-6",
+    ):
+        with pytest.raises(ValueError, match="requires"):
+            validate_evaluation_inputs(
+                project, selected_task, [training], wrong, dataset
+            )
+    with pytest.raises(ValueError, match="requires"):
+        validate_evaluation_inputs(
+            project, selected_task, [training], selected, "/data/train.jsonl"
+        )
     score = PipelineRun(
         run_id=uuid4(),
         conversation_id="chat",

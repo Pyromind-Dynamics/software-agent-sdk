@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type {
   EditOperations,
@@ -316,6 +317,10 @@ export interface FallbackSandboxFileClientOptions {
   retryFileApiMs?: number;
 }
 
+function isWorkflowPlan(path: string): boolean {
+  return path === "public_data/workflowPLAN.json" || path.endsWith("/public_data/workflowPLAN.json");
+}
+
 /**
  * File API first, terminal transport as the fallback.
  *
@@ -339,7 +344,7 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
 
   async read(path: string, limit?: number, signal?: AbortSignal): Promise<Buffer> {
     signal?.throwIfAborted();
-    if (this.terminalOnly) return this.terminal.read(path, limit, signal);
+    if (this.terminalOnly || isWorkflowPlan(path)) return this.terminal.read(path, limit, signal);
     try {
       const content = await this.fileApi.read(path, limit, signal);
       this.recovered();
@@ -352,7 +357,7 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
 
   async access(path: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
-    if (this.terminalOnly) return this.terminal.access(path, signal);
+    if (this.terminalOnly || isWorkflowPlan(path)) return this.terminal.access(path, signal);
     try {
       await this.fileApi.access(path, signal);
       this.recovered();
@@ -363,7 +368,7 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
   }
 
   async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
-    if (this.terminalOnly) return this.terminal.write(path, content, signal);
+    if (this.terminalOnly || isWorkflowPlan(path)) return this.terminal.write(path, content, signal);
     try {
       await this.fileApi.write(path, content, signal);
       this.recovered();
@@ -519,6 +524,24 @@ export function createSandboxFileOperations(
   const primeRead = async (path: string): Promise<void> => {
     cached = { path, buffer: await readBytes(path) };
   };
+  const writeFile = async (path: string, content: string): Promise<void> => {
+    const isPlan = isWorkflowPlan(path);
+    if (isPlan) {
+      try {
+        JSON.parse(content);
+      } catch {
+        throw new Error("The workflow plan is incomplete or invalid JSON. Read the plan and write a complete document.");
+      }
+    }
+    await client.write(path, content, signal);
+    if (!isPlan) return;
+    const expected = Buffer.from(content);
+    for (const waitMs of [0, 250, 1000]) {
+      if (waitMs) await delay(waitMs, undefined, { signal });
+      if ((await client.read(path, undefined, signal)).equals(expected)) return;
+    }
+    throw new Error("The saved workflow plan differs from the requested content. Verify the workspace file before continuing.");
+  };
   return {
     read: {
       readFile: read,
@@ -530,14 +553,14 @@ export function createSandboxFileOperations(
       },
     },
     write: {
-      writeFile: (path, content) => client.write(path, content, signal),
+      writeFile,
       // Both transports create parent directories for a write, so the explicit
       // mkdir the write tool issues before writing is already covered.
       mkdir: async () => undefined,
     },
     edit: {
       readFile: read,
-      writeFile: (path, content) => client.write(path, content, signal),
+      writeFile,
       access: primeRead,
     },
   };

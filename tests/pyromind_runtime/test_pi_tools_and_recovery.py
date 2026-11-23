@@ -2291,6 +2291,26 @@ async def test_sandbox_reads_project_request_through_workspace_port(
         is None
     )
 
+    # The sandbox API can expose an earlier byte count, splitting multibyte text.
+    plan_path = "public_data/workflowPLAN.json"
+    (root / plan_path).write_bytes('{"阶段":"完成"}'.encode()[:-3])
+
+    def download(**kwargs):
+        assert kwargs["storage_path"] == f"/.pyromind-agent/conversation-1/{plan_path}"
+        assert kwargs["max_bytes"] == 2048
+        return '{"阶段":"完成"}'.encode()
+
+    monkeypatch.setattr(pi_adapter_module, "download_file_from_pyromind", download)
+    assert (
+        await adapter.read_workspace_text(
+            adapter._handle(session),
+            plan_path,
+            RequestContext(user_id="42", cookie="auth_token=fixture"),
+            max_bytes=2048,
+        )
+        == '{"阶段":"完成"}'
+    )
+
 
 async def test_sandbox_project_request_read_does_not_start_an_idle_runner(
     tmp_path, monkeypatch

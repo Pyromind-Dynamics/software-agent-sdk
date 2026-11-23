@@ -6,7 +6,10 @@ import json
 from collections.abc import Iterable, Iterator
 from pathlib import PurePosixPath
 
-from pyromind_runtime.application.model_evaluation_plan import check_inference_receipt
+from pyromind_runtime.application.model_evaluation_plan import (
+    check_inference_receipt,
+    verified_input_path,
+)
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import ExperimentTask
@@ -159,28 +162,110 @@ def _is_plan_write(item: TimelineOperation) -> bool:
 
 def read_plan_tasks(text: str) -> list:
     plan = json.loads(text)
-    if not isinstance(plan, dict) or not isinstance(plan.get("tasks"), list):
+    if not isinstance(plan, dict):
         raise ValueError("workflow plan requires a tasks array")
-    tasks = plan["tasks"]
+    definition = plan if "tasks" in plan else plan.get("plan")
+    if not isinstance(definition, dict) or not isinstance(
+        definition.get("tasks"), list
+    ):
+        raise ValueError("workflow plan requires a tasks array")
+    tasks = definition["tasks"]
     runtime = plan.get("runtime")
     records = runtime.get("tasks") if isinstance(runtime, dict) else None
     if not isinstance(records, dict):
-        return tasks
+        records = plan.get("task_states", {})
     merged = []
     for task in tasks:
-        task_id = task.get("id") if isinstance(task, dict) else None
-        record = records.get(task_id) if isinstance(task_id, str) else None
+        if not isinstance(task, dict):
+            merged.append(task)
+            continue
+        task_id = task.get("id")
+        record = (
+            records.get(task_id)
+            if isinstance(records, dict) and isinstance(task_id, str)
+            else None
+        )
         if isinstance(record, dict) and record.get("plan_task_id", task_id) == task_id:
             task = {
                 **{key: record[key] for key in _RUNTIME_TASK_FIELDS if key in record},
                 **task,
             }
+        outputs = task.get("verified_outputs")
+        if isinstance(outputs, list):
+            declared = task.get("outputs")
+            names = (
+                {
+                    v["name"]
+                    for v in declared
+                    if isinstance(v, dict) and isinstance(v.get("name"), str)
+                }
+                if isinstance(declared, list)
+                else set()
+            )
+            paths: dict[str, list[str]] = {}
+            for value in outputs:
+                if isinstance(value, str) and value.strip():
+                    file = PurePosixPath(value)
+                    name = file.stem
+                    if name not in names and file.name == "report.json":
+                        name = f"{task_id}_report"
+                    if name in names:
+                        paths.setdefault(name, []).append(value)
+            task = {
+                **task,
+                "verified_outputs": {
+                    key: values[0] for key, values in paths.items() if len(values) == 1
+                },
+            }
         merged.append(task)
     return merged
 
 
+def completed_callback_task(
+    snapshot: ConversationSnapshot,
+    platform_id: str,
+    project_id: str | None = None,
+    *,
+    allow_pending_analysis: bool = False,
+) -> str | None:
+    """Match a successful platform receipt to its unique approved project step."""
+    external = next(
+        (task for task in snapshot.external_tasks if task.task_id == platform_id), None
+    )
+    if (
+        not external
+        or external.status != "succeeded"
+        or external.resume_auto_run is False
+        or (external.correlation and external.correlation.type != "main")
+    ):
+        return None
+    # external.run_id can be a platform pipeline ID. The submission receipt on
+    # the approved project step identifies its owner across both ID schemes.
+    matches = [
+        run.task_id
+        for run in snapshot.experiment_executions or ()
+        if run.platform_task_id == platform_id
+        and (project_id is None or run.project_id == project_id)
+        and run.role_id == "main"
+        and (
+            run.state in {"succeeded", "reported"}
+            or (
+                allow_pending_analysis
+                and run.state
+                in {"preparing", "waiting_analysis", "waiting_platform", "queued"}
+            )
+        )
+        and run.report_state != "failed"
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def next_approved_task(
-    project: ProjectView, rows: list, completed_task_id: str
+    project: ProjectView,
+    rows: list,
+    completed_task_id: str,
+    *,
+    completed_platform_id: str | None = None,
 ) -> tuple[ExperimentTask, dict[str, str]] | None:
     records = {
         row["id"]: row
@@ -192,8 +277,13 @@ def next_approved_task(
         completed.get("business_status") != "completed"
         or not isinstance(completed.get("verified_outputs"), dict)
         or not completed["verified_outputs"]
-        or completed.get("platform_task_id")
-        or completed.get("actual_platform_task_id")
+        or any(
+            ref and ref != completed_platform_id
+            for ref in (
+                completed.get("platform_task_id"),
+                completed.get("actual_platform_task_id"),
+            )
+        )
     ):
         return None
     enabled = {
@@ -225,7 +315,7 @@ def next_approved_task(
                     outputs, dict
                 ):
                     return None
-                path = outputs.get(item.output_name)
+                path = verified_input_path(item, outputs)
             if not isinstance(path, str) or not path.strip():
                 return None
             try:

@@ -47,6 +47,11 @@ _EXECUTION_STATES = frozenset({"waiting_analysis", "succeeded"})
 _PLATFORM_STATES = frozenset({"succeeded", "failed", "terminated", "stopped"})
 _ROUND_END = "本轮执行已结束。可查看原任务中的执行详情。"
 _ROUND_END_EN = "This execution round has ended. Open the original task for details."
+_NO_RESULT = "本轮执行已结束，执行记录中没有可展示的结果正文。"
+_NO_RESULT_EN = "This round ended without a recorded user-facing result."
+_QUOTED_REASONING_TAG = re.compile(
+    r"(?<!`)`<(/?(?:think|thinking|reasoning|analysis))>`(?!`)", re.IGNORECASE
+)
 
 
 @runtime_checkable
@@ -188,6 +193,8 @@ def completion_summary(
     text = "\n".join(
         block.text.strip() for block in final.content if isinstance(block, TextContent)
     ).strip()
+    # A standalone tag quoted as inline code names a data format in the report.
+    text = _QUOTED_REASONING_TAG.sub(r"`\1`", text)
     text = re.sub(
         r"<(think|thinking|analysis|reasoning)\b[^>]*>.*?</\1\s*>",
         "",
@@ -244,12 +251,28 @@ def public_summary_excerpt(evidence: str) -> str | None:
     return "\n".join(visible).strip() or None
 
 
+def _authorization_failure(event: ProductEvent) -> bool:
+    return (
+        event.type == "operation.failed"
+        and event.payload.get("error_code") == "sandbox_authorization_required"
+    )
+
+
 def candidate_for(
     event: ProductEvent, snapshot: ConversationSnapshot, readable_reports: set[str]
 ) -> Candidate | None:
     run = (snapshot.task_runs or {}).get(event.run_id) if event.run_id else None
     task_id = event.task_id or (run.task_id if run else None)
     origin = origin_for(snapshot, task_id, event.run_id)
+    if origin and _authorization_failure(event):
+        return Candidate(
+            f"sandbox-auth:{event.run_id or event.event_id}",
+            {"milestone": "sandbox_authorization_required"},
+            ExecutionNoticeLink(origin_turn_id=origin),
+            "执行暂时受阻，沙箱需要登录。请在本会话的凭据设置中应用有效的登录后继续。",
+            "Execution is blocked waiting for sandbox access. Apply your current "
+            "login in this conversation’s credential settings to continue.",
+        )
     if event.type == "artifact.registered":
         artifact_id = event.payload.get("artifact_id")
         if (
@@ -337,22 +360,25 @@ def candidate_for(
         )
         stage = execution.get("stage_id")
         project = snapshot.project
-        policy = snapshot.preparation.policy if snapshot.preparation else None
-        node = (
-            next((step.kind for step in project.plan.stages if step.id == stage), None)
+        stage_name = (
+            next((step.name for step in project.plan.stages if step.id == stage), None)
             if project
             else None
         )
         stage_facts: JsonObject = (
-            {
-                "stage": next(
-                    (item.name for item in policy.workflow_nodes if item.id == node),
-                    None,
-                )
-            }
-            if node and policy
+            {"stage": label}
+            if stage_name and (label := safe_question(stage_name))
             else {}
         )
+        if state == "failed" and not platform and report_state != "failed":
+            # Submission validation can fail inside a still-running turn which
+            # can correct the parameters itself. User decisions have separate
+            # input/permission events; the final turn still delivers its result.
+            if snapshot.status == "running" or any(
+                r.run_id == run and r.state != "failed"
+                for r in snapshot.experiment_executions or ()
+            ):
+                return None
         if report_ready:
             verified = next(
                 (
@@ -456,20 +482,110 @@ def candidate_for(
             "本轮执行遇到问题，请查看执行详情。",
             "This run could not finish. See the execution details.",
         )
-    if (
-        event.type == "status.changed"
-        and event.payload.get("status") in ("idle", "finished")
-        and event.run_id
-        and task_id
-        and origin
-        and (
-            task_id in snapshot.task_origins
-            or any(
-                task.task_id == task_id and task.run_id
-                for task in snapshot.external_tasks
+    return round_completion_candidate(event, snapshot)
+
+
+def resolved_submission_notices(
+    manager: ConversationSnapshot, chat: ConversationSnapshot
+) -> list[ProductEvent]:
+    # Only the pre-submission failure uses run:<attempt>:failed. Once this
+    # exact attempt has a bound receipt, its original blocker is historical.
+    notices = {
+        item.item_id: item
+        for item in chat.timeline
+        if isinstance(item, TimelineMessage) and item.execution_notice
+    }
+    updates = []
+    for step in manager.experiment_executions or ():
+        if step.role_id != "main" or not step.platform_task_id:
+            continue
+        key = f"run:{step.run_id}:failed"
+        message_id = _NOTICE_PREFIX + sha256(key.encode()).hexdigest()
+        item = notices.get(message_id)
+        if not item or not item.execution_notice:
+            continue
+        chinese = any(
+            isinstance(b, TextContent) and re.search(r"[\u3400-\u9fff]", b.text)
+            for b in item.content
+        )
+        text = (
+            "此前提交遇到问题，之后已成功提交到平台。"
+            if chinese
+            else (
+                "Submission initially failed. The platform later accepted this attempt."
             )
         )
+        if item.content == (TextContent(text=text),):
+            continue
+        updates.append(
+            ProductEvent(
+                conversation_id=chat.conversation_id,
+                event_id=message_id + ":submitted",
+                type="message.completed",
+                run_id=item.run_id,
+                payload={
+                    "role": "assistant",
+                    "message_id": message_id,
+                    "content": [{"type": "text", "text": text}],
+                    "execution_notice": item.execution_notice.model_dump(
+                        mode="json", exclude_none=True
+                    ),
+                },
+            )
+        )
+    return updates
+
+
+def direct_project_receipts(
+    snapshot: ConversationSnapshot,
+) -> dict[str, tuple[str, int]]:
+    """Link a direct project resume to chat only through a bound main submission."""
+    origins = {
+        step.platform_task_id: origin
+        for step in snapshot.experiment_executions or ()
+        if step.role_id == "main"
+        and step.platform_task_id
+        and (origin := snapshot.task_origins.get(f"project-start:{step.project_id}"))
+    }
+    runs: dict[str, tuple[str, int]] = {}
+    for op in snapshot.timeline:
+        if (
+            isinstance(op, TimelineOperation)
+            and op.run_id
+            and not op.task_id
+            and op.run_id not in (snapshot.task_runs or {})
+            and op.status == "completed"
+            and op.completed_seq
+            and op.name in {"df_submit_evaluation", "submit_workflow"}
+            and isinstance(op.details, dict)
+            and isinstance(receipt := op.details.get("task_id"), str)
+            and (origin := origins.get(receipt))
+        ):
+            runs.setdefault(op.run_id, (origin, op.completed_seq))
+    return runs
+
+
+def round_completion_candidate(
+    event: ProductEvent, snapshot: ConversationSnapshot
+) -> Candidate | None:
+    run = (snapshot.task_runs or {}).get(event.run_id) if event.run_id else None
+    task_id = event.task_id or (run.task_id if run else None)
+    if (
+        event.type != "status.changed"
+        or event.payload.get("status") not in ("idle", "finished")
+        or not event.run_id
     ):
+        return None
+    if task_id:
+        origin = origin_for(snapshot, task_id, event.run_id)
+        linked = task_id in snapshot.task_origins or any(
+            task.task_id == task_id and task.run_id for task in snapshot.external_tasks
+        )
+    else:
+        direct = direct_project_receipts(snapshot).get(event.run_id)
+        origin = direct[0] if direct and direct[1] < event.seq else None
+        linked = bool(origin)
+    if linked and origin:
         evidence = completion_summary(snapshot, event)
         followup = any(
             item.get("kind") == "project_continue"
@@ -490,12 +606,10 @@ def candidate_for(
             f"round:{event.run_id}",
             facts,
             ExecutionNoticeLink(origin_turn_id=origin, has_result=bool(excerpt)),
-            "本轮执行已结束，已排队继续下一步。"
-            if followup
-            else "本轮执行已结束，执行记录中没有可展示的结果正文。",
+            "本轮执行已结束，已排队继续下一步。" if followup else _NO_RESULT,
             "This round has ended and the next step is queued."
             if followup
-            else "This round ended without a recorded user-facing result.",
+            else _NO_RESULT_EN,
             report_excerpt=excerpt,
         )
     return None
@@ -547,7 +661,7 @@ class EchoMindNotices:
         manager_id = event.conversation_id
         if (
             not self.closed
-            and event.type in _NOTICE_EVENTS
+            and (event.type in _NOTICE_EVENTS or _authorization_failure(event))
             and not manager_id.startswith(CHAT_PREFIX)
             and self.runtime._store(CHAT_PREFIX + manager_id).metadata_path.is_file()
         ):
@@ -583,20 +697,57 @@ class EchoMindNotices:
             historical: dict[int, ProductEvent] = {}
             if manager_id not in self.observed and snapshot.task_runs:
                 chat_snapshot = await asyncio.to_thread(chat.load_snapshot)
-                missing = {
+                for update in resolved_submission_notices(snapshot, chat_snapshot):
+                    saved, _ = await asyncio.to_thread(chat.append, update)
+                    self.runtime._publish(saved)
+                missing: set[str] = set()
+                no_result: set[str] = set()
+                for item in chat_snapshot.timeline:
+                    if (
+                        isinstance(item, TimelineMessage)
+                        and item.execution_notice
+                        and item.run_id
+                        and item.run_id in snapshot.task_runs
+                        and len(item.content) == 1
+                        and isinstance(block := item.content[0], TextContent)
+                    ):
+                        if block.text in (_ROUND_END, _ROUND_END_EN):
+                            missing.add(item.run_id)
+                        elif block.text in (_NO_RESULT, _NO_RESULT_EN):
+                            no_result.add(item.run_id)
+                # A genuine no-result notice needs no replay. Check only runs
+                # whose previous result may have contained a quoted tag.
+                if no_result:
+                    missing.update(
+                        item.run_id
+                        for item in snapshot.timeline
+                        if isinstance(item, TimelineMessage)
+                        and item.run_id
+                        and item.run_id in no_result
+                        and item.role == "assistant"
+                        and any(
+                            isinstance(block, TextContent)
+                            and _QUOTED_REASONING_TAG.search(block.text)
+                            for block in item.content
+                        )
+                    )
+                starts = {run: snapshot.task_runs[run].seq for run in missing}
+                delivered = {
                     item.run_id
                     for item in chat_snapshot.timeline
                     if isinstance(item, TimelineMessage)
                     and item.execution_notice
-                    and item.run_id in snapshot.task_runs
-                    and item.content
-                    in (
-                        (TextContent(text=_ROUND_END),),
-                        (TextContent(text=_ROUND_END_EN),),
+                    and (
+                        item.execution_notice.has_result
+                        or item.execution_notice.action == "report"
                     )
                 }
-                if missing:
-                    first = min(snapshot.task_runs[run].seq for run in missing if run)
+                for run, (_, seq) in direct_project_receipts(snapshot).items():
+                    if run not in delivered and run != snapshot.active_run_id:
+                        starts[run] = seq
+                if starts:
+                    missing.update(starts)
+                    first = min(starts.values())
                     historical = {
                         e.seq: e
                         for e in await asyncio.to_thread(manager.replay, first - 1)
@@ -608,17 +759,24 @@ class EchoMindNotices:
             while True:
                 events = await asyncio.to_thread(manager.replay, cursor)
                 fresh = self.observed.pop(manager_id, {})
+                replayed_rounds = set(historical)
                 fresh.update(historical)
                 historical.clear()
                 fresh.update(
                     (event.seq, event)
                     for event in events
-                    if event.type in _NOTICE_EVENTS
+                    if event.type in _NOTICE_EVENTS or _authorization_failure(event)
                 )
                 candidates = [fresh[seq] for seq in sorted(fresh)]
                 if candidates:
                     await self._deliver(
-                        manager, chat, candidates, manager_id, chat_id, context
+                        manager,
+                        chat,
+                        candidates,
+                        manager_id,
+                        chat_id,
+                        context,
+                        replayed_rounds,
                     )
                 if events:
                     cursor = events[-1].seq
@@ -639,6 +797,7 @@ class EchoMindNotices:
         manager_id: str,
         chat_id: str,
         context: RequestContext,
+        replayed_rounds: set[int],
     ) -> None:
         snapshot = await self.runtime._load_saved_snapshot(
             manager_id, manager, context, recover_inputs=False
@@ -673,7 +832,11 @@ class EchoMindNotices:
             and link.get("action") == "report"
         }
         for event in events:
-            candidate = candidate_for(event, snapshot, readable_reports)
+            candidate = (
+                round_completion_candidate(event, snapshot)
+                if event.seq in replayed_rounds
+                else candidate_for(event, snapshot, readable_reports)
+            )
             if candidate is None or not candidate.current(snapshot):
                 continue
             if candidate.key.startswith("round:") and event.run_id in delivered_runs:
@@ -684,6 +847,8 @@ class EchoMindNotices:
                 if not candidate.report_excerpt or prior.payload.get("content") not in (
                     [{"type": "text", "text": _ROUND_END}],
                     [{"type": "text", "text": _ROUND_END_EN}],
+                    [{"type": "text", "text": _NO_RESULT}],
+                    [{"type": "text", "text": _NO_RESULT_EN}],
                 ):
                     continue
                 identity += ":readable-report"
@@ -737,7 +902,7 @@ class EchoMindNotices:
                         if english
                         else "正在等待平台结果。"
                     )
-            elif candidate.key.startswith("round:"):
+            elif candidate.key.startswith(("round:", "sandbox-auth:")):
                 text = fallback
             else:
                 text = await self._compose(chat_id, context, facts) or fallback
