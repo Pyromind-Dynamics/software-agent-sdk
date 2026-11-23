@@ -360,6 +360,7 @@ class SnapshotProjector:
         message = TimelineMessage(
             item_id=message_id,
             started_seq=event.seq,
+            started_at=event.occurred_at,
             role=cast(_MessageRole, role),
             content=self._content(event.payload),
             run_id=event.run_id,
@@ -380,6 +381,7 @@ class SnapshotProjector:
             item = TimelineMessage(
                 item_id=message_id,
                 started_seq=event.seq,
+                started_at=event.occurred_at,
                 role="assistant",
                 run_id=event.run_id,
                 turn_id=event.turn_id,
@@ -409,6 +411,7 @@ class SnapshotProjector:
             item = TimelineMessage(
                 item_id=message_id,
                 started_seq=event.seq,
+                started_at=event.occurred_at,
                 role=cast(_MessageRole, role),
                 run_id=event.run_id,
                 turn_id=event.turn_id,

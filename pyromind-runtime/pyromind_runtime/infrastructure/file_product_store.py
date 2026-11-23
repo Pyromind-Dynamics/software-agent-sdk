@@ -891,6 +891,12 @@ class FileProductStore:
             return None
         if snapshot.conversation_id != metadata.conversation_id:
             raise ProductStoreCorruptionError("snapshot conversation mismatch")
+        if any(
+            item.kind == "message" and item.started_at is None
+            for item in snapshot.timeline
+        ):
+            # Older snapshots omitted message times. The original events retain them.
+            return None
         return snapshot
 
     @staticmethod

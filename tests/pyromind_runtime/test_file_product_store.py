@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,37 @@ def test_store_lives_inside_conversation_and_rebuilds_snapshot(tmp_path: Path) -
     )
     store.snapshot_path.write_text("broken", encoding="utf-8")
     assert store.load_snapshot().status == "running"
+
+
+def test_historical_message_time_is_recovered_from_the_start_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    start, _ = store.append(
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="message.started",
+            payload={"message_id": "message-1", "role": "assistant"},
+        )
+    )
+    _, current = store.append(
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="message.completed",
+            payload={"message_id": "message-1", "role": "assistant"},
+        )
+    )
+    assert current.timeline[0].kind == "message"
+    assert current.timeline[0].started_at == start.occurred_at
+
+    old_snapshot = json.loads(current.model_dump_json())
+    old_snapshot["timeline"][0].pop("started_at")
+    store.snapshot_path.write_text(json.dumps(old_snapshot), encoding="utf-8")
+
+    restored = store.load_snapshot()
+    assert restored == current
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+    assert store.load_snapshot() == current
 
 
 def test_store_deduplicates_events(tmp_path: Path) -> None:
