@@ -38,7 +38,12 @@ type ConversationStatus = Literal[
 ]
 
 
-class TimelineMessage(ContractModel):
+class TimelineEntry(ContractModel):
+    turn_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    task_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class TimelineMessage(TimelineEntry):
     kind: Literal["message"] = "message"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -50,7 +55,7 @@ class TimelineMessage(ContractModel):
     command_id: str | None = None
 
 
-class TimelineOperation(ContractModel):
+class TimelineOperation(TimelineEntry):
     activity: OperationActivity | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -99,14 +104,14 @@ class WorkflowState(ContractModel):
     canvas: JsonObject | None = None
 
 
-class TimelineWorkflow(ContractModel):
+class TimelineWorkflow(TimelineEntry):
     kind: Literal["workflow"] = "workflow"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
     workflow: WorkflowState
 
 
-class TimelineCompaction(ContractModel):
+class TimelineCompaction(TimelineEntry):
     kind: Literal["compaction"] = "compaction"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -114,7 +119,7 @@ class TimelineCompaction(ContractModel):
     summary: str | None = None
 
 
-class TimelineNotice(ContractModel):
+class TimelineNotice(TimelineEntry):
     kind: Literal["notice"] = "notice"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -225,6 +230,9 @@ class ConversationSnapshot(ContractModel):
     experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None
     experiment_queue: tuple[JsonObject, ...] | None = None
+    task_origins: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     pending_permissions: tuple[PendingPermission, ...] = ()
     pending_inputs: tuple[PendingUserInput, ...] = ()
     # Automatic-turn suspension is separate from display status and is released by

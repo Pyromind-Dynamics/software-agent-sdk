@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+from pyromind_runtime.application.echomind_chat import EchoMindChat
 from pyromind_runtime.application.evaluation_annotations import (
     EvaluationAnnotationService,
     EvaluationLockRegistry,
@@ -84,6 +85,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.echomind_chat import CHAT_REQUIREMENT_COMMAND_PREFIX
 from pyromind_runtime.domain.errors import (
     EvaluationRunNotFoundError,
     EvaluationRunUnavailableError,
@@ -229,6 +231,7 @@ class _ActiveConversation:
     last_access: float = field(default_factory=time.monotonic)
     inflight: int = 0
     workflow_task_context: set[str] = field(default_factory=set)
+    notification_resume_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stopping: asyncio.Event | None = None
 
     def touch(self) -> None:
@@ -288,6 +291,7 @@ class ConversationRuntime:
         self._experiment_plan_project_binder = experiment_plan_project_binder
         self._observer = observer
         self._resource_limits = resource_limits
+        self.echomind_chat = EchoMindChat(self)
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
         self.versions = versions
@@ -296,7 +300,6 @@ class ConversationRuntime:
         self._projector = ProductEventProjector()
         self._user_input = UserInputCoordinator(publish=self._publish)
         self._input_response_tasks: set[asyncio.Task[CommandReceipt]] = set()
-        self._notification_resume_lock = asyncio.Lock()
         # Wake waiters when the policy changes. They reread persisted policy at the
         # execution boundary because one check cannot cover cancellation races.
         self._auto_execution_wakeups: dict[str, asyncio.Event] = {}
@@ -875,9 +878,11 @@ class ConversationRuntime:
                 snapshot.status == "running"
                 or snapshot.pending_inputs
                 or snapshot.pending_permissions
+                or snapshot.experiment_queue
             ):
                 raise ValueError(
-                    "wait for the preparation turn and pending questions to finish"
+                    "wait for queued requirements, preparation and pending questions "
+                    "to finish"
                 )
             receipt, _ = store.claim_command(command)
             if receipt.status == "completed":
@@ -925,15 +930,17 @@ class ConversationRuntime:
                     self._record_execution(
                         store,
                         next(
-                            plan_executions(
-                                project,
-                                [
-                                    {
-                                        "id": entry.request_id,
-                                        "stage_id": entry.stage_id,
-                                        "business_status": "pending",
-                                    }
-                                ],
+                            iter(
+                                plan_executions(
+                                    project,
+                                    [
+                                        {
+                                            "id": entry.request_id,
+                                            "stage_id": entry.stage_id,
+                                            "business_status": "pending",
+                                        }
+                                    ],
+                                )
                             )
                         ),
                     )
@@ -964,6 +971,47 @@ class ConversationRuntime:
                 )
             )
 
+    async def enqueue_chat_requirement(
+        self,
+        conversation_id: str,
+        command: EnqueueTaskCommand,
+        context: RequestContext,
+        *,
+        origin_turn_id: str | None = None,
+    ) -> JsonObject:
+        store = await self._authorized_store(conversation_id, context)
+        store.require_command(command.type)
+        self._adapter(store.harness_id())
+        instruction = command.instruction.strip()
+        if not instruction:
+            raise ValueError("A requirement is required")
+        validate_persisted_payload(instruction)
+        async with self._project_creation_locks.setdefault(
+            conversation_id, asyncio.Lock()
+        ):
+            receipt, _ = store.claim_command(command)
+            if receipt.status != "completed":
+                task_id = "requirement:" + command.command_id
+                self._queue_task(
+                    store,
+                    conversation_id,
+                    task_id,
+                    "requirement",
+                    instruction,
+                    origin_turn_id=origin_turn_id,
+                )
+                receipt = store.complete_command(
+                    receipt.model_copy(
+                        update={
+                            "status": "completed",
+                            "response": {"task_id": task_id},
+                        }
+                    )
+                )
+        self._schedule_read_recovery(conversation_id, store, context)
+        self._schedule_notification_retry(conversation_id)
+        return {**receipt.response, "status": "queued"}
+
     def _queue_task(
         self,
         store: FileProductStore,
@@ -971,12 +1019,16 @@ class ConversationRuntime:
         task_id: str,
         kind: str,
         instruction: str,
+        *,
+        origin_turn_id: str | None = None,
     ) -> None:
         payload: JsonObject = {
             "task_id": task_id,
             "kind": kind,
             "instruction": instruction,
         }
+        if origin_turn_id is not None:
+            payload["origin_turn_id"] = origin_turn_id
         validate_persisted_payload(payload)
         event, _ = store.append(
             ProductEvent(
@@ -1003,6 +1055,22 @@ class ConversationRuntime:
             if item.get("kind") not in {"project_start", "requirement"}:
                 continue
             task_id = str(item["task_id"])
+            command_id = task_id.removeprefix("requirement:")
+            if (
+                command_id.startswith(CHAT_REQUIREMENT_COMMAND_PREFIX)
+                and await self.get_project(snapshot.conversation_id, active.context)
+                is None
+            ):
+                owner = self._preparation_owner(
+                    snapshot.conversation_id, active.context
+                )
+                assert self._preparations is not None
+                await self._plan_io(
+                    self._preparations.store.invalidate, owner, command_id
+                )
+                self._notify_preparation(
+                    snapshot.conversation_id, "preparation.changed"
+                )
             result = await active.adapter.notify_external_task(
                 active.handle,
                 ExternalTaskNotification(
@@ -2733,7 +2801,12 @@ class ConversationRuntime:
             )
 
     async def _load_saved_snapshot(
-        self, conversation_id: str, store: FileProductStore, context: RequestContext
+        self,
+        conversation_id: str,
+        store: FileProductStore,
+        context: RequestContext,
+        *,
+        recover_inputs: bool = True,
     ) -> ConversationSnapshot:
         if store.harness_id() not in self.adapters:
             snapshot = await asyncio.to_thread(store.load_snapshot)
@@ -2760,7 +2833,7 @@ class ConversationRuntime:
                     "pending_permissions": (),
                 }
             )
-        if conversation_id not in self._active:
+        if recover_inputs and conversation_id not in self._active:
             await self._user_input.coordinate_recovery(store, conversation_id)
         snapshot = await asyncio.to_thread(store.load_snapshot)
         policy = await asyncio.to_thread(store.preparation_policy)
@@ -3014,13 +3087,13 @@ class ConversationRuntime:
                 and await self.get_project(conversation_id, context) is None
             ):
                 raise ValueError("create the Project before adding tasks")
-            instruction = (
-                command.instruction
-                if isinstance(command, EnqueueTaskCommand)
-                else "\n".join(
+            if isinstance(command, EnqueueTaskCommand):
+                instruction = command.instruction
+            else:
+                assert isinstance(command, UserMessageCommand)
+                instruction = "\n".join(
                     block.text for block in command.content if block.type == "text"
                 )
-            )
             validate_persisted_payload(instruction)
             receipt, _ = store.claim_command(command)
             if receipt.status == "completed":
@@ -3526,7 +3599,7 @@ class ConversationRuntime:
         )
         active = self._active.get(request.conversation_id)
         if active is not None:
-            async with self._notification_resume_lock:
+            async with active.notification_resume_lock:
                 await self._sync_workflow_task_context(active, store)
         return {
             "request_id": request.request_id,
@@ -3909,7 +3982,7 @@ class ConversationRuntime:
                         task.resume_pending for task in snapshot.external_tasks
                     ):
                         return
-                    async with self._notification_resume_lock:
+                    async with active.notification_resume_lock:
                         try:
                             await self._resume_notifications(active, store)
                         except Exception:
@@ -4417,7 +4490,7 @@ class ConversationRuntime:
             self._schedule_read_recovery(
                 active.handle.session_id, store, active.context, recover_execution=False
             )
-        async with self._notification_resume_lock:
+        async with active.notification_resume_lock:
             await self._repair_parked_await_bindings(active.handle.session_id)
             await self._sync_workflow_task_context(active, store)
             await self._resume_notifications(active, store)

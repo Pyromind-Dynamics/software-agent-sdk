@@ -54,6 +54,7 @@ export class PiAgentRuntime {
   private readonly outcome = new PiOutcomeNormalizer();
   private readonly finishedRuns = new Set<string>();
   private activeRunId: string | undefined;
+  private latestUserCommandId: string | undefined;
   private readonly cancelledRuns = new Set<string>();
   private readonly pendingCommandIds: string[] = [];
   private readonly subagentWakeTexts = new Set<string>();
@@ -139,6 +140,7 @@ export class PiAgentRuntime {
         onRepetitionDetected: () => this.suspendRepetitiveGeneration(),
         automaticTurnsSuspended: () => this.executionSuspended || this.cancelling,
         onSubagentWake: (text) => this.subagentWakeTexts.add(text),
+        currentUserCommandId: () => this.latestUserCommandId,
       },
     );
     this.recorder = recorder;
@@ -176,6 +178,9 @@ export class PiAgentRuntime {
           this.subagentWakeMessages.add(event.message);
         }
         if (this.subagentWakeMessages.has(event.message)) return;
+        if (event.type === "message_start") {
+          this.latestUserCommandId = this.pendingCommandIds[0];
+        }
       }
       for (const translated of this.normalizer.translate(event)) {
         if (translated.kind !== "usage.updated") this.peer.emit(translated);
@@ -198,7 +203,7 @@ export class PiAgentRuntime {
         details: isObject(message.details) ? message.details : {},
       } });
       else if (isObject(message.details) && message.details.resume_interrupted === true && !notificationSettled(session.sessionManager.getBranch(), runId)) {
-        this.pendingNotifications.push({ runId, message: recoveryMessage(runId) });
+        this.pendingNotifications.push({ runId, message: recoveryMessage(runId, message.details.task_id) });
       }
     }
     try { await subagents?.attach(session); }
@@ -372,12 +377,15 @@ export class PiAgentRuntime {
     this.finishedRuns.add(runId);
     if (this.cancelledRuns.delete(runId)) outcome = { status: "cancelled", stop_reason: "aborted" };
     if (this.activeRunId === runId) this.activeRunId = undefined;
+    const owner = this.normalizer?.runId === runId ? this.normalizer : undefined;
     const event: RunnerEvent = {
       protocolVersion: PROTOCOL_VERSION,
       type: "pi.event",
       eventId: randomUUID(),
       sessionId: this.sessionId,
       runId,
+      turnId: owner?.turnId,
+      taskId: owner?.taskId,
       occurredAt: new Date().toISOString(),
       kind: "run.finished",
       payload: {
@@ -456,7 +464,7 @@ export class PiAgentRuntime {
       const settled = notificationSettled(session.sessionManager.getBranch(), runId);
       if (settled) return { accepted: true, duplicate: true, completed: true, settled_status: settled };
       if (this.executionSuspended || session.isStreaming || this.normalizer || this.pendingNotifications.some(item => item.runId === runId)) return {accepted: true, duplicate: true, queued: true};
-      this.startNotification(runId, recoveryMessage(runId));
+      this.startNotification(runId, recoveryMessage(runId, isObject(params.details) ? params.details.task_id : undefined));
       return {accepted: true, resumed: true};
     }
     const details = { ...(isObject(params.details) ? params.details : {}), notification_run_id: runId };
@@ -514,7 +522,8 @@ export class PiAgentRuntime {
     message: { customType: string; content: string; display: boolean; details: JsonObject },
   ): void {
     const executionRunId = `${runId}:${randomUUID()}`;
-    this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds, this.storageUrls);
+    this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds, this.storageUrls,
+      typeof message.details.task_id === "string" ? message.details.task_id : undefined);
     this.activeRunId = executionRunId;
     this.outcome.reset();
     setImmediate(() => void this.runNotification(executionRunId, message, runId));
@@ -670,6 +679,6 @@ export function notificationSettled(entries: SessionEntry[], runId: string): str
   return status === "completed" || status === "failed" ? status : undefined;
 }
 
-function recoveryMessage(runId: string) {
-  return {customType: "pyromind.recovery", content: "Continue handling the interrupted notification already in this conversation. Read current task facts first; reuse existing executions and do not repeat platform submission.", display: false, details: {notification_run_id: runId}};
+function recoveryMessage(runId: string, taskId: JsonValue | undefined) {
+  return {customType: "pyromind.recovery", content: "Continue handling the interrupted notification already in this conversation. Read current task facts first; reuse existing executions and do not repeat platform submission.", display: false, details: {notification_run_id: runId, ...(typeof taskId === "string" ? {task_id: taskId} : {})}};
 }

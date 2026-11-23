@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import os
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from pydantic import Field, TypeAdapter, ValidationError, model_serializer
@@ -123,6 +124,22 @@ class FileProductStore:
         self._thread_lock = threading.RLock()
         self._lock_depth = threading.local()
         self._projector = SnapshotProjector()
+
+    @asynccontextmanager
+    async def lock_chat_creation(self):
+        fd = os.open(
+            self.directory / ".chat-creation.lock", os.O_CREAT | os.O_WRONLY, _FILE_MODE
+        )
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
+            yield
+        finally:
+            os.close(fd)
 
     def create(
         self,

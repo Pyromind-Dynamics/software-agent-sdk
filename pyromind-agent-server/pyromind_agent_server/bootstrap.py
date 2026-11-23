@@ -256,6 +256,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     )
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     pi_adapter.set_plan_submission_handler(runtime.bind_plan_submission)
+    pi_adapter.set_echo_chat_handler(runtime.echomind_chat.call)
     pi_adapter.set_project_reward_reader(runtime.project_reward)
     pi_adapter.set_evaluation_reward_reader(runtime.evaluation_reward)
     pi_adapter.set_preparation_handler(
@@ -312,6 +313,7 @@ def resource_limits_from_environment() -> ResourceLimits:
 
 def install_product_api(app: FastAPI) -> FastAPI:
     """Install the product API and own its runtime lifecycle."""
+    from pyromind_agent_server.api.echomind_chat import router as echomind_chat_router
     from pyromind_agent_server.api.echomind_projects import (
         router as echomind_projects_router,
     )
@@ -336,6 +338,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
     app.include_router(create_product_router())
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     app.include_router(echomind_projects_router)
+    app.include_router(echomind_chat_router)
     app.include_router(create_evaluation_runs_router())
     return app
 

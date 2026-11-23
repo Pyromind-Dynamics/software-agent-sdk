@@ -84,6 +84,7 @@ export interface PiSessionOptions {
   onRepetitionDetected?: () => void;
   automaticTurnsSuspended?: () => boolean;
   onSubagentWake?: (text: string) => void;
+  currentUserCommandId?: () => string | undefined;
   /** Test seam: the terminal socket used by a sandbox session. */
   terminalConnect?: SandboxTerminalConnector;
   /** The runner-local ask_user tool, present only for input-enabled sessions. */
@@ -276,7 +277,13 @@ export async function createPiSession(
       : [];
   let preparationRevision: number | undefined;
   const options: CreateToolsOptions = {
-    toolContext: (): JsonObject => preparationRevision === undefined ? {} : { preparation_revision: preparationRevision },
+    toolContext: (): JsonObject => {
+      const commandId = sessionOptions.currentUserCommandId?.();
+      return {
+        ...(preparationRevision === undefined ? {} : { preparation_revision: preparationRevision }),
+        ...(commandId === undefined ? {} : { origin_command_id: commandId }),
+      };
+    },
     terminalEnvironment: terminalEnvironment as Record<string, string>,
     terminalTimeouts: sandboxTerminalTimeouts(),
     scriptChunkChars: sandboxTerminalScriptChunkChars(),

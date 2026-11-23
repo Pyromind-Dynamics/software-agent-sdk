@@ -55,6 +55,8 @@ class WorkflowCompletionHook:
                     event_id=event_id,
                     conversation_id=self.handle.session_id,
                     run_id=event.run_id,
+                    turn_id=event.turn_id,
+                    task_id=event.task_id,
                     occurred_at=event.occurred_at,
                     type=kind,
                     payload=payload,

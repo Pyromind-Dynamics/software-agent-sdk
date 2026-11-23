@@ -267,7 +267,17 @@ class SnapshotProjector:
         queue = snapshot.experiment_queue or ()
         if any(item.get("task_id") == event.payload["task_id"] for item in queue):
             return snapshot
-        return snapshot.model_copy(update={"experiment_queue": (*queue, event.payload)})
+        task_id = self._string(event.payload, "task_id")
+        origin = self._optional_string(event.payload, "origin_turn_id")
+        origins = snapshot.task_origins
+        if origin and task_id not in origins:
+            origins = {**origins, task_id: origin}
+        return snapshot.model_copy(
+            update={
+                "experiment_queue": (*queue, event.payload),
+                "task_origins": origins,
+            }
+        )
 
     def _on_task_dispatched(
         self, snapshot: ConversationSnapshot, event: ProductEvent
@@ -353,6 +363,8 @@ class SnapshotProjector:
             role=cast(_MessageRole, role),
             content=self._content(event.payload),
             run_id=event.run_id,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
         )
         command_id = event.payload.get("command_id")
         if isinstance(command_id, str):
@@ -370,6 +382,8 @@ class SnapshotProjector:
                 started_seq=event.seq,
                 role="assistant",
                 run_id=event.run_id,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
             )
             snapshot = self._append(snapshot, item)
         text = self._string(event.payload, "text", allow_empty=True)
@@ -397,6 +411,8 @@ class SnapshotProjector:
                 started_seq=event.seq,
                 role=cast(_MessageRole, role),
                 run_id=event.run_id,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
             )
             snapshot = self._append(snapshot, item)
         update: dict[str, object] = {
@@ -436,6 +452,8 @@ class SnapshotProjector:
             if event.payload.get("execution") is not None
             else None,
             run_id=event.run_id,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
         )
         return self._append(snapshot, operation)
 
@@ -471,6 +489,8 @@ class SnapshotProjector:
                 name=self._string(event.payload, "name", default="operation"),
                 category="observation",
                 run_id=event.run_id,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
             )
             snapshot = self._append(snapshot, item)
         update: dict[str, object] = {}
@@ -732,6 +752,8 @@ class SnapshotProjector:
                 event.payload, "compaction_id", default=event.event_id
             ),
             started_seq=event.seq,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
             status=cast(_CompactionStatus, status),
             summary=self._optional_string(event.payload, "summary"),
         )
@@ -746,6 +768,8 @@ class SnapshotProjector:
         item = TimelineWorkflow(
             item_id=event.event_id,
             started_seq=event.seq,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
             workflow=workflow,
         )
         return self._append(snapshot, item).model_copy(
@@ -883,6 +907,8 @@ class SnapshotProjector:
             TimelineNotice(
                 item_id=event.event_id,
                 started_seq=event.seq,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
                 severity=cast(_NoticeSeverity, severity),
                 code=code,
                 message=message,

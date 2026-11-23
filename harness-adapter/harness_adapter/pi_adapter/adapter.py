@@ -25,7 +25,10 @@ from harness_adapter.pi_adapter.business_tool_host import (
     _forward_headers,
 )
 from harness_adapter.pi_adapter.business_tools import ProjectRewardReader
-from harness_adapter.pi_adapter.event_translator import translate_runner_event
+from harness_adapter.pi_adapter.event_translator import (
+    tool_operation_id,
+    translate_runner_event,
+)
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
@@ -76,6 +79,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.echomind_chat import CHAT_TOOLS
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.preparation import (
@@ -271,6 +275,13 @@ class PiAdapter:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
         self._plan_submission: Callable[..., Awaitable[str | None]] | None = None
+        self._echo_chat_call: (
+            Callable[
+                [str, str, JsonObject, str, RequestContext, str | None],
+                Awaitable[JsonObject],
+            ]
+            | None
+        ) = None
         self._preparation_call: Any = None
         self._preparation_revision: Any = None
         self._preparation_review: (
@@ -398,6 +409,15 @@ class PiAdapter:
             and "enqueue_task" in (session.config.get("command_allowlist") or ())
         )
 
+    def set_echo_chat_handler(
+        self,
+        callback: Callable[
+            [str, str, JsonObject, str, RequestContext, str | None],
+            Awaitable[JsonObject],
+        ],
+    ) -> None:
+        self._echo_chat_call = callback
+
     def set_preparation_handler(
         self,
         callback: Any,
@@ -474,6 +494,16 @@ class PiAdapter:
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
+        if self._echo_chat_call is not None:
+            specs += [
+                {
+                    "name": name,
+                    "description": description,
+                    "input_schema": model.model_json_schema(),
+                }
+                for name, (model, description) in CHAT_TOOLS.items()
+                if name in (session.config.get("tool_allowlist") or ())
+            ]
         if self._preparation_review is not None and session.user_input_enabled:
             specs += [
                 {
@@ -1635,6 +1665,7 @@ class PiAdapter:
                     runner.pid,
                 )
                 return
+            self._finish_inflight_items(session, inflight, "runner_exited")
             await self._runner_event(
                 session,
                 {
@@ -1643,6 +1674,8 @@ class PiAdapter:
                     "eventId": uuid4().hex,
                     "sessionId": session.session_id,
                     "runId": run_id_value,
+                    "turnId": inflight.get("turn_id"),
+                    "taskId": inflight.get("task_id"),
                     "occurredAt": datetime.now().astimezone().isoformat(),
                     "kind": "run.finished",
                     "payload": {
@@ -1885,6 +1918,25 @@ class PiAdapter:
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
+            if tool_name in CHAT_TOOLS:
+                tool_call_id = params.get("tool_call_id")
+                if self._echo_chat_call is None or not isinstance(tool_call_id, str):
+                    raise ValueError("EchoMind Chat Agent tool is unavailable")
+                origin = params.get("origin_command_id")
+                result = await self._echo_chat_call(
+                    session.session_id,
+                    tool_name,
+                    arguments,
+                    tool_call_id,
+                    session.context,
+                    origin if isinstance(origin, str) else None,
+                )
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                    ],
+                    "is_error": False,
+                }
             if tool_name in PREPARATION_TOOLS:
                 if self._preparation_call is None:
                     raise ValueError("plan tools are not configured")
@@ -1920,10 +1972,10 @@ class PiAdapter:
                     request_context=replace(session.context, task_origin=origin),
                 )
 
-            async def execute(arguments: dict[str, Any]) -> JsonObject:
+            async def execute(tool_arguments: dict[str, Any]) -> JsonObject:
                 return await self._business_tools.execute(
                     tool_name,
-                    arguments,
+                    tool_arguments,
                     tool_context,
                     tool_call_id=(
                         params.get("tool_call_id")
@@ -2296,7 +2348,13 @@ class PiAdapter:
             return
         if kind == "agent.started":
             session.running = True
-            session.files.save_inflight({"run_id": run_id})
+            session.files.save_inflight(
+                {
+                    "run_id": run_id,
+                    "turn_id": frame.get("turnId"),
+                    "task_id": frame.get("taskId"),
+                }
+            )
         elif kind == "run.finished":
             active_run = session.files.load_inflight() or {}
             if session.running and active_run.get("run_id") not in {None, run_id}:
@@ -2330,7 +2388,7 @@ class PiAdapter:
             )
             return
         else:
-            self._record_inflight(session, kind, payload, run_id)
+            self._record_inflight(session, kind, payload, frame, run_id)
         for event in translate_runner_event(frame):
             session.queue.put_nowait(event)
         if kind == "tool.completed" and _is_workflow_mutation(
@@ -2382,6 +2440,8 @@ class PiAdapter:
         return HarnessEvent(
             session_id=session.session_id,
             run_id=run_id,
+            turn_id=frame.get("turnId"),
+            task_id=frame.get("taskId"),
             event_id=f"{session.session_id}:{run_id}:finished",
             source_event_id=str(frame.get("eventId") or run_id),
             type="run.finished",
@@ -2389,18 +2449,71 @@ class PiAdapter:
         )
 
     def _record_inflight(
-        self, session: _PiSession, kind: Any, payload: dict[str, Any], run_id: str
+        self,
+        session: _PiSession,
+        kind: Any,
+        payload: dict[str, Any],
+        frame: dict[str, Any],
+        run_id: str,
     ) -> None:
         inflight = session.files.load_inflight() or {"run_id": run_id}
-        if kind == "message.started" and payload.get("role") == "assistant":
-            inflight["message_id"] = payload.get("message_id")
+        if kind == "message.started":
+            if isinstance(frame.get("turnId"), str):
+                inflight["turn_id"] = frame["turnId"]
+            if payload.get("role") == "assistant":
+                inflight["message_id"] = payload.get("message_id")
         elif kind == "message.completed":
             inflight.pop("message_id", None)
-        elif kind == "tool.started":
-            inflight["operation_id"] = payload.get("tool_call_id")
-        elif kind in {"tool.completed", "tool.failed"}:
-            inflight.pop("operation_id", None)
+        elif kind in {"tool.started", "tool.completed", "tool.failed"}:
+            operation_id = tool_operation_id(payload, frame.get("turnId"))
+            if isinstance(operation_id, str):
+                operations = self._inflight_operations(inflight)
+                if kind == "tool.started":
+                    operations[operation_id] = frame.get("turnId")
+                else:
+                    operations.pop(operation_id, None)
+                inflight.pop("operation_id", None)
+                inflight["operations"] = operations
         session.files.save_inflight(inflight)
+
+    @staticmethod
+    def _inflight_operations(inflight: dict[str, Any]) -> dict[str, str | None]:
+        operations = dict(inflight.get("operations") or {})
+        operation_id = inflight.get("operation_id")
+        if isinstance(operation_id, str):
+            operations.setdefault(operation_id, inflight.get("turn_id"))
+        return operations
+
+    def _finish_inflight_items(
+        self, session: _PiSession, inflight: dict[str, Any], error_code: str
+    ) -> None:
+        run_id = str(inflight.get("run_id") or "")
+        task_id = inflight.get("task_id")
+        message_id = inflight.get("message_id")
+        if isinstance(message_id, str):
+            session.queue.put_nowait(
+                HarnessEvent(
+                    event_id=f"{run_id}:interrupted-message:{message_id}",
+                    session_id=session.session_id,
+                    type="message.completed",
+                    run_id=run_id,
+                    turn_id=inflight.get("turn_id"),
+                    task_id=task_id,
+                    payload={"message_id": message_id, "role": "assistant"},
+                )
+            )
+        for operation_id, turn_id in self._inflight_operations(inflight).items():
+            session.queue.put_nowait(
+                HarnessEvent(
+                    event_id=f"{run_id}:interrupted-operation:{operation_id}",
+                    session_id=session.session_id,
+                    type="operation.failed",
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    task_id=task_id,
+                    payload={"operation_id": operation_id, "error_code": error_code},
+                )
+            )
 
     async def _recover_inflight(self, session: _PiSession) -> None:
         pending = session.files.load_pending_completions()
@@ -2442,31 +2555,7 @@ class PiAdapter:
         if isinstance(saved_completion, dict):
             session.queue.put_nowait(HarnessEvent.model_validate(saved_completion))
             return
-        message_id = inflight.get("message_id")
-        if isinstance(message_id, str):
-            session.queue.put_nowait(
-                HarnessEvent(
-                    session_id=session.session_id,
-                    type="message.completed",
-                    run_id=run_id,
-                    payload={"message_id": message_id, "role": "assistant"},
-                )
-            )
-        operation_id = inflight.get("operation_id")
-        if isinstance(operation_id, str):
-            session.queue.put_nowait(
-                HarnessEvent(
-                    session_id=session.session_id,
-                    type="operation.failed",
-                    run_id=run_id,
-                    payload={
-                        "operation_id": operation_id,
-                        "name": "operation",
-                        "details": None,
-                        "error_code": "runner_restarted",
-                    },
-                )
-            )
+        self._finish_inflight_items(session, inflight, "runner_restarted")
         permission_id = inflight.get("permission_id")
         if isinstance(permission_id, str):
             session.queue.put_nowait(
@@ -2474,6 +2563,8 @@ class PiAdapter:
                     session_id=session.session_id,
                     type="permission.resolved",
                     run_id=run_id,
+                    turn_id=inflight.get("turn_id"),
+                    task_id=inflight.get("task_id"),
                     payload={"permission_id": permission_id, "decision": "deny"},
                 )
             )
@@ -2481,6 +2572,8 @@ class PiAdapter:
             session,
             {
                 "runId": run_id,
+                "turnId": inflight.get("turn_id"),
+                "taskId": inflight.get("task_id"),
                 "eventId": f"{run_id}:recovered",
                 "kind": "run.finished",
                 "sessionId": session.session_id,
