@@ -16,10 +16,13 @@ from pyromind_runtime.domain.experiment_execution import (
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
+    ConversationStatus,
+    ExecutionNoticeLink,
     ExternalTaskState,
     OperationActivity,
     PendingPermission,
     PlanState,
+    TaskRunProgress,
     TimelineCompaction,
     TimelineMessage,
     TimelineNotice,
@@ -276,6 +279,9 @@ class SnapshotProjector:
             update={
                 "experiment_queue": (*queue, event.payload),
                 "task_origins": origins,
+                "task_runs": snapshot.task_runs
+                if snapshot.task_runs is not None
+                else ({} if origins else None),
             }
         )
 
@@ -318,6 +324,19 @@ class SnapshotProjector:
                 event,
                 code="unsupported_status",
                 message=f"Unsupported conversation status: {status}",
+            )
+        if snapshot.task_origins and event.run_id and event.task_id:
+            snapshot = snapshot.model_copy(
+                update={
+                    "task_runs": {
+                        **(snapshot.task_runs or {}),
+                        event.run_id: TaskRunProgress(
+                            task_id=event.task_id,
+                            status=cast(ConversationStatus, status),
+                            seq=event.seq,
+                        ),
+                    }
+                }
             )
         if (
             status != "running"
@@ -427,6 +446,8 @@ class SnapshotProjector:
             update["command_id"] = command_id
         if "content" in event.payload:
             update["content"] = self._content(event.payload)
+        if (notice := event.payload.get("execution_notice")) is not None:
+            update["execution_notice"] = ExecutionNoticeLink.model_validate(notice)
         return self._replace(snapshot, item.model_copy(update=update))
 
     def _on_operation_started(

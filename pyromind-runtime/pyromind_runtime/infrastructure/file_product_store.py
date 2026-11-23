@@ -209,6 +209,24 @@ class FileProductStore:
         allowed = self._load_metadata().tool_allowlist
         return allowed is not None and name in allowed
 
+    def owner_id(self) -> str:
+        return self._load_metadata().user_id
+
+    def execution_notice_cursor(self, baseline: int) -> int:
+        path = self.directory / "execution-notice-cursor"
+        with self._lock():
+            if path.is_file():
+                return int(path.read_text())
+            self._atomic_write(path, str(baseline))
+            return baseline
+
+    def save_execution_notice_cursor(self, seq: int) -> None:
+        path = self.directory / "execution-notice-cursor"
+        with self._lock():
+            current = int(path.read_text()) if path.is_file() else 0
+            if seq > current:
+                self._atomic_write(path, str(seq))
+
     def development_policy(self) -> SessionPolicy:
         metadata = self._load_metadata()
         return SessionPolicy(
@@ -602,6 +620,8 @@ class FileProductStore:
         if event.type in {"task.queued", "task.dispatched", "artifact.registered"}:
             # Redelivery after a restart can fall outside the tail deduplication window.
             return self._append_from_full_log(metadata, event)
+        if event.event_id.startswith("execution-notice:"):
+            return self._append_from_full_log(metadata, event)
         return self._commit(metadata, snapshot, event, metadata.last_sequence + 1)
 
     def _append_from_full_log(
@@ -891,6 +911,8 @@ class FileProductStore:
             return None
         if snapshot.conversation_id != metadata.conversation_id:
             raise ProductStoreCorruptionError("snapshot conversation mismatch")
+        if snapshot.task_origins and snapshot.task_runs is None:
+            return None
         if any(
             item.kind == "message" and item.started_at is None
             for item in snapshot.timeline

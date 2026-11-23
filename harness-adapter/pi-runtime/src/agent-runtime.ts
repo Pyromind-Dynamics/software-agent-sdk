@@ -39,6 +39,7 @@ export class PiAgentRuntime {
   private autonomousRunId?: string;
   private cancelling = false;
   private execution: WorkflowExecution | undefined;
+  private composeExecutionNotice?: (facts: JsonValue) => Promise<string>;
   private session: AgentSession | undefined;
   private sessionId: string | undefined;
   private workspaceRoot: string | undefined;
@@ -76,6 +77,10 @@ export class PiAgentRuntime {
   ) {}
 
   async handle(method: string, params: JsonObject): Promise<JsonValue> {
+    if (method === "chat.compose_execution_notice") {
+      if (!this.composeExecutionNotice) throw new Error("model not ready");
+      return this.composeExecutionNotice(params);
+    }
     if (method.startsWith("execution.")) {
       if (!this.execution) throw new Error("execution host not ready");
       return this.execution.handle(method, params);
@@ -128,7 +133,7 @@ export class PiAgentRuntime {
     this.executionSuspended = policy;
     this.queueUserMessages = params.queue_user_messages === true;
     const askUserTool = this.createAskUserTool(params.user_input);
-    const { session, sessionId, execution, subagents, recorder } = await createPiSession(
+    const { session, sessionId, execution, subagents, recorder, composeExecutionNotice } = await createPiSession(
       params,
       this.peer,
       { ...this.sessionOptions, ...(askUserTool ? {
@@ -187,6 +192,7 @@ export class PiAgentRuntime {
       }
     });
     this.session = session;
+    this.composeExecutionNotice = composeExecutionNotice;
     this.sessionId = sessionId;
     this.workspaceRoot = requiredString(params, "workspace_root");
     this.terminalBackend = requiredString(params, "terminal_backend");

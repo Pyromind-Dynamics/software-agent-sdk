@@ -43,6 +43,15 @@ class TimelineEntry(ContractModel):
     task_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
+class ExecutionNoticeLink(ContractModel):
+    has_result: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    origin_turn_id: str | None = None
+    action: Literal["plan", "confirmation", "report"] | None = None
+    target_id: str | None = None
+
+
 class TimelineMessage(TimelineEntry):
     kind: Literal["message"] = "message"
     item_id: str = Field(min_length=1)
@@ -56,6 +65,9 @@ class TimelineMessage(TimelineEntry):
     status: Literal["streaming", "completed", "failed"] = "streaming"
     run_id: str | None = None
     command_id: str | None = None
+    execution_notice: ExecutionNoticeLink | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class TimelineOperation(TimelineEntry):
@@ -212,6 +224,12 @@ class ExternalTaskState(ContractModel):
     error_summary: str | None = None
 
 
+class TaskRunProgress(ContractModel):
+    task_id: str
+    status: ConversationStatus
+    seq: int = Field(ge=1)
+
+
 class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
@@ -235,6 +253,9 @@ class ConversationSnapshot(ContractModel):
     experiment_queue: tuple[JsonObject, ...] | None = None
     task_origins: dict[str, str] = Field(
         default_factory=dict, exclude_if=lambda value: not value
+    )
+    task_runs: dict[str, TaskRunProgress] | None = Field(
+        default=None, exclude_if=lambda value: value is None
     )
     pending_permissions: tuple[PendingPermission, ...] = ()
     pending_inputs: tuple[PendingUserInput, ...] = ()

@@ -15,6 +15,7 @@ from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.commands import (
     CreateProjectCommand,
     EnqueueTaskCommand,
+    ReviewPreparationCommand,
     UserMessageCommand,
 )
 from pyromind_runtime.domain.content import TextContent
@@ -26,6 +27,10 @@ from pyromind_runtime.domain.echomind_chat import (
     GET_STATUS,
     READ_REPORT,
 )
+from pyromind_runtime.domain.errors import ProductRuntimeError
+from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
+from pyromind_runtime.domain.snapshot import TimelineMessage
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
@@ -40,6 +45,246 @@ from .test_preparation import (
     ready_request as ready_request,
 )
 from .test_product_api import _app
+
+
+async def test_standalone_saved_report_delivers_readable_link_once(
+    preparation_setup, tmp_path
+):
+    preparation, owner, policy = preparation_setup
+    manager_id = owner.conversation_id
+    context = RequestContext(user_id=owner.user_id, profile_id="echomind")
+    versions = Versions(
+        SQLiteVersionStore(tmp_path / "versions.db"),
+        FileArtifactSnapshots(tmp_path / "storage"),
+    )
+    root = tmp_path / "conversations"
+    runtime = ConversationRuntime(
+        root, FakeAdapter(), preparation_store=preparation, versions=versions
+    )
+    api = _app(tmp_path, runtime)
+    api.include_router(router)
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=manager_id,
+                user_id=context.user_id,
+                workspace_root=str(root / manager_id),
+                profile_id="echomind",
+                preparation_policy=policy,
+                delegated_roles=(DelegatedRole(name="eval"),),
+                command_allowlist=("enqueue_task",),
+            ),
+            context,
+        )
+        chat = await runtime.echomind_chat.open(manager_id, {}, context)
+        manager = runtime._store(manager_id)
+        runtime._queue_task(
+            manager,
+            manager_id,
+            "summary-task",
+            "requirement",
+            "Create a report",
+            origin_turn_id="request-turn",
+        )
+        started, _ = manager.append(
+            ProductEvent(
+                conversation_id=manager_id,
+                type="status.changed",
+                run_id="summary-run",
+                task_id="summary-task",
+                payload={"status": "running"},
+            )
+        )
+        runtime._publish(started)
+        request = VersionToolRequest(
+            action="save",
+            arguments={
+                "kind": "report",
+                "logical_key": "summary",
+                "source": {
+                    "text": "# Dataset summary\n\nFrozen report",
+                    "filename": "summary.md",
+                },
+            },
+        )
+        saved = await runtime.version_call(manager_id, request, "save-report", context)
+        artifact_id = saved["id"]
+        async with asyncio.timeout(5):
+            while runtime.echomind_notices.workers:
+                await asyncio.sleep(0.02)
+        chat_store = runtime._store(chat.conversation_id)
+        first = chat_store.load_snapshot().timeline[-1]
+        assert isinstance(first, TimelineMessage) and first.execution_notice
+        assert first.execution_notice.origin_turn_id == "request-turn"
+        assert first.execution_notice.action == "report"
+        assert first.execution_notice.target_id == artifact_id
+        runtime._record_execution(
+            manager,
+            ExperimentExecutionView(
+                run_id="business-run",
+                project_id="project",
+                task_id="summary",
+                task_name="Summary",
+                role_id="main",
+                state="reported",
+                report_state="ready",
+                artifacts=({"artifact_id": artifact_id},),
+            ),
+        )
+        async with asyncio.timeout(5):
+            while runtime.echomind_notices.workers:
+                await asyncio.sleep(0.02)
+        assert chat_store.load_snapshot().timeline[-1] == first
+        assert (
+            sum(
+                isinstance(item, TimelineMessage)
+                for item in chat_store.load_snapshot().timeline
+            )
+            == 1
+        )
+
+        url = f"/api/v2/echomind/conversations/{manager_id}/chat/reports/{artifact_id}"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api),
+            base_url="http://test",
+            headers={"x-pyromind-debug-user-id": context.user_id},
+        ) as client:
+            response = await client.get(url)
+            assert response.status_code == 200
+            assert response.json()["text"] == "# Dataset summary\n\nFrozen report"
+            assert response.headers["cache-control"] == "no-store"
+            denied = await client.get(url, headers={"x-pyromind-debug-user-id": "99"})
+            assert denied.status_code == 404
+    finally:
+        await runtime.close()
+
+
+async def test_execution_notice_writes_after_chat_replies_once_and_links_original_turn(
+    preparation_setup, tmp_path
+):
+    preparation, owner, policy = preparation_setup
+    manager_id = owner.conversation_id
+    context = RequestContext(user_id=owner.user_id, profile_id="echomind")
+    composing = asyncio.Event()
+    reply = asyncio.Event()
+
+    class Adapter(FakeAdapter):
+        async def compose_execution_notice(self, handle, facts):
+            if facts["milestone"] == "report_ready":
+                composing.set()
+                await reply.wait()
+                return '{"message":"报告已就绪，可以查看。"}'
+            return '{"message":null}'
+
+    runtime = ConversationRuntime(tmp_path, Adapter(), preparation_store=preparation)
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=manager_id,
+                user_id=context.user_id,
+                workspace_root=str(tmp_path / manager_id),
+                profile_id="echomind",
+                preparation_policy=policy,
+                delegated_roles=(DelegatedRole(name="eval"),),
+            ),
+            context,
+        )
+        chat = await runtime.echomind_chat.open(manager_id, {}, context)
+        manager = runtime._store(manager_id)
+        chat_store = runtime._store(chat.conversation_id)
+
+        def write_chat(message_id, role, turn_id):
+            event, _ = chat_store.append(
+                ProductEvent(
+                    conversation_id=chat.conversation_id,
+                    type="message.completed",
+                    turn_id=turn_id,
+                    payload={
+                        "message_id": message_id,
+                        "role": role,
+                        "content": [{"type": "text", "text": "用户正在对话。"}],
+                    },
+                )
+            )
+            runtime._publish(event)
+
+        write_chat("first", "user", "origin")
+        runtime._queue_task(
+            manager,
+            manager_id,
+            "linked-task",
+            "requirement",
+            "review",
+            origin_turn_id="origin",
+        )
+        execution = ExperimentExecutionView(
+            run_id="run",
+            project_id="project",
+            task_id="task",
+            task_name="evaluation",
+            role_id="main",
+            state="waiting_analysis",
+            report_state="not_started",
+            platform_task_id="linked-task",
+        )
+        runtime._record_execution(manager, execution)
+        result = execution.model_copy(
+            update={"state": "reported", "report_state": "ready"}
+        )
+        runtime._record_execution(manager, result)
+        async with asyncio.timeout(5):
+            await composing.wait()
+        write_chat("second", "user", "later")
+        write_chat("reply", "assistant", "later")
+        reply.set()
+        # Related projections can repeat the same verified milestone.
+        runtime._record_execution(
+            manager, result.model_copy(update={"summary": "updated"})
+        )
+        async with asyncio.timeout(5):
+            while runtime.echomind_notices.workers:
+                await asyncio.sleep(0.02)
+        messages = [
+            item
+            for item in chat_store.load_snapshot().timeline
+            if isinstance(item, TimelineMessage)
+        ]
+        assert [item.item_id for item in messages[:-1]] == ["first", "second", "reply"]
+        notice = messages[-1]
+        assert notice.execution_notice is not None
+        assert notice.execution_notice.origin_turn_id == "origin"
+        assert notice.content == (TextContent(text="报告已就绪，可以查看。"),)
+        assert (
+            sum(
+                event.type == "chat.notification.skipped"
+                for event in chat_store.replay()
+            )
+            == 1
+        )
+        pending, _ = manager.append(
+            ProductEvent(
+                conversation_id=manager_id,
+                type="input.requested",
+                task_id="linked-task",
+                payload={
+                    "request_id": "question",
+                    "questions": [{"id": "review", "prompt": "是否扩大测试范围？"}],
+                },
+            )
+        )
+        runtime._publish(pending)
+        async with asyncio.timeout(5):
+            while runtime.echomind_notices.workers:
+                await asyncio.sleep(0.02)
+        last = chat_store.load_snapshot().timeline[-1]
+        assert isinstance(last, TimelineMessage) and last.execution_notice is not None
+        assert last.execution_notice.action == "confirmation"
+        assert last.execution_notice.target_id == "question"
+        assert last.execution_notice.origin_turn_id == "origin"
+        assert last.content == (TextContent(text="执行需要你回复，请查看待确认事项。"),)
+    finally:
+        reply.set()
+        await runtime.close()
 
 
 async def test_chat_handles_new_requirements_before_busy_main_turn_finishes(
@@ -276,6 +521,13 @@ async def test_chat_handles_new_requirements_before_busy_main_turn_finishes(
                         if item.kind == "message" and item.status == "completed"
                     }.issuperset(queued)
                 )
+                await wait_for(
+                    lambda: {
+                        run.task_id
+                        for run in (store.load_snapshot().task_runs or {}).values()
+                        if run.status == "idle"
+                    }.issuperset(queued)
+                )
                 assert store.load_snapshot().task_origins == bindings
     finally:
         release_main.set()
@@ -302,8 +554,14 @@ async def test_preparation_requirement_survives_restart_and_guards_creation(
                 workspace_root=str(root / manager_id),
                 profile_id=context.profile_id,
                 preparation_policy=policy,
+                tool_allowlist=("set_preparation_plan",),
                 delegated_roles=(DelegatedRole(name="eval"),),
-                command_allowlist=("user_message", "create_project", "enqueue_task"),
+                command_allowlist=(
+                    "user_message",
+                    "create_project",
+                    "enqueue_task",
+                    "review_preparation",
+                ),
             ),
             context,
         )
@@ -348,6 +606,56 @@ async def test_preparation_requirement_survives_restart_and_guards_creation(
         }
         invalidated = preparation.get(owner)
         assert invalidated.review_pending and invalidated.revision == plan.revision + 1
+        assert "including when the saved plan is unchanged" in (
+            restored_adapter.external_task_notifications[0][1].hidden_text
+        )
+        with pytest.raises(ValueError, match="preparation is not ready"):
+            await restored.submit_command(
+                manager_id,
+                CreateProjectCommand(
+                    command_id="stale-draft",
+                    expected_preparation_revision=invalidated.revision,
+                ),
+                context,
+            )
+        review = ReviewPreparationCommand(
+            command_id="review", expected_preparation_revision=invalidated.revision
+        )
+        with pytest.raises(ProductRuntimeError, match="plan review changed"):
+            await restored.submit_command(
+                manager_id,
+                review.model_copy(
+                    update={
+                        "command_id": "obsolete-review",
+                        "expected_preparation_revision": plan.revision,
+                    }
+                ),
+                context,
+            )
+        accepted = await restored.submit_command(manager_id, review, context)
+        assert await restored.submit_command(manager_id, review, context) == accepted
+        with pytest.raises(ProductRuntimeError, match="plan review changed"):
+            await restored.submit_command(
+                manager_id,
+                review.model_copy(update={"command_id": "duplicate"}),
+                context,
+            )
+        async with asyncio.timeout(8):
+            while len(restored_adapter.external_task_notifications) < 2:
+                await asyncio.sleep(0.02)
+        _, notification, _ = restored_adapter.external_task_notifications[1]
+        assert notification.task_id == accepted.response["task_id"]
+        assert "Saved draft for review:" in notification.hidden_text
+        review_context = replace(context, preparation_revision=invalidated.revision)
+        result = await restored.preparation_call(
+            manager_id,
+            "set_preparation_plan",
+            ready_request.model_dump(mode="json"),
+            review_context,
+        )
+        assert result["phase"] == "ready"
+        assert not preparation.get(owner).review_pending
+        assert preparation.project(owner) is None
     finally:
         await restored.close()
 

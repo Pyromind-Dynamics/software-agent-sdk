@@ -282,6 +282,9 @@ class PiAdapter:
             ]
             | None
         ) = None
+        self._chat_history: (
+            Callable[[str, str, RequestContext], Awaitable[list[JsonObject]]] | None
+        ) = None
         self._preparation_call: Any = None
         self._preparation_revision: Any = None
         self._preparation_review: (
@@ -415,7 +418,10 @@ class PiAdapter:
             [str, str, JsonObject, str, RequestContext, str | None],
             Awaitable[JsonObject],
         ],
+        history: Callable[[str, str, RequestContext], Awaitable[list[JsonObject]]]
+        | None = None,
     ) -> None:
+        self._chat_history = history
         self._echo_chat_call = callback
 
     def set_preparation_handler(
@@ -1452,6 +1458,17 @@ class PiAdapter:
             )
             raise
 
+    async def compose_execution_notice(
+        self, handle: SessionHandle, facts: JsonObject
+    ) -> str:
+        session = self._session(handle.session_id)
+        await self._ensure_runner(session)
+        assert session.runner is not None
+        result = await session.runner.request("chat.compose_execution_notice", facts)
+        if not isinstance(result, str):
+            raise ValueError("execution notice model did not return text")
+        return result
+
     async def notify_external_task(
         self,
         handle: SessionHandle,
@@ -1709,6 +1726,8 @@ class PiAdapter:
             {
                 "session_id": session.session_id,
                 "workflows_enabled": self._workflow_call is not None,
+                "chat_turn_history": self._chat_history is not None
+                and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),
                 "execution_policy": {
                     "automatic_turns_suspended": bool(
@@ -1898,6 +1917,18 @@ class PiAdapter:
                     raise ValueError("execution belongs to another conversation")
                 await sink(params)
             return {}
+        if method == "chat.turn_history":
+            command_id = params.get("command_id")
+            if (
+                self._chat_history is None
+                or session.config.get("profile_id") != "echomind-chat"
+                or not isinstance(command_id, str)
+                or not command_id
+            ):
+                raise PermissionError("Chat history requires an active chat turn")
+            return await self._chat_history(
+                session.session_id, command_id, session.context
+            )
         if method == "preparation.version":
             if (
                 not self._tool_allowed(session, "set_preparation_plan")

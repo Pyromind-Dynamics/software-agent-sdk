@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.responses import StreamingResponse
 
 from pyromind_agent_server.api.router import (
@@ -85,6 +94,26 @@ async def chat_command(
         raise _product_error(exc) from exc
     except (FileNotFoundError, PermissionError, ProductStoreError, ValueError) as exc:
         raise _not_found(manager_id) from exc
+
+
+@router.get("/reports/{artifact_id}")
+async def read_report(
+    manager_id: str,
+    artifact_id: Annotated[str, Path(min_length=1, max_length=256)],
+    request: Request,
+    response: Response,
+) -> dict[str, str]:
+    runtime = get_product_runtime(request)
+    try:
+        text = await runtime.echomind_chat.read_report(
+            manager_id, artifact_id, request_context(request)
+        )
+    except ProductRuntimeError as exc:
+        raise _product_error(exc) from exc
+    except (FileNotFoundError, PermissionError, ProductStoreError, ValueError) as exc:
+        raise _not_found(manager_id) from exc
+    response.headers["Cache-Control"] = "no-store"
+    return {"artifact_id": artifact_id, "text": text}
 
 
 @router.get("/events")

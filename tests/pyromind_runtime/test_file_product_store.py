@@ -86,6 +86,60 @@ def test_historical_message_time_is_recovered_from_the_start_event(
     assert store.load_snapshot() == current
 
 
+def test_silent_task_progress_replays_without_moving_the_active_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    for event in (
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="task.queued",
+            payload={"task_id": "requirement", "origin_turn_id": "chat-turn"},
+        ),
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="task.dispatched",
+            payload={"task_id": "requirement"},
+        ),
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="status.changed",
+            run_id="silent-run",
+            task_id="requirement",
+            payload={"status": "running"},
+        ),
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="status.changed",
+            run_id="new-run",
+            payload={"status": "running"},
+        ),
+    ):
+        store.append(event)
+    _, current = store.append(
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="status.changed",
+            run_id="silent-run",
+            task_id="requirement",
+            payload={"status": "idle"},
+        )
+    )
+    assert current.status == "running"
+    assert current.active_run_id == "new-run"
+    assert current.timeline == ()
+    assert current.task_runs is not None
+    assert current.task_runs["silent-run"].status == "idle"
+    assert current.task_runs["silent-run"].task_id == "requirement"
+
+    old_snapshot = json.loads(current.model_dump_json())
+    del old_snapshot["task_runs"]
+    store.snapshot_path.write_text(json.dumps(old_snapshot), encoding="utf-8")
+    assert store.load_snapshot() == current
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+    assert store.load_snapshot() == current
+
+
 def test_store_deduplicates_events(tmp_path: Path) -> None:
     store = _store(tmp_path)
     event = ProductEvent(

@@ -38,6 +38,7 @@ type HarnessEventType = Literal[
 ]
 
 type ProductEventType = Literal[
+    "chat.notification.skipped",
     "preparation.changed",
     "project.changed",
     "task.queued",
