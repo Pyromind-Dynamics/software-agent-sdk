@@ -1,3 +1,4 @@
+import { writeFileSync, mkdirSync } from "node:fs";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, realpath, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -33,6 +34,12 @@ test("real children submit with distinct stable origins and resume only on their
     return {allow:true};
   }} as unknown as JsonlRpcPeer;
   const role = {name:"train",tools:["submit_workflow"],skills:[]};
+  // Existing conversations retain their materialized role contracts across upgrades.
+  const retained = join(root, "pi", "agent", "agents");
+  mkdirSync(retained, {recursive:true});
+  for (const name of ["init", "dataset", "train", "eval"]) {
+    writeFileSync(join(retained, name + ".md"), `---\nname: ${name}\ndescription: Retained role\n---\nLegacy ${name} instructions.\n`);
+  }
   const config = {session_id:"callback-conversation", workspace_root:root, terminal_backend:"os-sandbox", session_path:join(root,"pi","session.jsonl"), system_prompt:"Delegate when requested", skills_directory:join(root,"skills"), skill_roots:[], tools:[], delegated_roles:[role], delegated_tool_specs:{train:[{name:"submit_workflow",description:"Submit the workflow",input_schema:{type:"object",properties:{}}}]}, model:{provider:"openai",id:"custom-chat-model",api_key:"test",base_url:`http://127.0.0.1:${(server.address() as any).port}/v1`}};
   const {session, subagents} = await createPiSession(config, peer);
   t.after(async () => {await subagents.stopAll(); await session.abort(); await session.waitForIdle(); await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}); session.dispose(); await subagents.close();});

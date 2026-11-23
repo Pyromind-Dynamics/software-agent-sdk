@@ -34,7 +34,7 @@ def validate_workflow_catalog(
             raise ValueError(
                 f"plan.stages[{index}].kind: choose one of {', '.join(nodes)}"
             )
-        if stage.enabled and not node.roles:
+        if stage.enabled and not (node.roles if policy.allowed_roles else node.tasks):
             raise ValueError("unimplemented catalog nodes must remain disabled")
     for index, task in enumerate(plan.tasks):
         node = nodes[stages[task.stage_id].kind or ""]
@@ -80,7 +80,7 @@ class Preparations:
         if not stage.enabled or stage.placeholder:
             raise ValueError("entry task requires an enabled plan stage")
         node = next(node for node in policy.workflow_nodes if node.id == stage.kind)
-        if len(node.roles) != 1:
+        if policy.allowed_roles and len(node.roles) != 1:
             raise ValueError("entry stage must select exactly one execution role")
         resources = {resource.id: resource for resource in request.plan.resources}
         missing_inputs = (
@@ -97,7 +97,7 @@ class Preparations:
                 raise ValueError(missing_inputs)
             inputs[item.name] = resource.storage_path
         entry = DelegateExperimentTask(
-            role_id=node.roles[0],
+            role_id=node.roles[0] if node.roles else "main",
             request_id=task.id,
             stage_id=task.stage_id,
             task=DelegatedTask(

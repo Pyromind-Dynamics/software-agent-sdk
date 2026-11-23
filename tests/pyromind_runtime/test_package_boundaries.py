@@ -512,9 +512,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
     policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
     roles = ECHOMIND_PRODUCT_PROFILE.delegated_roles
-    assert roles is not None and set(policy.allowed_roles) <= {
-        role.name for role in roles
-    }
+    assert roles == policy.allowed_roles == ()
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
     review_tool = "request_reward_bundle_review"
     assert review_tool in tools
@@ -523,12 +521,8 @@ def test_preparation_policy_is_trusted_profile_configuration():
         ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()
     )
     assert review_tool not in (DEFAULT_PRODUCT_PROFILE.tool_allowlist or ())
-    assert all(review_tool not in role.tools for role in roles)
-    assert {role.name for role in roles if "get_project_reward" in role.tools} == {
-        "init",
-        "train",
-        "eval",
-    }
+    assert "get_project_reward" not in tools
+    assert "get_project_reward" in ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist
     assert "set_preparation_plan" in tools
     assert not {"get_preparation", "update_preparation", "inspect_resource"} & tools
     assert {"read", "write", "edit", "terminal"} <= tools
@@ -546,11 +540,28 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "write",
         "edit",
         "terminal",
-        "subagent",
         "ask_user",
         "get_storage_url",
+        "get_project_reward",
+        "df_submit_evaluation",
+        "df_submit_pipeline",
+        "df_check_progress",
+        "df_stop_task",
+        "validate_workflow_dsl",
+        "submit_workflow",
+        "inspect_workflow_task",
+        "training_analysis",
+        "product_versions",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist == ()
+    assert set(ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist or ()) == {
+        "data-processing",
+        "inference-evaluation",
+        "avi-baseline-evaluation",
+        "frozen-reward-evaluation",
+        "generate-workflow-dsl",
+        "workflow-execution",
+        "training-analysis",
+    }
     with pytest.raises(ValidationError):
         CreateConversationRequest.model_validate(
             {
@@ -624,14 +635,18 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
     roles = {role.name: role for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()}
     policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
-    assert (
-        set(roles) == set(policy.allowed_roles) == {"init", "dataset", "train", "eval"}
-    )
+    assert not roles and policy.allowed_roles == ()
+    assert all(not node.roles for node in policy.workflow_nodes)
+    assert {node.id for node in policy.workflow_nodes if node.tasks} == {
+        "init",
+        "dataset",
+        "train",
+        "eval",
+    }
     assert DEFAULT_PRODUCT_PROFILE.delegated_roles is None
-    for role in roles.values():
-        assert set(role.model_dump(mode="json")) == {"name", "tools", "skills"}
-    assert roles["init"] is not roles["eval"]
-    assert roles["init"].tools == roles["eval"].tools
+    assert "enqueue_task" in ECHOMIND_PRODUCT_PROFILE.command_allowlist
+    for name in ("init", "dataset", "train", "eval"):
+        assert not (ROOT / "harness-adapter/pi-runtime/agents" / f"{name}.md").exists()
     obsolete = {
         "request_experiment_task",
         "get_experiment_execution",
@@ -642,8 +657,6 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
         "record_experiment_result",
         "record_execution_checkpoint",
     }
-    for role in roles.values():
-        assert not obsolete & set(role.tools)
     assert not obsolete & set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ())
     with pytest.raises(ValidationError):
         PreparationPolicy.model_validate(

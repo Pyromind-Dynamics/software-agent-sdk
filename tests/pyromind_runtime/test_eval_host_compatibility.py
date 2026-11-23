@@ -15,7 +15,7 @@ from .test_product_api import _app
 
 
 @pytest.mark.parametrize("backend", ["sandbox", "os-sandbox"])
-async def test_actual_manager_and_eval_host_create_through_api(
+async def test_main_host_creates_through_api_and_executes_tools_directly(
     tmp_path, monkeypatch, preparation_setup, backend
 ):
     store, _, _ = preparation_setup
@@ -30,6 +30,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
     adapter.set_preparation_handler(
         runtime.preparation_call, runtime.preparation_revision
     )
+    adapter.set_version_handler(runtime.version_call, AsyncMock())
     adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     adapter.set_project_reward_reader(runtime.project_reward)
     app = _app(tmp_path, runtime)
@@ -51,34 +52,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
             )
             assert created.status_code == 201, created.text
             assert created.json()["conversation_id"]
-            assert ECHOMIND_PRODUCT_PROFILE.delegated_roles is not None
-            role = ECHOMIND_PRODUCT_PROFILE.delegated_roles[0]
-            business = {
-                item["name"]
-                for item in adapter._business_tools.specs(sandbox=backend == "sandbox")
-            }
-            native = {"read", "write", "edit", "terminal"}
-            runtime_tools = {"get_experiment_execution"}
-            assert set(role.tools) <= business | native | runtime_tools
-            assert "upload_file_to_pyromind" not in role.tools
-
-            for definition in ECHOMIND_PRODUCT_PROFILE.delegated_roles:
-                assert set(definition.tools) <= business | native
-            roles = {
-                definition.name: definition
-                for definition in ECHOMIND_PRODUCT_PROFILE.delegated_roles
-            }
-            assert set(roles) == {"init", "dataset", "train", "eval"}
-            assert roles["init"].tools == roles["eval"].tools
-            assert roles["init"].skills == roles["eval"].skills
-            assert "df_submit_pipeline" in roles["dataset"].tools
-            assert "df_submit_evaluation" not in roles["dataset"].tools
-            assert {
-                "inspect_workflow_task",
-                "training_analysis",
-                "submit_workflow",
-            } <= set(roles["train"].tools)
-            assert "df_submit_evaluation" not in roles["train"].tools
+            assert ECHOMIND_PRODUCT_PROFILE.delegated_roles == ()
             session = adapter._sessions[created.json()["conversation_id"]]
             assert created.json()["preparation"]["phase"] == "collecting"
             assert {"read", "write", "edit", "terminal"} <= set(
@@ -105,19 +79,17 @@ async def test_actual_manager_and_eval_host_create_through_api(
                     user_id="42", profile_id=ECHOMIND_PRODUCT_PROFILE.profile_id
                 ),
             )
-            assert set(session.config["tool_allowlist"]) == {
-                "read",
-                "write",
-                "edit",
-                "terminal",
-                "subagent",
-                "ask_user",
-                "get_storage_url",
-            }
-            assert not session.config["skill_allowlist"]
-            assert {item["name"] for item in adapter._tool_specs(session)} == {
-                "get_storage_url",
-            }
+            native = {"read", "write", "edit", "terminal", "ask_user"}
+            assert set(session.config["tool_allowlist"]) == set(
+                ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist
+            )
+            assert set(session.config["skill_allowlist"]) == set(
+                ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist
+            )
+            assert {item["name"] for item in adapter._tool_specs(session)} == set(
+                session.config["tool_allowlist"]
+            ) - native
+            assert not (session.workspace_root / "pi" / "subagents").exists()
 
             execute = AsyncMock(
                 return_value={
@@ -144,28 +116,17 @@ async def test_actual_manager_and_eval_host_create_through_api(
                     )
                 ),
             )
-            for child, tool in (
-                ("init", "df_submit_evaluation"),
-                ("dataset", "df_submit_pipeline"),
-                ("train", "training_analysis"),
-                ("eval", "df_submit_evaluation"),
+            for tool in (
+                "df_submit_evaluation",
+                "df_submit_pipeline",
+                "submit_workflow",
+                "training_analysis",
             ):
                 await adapter._runner_request(
-                    session,
-                    "role.tool.execute",
-                    {
-                        "role": child,
-                        "tool_name": tool,
-                        "arguments": {},
-                        "origin": {"type": "subagent", "subagent_id": child},
-                        "tool_call_id": f"native:{child}:call",
-                    },
+                    session, "tool.execute", {"tool_name": tool, "arguments": {}}
                 )
                 assert execute.call_args.args[0] == tool
-                assert (
-                    execute.call_args.args[2].request_context.task_origin.subagent_id
-                    == child
-                )
+                assert execute.call_args.args[2].request_context.task_origin is None
             assert execute.await_count == 4
             with pytest.raises(PermissionError):
                 await adapter._runner_request(
@@ -183,7 +144,7 @@ async def test_actual_manager_and_eval_host_create_through_api(
                     session,
                     "tool.execute",
                     {
-                        "tool_name": "df_submit_evaluation",
+                        "tool_name": "subagent",
                         "arguments": {},
                     },
                 )

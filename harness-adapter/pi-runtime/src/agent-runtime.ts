@@ -44,6 +44,7 @@ export class PiAgentRuntime {
   private workspaceRoot: string | undefined;
   private terminalBackend: string | undefined;
   private hasDelegatedRoles = false;
+  private queueUserMessages = false;
   private normalizer: PiEventNormalizer | undefined;
   private readonly storageUrls = new Map<string, string>();
   /** Blocks automatic scheduling (notifications, stages) until a user prompt. */
@@ -89,15 +90,16 @@ export class PiAgentRuntime {
     if (method === "session.has_pending_work") {
       const session = this.requireSession();
       return this.normalizer !== undefined || session.isStreaming ||
-        subagentLiveness().hasActiveProvider({
+        (!this.executionSuspended && this.pendingNotifications.length > 0) ||
+        (!!this.subagents && subagentLiveness().hasActiveProvider({
           sessionId: session.sessionManager.getSessionId(),
           sessionFile: session.sessionManager.getSessionFile(),
-        });
+        }));
     }
     if (method === "prompt.prepare") {
       const session = this.requireSession();
       parsePromptContent(params.content);
-      if (this.normalizer && !session.isStreaming) throw new Error("Pi agent is already running");
+      if (!this.queueUserMessages && this.normalizer && !session.isStreaming) throw new Error("Pi agent is already running");
       this.userInput.reservePrompt(requiredString(params, "run_id"));
       return { admitted: true };
     }
@@ -123,6 +125,7 @@ export class PiAgentRuntime {
       : false;
     // Attach applies the recovered policy before the first automatic schedule.
     this.executionSuspended = policy;
+    this.queueUserMessages = params.queue_user_messages === true;
     const askUserTool = this.createAskUserTool(params.user_input);
     const { session, sessionId, execution, subagents, recorder } = await createPiSession(
       params,
@@ -149,10 +152,10 @@ export class PiAgentRuntime {
         this.outcome.reset();
       }
       this.outcome.observe(event);
-      if (event.type === "tool_execution_start" && event.toolName === "subagent") subagents.observeCall(event.toolCallId, event.args);
-      if (event.type === "tool_execution_update" && event.toolName === "subagent") subagents.observeProgress(event.partialResult, event.toolCallId);
-      if (event.type === "message_end" && event.message.role === "assistant") setImmediate(() => void subagents.refresh().catch(() => {}));
-      if (event.type === "tool_execution_end" && event.toolName === "subagent") subagents.observeResult(event.result, event.toolCallId, event.isError);
+      if (event.type === "tool_execution_start" && event.toolName === "subagent") subagents?.observeCall(event.toolCallId, event.args);
+      if (event.type === "tool_execution_update" && event.toolName === "subagent") subagents?.observeProgress(event.partialResult, event.toolCallId);
+      if (event.type === "message_end" && event.message.role === "assistant") setImmediate(() => void subagents?.refresh().catch(() => {}));
+      if (event.type === "tool_execution_end" && event.toolName === "subagent") subagents?.observeResult(event.result, event.toolCallId, event.isError);
       if (event.type === "agent_end" && this.autonomousRunId) {
         const id = this.autonomousRunId;
         setImmediate(() => void session.waitForIdle().then(() => {
@@ -182,7 +185,7 @@ export class PiAgentRuntime {
     this.sessionId = sessionId;
     this.workspaceRoot = requiredString(params, "workspace_root");
     this.terminalBackend = requiredString(params, "terminal_backend");
-    this.hasDelegatedRoles = Array.isArray(params.delegated_roles);
+    this.hasDelegatedRoles = !!subagents && Array.isArray(params.delegated_roles) && params.delegated_roles.length > 0;
     for (const entry of session.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== "pyromind.notification" || !isObject(entry.data)) continue;
       const { runId, message } = entry.data;
@@ -198,11 +201,11 @@ export class PiAgentRuntime {
         this.pendingNotifications.push({ runId, message: recoveryMessage(runId) });
       }
     }
-    try { await subagents.attach(session); }
+    try { await subagents?.attach(session); }
     catch (error) {
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
       session.dispose();
-      await subagents.close();
+      await subagents?.close();
       this.session = undefined;
       throw error;
     }
@@ -313,13 +316,16 @@ export class PiAgentRuntime {
     const runId = requiredString(params, "run_id");
     try {
       const prompt = parsePromptContent(params.content);
-      if (forceSteer || session.isStreaming) {
+      if (forceSteer || session.isStreaming || (this.queueUserMessages && this.normalizer)) {
         const suspensionRevision = this.suspensionRevision;
         this.pendingCommandIds.push(runId);
-        try { await session.steer(prompt.text, prompt.images); }
+        try {
+          if (this.queueUserMessages) await session.followUp(prompt.text, prompt.images);
+          else await session.steer(prompt.text, prompt.images);
+        }
         catch (error) { this.discardCommand(runId); throw error; }
         if (this.suspensionRevision === suspensionRevision) this.executionSuspended = false;
-        return { accepted: true, steered: true };
+        return this.queueUserMessages ? { accepted: true, queued: true } : { accepted: true, steered: true };
       }
       if (this.normalizer) throw new Error("Pi agent is already running");
       this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds, this.storageUrls);
@@ -396,7 +402,7 @@ export class PiAgentRuntime {
 
   private async cancel(): Promise<JsonValue> {
     this.cancelling = true;
-    if (this.hasDelegatedRoles || this.userInput.hasActive()) {
+    if (this.queueUserMessages || this.hasDelegatedRoles || this.userInput.hasActive()) {
       this.executionSuspended = true;
       this.suspensionRevision++;
     }

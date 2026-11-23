@@ -2,6 +2,7 @@ import json
 from uuid import uuid4
 
 import pytest
+
 from pyromind_agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
     ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
@@ -63,18 +64,13 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "terminal",
         "ask_user",
         "set_preparation_plan",
+        "request_reward_bundle_review",
     }
-    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == ("model-evaluation-preparation",)
+    assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == (
+        "model-evaluation-preparation",
+        "rubric-elicitation",
+    )
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
-    assert set(ECHOMIND_MANAGER_DEVELOPMENT_TOOLS) == {
-        "read",
-        "write",
-        "edit",
-        "terminal",
-        "subagent",
-        "ask_user",
-        "get_storage_url",
-    }
     assert (
         ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist
         == ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
@@ -82,16 +78,10 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert (
         ECHOMIND_PRODUCT_PROFILE.development_skill_allowlist
         == ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
-        == ()
     )
-    assert set(
-        role.name for role in ECHOMIND_PRODUCT_PROFILE.delegated_roles or ()
-    ) == {
-        "init",
-        "dataset",
-        "train",
-        "eval",
-    }
+    assert "subagent" not in ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
+    assert "training-analysis" in ECHOMIND_MANAGER_DEVELOPMENT_SKILLS
+    assert ECHOMIND_PRODUCT_PROFILE.delegated_roles == ()
 
 
 def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path):

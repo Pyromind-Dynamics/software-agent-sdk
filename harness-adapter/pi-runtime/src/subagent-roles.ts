@@ -19,7 +19,7 @@ export function readBundledSubagentRole(name: string): string {
   return readFileSync(new URL(`${name}.md`, bundledAgents), "utf8");
 }
 
-export function parseSubagentRoles(value: unknown): SubagentRoleDefinition[] | undefined {
+export function parseSubagentRoles(value: unknown, retainedDirectory?: string): SubagentRoleDefinition[] | undefined {
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value) || value.length > 16) throw new Error("Invalid delegated roles");
   const names = new Set<string>();
@@ -32,7 +32,10 @@ export function parseSubagentRoles(value: unknown): SubagentRoleDefinition[] | u
       throw new Error("Invalid delegated role definition");
     }
     if (role.skills !== undefined && (!Array.isArray(role.skills) || role.skills.some((name: unknown) => typeof name !== "string" || !/^[a-z][a-z0-9_-]*$/.test(name)))) throw new Error("Invalid delegated role skills");
-    const { frontmatter, body } = parseFrontmatter(readBundledSubagentRole(role.name));
+    const source = new URL(`${role.name}.md`, bundledAgents);
+    // Previously materialized roles can finish work accepted before an upgrade.
+    const path = !existsSync(source) && retainedDirectory ? join(retainedDirectory, `${role.name}.md`) : source;
+    const { frontmatter, body } = parseFrontmatter(readFileSync(path, "utf8"));
     const description = frontmatter.description;
     if (frontmatter.name !== role.name || !body || typeof description !== "string"
       || !description.trim() || /[\r\n]/.test(description)) {

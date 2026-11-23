@@ -164,8 +164,20 @@ class Versions:
         project = self.project(
             conversation_id,
             context,
-            create=request.action not in {"list", "compare", "recover"},
+            create=request.action not in {"list", "read", "compare", "recover"},
         )
+        if request.action == "read":
+            if project is None:
+                raise ValueError("unknown artifact in this conversation")
+            version = self.store.get_version(
+                project.id, self._string(request.arguments, "artifact_id")
+            )
+            if version.state != "ready":
+                raise ValueError("artifact is not a frozen, readable snapshot")
+            return {
+                "artifact_id": version.id,
+                "text": self.snapshots.read_text(snapshot_result(version), context),
+            }
         if project is None:
             return {"project": None, "versions": [], "runs": []}
         args = request.arguments

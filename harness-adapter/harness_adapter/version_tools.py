@@ -8,6 +8,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any, Literal, Protocol, Self
 
 from pydantic import Field
+
 from pyromind_common.sdk.tool import (
     Action,
     Observation,
@@ -26,9 +27,10 @@ type VersionCall = Callable[
 ]
 
 VERSION_DESCRIPTION = """Manage this conversation's artifact versions.
-Actions: list (no arguments); save (kind, logical_key, source with storage_ref OR
-text and filename, optional parents and summary); compare (left_version_id,
-right_version_id); select (slot, version_id, expected_revision, optional reason);
+Actions: list (no arguments); read (artifact_id of a frozen text file); save (kind,
+logical_key, source with storage_ref OR text and filename, optional parents and
+summary); compare (left_version_id, right_version_id);
+select (slot, version_id, expected_revision, optional reason);
 new_iteration (goal, expected_revision); recover (retry unfinished snapshots).
 Use the revision returned by list for selections and new iterations. Reuse the
 same command_id when retrying the same operation. A reference_only record is not
@@ -38,7 +40,9 @@ Use version://<slot> in workflow path fields to consume a selected version.
 
 
 class ProductVersionsAction(Action):
-    action: Literal["save", "list", "compare", "select", "new_iteration", "recover"]
+    action: Literal[
+        "save", "list", "read", "compare", "select", "new_iteration", "recover"
+    ]
     command_id: str = Field(
         min_length=1, description="Stable unique operation ID; reuse on retries."
     )
@@ -139,8 +143,9 @@ def submission_bridge(
     loop: asyncio.AbstractEventLoop,
     graph_run_id: str | None = None,
 ):
-    from pyromind_common.tools.workflow.task_submission import current_task_correlation
     from pyromind_sdk.client.models import TrainingTaskCreateResponse
+
+    from pyromind_common.tools.workflow.task_submission import current_task_correlation
 
     def submit(workflow: dict, name: str, code: str | None):
         effective = {**workflow, "name": name}

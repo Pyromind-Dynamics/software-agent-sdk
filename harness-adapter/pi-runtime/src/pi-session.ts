@@ -206,11 +206,12 @@ export async function createPiSession(
   session: AgentSession;
   sessionId: string;
   execution: WorkflowExecution;
-  subagents: SubagentHost;
+  subagents?: SubagentHost;
 }> {
-  const nativeDelivery = Array.isArray(params.delegated_roles);
-  if (nativeDelivery) subagentLiveness();
   const config = parseConfig(params);
+  const enableDelegation = config.toolAllowlist?.includes("subagent") ?? true;
+  const nativeDelivery = enableDelegation && !!config.delegatedRoles?.length;
+  if (nativeDelivery) subagentLiveness();
   let executionAccess: ExecutionAccess | undefined;
   let sandboxTools: SandboxTools | undefined;
   const recorder = new ObservationRecorder({
@@ -238,8 +239,8 @@ export async function createPiSession(
       skill_roots: config.skillRoots,
       discoverable_skills: discoverableSkills(config),
       instrumented_hooks: ["no-progress-guard", "tool-result-status"],
-      other_registered_behaviors: ["subagent-host", ...(config.terminalBackend === "sandbox" ? ["sandbox-path-rewrite", "skill-context-rewrite"] : []),
-        ...(params.workflows_enabled === true ? ["agentgenome"] : []), "pi-subagents"],
+      other_registered_behaviors: [...(enableDelegation ? ["subagent-host", "pi-subagents"] : []), ...(config.terminalBackend === "sandbox" ? ["sandbox-path-rewrite", "skill-context-rewrite"] : []),
+        ...(params.workflows_enabled === true ? ["agentgenome"] : [])],
       hook_inventory: "project registrations; third-party handlers not enumerated",
       terminal_backend: config.terminalBackend,
       retry: modelRetrySettings(),
@@ -385,7 +386,7 @@ export async function createPiSession(
     return [role.name, [...scoped, ...business, ...askUser]];
   })) : undefined;
   const sandbox = sandboxTools;
-  const subagents = new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases, sandbox && {
+  const subagents = enableDelegation ? new SubagentHost(config.workspaceRoot, config.sessionId, peer, childTools, modelRuntime, model, childInstructions, config.delegatedRoles, roleToolSets, sandboxPathAliases, sandbox && {
     createLane: sandbox.createLane,
     tools(lane, roleName) {
       const role = config.delegatedRoles?.find((definition) => definition.name === roleName);
@@ -408,8 +409,8 @@ export async function createPiSession(
     async close() {
       await Promise.all([sandbox.main.terminal.close(), sandbox.workflow.terminal.close()]);
     },
-  });
-  const { default: subagentExtension } = await import("pi-subagents");
+  }) : undefined;
+  const subagentExtension = subagents ? (await import("pi-subagents")).default : undefined;
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
     retry: modelRetrySettings(),
@@ -426,13 +427,19 @@ export async function createPiSession(
       ? ["历史经验复用时，Storage 文件统一写成 /workspace/<path>，会话文件写成 public_data/...。"]
       : [],
     eventBus: experienceHost.eventBus,
+    noExtensions: !enableDelegation,
     additionalExtensionPaths: experienceHost.additionalExtensionPaths,
     extensionFactories: [
       (pi) => langfusePlugin(pi, recorder),
-      subagents.extension,
+      ...(subagents && subagentExtension ? [subagents.extension,
       (pi: ExtensionAPI) => subagentExtension(subagents.pluginApi(nativeDelivery
         ? nativeSubagentApi(pi, sessionOptions, subagents.filterCompletion)
-        : pi)),
+        : pi))] : []),
+      ...(sandbox && !subagents ? [(pi: ExtensionAPI) => {
+        pi.on("session_shutdown", async () => {
+          await Promise.all([sandbox.main.terminal.close(), sandbox.workflow.terminal.close()]);
+        });
+      }] : []),
       createToolResultExtension(recorder),
       createNoProgressGuardExtension(recorder),
       { name: "no-spin", factory: createNoSpinExtension(sessionOptions.onRepetitionDetected) },
@@ -523,7 +530,7 @@ export async function createPiSession(
     sessionManager,
     settingsManager,
   });
-  try { await subagents.start(); }
+  try { await subagents?.start(); }
   catch (error) { session.dispose(); throw error; }
   return { recorder, session, subagents, sessionId: config.sessionId, execution: new WorkflowExecution(executionAccess, peer, async (request, signal) => {
     const stream = modelRuntime.streamSimple(model, {
@@ -581,7 +588,8 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     tools: parseTools(value.tools),
     toolAllowlist: parseAllowlist(value.tool_allowlist),
     skillAllowlist: parseAllowlist(value.skill_allowlist),
-    delegatedRoles: parseSubagentRoles(value.delegated_roles),
+    delegatedRoles: Array.isArray(value.tool_allowlist) && !value.tool_allowlist.includes("subagent")
+      ? undefined : parseSubagentRoles(value.delegated_roles, join(requiredString(value, "workspace_root"), "pi", "agent", "agents")),
   };
 }
 

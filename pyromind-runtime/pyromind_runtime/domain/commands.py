@@ -20,6 +20,12 @@ class UserMessageCommand(ContractModel):
     workflow_xyflow: JsonObject | None = None
 
 
+class EnqueueTaskCommand(ContractModel):
+    type: Literal["enqueue_task"] = "enqueue_task"
+    command_id: str = Field(min_length=1, max_length=128)
+    instruction: str = Field(min_length=1, max_length=32000)
+
+
 class CancelCommand(ContractModel):
     command_id: str = Field(min_length=1)
     type: Literal["cancel"] = "cancel"
@@ -74,6 +80,7 @@ class CreateProjectCommand(ContractModel):
 
 type ProductCommand = Annotated[
     UserMessageCommand
+    | EnqueueTaskCommand
     | CancelCommand
     | PermissionResponseCommand
     | RollbackWorkflowCommand
