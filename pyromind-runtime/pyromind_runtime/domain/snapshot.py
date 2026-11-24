@@ -66,6 +66,9 @@ class ExecutionNoticeLink(ContractModel):
 
 
 class TimelineMessage(TimelineEntry):
+    preparation_reply: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     kind: Literal["message"] = "message"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)

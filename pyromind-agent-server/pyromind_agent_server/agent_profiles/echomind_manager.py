@@ -67,7 +67,8 @@ needed for the next decision. End the turn while awaiting external work.
 Accept results against the goal before marking a task or stage complete.
 Record progress, failures and deliverables in the existing workflow state and
 artifacts. The workbench presents these records. Use ask_user for required
-decisions. Do not send conversational updates or stage announcements.
+decisions. After Project creation, do not send conversational updates or stage
+announcements.
 Use the user's language.""",
     tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
     skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
