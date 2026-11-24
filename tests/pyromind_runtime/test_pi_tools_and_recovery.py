@@ -1862,6 +1862,45 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
     assert (await session.queue.get()).payload["status"] == "idle"
 
 
+async def test_run_failure_is_delivered_when_sandbox_snapshot_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
+    files = PiSessionFiles(tmp_path / "conversation-1")
+    files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
+    session = SimpleNamespace(
+        session_id="conversation-1",
+        finished_runs=set(),
+        running=True,
+        files=files,
+        queue=asyncio.Queue(),
+    )
+
+    async def unavailable(_session):
+        raise RuntimeError("PI_SANDBOX_NOT_RUNNING")
+
+    monkeypatch.setattr(adapter, "_read_workflow", unavailable)
+    await adapter._runner_event(
+        cast(Any, session),
+        {
+            "eventId": "completion-1",
+            "sessionId": "conversation-1",
+            "runId": "run-1",
+            "kind": "run.finished",
+            "payload": {
+                "outcome": {"status": "failed", "error_code": "model_error"},
+            },
+        },
+    )
+
+    completion = session.queue.get_nowait()
+    assert completion.payload["status"] == "error"
+    error = completion.payload["error"]
+    assert isinstance(error, dict) and error["code"] == "model_error"
+    assert completion.payload["snapshot_error"] is True
+    assert "run-1" in files.load_pending_completions()
+
+
 async def test_adapter_projects_generic_write_completion_to_workflow(tmp_path) -> None:
     adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     workspace = tmp_path / "conversation-1"

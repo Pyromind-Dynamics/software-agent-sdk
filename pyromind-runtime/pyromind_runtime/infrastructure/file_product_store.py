@@ -617,7 +617,12 @@ class FileProductStore:
         ):
             # A delayed callback can follow a terminal poll beyond the tail window.
             return self._append_from_full_log(metadata, event)
-        if event.type in {"task.queued", "task.dispatched", "artifact.registered"}:
+        if event.type in {
+            "task.queued",
+            "task.dispatched",
+            "artifact.registered",
+            "project_stage_analysis.changed",
+        }:
             # Redelivery after a restart can fall outside the tail deduplication window.
             return self._append_from_full_log(metadata, event)
         if event.event_id.startswith("execution-notice:"):
@@ -768,6 +773,21 @@ class FileProductStore:
                 existing.model_copy(update={"receipt": receipt}).model_dump_json(),
             )
             return receipt
+
+    @contextmanager
+    def claim_stage_analysis(self, job_id: str) -> Iterator[bool]:
+        identity = hashlib.sha256(job_id.encode()).hexdigest()
+        path = self.directory / f"stage-analysis-{identity}.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, _FILE_MODE)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+            else:
+                yield True
+        finally:
+            os.close(fd)
 
     @contextmanager
     def _lock(self) -> Iterator[None]:

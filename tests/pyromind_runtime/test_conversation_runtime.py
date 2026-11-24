@@ -507,7 +507,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
             queried.set()
             await release_query.wait()
             returned.set()
-            return {"status": "Failed"}
+            return {"status": "Failed", "error_summary": "Platform node failed"}
 
     class Adapter(FakeAdapter):
         async def notify_external_task(self, handle, notification, context):
@@ -523,6 +523,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
             conversation_id,
             task_id="task-1",
             status="Failed",
+            error_summary="Platform node failed",
             correlation=correlation,
         )
 
@@ -558,6 +559,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
         assert terminal == [repeated]
         task = store.load_snapshot().external_tasks[0]
         assert task.status == "failed" and not task.resume_pending
+        assert task.error_summary == "Platform node failed"
         assert len(adapter.external_task_notifications) == 1
         _, notice, _ = adapter.external_task_notifications[0]
         assert notice.correlation == correlation

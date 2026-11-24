@@ -48,6 +48,13 @@ from pyromind_runtime.application.model_evaluation_plan import (
     submission_paths,
     validate_evaluation_inputs,
 )
+from pyromind_runtime.application.plan_artifact_delivery import (
+    DELIVERY_STAGE_KINDS,
+    InvalidPlanDelivery,
+    delivery_key,
+    delivery_report,
+    register_plan_delivery,
+)
 from pyromind_runtime.application.plan_execution import (
     PLAN_PATH,
     completed_callback_task,
@@ -55,11 +62,19 @@ from pyromind_runtime.application.plan_execution import (
     next_approved_task,
     plan_executions,
     read_plan_tasks,
+    recover_plan_delivery_rows,
+    resolve_plan_output_paths,
     restore_saved_data_status,
+    with_plan_report,
     with_platform_states,
 )
 from pyromind_runtime.application.preparation import (
     Preparations,
+)
+from pyromind_runtime.application.project_observations import (
+    baseline_evaluation_metrics,
+    observation_report_details,
+    project_observations,
 )
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
@@ -77,8 +92,16 @@ from pyromind_runtime.application.reward_workflows import (
     validate_reward_workflow,
 )
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
+from pyromind_runtime.application.stage_analysis import (
+    existing_stage_analysis,
+    ready_stage_analyses,
+    save_stage_analysis,
+    stage_analysis_evidence,
+    validate_stage_analysis,
+)
+from pyromind_runtime.application.train_observer import TrainObserver
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
-from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.application.versions import Versions, VersionSnapshotError
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
 from pyromind_runtime.domain.capabilities import HarnessCapabilities, ResourceLimits
 from pyromind_runtime.domain.commands import (
@@ -116,9 +139,15 @@ from pyromind_runtime.domain.experiment_execution import (
     ExperimentExecutionView,
 )
 from pyromind_runtime.domain.experiment_plans import (
+    ExperimentTask,
     PlanOwner,
 )
 from pyromind_runtime.domain.experiments import ExperimentCatalog, ExperimentMetric
+from pyromind_runtime.domain.observations import (
+    ObservationOverview,
+    ObservationReportDetails,
+    SeriesPage,
+)
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import (
@@ -148,6 +177,11 @@ from pyromind_runtime.domain.snapshot import (
     TimelineOperation,
     WorkflowState,
 )
+from pyromind_runtime.domain.stage_analysis import (
+    StageAnalysisJob,
+    StageAnalysisMetric,
+    StageAnalysisResult,
+)
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.training_evaluation import CheckpointArtifact
 from pyromind_runtime.domain.user_input import PendingUserInput, PreparedUserInput
@@ -157,6 +191,7 @@ from pyromind_runtime.domain.versions import (
     RunSpec,
     SaveVersion,
     SnapshotSource,
+    VersionProject,
     VersionToolRequest,
     fingerprint,
 )
@@ -177,6 +212,7 @@ from pyromind_runtime.ports.harness import (
     HarnessAdapter,
     OperationActivityReader,
     ProductCheckpoint,
+    ProjectStageAnalyzer,
     RestoreWorkflowSpec,
     SessionHandle,
     SessionLivenessAdapter,
@@ -187,6 +223,7 @@ from pyromind_runtime.ports.preparation import PreparationStore, ResourceMediaRe
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
+    EvaluationStorageUnavailableError,
 )
 from pyromind_runtime.ports.workflow_submission import (
     ExternalTaskQueryPort,
@@ -253,6 +290,7 @@ class _ActiveConversation:
     context: RequestContext
     last_access: float = field(default_factory=time.monotonic)
     inflight: int = 0
+    plan_projection_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     workflow_task_context: set[str] = field(default_factory=set)
     notification_resume_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     chat_dispatching: str | None = None
@@ -294,7 +332,10 @@ class ConversationRuntime:
         workflow_submission: WorkflowSubmissionPort | None = None,
         versions: Versions | None = None,
         experiment_index: ExperimentIndex | None = None,
+        train_observer: TrainObserver | None = None,
         evaluation_storage_factory: Callable[[RequestContext], EvaluationStorage]
+        | None = None,
+        observation_storage_factory: Callable[[RequestContext], EvaluationStorage]
         | None = None,
     ) -> None:
         self.conversation_root = Path(conversation_root)
@@ -321,6 +362,10 @@ class ConversationRuntime:
         self.versions = versions
         self._experiment_index = experiment_index
         self._evaluation_storage_factory = evaluation_storage_factory
+        self._observation_storage_factory = (
+            observation_storage_factory or evaluation_storage_factory
+        )
+        self._train_observer = train_observer
         self._projector = ProductEventProjector()
         self._user_input = UserInputCoordinator(publish=self._publish)
         self._input_response_tasks: set[asyncio.Task[CommandReceipt]] = set()
@@ -363,6 +408,12 @@ class ConversationRuntime:
         self._read_recoveries: dict[str, asyncio.Task[None]] = {}
         self._version_recovery_completed: set[str] = set()
         self._plan_recovery_checks: dict[str, tuple[int, float]] = {}
+        self._stage_analysis_workers: dict[str, asyncio.Task[None]] = {}
+        self._stage_analysis_rechecks: dict[str, asyncio.Task[None]] = {}
+        self._stage_analysis_recovered: set[str] = set()
+        self._stage_analysis_retry_after: dict[str, float] = {}
+        self._stage_analysis_dirty: set[str] = set()
+        self._stage_analysis_capacity = asyncio.Semaphore(4)
 
     async def apply_session_configuration(
         self, conversation_id: str, policy: SessionPolicy, context: RequestContext
@@ -548,10 +599,14 @@ class ConversationRuntime:
                             str(result.get("status", ""))
                         )
                         if status in _TERMINAL_EXTERNAL_TASK_STATUSES:
+                            error_summary = result.get("error_summary")
                             await self.deliver_external_task_status(
                                 conversation_id,
                                 task_id=task.task_id,
                                 status=status,
+                                error_summary=error_summary
+                                if isinstance(error_summary, str)
+                                else None,
                                 correlation=task.correlation,
                             )
                     except PermissionError:
@@ -1337,7 +1392,10 @@ class ConversationRuntime:
                     text = await active.adapter.read_workspace_text(
                         active.handle, PLAN_PATH, context, max_bytes=1024 * 1024
                     )
-                    rows = read_plan_tasks(text) if text else []
+                    rows = read_plan_tasks(text, project) if text else []
+                    rows = await self._plan_rows_for_execution(
+                        project, store, rows, context
+                    )
                 validate_evaluation_inputs(project, task, rows, *paths)
             for previous in store.load_snapshot().experiment_executions or ():
                 if previous.run_id == run.run_id and previous.platform_task_id:
@@ -1385,48 +1443,510 @@ class ConversationRuntime:
         self._publish(event)
 
     async def _capture_plan_progress(
-        self, active: _ActiveConversation, store: FileProductStore
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        *,
+        retry_delivery_stage: str | None = None,
     ) -> list | None:
         policy = store.preparation_policy()
         if policy is None or policy.allowed_roles:
-            return
+            return []
         scope = active.handle.session_id
         try:
-            project = await self.get_project(scope, active.context)
-            if project is None:
-                return
-            text = await active.adapter.read_workspace_text(
-                active.handle, PLAN_PATH, active.context, max_bytes=1024 * 1024
-            )
-            if not text:
-                return
-            rows = read_plan_tasks(text)
-            artifacts = await asyncio.to_thread(
-                self._artifact_versions, scope, active.context
-            )
-            registered = store.load_snapshot().experiment_executions or ()
-            required = model_evaluation_tasks(project, policy)
-            pipelines = (
-                await asyncio.to_thread(store.load_pipeline_runs) if required else {}
-            )
-            receipts = {p.task_id: p for p in pipelines.values() if p.task_id}
-            previous_ids = {r.run_id: r.platform_task_id for r in registered}
-            for run in plan_executions(project, rows, artifacts, registered=registered):
-                if run.task_id in required:
-                    run = run.model_copy(
-                        update={"platform_task_id": previous_ids.get(run.run_id)}
+            async with active.plan_projection_lock:
+                project = await self.get_project(scope, active.context)
+                if project is None:
+                    return []
+                snapshot = store.load_snapshot()
+                try:
+                    text = await active.adapter.read_workspace_text(
+                        active.handle, PLAN_PATH, active.context, max_bytes=1024 * 1024
                     )
-                    run = check_inference_receipt(run, receipts)
-                if run.state != "queued":
-                    self._record_execution(store, run)
-            return rows
+                except (ProductRuntimeError, OSError):
+                    text = None
+                rows = (
+                    read_plan_tasks(text, project)
+                    if text
+                    else recover_plan_delivery_rows(snapshot, project)
+                )
+                if not text and not rows:
+                    if self.versions and self._observation_storage_factory:
+                        self._record_unrecoverable_delivery(store, snapshot, project)
+                    return None
+                artifacts = await asyncio.to_thread(
+                    self._artifact_versions, scope, active.context
+                )
+                registered = snapshot.experiment_executions or ()
+                previous_runs = {
+                    run.run_id: run
+                    for run in registered
+                    if run.plan_sequence == project.plan_sequence
+                }
+                latest_attempts: dict[str, int] = {}
+                for previous in previous_runs.values():
+                    attempt = previous.run_id.rsplit(":", 1)[-1]
+                    if previous.role_id == "main" and attempt.isdecimal():
+                        latest_attempts[previous.task_id] = max(
+                            int(attempt), latest_attempts.get(previous.task_id, 0)
+                        )
+                rows_by_task = {
+                    row["id"]: row
+                    for row in rows
+                    if isinstance(row, dict) and "id" in row
+                }
+                plan_tasks = {task.id: task for task in project.plan.tasks}
+                stages_with_outputs = {
+                    task.stage_id
+                    for task in project.plan.tasks
+                    if task.outputs
+                    or rows_by_task.get(task.id, {}).get("report_version_id")
+                }
+                external = {
+                    task.task_id: task.status for task in snapshot.external_tasks
+                }
+                producers = {}
+                if self.versions and any(item.producer_run_id for item in artifacts):
+                    version_project = await asyncio.to_thread(
+                        self.versions.project, scope, active.context, create=False
+                    )
+                    if version_project:
+                        producers = {
+                            item.id: item.source.task_id
+                            for item in await asyncio.to_thread(
+                                self.versions.store.list_runs, version_project.id
+                            )
+                        }
+                required = model_evaluation_tasks(project, policy)
+                pipelines = (
+                    await asyncio.to_thread(store.load_pipeline_runs)
+                    if required
+                    else {}
+                )
+                receipts = {p.task_id: p for p in pipelines.values() if p.task_id}
+                previous_ids = {r.run_id: r.platform_task_id for r in registered}
+                for run in plan_executions(
+                    project, rows, artifacts, registered=registered
+                ):
+                    previous = previous_runs.get(run.run_id)
+                    if previous and previous.platform_task_id:
+                        run = run.model_copy(
+                            update={"platform_task_id": previous.platform_task_id}
+                        )
+                    if run.task_id in required:
+                        run = run.model_copy(
+                            update={"platform_task_id": previous_ids.get(run.run_id)}
+                        )
+                        run = check_inference_receipt(run, receipts)
+                    attempt = run.run_id.rsplit(":", 1)[-1]
+                    if (
+                        self.versions
+                        and self._observation_storage_factory
+                        and run.state == "succeeded"
+                        and (run.stage_snapshot or {}).get("kind")
+                        in DELIVERY_STAGE_KINDS
+                        and attempt.isdecimal()
+                        and int(attempt) >= latest_attempts.get(run.task_id, 0)
+                        and (
+                            not run.platform_task_id
+                            or external.get(run.platform_task_id) == "succeeded"
+                        )
+                    ):
+                        row = rows_by_task[run.task_id]
+                        report = delivery_report(run, row, artifacts, producers)
+                        if report:
+                            row["report_version_id"] = report.id
+                            run = with_plan_report(run, report)
+                        elif (
+                            not plan_tasks[run.task_id].outputs
+                            and run.stage_id not in stages_with_outputs
+                        ):
+                            run = self._delivery_failed(run, "missing_output")
+                        elif not self._closing:
+                            run = self._schedule_plan_delivery(
+                                active,
+                                store,
+                                plan_tasks[run.task_id],
+                                run,
+                                row,
+                                previous,
+                                retry=retry_delivery_stage is not None
+                                and run.stage_id == retry_delivery_stage,
+                            )
+                    if run.state != "queued":
+                        self._record_execution(store, run)
+                await self._queue_stage_analyses(
+                    active, store, project, rows, artifacts
+                )
+                # Restored tool receipts can register existing outputs only.
+                return rows if text else []
         except Exception as exc:
-            # Drafts can be incomplete when a turn ends.
             logger.warning(
                 "Plan projection pending: conversation=%s error=%s",
                 scope,
                 type(exc).__name__,
             )
+            return None
+
+    def _record_unrecoverable_delivery(
+        self,
+        store: FileProductStore,
+        snapshot: ConversationSnapshot,
+        project: ProjectView,
+    ) -> None:
+        stages = {
+            stage.id
+            for stage in project.plan.stages
+            if stage.enabled
+            and not stage.placeholder
+            and stage.kind in DELIVERY_STAGE_KINDS
+        }
+        for run in snapshot.experiment_executions or ():
+            if (
+                run.project_id == project.project_id
+                and run.plan_sequence == project.plan_sequence
+                and run.role_id == "main"
+                and run.stage_id in stages
+                and run.state == "succeeded"
+                and run.report_state == "not_started"
+            ):
+                self._record_execution(
+                    store, self._delivery_failed(run, "missing_execution_record")
+                )
+
+    def _schedule_plan_delivery(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        task: ExperimentTask,
+        run: ExperimentExecutionView,
+        row: dict,
+        previous: ExperimentExecutionView | None,
+        *,
+        retry: bool,
+    ) -> ExperimentExecutionView:
+        context = active.context
+        has_storage_credentials = bool(context.cookie or context.authorization)
+        if (
+            previous
+            and previous.report_state == "registration_failed"
+            and not retry
+            and not (
+                previous.delivery_error == "credentials_required"
+                and has_storage_credentials
+            )
+        ):
+            return previous
+        if not task.outputs:
+            return run
+        job_id = delivery_key(run, "report")
+        if (
+            job_id in self._stage_analysis_workers
+            and previous
+            and previous.report_state == "registering"
+        ):
+            return previous
+        if not has_storage_credentials:
+            return self._delivery_failed(run, "credentials_required")
+        pending = run.model_copy(
+            update={
+                "report_state": "registering",
+                "report_uri": None,
+                "artifacts": (),
+                "delivery_error": None,
+            }
+        )
+        if job_id not in self._stage_analysis_workers:
+            active.inflight += 1
+            worker = asyncio.create_task(
+                self._register_plan_delivery(
+                    active, store, task, pending, row, context, job_id
+                )
+            )
+            self._stage_analysis_workers[job_id] = worker
+            worker.add_done_callback(
+                lambda finished: self._stage_analysis_finished(active, job_id, finished)
+            )
+        return pending
+
+    async def _register_plan_delivery(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        task: ExperimentTask,
+        run: ExperimentExecutionView,
+        row: dict,
+        context: RequestContext,
+        job_id: str,
+    ) -> None:
+        versions = self.versions
+        factory = self._observation_storage_factory
+        assert versions is not None and factory is not None
+        scope = active.handle.session_id
+        async with self._stage_analysis_capacity:
+            with store.claim_stage_analysis(job_id) as claimed:
+                if not claimed:
+                    return
+                error_code = "storage_unavailable"
+                for delay in (0, 1, 4):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    try:
+                        await asyncio.to_thread(
+                            register_plan_delivery,
+                            versions,
+                            factory(context),
+                            task,
+                            run,
+                            row,
+                            scope,
+                            context,
+                        )
+                    except InvalidPlanDelivery as exc:
+                        error_code = exc.code
+                        break
+                    except (EvaluationStorageMissingError, FileNotFoundError):
+                        error_code = "missing_output"
+                        break
+                    except PermissionError:
+                        error_code = "credentials_required"
+                        break
+                    except EvaluationStorageUnavailableError as exc:
+                        cause = exc.__cause__
+                        if exc.retryable is False or (
+                            exc.retryable is None
+                            and cause is not None
+                            and not (
+                                isinstance(cause, OSError)
+                                or getattr(cause, "retryable", False)
+                            )
+                        ):
+                            break
+                    except VersionSnapshotError as exc:
+                        if not exc.retryable:
+                            error_code = "version_error"
+                            break
+                    except OSError:
+                        continue
+                    except Exception as exc:
+                        logger.warning(
+                            "Plan artifact registration failed: job=%s error=%s",
+                            job_id,
+                            type(exc).__name__,
+                        )
+                        error_code = "version_error"
+                        break
+                    else:
+                        try:
+                            await self._publish_artifacts(scope, context)
+                        finally:
+                            self._schedule_stage_analysis_recheck(scope, active, store)
+                        return
+                self._record_execution(store, self._delivery_failed(run, error_code))
+
+    @staticmethod
+    def _delivery_failed(
+        run: ExperimentExecutionView, code: str
+    ) -> ExperimentExecutionView:
+        return run.model_copy(
+            update={
+                "report_state": "registration_failed",
+                "report_uri": None,
+                "artifacts": (),
+                "delivery_error": code,
+            }
+        )
+
+    async def _queue_stage_analyses(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        project: ProjectView,
+        rows: list,
+        artifacts: tuple[ArtifactVersion, ...],
+    ) -> None:
+        versions = self.versions
+        if (
+            self._closing
+            or versions is None
+            or not isinstance(active.adapter, ProjectStageAnalyzer)
+        ):
+            return
+        version_project = await asyncio.to_thread(
+            versions.project, active.handle.session_id, active.context, create=False
+        )
+        if version_project is None:
+            return
+        producers = await asyncio.to_thread(
+            versions.store.list_runs, version_project.id
+        )
+        snapshot = store.load_snapshot()
+        jobs = {item.job_id: item for item in snapshot.stage_analyses}
+        for candidate in ready_stage_analyses(
+            project,
+            rows,
+            snapshot.experiment_executions or (),
+            snapshot.external_tasks,
+            artifacts,
+            producers,
+        ):
+            job = jobs.get(candidate.job_id)
+            if job is None:
+                job = candidate
+                self._record_stage_analysis(store, job)
+            if (
+                job.status == "queued"
+                and job.job_id not in self._stage_analysis_workers
+            ):
+                active.inflight += 1
+                worker = asyncio.create_task(
+                    self._run_stage_analysis(
+                        active, store, job, versions, version_project
+                    )
+                )
+                self._stage_analysis_workers[job.job_id] = worker
+                worker.add_done_callback(
+                    lambda task, job_id=job.job_id: self._stage_analysis_finished(
+                        active, job_id, task
+                    )
+                )
+
+    def _stage_analysis_finished(
+        self, active: _ActiveConversation, job_id: str, task: asyncio.Task[None]
+    ) -> None:
+        active.inflight -= 1
+        self._stage_analysis_workers.pop(job_id, None)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.warning(
+                "Stage analysis worker stopped: job=%s error=%s",
+                job_id,
+                type(error).__name__,
+            )
+
+    def _record_stage_analysis(
+        self, store: FileProductStore, job: StageAnalysisJob
+    ) -> None:
+        event, _ = store.append(
+            ProductEvent(
+                conversation_id=store.conversation_dir.name,
+                event_id=f"stage-analysis:{job.job_id}:{job.status}",
+                type="project_stage_analysis.changed",
+                payload={"job": job.model_dump(mode="json")},
+            )
+        )
+        self._publish(event)
+
+    async def _run_stage_analysis(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        job: StageAnalysisJob,
+        versions: Versions,
+        version_project: VersionProject,
+    ) -> None:
+        async with self._stage_analysis_capacity:
+            with store.claim_stage_analysis(job.job_id) as claimed:
+                if claimed and any(
+                    item.job_id == job.job_id and item.status == "queued"
+                    for item in store.load_snapshot().stage_analyses
+                ):
+                    await self._complete_stage_analysis(
+                        active, store, job, versions, version_project
+                    )
+
+    async def _complete_stage_analysis(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        job: StageAnalysisJob,
+        versions: Versions,
+        version_project: VersionProject,
+    ) -> None:
+        for delay in (0, 1, 4):
+            if delay:
+                await asyncio.sleep(delay)
+            context = active.context
+            try:
+                report = await asyncio.to_thread(
+                    existing_stage_analysis, job, versions, version_project
+                )
+                if report:
+                    result = StageAnalysisResult.model_validate(report.manifest.summary)
+                    report = await asyncio.to_thread(versions.finish, report, context)
+                else:
+                    evidence = await asyncio.to_thread(
+                        stage_analysis_evidence,
+                        job,
+                        versions,
+                        version_project,
+                        context,
+                    )
+                    adapter = active.adapter
+                    assert isinstance(adapter, ProjectStageAnalyzer)
+                    response = await adapter.analyze_project_stage(
+                        active.handle, job.role, evidence, context
+                    )
+                    result = validate_stage_analysis(response, evidence)
+                    report = await asyncio.to_thread(
+                        save_stage_analysis,
+                        job,
+                        result,
+                        versions,
+                        version_project,
+                        context,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Stage analysis attempt failed: job=%s error=%s",
+                    job.job_id,
+                    type(exc).__name__,
+                )
+                continue
+            self._record_stage_analysis(
+                store,
+                job.model_copy(
+                    update={
+                        "status": "ready",
+                        "report_version_id": report.id,
+                        "result": result,
+                    }
+                ),
+            )
+            await self._publish_artifacts(active.handle.session_id, context)
+            return
+        self._record_stage_analysis(store, job.model_copy(update={"status": "failed"}))
+
+    def _schedule_stage_analysis_recheck(
+        self,
+        scope: str,
+        active: _ActiveConversation,
+        store: FileProductStore,
+    ) -> None:
+        if self._closing:
+            return
+        self._stage_analysis_dirty.add(scope)
+        if scope in self._stage_analysis_rechecks:
+            return
+        self._stage_analysis_rechecks[scope] = asyncio.create_task(
+            self._recheck_stage_analysis(scope, active, store)
+        )
+
+    async def _recheck_stage_analysis(
+        self, scope: str, active: _ActiveConversation, store: FileProductStore
+    ) -> None:
+        try:
+            checked = False
+            while scope in self._stage_analysis_dirty and not active.stopping:
+                self._stage_analysis_dirty.discard(scope)
+                checked = await self._capture_plan_progress(active, store) is not None
+            if checked:
+                self._stage_analysis_recovered.add(scope)
+                self._stage_analysis_retry_after.pop(scope, None)
+            else:
+                self._stage_analysis_recovered.discard(scope)
+                self._stage_analysis_retry_after[scope] = time.monotonic() + 5
+        finally:
+            self._stage_analysis_rechecks.pop(scope, None)
 
     async def _continue_approved_project(
         self,
@@ -1473,7 +1993,7 @@ class ConversationRuntime:
             completed_platform_id = task_id
         next_step = next_approved_task(
             project,
-            rows,
+            await self._plan_rows_for_execution(project, store, rows, active.context),
             completed_task_id,
             completed_platform_id=completed_platform_id,
         )
@@ -1499,6 +2019,42 @@ class ConversationRuntime:
             "Pause if additional authorization is required.\n"
             + json.dumps(payload, ensure_ascii=False),
             origin_turn_id=snapshot.task_origins.get(start_id),
+        )
+
+    async def _plan_rows_for_execution(
+        self,
+        project: ProjectView,
+        store: FileProductStore,
+        rows: list,
+        context: RequestContext,
+    ) -> list:
+        versions = self.versions
+        if versions is None or not any(
+            isinstance(row, dict)
+            and isinstance(outputs := row.get("verified_outputs"), dict)
+            and any(
+                isinstance(ref, str) and not ref.startswith("/")
+                for ref in outputs.values()
+            )
+            for row in rows
+        ):
+            return rows
+        version_project = await asyncio.to_thread(
+            versions.project, project.conversation_id, context, create=False
+        )
+        if version_project is None:
+            return rows
+        artifacts, producers, snapshot = await asyncio.gather(
+            asyncio.to_thread(versions.store.list_versions, version_project.id),
+            asyncio.to_thread(versions.store.list_runs, version_project.id),
+            asyncio.to_thread(store.load_snapshot),
+        )
+        return resolve_plan_output_paths(
+            project,
+            rows,
+            snapshot.experiment_executions or (),
+            tuple(artifacts),
+            {run.id: run.source.task_id for run in producers},
         )
 
     def _artifact_versions(
@@ -1527,6 +2083,7 @@ class ConversationRuntime:
             if event.type == "artifact.registered"
             and isinstance(artifact_id := event.payload.get("artifact_id"), str)
         }
+        changed = False
         for artifact in artifacts:
             if artifact.id in published or artifact.state not in {
                 "ready",
@@ -1548,6 +2105,11 @@ class ConversationRuntime:
                 )
             )
             self._publish(event)
+
+            changed = True
+        active = self._active.get(scope)
+        if changed and active is not None and not active.stopping:
+            self._schedule_stage_analysis_recheck(scope, active, store)
 
     @staticmethod
     def _registry_only_update(store: FileProductStore, task: ExternalTaskState) -> bool:
@@ -1631,6 +2193,61 @@ class ConversationRuntime:
         run_id = (
             store.load_snapshot().active_run_id if request.action == "save" else None
         )
+        if request.action == "save":
+            arguments = dict(request.arguments)
+            task_id = arguments.pop("plan_task_id", None)
+            attempt = arguments.pop("plan_attempt", 1)
+            summary = arguments.get("summary", {})
+            if isinstance(summary, dict) and "plan_execution" in summary:
+                raise ValueError("plan_execution is assigned by the host")
+            policy = store.preparation_policy()
+            main_plan = policy is not None and not policy.allowed_roles
+            key = arguments.get("logical_key")
+            namespace = (
+                key.partition("/")[0] if isinstance(key, str) and "/" in key else None
+            )
+            project = (
+                await self.get_project(conversation_id, context)
+                if main_plan and (task_id is not None or namespace)
+                else None
+            )
+            if project and namespace in {task.id for task in project.plan.tasks}:
+                if task_id is None:
+                    existing = await asyncio.to_thread(
+                        self._artifact_versions, conversation_id, context
+                    )
+                    if not any(
+                        v.registration_key == f"manual:{command_id}" for v in existing
+                    ):
+                        raise ValueError(
+                            "Task-scoped saves require arguments.plan_task_id and "
+                            "the current plan_attempt"
+                        )
+                elif task_id != namespace:
+                    raise ValueError("plan_task_id conflicts with the logical_key task")
+            if task_id is not None:
+                if not main_plan or (
+                    context.task_origin is not None
+                    and context.task_origin.type != "main"
+                ):
+                    raise ValueError("plan artifacts require main session execution")
+                if (
+                    not project
+                    or not isinstance(task_id, str)
+                    or not any(task.id == task_id for task in project.plan.tasks)
+                    or type(attempt) is not int
+                    or attempt < 1
+                    or not isinstance(summary, dict)
+                ):
+                    raise ValueError("plan artifact requires a valid task and attempt")
+                arguments["summary"] = {
+                    **summary,
+                    "plan_execution": [
+                        project.plan_sequence,
+                        f"{project.project_id}:{task_id}:{attempt}",
+                    ],
+                }
+            request = request.model_copy(update={"arguments": arguments})
         result = await asyncio.to_thread(
             self.versions.call, conversation_id, request, command_id, context
         )
@@ -1643,6 +2260,186 @@ class ConversationRuntime:
                 run_id=run_id,
             )
         return result
+
+    async def get_project_observations(
+        self, conversation_id: str, project_id: str, context: RequestContext
+    ) -> ObservationOverview:
+        snapshot = await self.get_snapshot(conversation_id, context)
+        overview = project_observations(snapshot, project_id)
+        policy = snapshot.preparation.policy if snapshot.preparation else None
+        if (
+            not self._closing
+            and policy is not None
+            and snapshot.project is not None
+            and not policy.allowed_roles
+            and (context.cookie or context.authorization)
+            and conversation_id not in self._stage_analysis_recovered
+            and time.monotonic()
+            >= self._stage_analysis_retry_after.get(conversation_id, 0)
+        ):
+
+            async def recover() -> None:
+                try:
+                    store = await self._ensure_active(conversation_id, context)
+                    active = self._active[conversation_id]
+                    self._stage_analysis_dirty.add(conversation_id)
+                    await self._recheck_stage_analysis(conversation_id, active, store)
+                except Exception as exc:
+                    self._stage_analysis_recovered.discard(conversation_id)
+                    self._stage_analysis_retry_after[conversation_id] = (
+                        time.monotonic() + 5
+                    )
+                    logger.warning(
+                        "Stage analysis recovery failed: error=%s", type(exc).__name__
+                    )
+                finally:
+                    self._stage_analysis_rechecks.pop(conversation_id, None)
+
+            if conversation_id not in self._stage_analysis_rechecks:
+                self._stage_analysis_rechecks[conversation_id] = asyncio.create_task(
+                    recover()
+                )
+        return overview
+
+    async def retry_project_artifact_delivery(
+        self,
+        conversation_id: str,
+        project_id: str,
+        node_id: str,
+        context: RequestContext,
+    ) -> None:
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        if not (context.cookie or context.authorization):
+            raise PermissionError("Storage authorization is required")
+        snapshot = await self.get_snapshot(conversation_id, context)
+        node = next(
+            (
+                item
+                for item in project_observations(snapshot, project_id).nodes
+                if item.id == node_id and item.type in DELIVERY_STAGE_KINDS
+            ),
+            None,
+        )
+        if (
+            snapshot.capabilities.read_only
+            or node is None
+            or node.delivery_status != "failed"
+        ):
+            raise ValueError("This stage has no failed artifact delivery")
+        await self._ensure_active(conversation_id, context)
+        rows = await self._capture_plan_progress(
+            self._active[conversation_id], store, retry_delivery_stage=node_id
+        )
+        if rows is None:
+            raise ValueError("The current execution record is unavailable")
+
+    async def get_project_observation_report(
+        self,
+        conversation_id: str,
+        project_id: str,
+        node_id: str,
+        analysis_job_id: str | None,
+        context: RequestContext,
+        *,
+        report_version_id: str | None = None,
+    ) -> ObservationReportDetails:
+        snapshot = await self.get_snapshot(conversation_id, context)
+        if self.versions is None:
+            raise FileNotFoundError("Observation stage report is unavailable")
+
+        def load_baseline_metrics(task_id: str) -> list[StageAnalysisMetric]:
+            factory = self._observation_storage_factory
+            if factory is None:
+                return []
+            try:
+                store = self._store(conversation_id)
+                pipelines = [
+                    run
+                    for run in store.load_pipeline_runs().values()
+                    if run.conversation_id == conversation_id
+                    and run.task_id == task_id
+                    and run.submission_status == "submitted"
+                ]
+                if len(pipelines) != 1:
+                    return []
+                storage = factory(context)
+                _, output_dir, _ = resolve_evaluation_run(
+                    conversation_id=conversation_id,
+                    store=store,
+                    run_id=str(pipelines[0].run_id),
+                    storage=storage,
+                    locks=self._evaluation_locks,
+                )
+                data = storage.read(f"{output_dir}/metrics.json")
+                return (
+                    baseline_evaluation_metrics(json.loads(data))
+                    if len(data) <= 48 * 1024
+                    else []
+                )
+            except (
+                EvaluationRunNotFoundError,
+                EvaluationRunUnavailableError,
+                EvaluationStorageMissingError,
+                EvaluationStorageUnavailableError,
+                OSError,
+                ValueError,
+            ):
+                return []
+
+        return await asyncio.to_thread(
+            observation_report_details,
+            snapshot,
+            project_id,
+            node_id,
+            analysis_job_id,
+            self.versions,
+            context,
+            load_baseline_metrics,
+            report_version_id=report_version_id,
+        )
+
+    async def get_project_training_series(
+        self,
+        conversation_id: str,
+        project_id: str,
+        node_id: str,
+        run_id: str,
+        keys: tuple[str, ...],
+        cursor: str | None,
+        limit: int,
+        context: RequestContext,
+    ) -> SeriesPage:
+        overview = await self.get_project_observations(
+            conversation_id, project_id, context
+        )
+        binding = next(
+            (
+                b
+                for b in overview.bindings
+                if b.run_id == run_id and b.project_node_id == node_id
+            ),
+            None,
+        )
+        panel = next(
+            (p for p in overview.config.panels if p.project_node_id == node_id), None
+        )
+        if binding is None or panel is None or self._train_observer is None:
+            raise ValueError("Training run is not bound to this Project stage")
+        metrics = tuple(
+            metric for metric in panel.metrics if not keys or metric.key in keys
+        )
+        if keys and {metric.key for metric in metrics} != set(keys):
+            raise ValueError("Unknown training metric")
+        return await self._train_observer.series(
+            project_id=project_id,
+            config_version=overview.config_version,
+            binding=binding,
+            metrics=metrics,
+            context=context,
+            cursor=cursor,
+            limit=limit,
+        )
 
     async def get_experiments(
         self, conversation_id: str, context: RequestContext
@@ -4296,6 +5093,8 @@ class ConversationRuntime:
             )
             return persisted
         self._publish(persisted)
+        if terminal and active is not None and not active.stopping:
+            self._schedule_stage_analysis_recheck(conversation_id, active, store)
         # Use persisted policy at the decision point: cancellation may have been
         # persisted while this task was waiting, after the earlier blocked check.
         if notify and self._suspends_auto_execution(conversation_id):
@@ -4557,6 +5356,13 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        analysis_tasks = (
+            *self._stage_analysis_rechecks.values(),
+            *self._stage_analysis_workers.values(),
+        )
+        for task in analysis_tasks:
+            task.cancel()
+        await asyncio.gather(*analysis_tasks, return_exceptions=True)
         recoveries = tuple(self._read_recoveries.values())
         for task in recoveries:
             task.cancel()

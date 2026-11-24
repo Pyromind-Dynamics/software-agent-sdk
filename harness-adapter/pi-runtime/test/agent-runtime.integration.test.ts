@@ -380,7 +380,11 @@ for (const workflowsEnabled of [false, true]) {
     if (workflowsEnabled) {
       assert.ok(system.includes("genome_list"));
       assert.ok(system.includes("/workspace/<path>"));
-      assert.ok(!system.includes("/target-workspace"));
+      for (const sentence of system.split(/[。\n]/u)) {
+        if (sentence.includes("/target-workspace")) {
+          assert.match(sentence, /(?:不要写挂载前缀|禁止)\s+[^。]*\/target-workspace/u);
+        }
+      }
     }
   });
 }

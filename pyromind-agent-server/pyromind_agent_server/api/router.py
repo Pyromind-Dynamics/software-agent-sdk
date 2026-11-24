@@ -280,9 +280,12 @@ def create_product_router(
         request: Request,
     ) -> ConversationSnapshot:
         await asyncio.to_thread(_require_profile, request, conversation_id, profile)
+        context = context_for(request)
         try:
+            if context.cookie or context.authorization:
+                await configure_session(request, conversation_id, profile)
             snapshot = await get_product_runtime(request).get_snapshot(
-                conversation_id, context_for(request)
+                conversation_id, context
             )
             return public_snapshot(snapshot)
         except ProductRuntimeError as exc:
@@ -362,6 +365,8 @@ def create_product_router(
         runtime = get_product_runtime(request)
         await asyncio.to_thread(_require_profile, request, conversation_id, profile)
         try:
+            if context.cookie or context.authorization:
+                await configure_session(request, conversation_id, profile)
             await runtime.authorize_event_stream(conversation_id, context)
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc

@@ -37,6 +37,12 @@ def snapshot_result(version: ArtifactVersion) -> SnapshotResult:
     )
 
 
+class VersionSnapshotError(ValueError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class Versions:
     def __init__(
         self,
@@ -149,9 +155,11 @@ class Versions:
             self.store.fail_version(version.project_id, version.id, type(exc).__name__)
             # Do not expose remote service errors or paths in a tool response. The
             # stage and version id identify the failing operation for diagnosis.
-            raise ValueError(
+            raise VersionSnapshotError(
                 f"snapshot not completed ({type(exc).__name__}, {stage}, "
-                f"version={version.id}); retry the same operation"
+                f"version={version.id}); retry the same operation",
+                retryable=isinstance(exc, OSError)
+                or bool(getattr(exc, "retryable", False)),
             ) from None
 
     def call(
