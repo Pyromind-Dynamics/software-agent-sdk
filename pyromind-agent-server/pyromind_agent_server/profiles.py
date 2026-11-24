@@ -92,14 +92,15 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=38,
+    configuration_version=39,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
     instructions="""Before Project creation only, read model-evaluation-preparation.
 During preparation you are the user's conversation partner. Answer questions
-directly in the user's language. For a user-facing reply, begin the final text
+directly in the user's language as EchoMind. Keep internal agent names and
+routing out of replies. For a user-facing reply, begin the final text
 with [[echomind:reply]]. Keep tool commentary and reasoning separate.
 Use the Skill to determine the information needed for the user's task. Read
 data and knowledge with the available workspace tools. For training without a

@@ -250,6 +250,9 @@ class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
     through_seq: int = Field(default=0, ge=0)
+    created_at: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     updated_at: AwareDatetime | None = None
     status: ConversationStatus = "idle"
     active_run_id: str | None = None
@@ -316,6 +319,9 @@ class ConversationSummary(ContractModel):
     status: ConversationStatus
     through_seq: int = Field(ge=0)
     title: str | None = None
+    created_at: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     updated_at: AwareDatetime | None = None
     project_id: str | None = None
     cluster: str | None = None
@@ -342,6 +348,7 @@ class ConversationSummary(ContractModel):
             conversation_id=snapshot.conversation_id,
             status=snapshot.status,
             through_seq=snapshot.through_seq,
+            created_at=snapshot.created_at,
             updated_at=snapshot.updated_at,
             title=title,
             project_id=project.project_id if project else None,

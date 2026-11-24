@@ -261,6 +261,9 @@ class SnapshotProjector:
         return updated.model_copy(
             update={
                 "through_seq": event.seq,
+                "created_at": event.occurred_at
+                if event.seq == 1
+                else snapshot.created_at,
                 "updated_at": _latest(snapshot.updated_at, event.occurred_at),
             }
         )

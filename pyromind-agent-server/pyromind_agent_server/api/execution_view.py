@@ -37,12 +37,7 @@ def execution_snapshot(snapshot: ConversationSnapshot) -> ConversationSnapshot:
                 }
             )
         elif isinstance(item, TimelineMessage) and item.role != "user":
-            if (
-                snapshot.project
-                or item.task_id
-                or item.role != "assistant"
-                or not item.preparation_reply
-            ):
+            if item.task_id or item.role != "assistant" or not item.preparation_reply:
                 continue
             item = item.model_copy(
                 update={

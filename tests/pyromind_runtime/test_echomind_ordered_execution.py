@@ -816,9 +816,10 @@ async def test_manager_execution_never_writes_chat_or_replays_old_notices(
             await runtime.echomind_chat.snapshot(cid, context),
             await runtime.echomind_chat.open(cid, {}, context),
         ):
-            assert snapshot and not any(
-                isinstance(m, TimelineMessage) for m in snapshot.timeline
-            )
+            assert snapshot
+            assert [
+                m.item_id for m in snapshot.timeline if isinstance(m, TimelineMessage)
+            ] == ["legacy"]
         assert chat_store.replay() == chat_events
         assert [
             event.payload.get("message_id")
@@ -899,3 +900,37 @@ def test_chat_model_keeps_own_receipts_and_excludes_historical_main_results():
         {"question": "Inspect A", "answer": "Queue receipt"},
         {"question": "Explain B", "answer": "Answer B"},
     ]
+
+
+def test_chat_handoff_uses_only_completed_public_preparation_answers():
+    rows = [
+        ("user", "u1", "a", "Remember Cedar", None, None),
+        ("assistant", "a1", "a", "private draft", "Cedar", None),
+        ("user", "u2", "b", "Another question", None, None),
+        ("assistant", "a2", "b", "internal execution output", None, None),
+        ("assistant", "a3", "a", "task details", "background result", "task"),
+    ]
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": "manager",
+            "capabilities": {},
+            "timeline": [
+                dict(
+                    kind="message",
+                    role=role,
+                    item_id=item,
+                    turn_id=turn,
+                    started_seq=seq,
+                    status="completed",
+                    content=[dict(type="text", text=text)],
+                    preparation_reply=reply,
+                    task_id=task,
+                )
+                for seq, (role, item, turn, text, reply, task) in enumerate(rows, 1)
+            ],
+        }
+    )
+    assert completed_chat_turns(snapshot, "new", preparation=True) == [
+        {"question": "Remember Cedar", "answer": "Cedar"}
+    ]
+    assert completed_chat_turns(snapshot, "new", preparation=True, budget=1) == []

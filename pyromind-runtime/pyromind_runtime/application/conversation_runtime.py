@@ -49,7 +49,9 @@ from pyromind_runtime.application.model_evaluation_plan import (
     validate_evaluation_inputs,
 )
 from pyromind_runtime.application.plan_artifact_delivery import (
+    DATASET_REPORT_FORMAT_VERSION,
     DELIVERY_STAGE_KINDS,
+    MERGED_DATASET_OUTPUTS,
     InvalidPlanDelivery,
     delivery_key,
     delivery_report,
@@ -598,7 +600,19 @@ class ConversationRuntime:
                         status = _normalize_external_status(
                             str(result.get("status", ""))
                         )
-                        if status in _TERMINAL_EXTERNAL_TASK_STATUSES:
+                        if status == "running":
+                            # A callback may have moved the task on while the
+                            # platform status request was in flight.
+                            if task.status != "pending" or not any(
+                                current.task_id == task.task_id
+                                and current.status == "pending"
+                                for current in store.load_snapshot().external_tasks
+                            ):
+                                continue
+                        if (
+                            status == "running"
+                            or status in _TERMINAL_EXTERNAL_TASK_STATUSES
+                        ):
                             error_summary = result.get("error_summary")
                             await self.deliver_external_task_status(
                                 conversation_id,
@@ -1627,16 +1641,19 @@ class ConversationRuntime:
     ) -> ExperimentExecutionView:
         context = active.context
         has_storage_credentials = bool(context.cookie or context.authorization)
-        if (
-            previous
-            and previous.report_state == "registration_failed"
-            and not retry
-            and not (
-                previous.delivery_error == "credentials_required"
-                and has_storage_credentials
+        if previous and previous.report_state == "registration_failed" and not retry:
+            format_changed = (
+                previous.delivery_error == "invalid_report"
+                and (run.stage_snapshot or {}).get("kind") == "dataset"
+                and MERGED_DATASET_OUTPUTS.keys()
+                <= {output.name for output in task.outputs}
+                and (previous.dataset_report_format_version or 0)
+                < DATASET_REPORT_FORMAT_VERSION
             )
-        ):
-            return previous
+            if not has_storage_credentials or not (
+                previous.delivery_error == "credentials_required" or format_changed
+            ):
+                return previous
         if not task.outputs:
             return run
         job_id = delivery_key(run, "report")
@@ -1754,6 +1771,10 @@ class ConversationRuntime:
                 "report_uri": None,
                 "artifacts": (),
                 "delivery_error": code,
+                "dataset_report_format_version": DATASET_REPORT_FORMAT_VERSION
+                if code == "invalid_report"
+                and (run.stage_snapshot or {}).get("kind") == "dataset"
+                else None,
             }
         )
 

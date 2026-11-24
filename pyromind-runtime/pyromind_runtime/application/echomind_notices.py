@@ -21,7 +21,11 @@ def visible_chat_snapshot(snapshot: ConversationSnapshot) -> ConversationSnapsho
             "timeline": tuple(
                 item
                 for item in snapshot.timeline
-                if not (isinstance(item, TimelineMessage) and item.execution_notice)
+                if not (
+                    isinstance(item, TimelineMessage)
+                    and item.execution_notice
+                    and (item.role != "assistant" or item.status != "completed")
+                )
             )
         }
     )

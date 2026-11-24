@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.events import ProductEvent
-from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.snapshot import ConversationSnapshot, ConversationSummary
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
     FileProductStore,
@@ -84,6 +85,38 @@ def test_historical_message_time_is_recovered_from_the_start_event(
     assert restored == current
     monkeypatch.setattr(store, "_load_events", _reject_full_read)
     assert store.load_snapshot() == current
+
+
+def test_summary_keeps_first_event_time_after_activity_and_on_legacy_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    created = datetime(2026, 9, 1, tzinfo=UTC)
+    updated = datetime(2026, 9, 2, tzinfo=UTC)
+    store.append(
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="conversation.created",
+            occurred_at=created,
+        )
+    )
+    _, snapshot = store.append(
+        ProductEvent(
+            conversation_id="conversation-1",
+            type="status.changed",
+            occurred_at=updated,
+            payload={"status": "running"},
+        )
+    )
+    assert snapshot.created_at == created
+    assert snapshot.updated_at == updated
+
+    previous_format = snapshot.model_dump(mode="json", exclude={"created_at"})
+    store.snapshot_path.write_text(json.dumps(previous_format), encoding="utf-8")
+    monkeypatch.setattr(store, "_load_events", _reject_full_read)
+    summary = ConversationSummary.from_snapshot(store.load_snapshot())
+    assert summary.created_at == created
+    assert summary.updated_at == updated
 
 
 def test_silent_task_progress_replays_without_moving_the_active_run(

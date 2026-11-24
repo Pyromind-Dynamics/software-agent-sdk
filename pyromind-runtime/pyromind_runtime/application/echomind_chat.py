@@ -39,8 +39,12 @@ if TYPE_CHECKING:
 
 
 def completed_chat_turns(
-    snapshot: ConversationSnapshot, current: str
-) -> list[JsonObject]:
+    snapshot: ConversationSnapshot,
+    current: str,
+    *,
+    preparation: bool = False,
+    budget: int = 32000,
+) -> list[dict[str, str]]:
     questions: dict[str, str] = {}
     replies: dict[str, str] = {}
     latest: dict[str, int] = {}
@@ -52,11 +56,13 @@ def completed_chat_turns(
             if turn:
                 replies.pop(turn, None)
             continue
-        if item.status != "completed":
+        if item.status != "completed" or (preparation and item.task_id):
             continue
         text = "\n".join(
             b.text for b in item.content if isinstance(b, TextContent)
         ).strip()
+        if preparation and item.role == "assistant":
+            text = item.preparation_reply or ""
         if not text:
             continue
         if item.execution_notice:
@@ -73,8 +79,8 @@ def completed_chat_turns(
 
     # Select recently answered turns (including queued requirements), then restore
     # original question order for the model. Never split a pair across the budget.
-    selected: dict[str, JsonObject] = {}
-    remaining = 32000
+    selected: dict[str, dict[str, str]] = {}
+    remaining = budget
     for key in sorted(questions, key=lambda k: latest.get(k, 0), reverse=True):
         if key not in replies:
             continue
@@ -152,7 +158,19 @@ class EchoMindChat:
             raise PermissionError("EchoMind chat session required")
         store = await self._runtime._authorized_store(chat_id, context)
         snapshot = await asyncio.to_thread(store.load_snapshot)
-        return completed_chat_turns(snapshot, current)
+        turns = completed_chat_turns(snapshot, current)
+        manager = await self._runtime._authorized_store(
+            chat_id.removeprefix(CHAT_PREFIX),
+            replace(context, profile_id=MANAGER_PROFILE),
+        )
+        history = await asyncio.to_thread(manager.load_snapshot)
+        remaining = 32000 - sum(
+            len(row["question"]) + len(row["answer"]) for row in turns
+        )
+        preparation = completed_chat_turns(
+            history, current, preparation=True, budget=remaining
+        )
+        return [dict(row) for row in (*preparation, *turns)]
 
     async def call(
         self,
