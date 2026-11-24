@@ -16,7 +16,6 @@ from uuid import uuid4
 
 from pyromind_runtime.application.echomind_chat import EchoMindChat
 from pyromind_runtime.application.echomind_notices import (
-    EchoMindNotices,
     latest_origin,
     visible_chat_event,
     visible_chat_snapshot,
@@ -317,7 +316,6 @@ class ConversationRuntime:
         self._observer = observer
         self._resource_limits = resource_limits
         self.echomind_chat = EchoMindChat(self)
-        self.echomind_notices = EchoMindNotices(self)
         self._external_tasks = external_tasks
         self._workflow_submission = workflow_submission
         self.versions = versions
@@ -4559,7 +4557,6 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
-        await self.echomind_notices.close()
         recoveries = tuple(self._read_recoveries.values())
         for task in recoveries:
             task.cancel()
@@ -5308,7 +5305,6 @@ class ConversationRuntime:
             ready.set()
 
     def _publish(self, event: ProductEvent) -> None:
-        self.echomind_notices.observe(event)
         if event.type == "execution.policy.updated":
             wakeup = self._auto_execution_wakeups.get(event.conversation_id)
             if wakeup is not None:

@@ -65,7 +65,6 @@ _PREPARATION_TOOLS = (
     "terminal",
     "ask_user",
     "set_preparation_plan",
-    "publish_echomind_update",
     START_REWARD_REVIEW,
 )
 
@@ -93,7 +92,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=36,
+    configuration_version=37,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
@@ -114,10 +113,7 @@ the user creates the Project.
 After creation, preparation is finished. Use the accepted plan supplied in the
 Project notification to create public_data/workflowPLAN.json with write, then
 execute the accepted entry task directly.
-Before finishing an execution round, give a concise public result in the user's
-language. State what was completed, or what is still waiting or blocked.
-Deliver requested summaries in that result. Keep internal reasoning,
-credentials and tool transcripts out of the result.
+Record execution outcomes in workflowPLAN and verified outputs.
 """
     + (ECHOMIND_MANAGER_PROFILE.system_prompt or ""),
     tool_allowlist=_PREPARATION_TOOLS,

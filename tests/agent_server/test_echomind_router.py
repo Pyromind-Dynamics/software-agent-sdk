@@ -64,7 +64,6 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "terminal",
         "ask_user",
         "set_preparation_plan",
-        "publish_echomind_update",
         "request_reward_bundle_review",
     }
     assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == (
