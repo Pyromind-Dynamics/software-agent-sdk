@@ -173,7 +173,7 @@ def _uploaded_script(client: _FakeSandboxClient) -> str:
 
 _SCRIPT_COMMAND = re.compile(r"sh (/tmp/pi-sandbox-[0-9a-f]+\.sh)")
 _MOVE_LINE = re.compile(r"^mv (\S+) (\S+)$", re.MULTILINE)
-_TAR_LINE = re.compile(r"tar -xzf (\S+) -C (\S+)")
+_TAR_LINE = re.compile(r"tar --unlink-first -xzf (\S+) -C (\S+)")
 _PROBE_SCRIPT = re.compile(r"test -f (\S+)\n")
 
 
@@ -880,6 +880,9 @@ def test_ensure_unpacks_resources_from_one_archive(
     assert (
         f"{workspace}/knowledge/__pycache__/notes.cpython-313.pyc" not in client.files
     )
+    # Reinstallation must replace packaged files without replacing their
+    # directories (which may contain additional project-owned files).
+    assert any(b"tar --unlink-first -xzf " in body for body in client.files.values())
     # The tree arrives in one archive: nothing is written file by file.
     assert [
         call for call in client.calls if call.startswith(f"write:{workspace}/")

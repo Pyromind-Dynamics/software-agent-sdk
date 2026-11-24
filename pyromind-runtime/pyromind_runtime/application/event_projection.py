@@ -21,6 +21,8 @@ class ProductEventProjector:
             occurred_at=event.occurred_at,
             type=cast(ProductEventType, event.type),
             run_id=event.run_id,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
             payload=event.payload,
             source_event_id=event.source_event_id,
         )

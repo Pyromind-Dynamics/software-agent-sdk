@@ -49,8 +49,9 @@ Gap，再进入 [合成范式](../data-processing/references/paradigms/gap-drive
 选择合成方法、试跑和复核。
 loss 只能提示问题，不能证明某个类别缺样，也不能直接据此决定扩增数量。
 执行训练的完成回调还需按原任务衔接 [inference-evaluation](../inference-evaluation/SKILL.md)：
-用户未排除评测时，先复用训练 eval 产物选择 checkpoint，已有基线按同口径复用评分。仅 train + val 不新增模型推理；独立 test 在验证集选模后
-使用所选 checkpoint 推理评分，不参与选模；LoRA 合并所选 step。
+计划要求评测训练模型时，从该次训练已核验的输出取得模型路径，在指定数据集上执行推理。
+选模或重评可复用同一模型在同一批样本上的预测；更换或扩大验证集时，对目标验证集执行推理。
+用户仅授权已有预测评分时，报告旧预测覆盖的样本范围。独立 test 使用验证集选定的 checkpoint。
 人工打标交给 [label-studio](../label-studio/SKILL.md)，用 `label_studio_project`
 导入已有 badcase；不以分布分析、重新评分或完整评测报告作为打标前置条件。
 已有可比基线直接复用。只分析已有 run 或明确不评测时不新增任务；缺少验证集、GT 或可用产物时

@@ -38,6 +38,7 @@ from harness_adapter.pi_adapter.business_tool_host import (
     _forward_headers,
 )
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.protocol import SandboxAuthorizationRequired
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
 from pyromind_common.tools.sandbox import (
     create_sandbox_api_client,
@@ -1007,7 +1008,10 @@ class SandboxExecutionManager:
                 if staged is not None
                 else ""
             )
-            + f"tar -xzf {shlex.quote(cached)} -C {shlex.quote(workspace_path)}\n"
+            # The Storage mount can reject in-place replacement with EEXIST.
+            # Unlink only the packaged resource files before extracting them.
+            + f"tar --unlink-first -xzf {shlex.quote(cached)} "
+            f"-C {shlex.quote(workspace_path)}\n"
         )
         output, exit_code, timed_out = await self._run_script(
             client,
@@ -1265,7 +1269,7 @@ def _sandbox_client(context: ToolExecutionContext) -> SandboxClientLike:
     env, cluster = _execution_target(context)
     auth_token = _auth_token(context.request_context)
     if not auth_token:
-        raise ValueError(
+        raise SandboxAuthorizationRequired(
             "Sandbox execution requires a Pyromind auth_token cookie or "
             "Bearer authorization."
         )

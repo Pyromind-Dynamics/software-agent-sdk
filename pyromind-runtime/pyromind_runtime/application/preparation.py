@@ -45,6 +45,12 @@ def validate_workflow_catalog(
                 f"allowed task kinds: {', '.join(allowed) or '(none)'}"
             )
 
+        definition = next(item for item in node.tasks if item.id == task.kind)
+        if definition.evaluation_target == "model" and not {"model", "dataset"} <= {
+            item.name for item in task.inputs
+        }:
+            raise ValueError(f"{task.id} requires the planned model and dataset inputs")
+
 
 class Preparations:
     def __init__(self, store: PreparationStore):

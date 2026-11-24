@@ -150,6 +150,24 @@ test("a call which never started drops the endpoint bundle", () => {
   assert.equal(isUnstartedTerminalFailure(new Error("boom")), false);
 });
 
+test("missing sandbox authorization fails once and the next call can use a refreshed login", async () => {
+  let attempts = 0;
+  const endpoints = new SandboxEndpointSession(async () => {
+    if (++attempts === 1) throw Object.assign(new Error("Sign in to continue"), { code: "sandbox_authorization_required" });
+    return ENDPOINT;
+  });
+  const { connect } = scriptedConnector([(socket, _line, token) => {
+    socket.emit(frames(token).begin);
+    socket.emit(frames(token).end(0));
+  }]);
+  const terminal = new LazySandboxTerminalOperations(endpoints, { connect, writeFile: async () => {} });
+  await assert.rejects(terminal.exec("true", ".", { onData: () => {} }), (error: unknown) =>
+    error instanceof SandboxTerminalExecutionError && error.execution.started === false
+    && error.execution.error_code === "sandbox_authorization_required");
+  assert.equal(attempts, 1);
+  assert.equal((await terminal.exec("true", ".", { onData: () => {} })).exitCode, 0);
+});
+
 test("a persistent endpoint resolution failure reports the control-plane error", async () => {
   const cause = new Error("request_failed: POST /api/v1/sandboxes -> 503 too many 503 error responses");
   const endpoints = new SandboxEndpointSession(async () => {

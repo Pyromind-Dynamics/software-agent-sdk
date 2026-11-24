@@ -38,6 +38,7 @@ type HarnessEventType = Literal[
 ]
 
 type ProductEventType = Literal[
+    "chat.notification.skipped",
     "preparation.changed",
     "project.changed",
     "task.queued",
@@ -79,6 +80,8 @@ class HarnessEvent(ContractModel):
     occurred_at: AwareDatetime = Field(default_factory=utc_now)
     type: HarnessEventType
     run_id: str | None = None
+    turn_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    task_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     payload: JsonObject = Field(default_factory=dict)
     source_event_id: str | None = None
 
@@ -91,6 +94,8 @@ class ProductEvent(ContractModel):
     occurred_at: AwareDatetime = Field(default_factory=utc_now)
     type: ProductEventType
     run_id: str | None = None
+    turn_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    task_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     payload: JsonObject = Field(default_factory=dict)
     source_event_id: str | None = None
 

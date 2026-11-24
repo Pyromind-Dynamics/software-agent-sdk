@@ -30,6 +30,7 @@ class ConversationProfile:
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     conversation_marker: str | None = None
     preparation_policy: PreparationPolicy | None = None
+    execution_only: bool = False
 
 
 _PRODUCT_ROUTING_INSTRUCTIONS = """For Pyromind workflow requests, read the matching
@@ -64,6 +65,7 @@ _PREPARATION_TOOLS = (
     "terminal",
     "ask_user",
     "set_preparation_plan",
+    "publish_echomind_update",
     START_REWARD_REVIEW,
 )
 
@@ -91,8 +93,9 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=29,
+    configuration_version=35,
     route_prefix="/api/v2/echomind/conversations",
+    execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
     instructions="""Before Project creation only, read model-evaluation-preparation.
@@ -102,6 +105,8 @@ programmatically verifiable answer, consult rubric-elicitation to choose and
 confirm the scoring method. Use ask_user only for
 essential information or decisions that cannot be established. Once ready,
 submit a compact review plan with set_preparation_plan(plan, entry_task_id).
+After each new preparation request or answer, submit the reviewed plan again
+before ending the turn, even when the saved draft does not need changes.
 Include confirmed inputs and constraints in the plan, not a separate Checklist.
 The user may revise it in chat and creates/starts the Project with the UI button.
 Use the Sandbox to inspect data and prepare files. Start business tasks only after
@@ -109,6 +114,10 @@ the user creates the Project.
 After creation, preparation is finished. Use the accepted plan supplied in the
 Project notification to create public_data/workflowPLAN.json with write, then
 execute the accepted entry task directly.
+Before finishing an execution round, give a concise public result in the user's
+language. State what was completed, or what is still waiting or blocked.
+Deliver requested summaries in that result. Keep internal reasoning,
+credentials and tool transcripts out of the result.
 """
     + (ECHOMIND_MANAGER_PROFILE.system_prompt or ""),
     tool_allowlist=_PREPARATION_TOOLS,
@@ -121,6 +130,7 @@ execute the accepted entry task directly.
         "input_response",
         "cancel",
         "create_project",
+        "review_preparation",
         "enqueue_task",
         "permission_response",
         "workflow_execution",

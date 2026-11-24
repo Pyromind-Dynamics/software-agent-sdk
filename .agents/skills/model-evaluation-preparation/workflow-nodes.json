@@ -49,8 +49,14 @@
       "roles": [],
       "tasks": [
         {
+          "id": "model_eval",
+          "description": "对指定模型执行推理和评分。model 输入绑定目标模型，dataset 输入绑定评测集。",
+          "evaluation_target": "model"
+        },
+        {
           "id": "checkpoint_eval",
-          "description": "评测冻结的候选 checkpoint 或预测。"
+          "description": "兼容已有候选评测计划。新计划评测模型选 model_eval，复用预测评分或选模选 analysis。",
+          "evaluation_target": "model_or_predictions"
         },
         {
           "id": "analysis",

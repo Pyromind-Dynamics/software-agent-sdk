@@ -164,7 +164,12 @@ class PipelineRuns:
             in {"prediction_evaluation", "evaluation_products", "badcase_review"}
             or run.definition.get("dataset_role") == "test"
             else self._versions.resolve_inputs(
-                project, input_definition, inputs, self._context, key
+                project,
+                input_definition,
+                inputs,
+                self._context,
+                key,
+                respect_explicit_paths=bool(run.definition.get("plan_task_id")),
             )
         )
         if isinstance(
@@ -361,6 +366,13 @@ class PipelineRuns:
             self._store, self.conversation_id, definition
         )
         inference = definition.get("inference") or {}
+        if (
+            inference
+            and self._context
+            and self._context.plan_task_id
+            and not resume_run_id
+        ):
+            definition = {**definition, "plan_task_id": self._context.plan_task_id}
         checkpoint_id = inference.get("source_checkpoint_version_id")
         source = (definition.get("evaluation_config") or {}).get("model_source", {})
         if (

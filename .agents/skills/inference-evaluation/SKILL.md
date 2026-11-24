@@ -8,9 +8,10 @@ description: 模型效果评测的统一入口，包括基模 Benchmark、训后
 当前 Agent 负责理解任务和制定 rubric；被测模型只生成 prediction，固定的评测脚本负责评分。
 业务效果评测统一走本 Skill，包括训练前后的独立评测；不通过 generate-workflow-dsl
 另建 Metric/Eval 评测链。训练工作流负责训练及模型产物准备；已有预测评分不需要加载或合并模型。
-训练后按数据集角色处理：只有 train + val 时，复用已有 eval_step_n.jsonl 评分选模，
-不额外启动模型推理。存在独立 test 时，先用 val 选择 checkpoint，再对该模型执行 test
-推理和同口径评分；test 不参与选模。缺少已有预测时报告缺口，不自动补跑 GPU。
+以计划中的评测对象为准。评测训练产出的模型时，从上游已核验的输出读取目标模型路径，用
+`operation="inference"` 在计划指定的数据集上生成逐样本预测并评分。已合并的模型用
+`model_source.type="storage"`。即使只有 train 和 val，也在指定的 val 上执行这项评测。
+训练期间的 eval_step 文件用于已有预测评分或验证集选模。复用前核对模型版本和样本范围；验证集更换或扩大时，使用目标模型在指定验证集上推理。独立 test 在验证集选模后推理和评分。
 
 ## 已有预测与训练产物
 

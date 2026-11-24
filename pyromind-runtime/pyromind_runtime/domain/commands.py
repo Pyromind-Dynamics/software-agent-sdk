@@ -78,6 +78,12 @@ class CreateProjectCommand(ContractModel):
     expected_preparation_revision: int = Field(ge=0)
 
 
+class ReviewPreparationCommand(ContractModel):
+    type: Literal["review_preparation"] = "review_preparation"
+    command_id: str = Field(min_length=1, max_length=128)
+    expected_preparation_revision: int = Field(ge=0)
+
+
 type ProductCommand = Annotated[
     UserMessageCommand
     | EnqueueTaskCommand
@@ -85,7 +91,8 @@ type ProductCommand = Annotated[
     | PermissionResponseCommand
     | RollbackWorkflowCommand
     | InputResponseCommand
-    | CreateProjectCommand,
+    | CreateProjectCommand
+    | ReviewPreparationCommand,
     Field(discriminator="type"),
 ]
 

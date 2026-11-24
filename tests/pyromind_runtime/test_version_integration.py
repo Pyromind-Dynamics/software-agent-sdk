@@ -767,8 +767,18 @@ async def test_direct_submission_checks_snapshot_before_platform_submit(
     assert submission.submissions == []
 
 
-@pytest.mark.parametrize("model_source", ["storage", "clone", "download"])
-def test_pipeline_execution_uses_frozen_script_and_config(tmp_path, model_source):
+@pytest.mark.parametrize(
+    ("model_source", "planned"),
+    [
+        ("storage", False),
+        ("clone", False),
+        ("download", False),
+        ("storage", True),
+    ],
+)
+def test_pipeline_execution_uses_frozen_script_and_config(
+    tmp_path, model_source, planned
+):
     root = tmp_path / "c"
     root.mkdir()
     product = FileProductStore(root)
@@ -780,9 +790,11 @@ def test_pipeline_execution_uses_frozen_script_and_config(tmp_path, model_source
         SQLiteVersionStore(tmp_path / "versions.sqlite3"),
         FileArtifactSnapshots(tmp_path / "storage"),
     )
-    context = RequestContext(user_id="42")
+    context = RequestContext(
+        user_id="42", plan_task_id="evaluate-model" if planned else None
+    )
     assert isinstance(service.snapshots, FileArtifactSnapshots)
-    for reference in ("/data.jsonl", "/model"):
+    for reference in ("/data.jsonl", "/model", "/trained/merged"):
         path = service.snapshots.path(reference, context)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("source")
@@ -810,6 +822,8 @@ def test_pipeline_execution_uses_frozen_script_and_config(tmp_path, model_source
         project.revision,
     )
     reference = "/model" if model_source == "storage" else "Unlisted/Model"
+    if planned:
+        reference = "/trained/merged"
     definition = {
         "input_path": "/data.jsonl",
         "inference": {"model_path": reference},
@@ -844,7 +858,9 @@ def test_pipeline_execution_uses_frozen_script_and_config(tmp_path, model_source
     saved_inference = saved_definition["inference"]
     assert isinstance(saved_inference, dict)
     assert saved_inference["model_path"] == (
-        selected.manifest.storage_ref if model_source == "storage" else reference
+        selected.manifest.storage_ref
+        if model_source == "storage" and not planned
+        else reference
     )
     assert ("input.inference.model_path" in record.spec.inputs) == (
         model_source == "storage"

@@ -3,6 +3,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from aiohttp import web
@@ -19,6 +20,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy, SetPreparationPlan
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.versions import VersionToolRequest
@@ -76,6 +78,23 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             return await execute(name, arguments, tool_context, **kwargs)
         assert "plan_task_id" not in arguments
         task_id = f"evaluation-{len(jobs) + 1}"
+        assert arguments["operation"] == "inference"
+        assert tool_context.request_context.plan_task_id in {"baseline", "candidate"}
+        runtime._store(scope).save_pipeline_run(
+            PipelineRun(
+                run_id=uuid4(),
+                conversation_id=scope,
+                task_id=task_id,
+                definition={
+                    "inference": {"model_path": arguments["model_path"]},
+                    "input_path": arguments["input_path"],
+                },
+                fingerprint="test",
+                output_dir="/test",
+                submission_status="submitted",
+            ),
+            expected_revision=None,
+        )
         jobs.append(task_id)
         return {
             "is_error": False,
@@ -93,7 +112,7 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
     stages = [
         ("baseline", "init", "bench"),
         ("training", "train", "train_run"),
-        ("candidate", "eval", "checkpoint_eval"),
+        ("candidate", "eval", "model_eval"),
     ]
     plan = {
         "goal": "Optimize and evaluate",
@@ -102,7 +121,12 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 "id": "data",
                 "name": "Dataset",
                 "storage_path": "/workspace/samples.jsonl",
-            }
+            },
+            {
+                "id": "merged",
+                "name": "Merged model",
+                "storage_path": "/workspace/model",
+            },
         ],
         "stages": [{"id": key, "kind": node, "name": key} for key, node, _ in stages],
         "tasks": [
@@ -111,7 +135,12 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 "kind": kind,
                 "stage_id": key,
                 "name": key,
-                "inputs": [{"name": "data", "resource_id": "data"}],
+                "inputs": [
+                    {"name": "model", "resource_id": "merged"},
+                    {"name": "dataset", "resource_id": "data"},
+                ]
+                if key == "candidate"
+                else [{"name": "data", "resource_id": "data"}],
             }
             for key, _, kind in stages
         ],
@@ -141,10 +170,27 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             "submit_workflow",
             {
                 "plan_task_id": "training",
+                "plan_attempt": 3,
                 "workflow_path": "public_data/workflow_canvas/workflow.py",
             },
         ),
         None,
+        (
+            "df_submit_evaluation",
+            {
+                "operation": "score",
+                "input_path": "/workspace/predictions",
+                "plan_task_id": "candidate",
+            },
+        ),
+        (
+            "df_submit_evaluation",
+            {
+                **evaluations,
+                "model_path": "/workspace/wrong-model",
+                "plan_task_id": "candidate",
+            },
+        ),
         ("df_submit_evaluation", {**evaluations, "plan_task_id": "candidate"}),
         None,
         ("product_versions", report),
@@ -170,10 +216,11 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 for item in runtime._artifact_versions(scope, context)
                 if item.kind == "report"
             ]
-            rows = [
+            rows: list[dict] = [
                 {"id": key, "stage_id": key, "business_status": "completed"}
                 for key, _, _ in stages
             ]
+            rows[1]["plan_attempt"] = 3
             rows[-1]["report_version_id"] = artifact.id
             rows[-1]["business_status"] = "in_progress"
             action = (
@@ -265,7 +312,7 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 assert (
                     next(
                         r.stage_id
-                        for r in snapshot.experiment_executions
+                        for r in snapshot.experiment_executions or ()
                         if r.platform_task_id == platform_id
                     )
                     == stages[i][0]
@@ -293,7 +340,16 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 context,
             )
             snapshot = await runtime.get_snapshot(scope, context)
-            assert all(r.state == "succeeded" for r in snapshot.experiment_executions)
+            assert all(
+                r.state == "succeeded" for r in snapshot.experiment_executions or ()
+            )
+            (training,) = (
+                r
+                for r in snapshot.experiment_executions or ()
+                if r.stage_id == "training"
+            )
+            assert training.run_id.endswith(":training:3")
+            assert training.platform_task_id == "task-123"
             events = runtime._store(scope).replay()
             (artifact_id,) = [
                 e.payload["artifact_id"]
@@ -346,7 +402,7 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             )
             await runtime.submit_command(scope, follow_up, context)
             snapshot = await runtime.get_snapshot(scope, context)
-            assert [item["task_id"] for item in snapshot.experiment_queue] == [
+            assert [item["task_id"] for item in snapshot.experiment_queue or ()] == [
                 "requirement:while-reviewing"
             ]
             assert "Check sample coverage" not in json.dumps(requests[-1])
@@ -437,10 +493,11 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
         assert await runtime.apply_session_configuration(scope, policy, context)
         assert store.access_policy()["delegated_roles"] == ()
         snapshot = await runtime.get_snapshot(scope, context)
+        assert snapshot.project is not None
         assert snapshot.project.plan == ready_request.plan
         assert any(
             r.run_id == "legacy-run" and r.stage_id == "evaluation"
-            for r in snapshot.experiment_executions
+            for r in snapshot.experiment_executions or ()
         )
 
         # The receiver has not acknowledged this requirement before shutdown.
@@ -452,10 +509,8 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
             command_id="durable", instruction="Review the accepted report"
         )
         await runtime.submit_command(scope, queued, context)
-        assert (
-            store.load_snapshot().experiment_queue[0]["task_id"]
-            == "requirement:durable"
-        )
+        queue = store.load_snapshot().experiment_queue
+        assert queue and queue[0]["task_id"] == "requirement:durable"
     finally:
         await runtime.close()
 

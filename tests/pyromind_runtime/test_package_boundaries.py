@@ -529,6 +529,17 @@ def test_preparation_policy_is_trusted_profile_configuration():
     assert policy is not None
     roles = ECHOMIND_PRODUCT_PROFILE.delegated_roles
     assert roles == policy.allowed_roles == ()
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    eval_tasks = {
+        task.id: task.evaluation_target
+        for node in policy.workflow_nodes
+        if node.id == "eval"
+        for task in node.tasks
+    }
+    assert eval_tasks["model_eval"] == "model"
+    assert eval_tasks["analysis"] is None
+    assert DEFAULT_PRODUCT_PROFILE.preparation_policy is None
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
     review_tool = "request_reward_bundle_review"
     assert review_tool in tools
@@ -562,6 +573,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "ask_user",
         "get_storage_url",
         "propose_runtime_resources",
+        "publish_echomind_update",
         "get_project_reward",
         "df_submit_evaluation",
         "df_submit_pipeline",

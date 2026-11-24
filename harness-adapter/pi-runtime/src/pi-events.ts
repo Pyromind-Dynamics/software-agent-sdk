@@ -6,34 +6,60 @@ import { PROTOCOL_VERSION, isRecord, type JsonObject, type JsonValue, type Runne
 
 const SECRET = /(^|[_-])(api[_-]?key|authorization|cookie|password|secret|token)($|[_-])/i;
 const MAX_STRING = 64 * 1024;
+const REASONING_TAG = /<\/?(?:think|thinking|analysis|reasoning)(?=[\s/>])/i;
 
 export class PiEventNormalizer {
   private messageId: string | undefined;
   private commandId: string | undefined;
+  turnId: string | undefined;
   private messageRole: "user" | "assistant" | undefined;
-  private readonly toolArguments = new Map<string, JsonValue>();
+  private readonly toolArguments = new Map<string, { args: JsonValue; turnId?: string }>();
 
-  constructor(private readonly sessionId: string, private readonly runId: string, private readonly pendingCommandIds: string[] = [], private readonly storageUrls = new Map<string, string>()) {}
+  constructor(private readonly sessionId: string, readonly runId: string, private readonly pendingCommandIds: string[] = [], private readonly storageUrls = new Map<string, string>(), readonly taskId?: string) {}
 
-  translate(event: AgentSessionEvent): RunnerEvent[] {
+  private publicHeader: string | null = "";
+  private pendingTag = "";
+  private readonly publishedArguments = new Map<string, string>();
+
+  translate(event: AgentSessionEvent, publicUpdates = false): RunnerEvent[] {
     switch (event.type) {
       case "agent_start": return [this.make("agent.started", {})];
       case "agent_end": return [];
       case "turn_end": return [];
       case "turn_start": return [];
       case "message_start": return this.startMessage(event.message);
-      case "message_update":
-        if (event.assistantMessageEvent.type !== "text_delta" || !this.messageId) return [];
-        return [this.make("message.delta", { message_id: this.messageId, text: event.assistantMessageEvent.delta })];
+      case "message_update": {
+        const update = event.assistantMessageEvent;
+        if (publicUpdates && update.type === "toolcall_delta") {
+          const block = update.partial.content[update.contentIndex];
+          if (block?.type !== "toolCall" || !block.id || block.name !== "publish_echomind_update") return [];
+          const message = block.arguments.message;
+          const previous = this.publishedArguments.get(block.id) ?? "";
+          if (typeof message !== "string" || !message.startsWith(previous)) return [];
+          // A JSON escape or a surrogate pair may still be incomplete at the chunk boundary.
+          const decoded = message.replace(/[\\\uD800-\uDBFF]+$/u, "");
+          const stable = decoded.slice(0, publicTextLength(decoded));
+          const text = stable.slice(previous.length);
+          if (!text) return [];
+          this.publishedArguments.set(block.id, stable);
+          return [this.make("message.delta", {
+            message_id: `echomind-update:${this.runId}:${block.id}`, text, public_delta: text,
+          })];
+        }
+        if (update.type !== "text_delta" || !this.messageId || this.messageRole !== "assistant") return [];
+        const text = update.delta;
+        const visible = publicUpdates ? this.publicReplyDelta(text) : "";
+        return [this.make("message.delta", { message_id: this.messageId, text, ...(visible ? { public_delta: visible } : {}) })];
+      }
       case "message_end": return this.endMessage(event.message);
       case "tool_execution_start":
-        this.toolArguments.set(event.toolCallId, sanitizeJson(event.args));
+        this.toolArguments.set(event.toolCallId, { args: sanitizeJson(event.args), turnId: this.turnId });
         return [this.make("tool.started", {
           tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), arguments: sanitizeJson(event.args),
         })];
       case "tool_execution_update": return [this.make("tool.progress", {
         tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...resultPayload(event.partialResult),
-      })];
+      }, this.toolArguments.get(event.toolCallId)?.turnId ?? null)];
       case "tool_execution_end": {
         if (event.toolName === "get_storage_url" && !event.isError && isRecord(event.result) && Array.isArray(event.result.content)) {
           for (const block of event.result.content) {
@@ -53,19 +79,45 @@ export class PiEventNormalizer {
           ? details.error_code.slice(0, MAX_STRING) : "tool_execution_failed";
         return [this.make(event.isError ? "tool.failed" : "tool.completed", {
           tool_call_id: event.toolCallId, tool_name: visibleToolName(event.toolName), ...result,
-          ...(arguments_ !== undefined ? { arguments: arguments_ } : {}),
+          ...(arguments_ !== undefined ? { arguments: arguments_.args } : {}),
           ...(event.isError ? { error_code: errorCode } : {}),
-        })];
+        }, arguments_?.turnId ?? null)];
       }
       default: return [];
     }
   }
 
+  private publicReplyDelta(text: string): string {
+    const header = "[[echomind:reply]]";
+    if (this.publicHeader === null) return "";
+    if (this.publicHeader !== header) {
+      const prefix = (this.publicHeader + text).trimStart();
+      if (!prefix.startsWith(header)) {
+        this.publicHeader = header.startsWith(prefix) ? prefix : null;
+        return "";
+      }
+      this.publicHeader = header;
+      text = prefix.slice(header.length);
+    }
+    const chunk = this.pendingTag + text;
+    const length = publicTextLength(chunk);
+    this.pendingTag = chunk.slice(length);
+    if (REASONING_TAG.test(this.pendingTag)) {
+      this.publicHeader = null;
+      this.pendingTag = "";
+    }
+    return chunk.slice(0, length);
+  }
+
   private startMessage(message: AgentMessage): RunnerEvent[] {
     if (message.role !== "user" && message.role !== "assistant") return [];
+    this.publicHeader = "";
+    this.pendingTag = "";
+    this.publishedArguments.clear();
     this.messageId = randomUUID();
     this.messageRole = message.role;
     this.commandId = message.role === "user" ? this.pendingCommandIds.shift() : undefined;
+    if (this.commandId) this.turnId = this.commandId;
     return [this.make("message.started", { message_id: this.messageId, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content: messageContent(message) })];
   }
 
@@ -86,10 +138,22 @@ export class PiEventNormalizer {
     return events;
   }
 
-  private make(kind: RunnerEventKind, payload: JsonObject): RunnerEvent {
+  private make(kind: RunnerEventKind, payload: JsonObject, turnId: string | null | undefined = this.turnId): RunnerEvent {
     return { protocolVersion: PROTOCOL_VERSION, type: "pi.event", eventId: randomUUID(), sessionId: this.sessionId,
-      runId: this.runId, occurredAt: new Date().toISOString(), kind, payload };
+      runId: this.runId, turnId: turnId ?? undefined, taskId: this.taskId, occurredAt: new Date().toISOString(), kind, payload };
   }
+}
+
+// Hold a possible reasoning delimiter across network chunks. Other HTML and
+// ordinary less-than signs can be streamed as soon as they are unambiguous.
+function publicTextLength(text: string): number {
+  const complete = REASONING_TAG.exec(text);
+  if (complete) return complete.index;
+  const last = text.lastIndexOf("<");
+  if (last < 0) return text.length;
+  const suffix = text.slice(last).toLowerCase();
+  return ["think", "thinking", "analysis", "reasoning"].some(name =>
+    (`<${name}`).startsWith(suffix) || (`</${name}`).startsWith(suffix)) ? last : text.length;
 }
 
 function visibleToolName(name: string): string { return name === "bash" ? "terminal" : name; }

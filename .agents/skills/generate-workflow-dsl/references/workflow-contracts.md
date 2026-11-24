@@ -82,10 +82,10 @@ Text 的 assistant 默认 `gt`，rejected 默认 `rejected_answer`；Message 的
 rejected 默认 `rejected_messages`；Vision 的 `image_field` 必填。字段名以真实样本或已有有效映射为准。
 已有 messages 保留原格式，媒体内容按实际节点契约配置，不套用平铺字段默认值。
 
-平铺 Vision 示例（图片路径以训练加载器的解析基准为准）：
+平铺 Vision 示例（默认加载器直接打开图片列中的路径）：
 
 ```json
-{"images":["images/a.png"],"system_prompt":"你是图像质检专家。","user_prompt":"判断图中缺陷。","gt":"存在划痕。"}
+{"images":["/workspace/datasets/my_data/images/a.png"],"system_prompt":"你是图像质检专家。","user_prompt":"判断图中缺陷。","gt":"存在划痕。"}
 ```
 
 ```python

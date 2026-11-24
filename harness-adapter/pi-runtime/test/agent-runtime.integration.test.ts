@@ -9,6 +9,79 @@ import type { JsonObject, JsonValue, RunnerEvent } from "../src/protocol.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { PiAgentRuntime } from "../src/agent-runtime.js";
 
+test("execution notice uses the configured model without starting a chat turn", async (context) => {
+  const tempEnvironment = new Map(["TMPDIR", "TMP", "TEMP"].map(key => [key, process.env[key]]));
+  context.after(() => {
+    for (const [key, value] of tempEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-execution-notice-")));
+  const skills = join(root, "skills");
+  await Promise.all([mkdir(skills), mkdir(join(root, "public_data")), mkdir(join(root, "pi", "terminal-output"), { recursive: true })]);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const requests: JsonObject[] = [];
+  const server = createServer(async (request, response) => {
+    requests.push(await readJson(request));
+    sendText(response, '{"message":"The report is ready."}');
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  context.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const events: RunnerEvent[] = [];
+  let historyAvailable = true;
+  const peer = {
+    request: async (method: string) => {
+      if (method !== "chat.turn_history" || !historyAvailable) throw new Error("history unavailable");
+      return [{ question: "Original question", answer: "Late result" }];
+    },
+    emit: (event: RunnerEvent) => { events.push(event); },
+  } as unknown as JsonlRpcPeer;
+  const runtime = new PiAgentRuntime(peer);
+  await runtime.handle("start", {
+    session_id: "notification-test",
+    chat_turn_history: true,
+    workspace_root: root,
+    terminal_backend: "os-sandbox",
+    session_path: join(root, "session.jsonl"),
+    skills_directory: skills,
+    skill_roots: [],
+    tools: [],
+    tool_allowlist: [],
+    system_prompt: "Answer ordinary chats.",
+    model: {
+      provider: "openai",
+      id: "configured-notice-model",
+      api_key: "test-key",
+      base_url: `http://127.0.0.1:${address.port}/v1`,
+    },
+  });
+  const baseline = events.length;
+  assert.equal(await runtime.handle("chat.compose_execution_notice", {
+    milestone: "report_ready", language: "English", notification_required: true,
+  }), '{"message":"The report is ready."}');
+  assert.equal(events.length, baseline);
+  assert.equal(requests[0]?.model, "configured-notice-model");
+  assert.equal(requests[0]?.tools, undefined);
+  assert.equal(JSON.stringify(requests[0]).includes("Answer ordinary chats."), false);
+  for (const runId of ["follow-up", "unavailable"]) {
+    historyAvailable = runId === "follow-up";
+    await runtime.handle("prompt", { run_id: runId, content: [{ type: "text", text: runId }] });
+    const deadline = Date.now() + 5000;
+    while (!events.some(event => event.kind === "run.finished" && event.runId === runId)) {
+      assert.ok(Date.now() < deadline, "prompt did not finish");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const messages = requests.at(-1)!.messages as Array<{ role: string; content: string }>;
+    assert.deepEqual(messages.filter(m => ["user", "assistant"].includes(m.role)).map(m => m.content),
+      historyAvailable ? ["Original question", "Late result", [{ type: "text", text: runId }]] : [[{ type: "text", text: runId }]]);
+  }
+  context.mock.method(process, "exit", () => undefined);
+  await runtime.handle("close", {});
+  await new Promise<void>(resolve => setImmediate(resolve));
+});
+
 test("AgentSession resolves an uncovered workflow node through the knowledge index without terminal", async (context) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-runtime-test-")));
   const workspace = join(root, "conversation");

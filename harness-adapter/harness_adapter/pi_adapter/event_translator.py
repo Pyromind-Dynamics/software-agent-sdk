@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import re
 from datetime import datetime
 from typing import Any, cast
 
+from pyromind_runtime.domain.echomind_chat import CHAT_TOOLS
 from pyromind_runtime.domain.events import HarnessEvent, HarnessEventType
 from pyromind_runtime.domain.experiment_execution import ExecutionBinding
 from pyromind_runtime.domain.snapshot import OperationActivity
@@ -27,6 +29,8 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
         "event_id": str(frame.get("eventId")),
         "session_id": str(frame.get("sessionId")),
         "run_id": str(frame.get("runId")),
+        "turn_id": frame.get("turnId"),
+        "task_id": frame.get("taskId"),
         "occurred_at": _occurred_at(frame.get("occurredAt")),
     }
     if kind == "execution.policy.updated":
@@ -159,7 +163,7 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
         payload = {**payload, "content": _content(payload.get("content"), kind=kind)}
     elif kind == "tool.started":
         payload = {
-            "operation_id": payload.get("tool_call_id"),
+            "operation_id": tool_operation_id(payload, common["turn_id"]),
             "name": payload.get("tool_name") or "tool",
             "category": "tool",
             "arguments": payload.get("arguments", {}),
@@ -167,7 +171,7 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
         }
     elif isinstance(kind, str) and kind.startswith("tool."):
         payload = {
-            "operation_id": payload.get("tool_call_id"),
+            "operation_id": tool_operation_id(payload, common["turn_id"]),
             "name": payload.get("tool_name") or "tool",
             "output": _content(payload.get("content"), kind=kind),
             "details": payload.get("details")
@@ -200,6 +204,19 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
                 ),
             )
     return (translated,)
+
+
+def tool_operation_id(payload: dict[str, Any], turn_id: Any) -> Any:
+    call_id = payload.get("tool_call_id")
+    name = payload.get("tool_name")
+    if (
+        isinstance(call_id, str)
+        and isinstance(turn_id, str)
+        and isinstance(name, str)
+        and name in CHAT_TOOLS
+    ):
+        return "turn:" + json.dumps([turn_id, call_id], separators=(",", ":"))
+    return call_id
 
 
 def _content(value: Any, *, kind: str) -> list[dict[str, Any]]:

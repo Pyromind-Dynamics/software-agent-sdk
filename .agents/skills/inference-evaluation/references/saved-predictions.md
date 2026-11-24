@@ -118,9 +118,9 @@ LoRA 写 `{"type":"checkpoint","kind":"lora","base_model":"/models/实际基模"
 基模必须已准备到 Storage，远端模型标识先通过已有 clone/download 能力解析到实际文件。
 工具生成所选 LoRA 的 Merge → Inference → CPU，合并输出位于本次推理 output_dir/merged-model，
 版本登记记录父 checkpoint。该显式引用不会被项目当前默认模型替换。
-这一步只用于缺少目标预测、独立测试集或生成配置变化的评测，不为全 step 评分触发。
+评测已合并的模型时使用其实际 Storage 路径和 storage 来源，在指定数据集上重新生成预测。
 
-仅 train + val 时，不额外推理；rubric 变化只重新 CPU 评分。存在独立 test 时，先完成
+仅调整已有预测的 rubric 时重新执行 CPU 评分。存在独立 test 时，先完成
 验证集选模，再在工具顶层传 selection_run_id=选模批次 run_id，input_path 使用该批次
 清单 datasets.test.path，model_path 与 model_source 精确对应选中 checkpoint。
 测试集文件必须与 train/validation 不同且指纹不同；应由数据来源确认独立划分，路径和指纹
