@@ -518,9 +518,10 @@ def download_file_from_pyromind(
     headers: dict[str, str],
     timeout: float,
     max_bytes: int,
+    attempts: int = 3,
 ) -> bytes:
     """Download a bounded file, retrying only temporary read failures."""
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             return _download_file_once(
                 storage_path=storage_path,
@@ -530,7 +531,7 @@ def download_file_from_pyromind(
                 max_bytes=max_bytes,
             )
         except StorageReadError as exc:
-            if not exc.retryable or attempt == 2:
+            if not exc.retryable or attempt + 1 == attempts:
                 raise
             time.sleep(0.5 * 2**attempt)
     raise AssertionError("unreachable")

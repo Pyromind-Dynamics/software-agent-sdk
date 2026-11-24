@@ -97,7 +97,8 @@ class DfSubmitEvaluationAction(Action):
         min_length=1,
         description=(
             "Source data path in user Storage, e.g. "
-            "'/workspace/datasets/test.jsonl'; unchanged on resume."
+            "'/workspace/datasets/test.jsonl'; unchanged on resume. "
+            "For inference, a directory uses its val.jsonl."
         ),
     )
     model_path: str | None = Field(

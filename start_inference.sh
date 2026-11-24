@@ -58,15 +58,12 @@ case "${EXPERIMENT_DB_BACKEND}" in
   *) echo "ERROR: EXPERIMENT_DB_BACKEND must be sqlite or mariadb" >&2; exit 1 ;;
 esac
 
-export OPENAI_API_KEY
 export OPENROUTER_API_KEY
 export PYROMIND_HARNESS_BACKEND="pi"
-export PYROMIND_RUN_ARCHIVES_ENABLED=1
 # Studio, Storage and Sandbox route by this environment and the request region.
 export APP_ENV="${APP_ENV:-prod}"
 export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"
 export PYROMIND_PUBLIC_API_BASE="${PYROMIND_PUBLIC_API_BASE:-http://localhost:5173}"
-export PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET
 
 # Only the os-sandbox backend binds tools to the host OS sandbox helpers;
 # the default platform sandbox runs in a remote container and needs none of
@@ -98,33 +95,34 @@ fi
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-export LLM_MODEL="${LLM_MODEL:-deepseek-v4-pro-0813}"
-export LLM_BASE_URL="${LLM_BASE_URL:-https://token-plan-cn-east-1.pyromind-asia.cn/v1}"
-# export LLM_MODEL="deepseek/deepseek-v4.1-flash-1017"
-# export LLM_BASE_URL="https://openrouter.ai/api/v1"
-export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+default_model="openai/deepseek-v4-pro-0813"
+default_base_url="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
+export LLM_MODEL="${LLM_MODEL:-${default_model}}"
+export LLM_BASE_URL="${LLM_BASE_URL:-${default_base_url}}"
 
-
-export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
-export LABEL_STUDIO_PORTAL_BASE_URL=https://pre-label-studio.pyromind.ai
-
-#export LLM_MODEL="openai/deepseek-v4-pro"
-#export LLM_BASE_URL="https://api.deepseek.com"
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: OPENAI_API_KEY is required. Export it before running start_inference.sh." >&2
+  echo "ERROR: OPENAI_API_KEY is required. Export it or set it in .env.test.local." >&2
   exit 1
 fi
+export OPENAI_API_KEY
+export PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET
 
-
-export DF_API_BASE_URL="https://openrouter.ai/api/v1"
-export DF_API_URL="https://openrouter.ai/api/v1/chat/completions"
-export DF_MODEL_NAME="deepseek/deepseek-v4.1-flash-1017"
+export DF_MODEL_NAME="${DF_MODEL_NAME:-${default_model}}"
+dataflow_base_url="${default_base_url}"
+if [[ -n "${DF_API_URL:-}" ]]; then
+  dataflow_base_url="${DF_API_URL%/}"
+  dataflow_base_url="${dataflow_base_url%/chat/completions}"
+fi
+export DF_API_BASE_URL="${DF_API_BASE_URL:-${dataflow_base_url}}"
+export DF_API_URL="${DF_API_URL:-${DF_API_BASE_URL%/}/chat/completions}"
 export DF_API_KEY="${DF_API_KEY:-${OPENROUTER_API_KEY:-}}"
-if [[ -z "${DF_API_KEY:-}" ]]; then
+if [[ -z "${DF_API_KEY}" ]]; then
   echo "ERROR: DF_API_KEY is required. Set DF_API_KEY or OPENROUTER_API_KEY." >&2
   exit 1
 fi
 
+export LABEL_STUDIO_BASE_URL=https://pre-label-studio.pyromind.ai
+export LABEL_STUDIO_PORTAL_BASE_URL=https://pre-label-studio.pyromind.ai
 
 # ----------------------------------------------------------
 # Agent Server Configuration
@@ -142,20 +140,8 @@ fi
 
 export OH_ENABLE_PYROMIND_JWT_AUTH="${OH_ENABLE_PYROMIND_JWT_AUTH:-true}"
 
-# Use the JWT signing key from the selected Studio environment.
-# Export PYROMIND_WEB_SECRET_KEY or provide a web_secret_key file under
-# PYROMIND_SECRET_PATH (defaults to /etc/secrets). Never print the key.
-export PYROMIND_WEB_SECRET_KEY="${PYROMIND_WEB_SECRET_KEY:-}"
-export PYROMIND_SECRET_PATH="${PYROMIND_SECRET_PATH:-/etc/secrets}"
-case "${OH_ENABLE_PYROMIND_JWT_AUTH}" in
-  true|True|TRUE|1)
-    uv run --project "${SOFTWARE_AGENT_SDK_DIR}" python -c \
-      'from pyromind_common.platform.auth import find_secret_key; find_secret_key()'
-    ;;
-esac
-
-# Consume workflow events from the selected platform environment.
-export KAFKA_ENV="${KAFKA_ENV:-${APP_ENV}}"
+# Keep the server in local development mode while consuming pre workflow events.
+export KAFKA_ENV="${KAFKA_ENV:-prod}"
 export POD_NAME="${POD_NAME:-local-agent-server-${USER:-unknown}}"
 export KAFKA_URL="${KAFKA_URL:-kafka-portal.pyromind.ai:31011,kafka-portal.pyromind.ai:31012,kafka-portal.pyromind.ai:31013}"
 
@@ -233,7 +219,7 @@ fi
 # Keep DataFlow outside the agent-server venv: some native dependencies do not
 # provide Python 3.13 wheels. Every harness inherits the same interpreter via
 # DATAFLOW_PYTHON, so adapters do not need harness-specific setup.
-DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.10}"
+DATAFLOW_VERSION="${DATAFLOW_VERSION:-1.0.13}"
 DATAFLOW_RUNTIME_DIR="${DATAFLOW_RUNTIME_DIR:-${WORKSPACE_DIR}/runtime/dataflow-venv}"
 
 if [[ -z "${DATAFLOW_PYTHON:-}" ]]; then
@@ -330,13 +316,13 @@ echo " Bash events:       ${OH_BASH_EVENTS_DIR}"
 echo " Config path:       ${OPENHANDS_AGENT_SERVER_CONFIG_PATH}"
 echo " Plan database:     ${EXPERIMENT_DB_BACKEND}"
 echo " Pyromind JWT auth: ${OH_ENABLE_PYROMIND_JWT_AUTH}"
-echo " Server env:        ${APP_ENV:-prod}"
+echo " Server env:        ${APP_ENV}"
 echo " Kafka env:         ${KAFKA_ENV}"
 echo " Kafka brokers:     ${KAFKA_URL:-cluster-internal default}"
 echo " Kafka group:       ${POD_NAME}"
 echo " Session API key:   $([[ -n "${SESSION_API_KEY}" ]] && echo configured || echo disabled)"
 echo " Host:              127.0.0.1"
-echo " Port:              8001"
+echo " Port:              8000"
 echo " Auto-reload:       enabled"
 echo "============================================"
 echo ""

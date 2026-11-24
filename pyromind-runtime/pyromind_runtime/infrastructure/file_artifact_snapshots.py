@@ -145,9 +145,30 @@ class FileArtifactSnapshots:
         if files != json.loads((receipt.parent / "files.json").read_text()):
             raise ValueError("snapshot manifest changed")
 
+    def verify_reference(self, storage_ref: str, context: RequestContext) -> None:
+        path = self.path(storage_ref, context)
+        if path.is_dir():
+            next(path.iterdir(), None)
+        else:
+            with path.open("rb") as stream:
+                stream.read(1)
+
     def read_text(self, result: SnapshotResult, context: RequestContext) -> str:
         self.verify(result, context)
         path = self.path(result.storage_ref, context)
         if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
             raise ValueError("text comparison requires a file under 2 MiB")
         return path.read_text(encoding="utf-8")
+
+    def file_sizes(
+        self, references: tuple[str, ...], context: RequestContext
+    ) -> dict[str, int]:
+        sizes = {}
+        for reference in references:
+            try:
+                path = self.path(reference, context)
+                if path.is_file():
+                    sizes[reference] = path.stat().st_size
+            except (OSError, ValueError):
+                continue
+        return sizes

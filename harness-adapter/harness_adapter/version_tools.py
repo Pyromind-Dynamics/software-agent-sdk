@@ -29,7 +29,8 @@ type VersionCall = Callable[
 VERSION_DESCRIPTION = """Manage this conversation's artifact versions.
 Actions: list (no arguments); read (artifact_id of a frozen text file); save (kind,
 logical_key, source with storage_ref OR text and filename, optional parents and
-summary); compare (left_version_id, right_version_id);
+summary; for Project task outputs include plan_task_id and plan_attempt inside
+arguments alongside logical_key); compare (left_version_id, right_version_id);
 select (slot, version_id, expected_revision, optional reason);
 new_iteration (goal, expected_revision); recover (retry unfinished snapshots).
 Use the revision returned by list for selections and new iterations. Reuse the

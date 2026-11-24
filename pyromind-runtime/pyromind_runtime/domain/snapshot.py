@@ -19,6 +19,7 @@ from pyromind_runtime.domain.experiment_plans import (
     ExperimentPlanView,
 )
 from pyromind_runtime.domain.preparation import PreparationView, ProjectView
+from pyromind_runtime.domain.stage_analysis import StageAnalysisJob
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.user_input import PendingUserInput
 
@@ -263,6 +264,9 @@ class ConversationSnapshot(ContractModel):
     experiment_plan: ExperimentPlanView | None = None
     experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None
+    stage_analyses: tuple[StageAnalysisJob, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     experiment_queue: tuple[JsonObject, ...] | None = None
     task_origins: dict[str, str] = Field(
         default_factory=dict, exclude_if=lambda value: not value

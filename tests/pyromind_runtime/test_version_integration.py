@@ -689,9 +689,12 @@ async def test_native_submission_bridge_returns_platform_response(version_runtim
 
 def test_platform_snapshot_upload_and_resume_use_original_bytes(tmp_path, monkeypatch):
     objects = {"/train.py": b"original"}
+    downloads = []
 
     def download(**kwargs):
-        return objects[kwargs["storage_path"]]
+        path = kwargs["storage_path"]
+        downloads.append(path)
+        return objects[path]
 
     def upload(**kwargs):
         path = str(Path(kwargs["target_dir"]) / kwargs["local_path"].name)
@@ -714,10 +717,49 @@ def test_platform_snapshot_upload_and_resume_use_original_bytes(tmp_path, monkey
         context,
     )
     assert replay == result
+    downloads.clear()
     assert snapshots.read_text(result, context) == "original"
+    assert len(downloads) == 2 and downloads.count(result.storage_ref) == 1
     objects[result.storage_ref] = b"tampered"
     with pytest.raises(ValueError, match="digest changed"):
         snapshots.verify(result, context)
+    with pytest.raises(ValueError, match="digest changed"):
+        snapshots.read_text(result, context)
+
+
+def test_platform_dataset_sizes_group_files_and_stat_missing_entries(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def post(url, *, headers, json, timeout):
+        calls.append((url.rsplit("/", 1)[-1], json["path"]))
+        assert headers["cookie"] == "fixture-cookie"
+        assert timeout == 2
+        data = (
+            {
+                "list": [
+                    {"name": "train.jsonl", "size": 123},
+                    {"name": "unused", "size": 99},
+                ]
+            }
+            if url.endswith("/file_list")
+            else {"size": "456", "is_dir": False}
+        )
+        return platform.httpx.Response(
+            200,
+            json={"success": True, "data": data},
+            request=platform.httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(platform.httpx, "post", post)
+    snapshots = platform.PlatformArtifactSnapshots(tmp_path)
+    context = RequestContext(user_id="owner", cookie="fixture-cookie")
+    assert snapshots.file_sizes(("/data/train.jsonl", "/data/val.jsonl"), context) == {
+        "/data/train.jsonl": 123,
+        "/data/val.jsonl": 456,
+    }
+    assert calls == [("file_list", "/data"), ("get_file_metadata", "/data/val.jsonl")]
 
 
 def test_version_code_respects_architecture_boundaries():

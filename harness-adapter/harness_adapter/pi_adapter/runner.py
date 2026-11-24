@@ -90,7 +90,7 @@ class PiRunnerProcess:
     def pid(self) -> int | None:
         return self._pid
 
-    async def start(self, config: dict[str, Any]) -> None:
+    async def start(self, config: dict[str, Any]) -> Any:
         if self.running:
             raise PiRunnerError("Pi runner is already running")
         if not self._entrypoint.is_file():
@@ -117,7 +117,7 @@ class PiRunnerProcess:
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
         try:
-            await self.request("start", config)
+            return await self.request("start", config)
         except Exception:
             await self.terminate(reason="shutdown")
             raise

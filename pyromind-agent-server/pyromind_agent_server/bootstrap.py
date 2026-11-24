@@ -16,7 +16,10 @@ from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.task_status_query import PlatformTaskStatusQuery
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
 from pyromind_agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
-from pyromind_agent_server.evaluation_storage import build_evaluation_storage
+from pyromind_agent_server.evaluation_storage import (
+    build_evaluation_storage,
+    build_observation_evaluation_storage,
+)
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
 )
@@ -27,11 +30,13 @@ from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.task_monitor_worker import TOKEN_ENV
+from pyromind_agent_server.training_metric_source import PlatformTrainingMetricSource
 from pyromind_agent_server.workflow_status import set_workflow_status_dispatcher
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.task_monitor import TaskMonitor
+from pyromind_runtime.application.train_observer import ObservationCursor, TrainObserver
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.content import JsonObject
@@ -227,6 +232,10 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
+        observation_storage_factory=build_observation_evaluation_storage,
+        train_observer=TrainObserver(
+            PlatformTrainingMetricSource(), ObservationCursor(secrets.token_bytes(32))
+        ),
     )
     if os.getenv("PYROMIND_TASK_MONITOR_ENABLED", "1") == "1":
         runtime.task_monitor = TaskMonitor(
@@ -299,6 +308,9 @@ def resource_limits_from_environment() -> ResourceLimits:
 def install_product_api(app: FastAPI) -> FastAPI:
     """Install the product API and own its runtime lifecycle."""
     from pyromind_agent_server.api.echomind_chat import router as echomind_chat_router
+    from pyromind_agent_server.api.echomind_observations import (
+        router as observations_router,
+    )
     from pyromind_agent_server.api.echomind_projects import (
         router as echomind_projects_router,
     )
@@ -336,6 +348,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     app.include_router(echomind_projects_router)
     app.include_router(echomind_chat_router)
+    app.include_router(observations_router)
     app.include_router(create_evaluation_runs_router())
     return app
 

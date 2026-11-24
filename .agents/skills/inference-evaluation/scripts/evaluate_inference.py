@@ -1695,6 +1695,14 @@ def evaluate_inference(
     if limit < 0:
         raise ValueError("limit must be nonnegative")
     dataset_file = Path(dataset_path).resolve()
+    if dataset_file.is_dir():
+        validation_file = (dataset_file / "val.jsonl").resolve()
+        if validation_file.parent != dataset_file or not validation_file.is_file():
+            raise ValueError(
+                f"Evaluation directory {dataset_file} needs a val.jsonl file "
+                "inside it, or pass the exact dataset JSONL path."
+            )
+        dataset_file = validation_file
     config = _json_object(dataset_config_json, "dataset config")
     evaluation = _json_object(evaluation_config_json, "evaluation config")
     if evaluation.get("mode") != _AGENT_RUBRIC_MODE:

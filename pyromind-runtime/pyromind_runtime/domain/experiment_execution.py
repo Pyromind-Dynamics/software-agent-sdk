@@ -50,6 +50,9 @@ class ExperimentExecutionView(ContractModel):
     role_id: str
     state: str
     report_state: str
+    delivery_error: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     fingerprint: str | None = None
     proposal: JsonObject | None = None
     metrics: JsonObject | None = None

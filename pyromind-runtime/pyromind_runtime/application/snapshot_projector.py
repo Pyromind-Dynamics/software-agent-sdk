@@ -31,6 +31,7 @@ from pyromind_runtime.domain.snapshot import (
     UsageState,
     WorkflowState,
 )
+from pyromind_runtime.domain.stage_analysis import StageAnalysisJob
 from pyromind_runtime.domain.user_input import PendingUserInput
 
 
@@ -294,6 +295,18 @@ class SnapshotProjector:
             if item.get("task_id") != event.payload["task_id"]
         )
         return snapshot.model_copy(update={"experiment_queue": queue})
+
+    def _on_project_stage_analysis_changed(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        job = StageAnalysisJob.model_validate(event.payload["job"])
+        updated = tuple(
+            job if prior.job_id == job.job_id else prior
+            for prior in snapshot.stage_analyses
+        )
+        if not any(prior.job_id == job.job_id for prior in snapshot.stage_analyses):
+            updated += (job,)
+        return snapshot.model_copy(update={"stage_analyses": updated})
 
     def _on_experiment_execution_changed(
         self, snapshot: ConversationSnapshot, event: ProductEvent

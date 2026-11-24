@@ -1213,6 +1213,7 @@ def test_selected_checkpoint_preparation_binds_exact_step(inference_submission, 
         assert merged["lora_path"] == "/workspace/train/checkpoint-100"
         assert merged["model_path"] == "/workspace/models/base"
         assert merged["output_path"].endswith("/merged-model")
+        assert merged["model_type"] == "auto"
         assert any(e["sourceHandle"] == "merged_model_path" for e in workflow["edges"])
     else:
         assert (
@@ -1220,6 +1221,45 @@ def test_selected_checkpoint_preparation_binds_exact_step(inference_submission, 
             == "/workspace/train/checkpoint-100"
         )
         assert "ModelMergeLoraNode" not in by_type
+
+
+@pytest.mark.parametrize(
+    ("architecture", "loader"), [("qwen3_vl", "qwen3vl"), ("qwen3_5", "qwen3.5")]
+)
+def test_lora_uses_base_architecture_and_one_merge_gpu(
+    inference_submission, monkeypatch, architecture, loader
+):
+    from pyromind_common.tools.data_preparation.submission import SubmissionFiles
+
+    ctx = inference_submission
+    path = ctx.workspace / "public_data/evaluation.json"
+    config = json.loads(path.read_text())
+    config["model_source"] = {
+        "type": "checkpoint",
+        "kind": "lora",
+        "base_model": "/workspace/models/internal-alias",
+    }
+    path.write_text(json.dumps(config))
+    original_read_text = SubmissionFiles.read_text
+
+    def read_text(files, path):
+        if path == "/workspace/models/internal-alias/config.json":
+            return json.dumps({"model_type": architecture})
+        return original_read_text(files, path)
+
+    monkeypatch.setattr(SubmissionFiles, "read_text", read_text)
+    action = ctx.action.model_copy(
+        update={"model_path": "/train/checkpoint-100", "gpu_count": 2}
+    )
+    result = ctx.executor(action, cast(Any, ctx.conversation))
+    assert not result.is_error, result.text
+    configs = {
+        node["data"]["nodeType"]: node["data"]["config"]
+        for node in ctx.submit.call_args.kwargs["workflow"]["nodes"]
+    }
+    assert configs["ModelMergeLoraNode"]["model_type"] == loader
+    assert configs["ModelMergeLoraNode"]["gpu_count"] == 1
+    assert configs["VLLMInference"]["gpu_count"] == 2
 
 
 def test_checkpoint_versioning_never_rebinds_to_default_model(

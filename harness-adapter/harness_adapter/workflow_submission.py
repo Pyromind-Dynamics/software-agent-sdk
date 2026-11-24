@@ -8,6 +8,8 @@ from copy import deepcopy
 from pathlib import PurePosixPath
 
 from pydantic import JsonValue
+
+from harness_adapter.workflow_validation import ResourceValidatedWorkflowDslExecutor
 from pyromind_common.platform.auth import parse_auth_token_from_cookie_header
 from pyromind_common.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
@@ -35,8 +37,6 @@ from pyromind_common.tools.workflow.validate_workflow_dsl import (
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
-
-from harness_adapter.workflow_validation import ResourceValidatedWorkflowDslExecutor
 
 
 def _storage_path(workflow_path: str) -> str:
@@ -91,6 +91,8 @@ class PlatformWorkflowSubmission:
                 "task_id": task_id,
                 "status": str(getattr(status, "value", status)),
             }
+            if task.error_message:
+                result["error_summary"] = task.error_message
             return result
 
         return await asyncio.to_thread(fetch)
