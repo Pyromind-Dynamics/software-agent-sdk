@@ -253,6 +253,7 @@ async def test_workflow_submits_directly_once_and_resumes_followup(
         "/workspace/.pyromind-agent/workflow.py",
         context,
         request_id="request-1",
+        continue_after_completion=True,
     )
     assert prepared["status"] == "submitted"
     assert prepared["task_id"] == "task-123"
@@ -270,6 +271,7 @@ async def test_workflow_submits_directly_once_and_resumes_followup(
         "/workspace/.pyromind-agent/workflow.py",
         context,
         request_id="request-1",
+        continue_after_completion=True,
     )
     assert repeated["task_id"] == "task-123"
     assert submission.submissions == [
@@ -410,6 +412,7 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
         "/workspace/project/workflow.py",
         context,
         request_id="r",
+        continue_after_completion=True,
     )
     await runtime.deliver_external_task_status(
         "workflow-conversation", task_id="task-123", status="Failed"
@@ -459,6 +462,7 @@ async def test_callback_arriving_during_create_waits_for_task_registration(tmp_p
         "/workspace/project/workflow.py",
         context,
         request_id="r",
+        continue_after_completion=True,
     )
     assert callback is not None
     await callback
@@ -469,6 +473,26 @@ async def test_callback_arriving_during_create_waits_for_task_registration(tmp_p
     await runtime.close()
 
 
+async def test_default_workflow_callback_reports_without_starting_a_turn(tmp_path):
+    runtime, adapter, _, context = await _runtime(tmp_path)
+    try:
+        conversation_id = "workflow-conversation"
+        await runtime.prepare_workflow_execution(conversation_id, "/train.py", context)
+        await runtime.deliver_external_task_status(
+            conversation_id, task_id="task-123", status="Succeeded"
+        )
+        assert not any(
+            entry[1].trigger_turn for entry in adapter.external_task_notifications
+        )
+        assert any(
+            event.type == "message.completed"
+            and event.payload.get("message_id") == "external-task:task-123:notice"
+            for event in FileProductStore(tmp_path / conversation_id).replay()
+        )
+    finally:
+        await runtime.close()
+
+
 async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
     skills = Path(__file__).parents[2] / ".agents" / "skills"
     host = PyromindBusinessToolHost(
@@ -477,8 +501,15 @@ async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
     calls: list[tuple[str, str, str, str | None]] = []
 
     async def prepare(
-        conversation_id, workflow_path, context, *, request_id, workflow_storage_path
+        conversation_id,
+        workflow_path,
+        context,
+        *,
+        request_id,
+        workflow_storage_path,
+        continue_after_completion,
     ):
+        assert continue_after_completion is False
         calls.append(
             (conversation_id, workflow_path, workflow_storage_path, request_id)
         )

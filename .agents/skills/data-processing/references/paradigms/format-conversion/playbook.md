@@ -13,6 +13,14 @@
 只有用户明确要求平台执行，或确实需要平台 run 目录、`report.json` 和冻结运行时
 时，才走下面的平台路径。
 
+输出媒体引用使用数据集相对路径或 Storage 根路径（如 `/datasets/...`），不得
+保存 `/workspace/...`、`/target-workspace/...`。使用 `cleaning_utils.write_jsonl`
+或 `run_cleaning` 时会自动处理已知媒体字段；自行序列化前须调用
+`normalize_media_references`。自定义字段先明确哪些值确实是文件引用，再对这些值
+调用 `normalize_storage_reference`，不要全文替换。读取时使用
+`resolve_storage_reference` 明确传入当前挂载目录与相对路径基准；输出文件搬到
+其他目录时须重新计算相对引用，不能直接沿用旧基准。
+
 ## 沙箱路径（默认）
 
 1. 查看用户给出的 Storage 路径：直接读 `/workspace/<path>`。目录包含多个候选文件时，
@@ -65,6 +73,8 @@ write_split(output_dir / "val.jsonl", val_rows, val_image_root)
    `script_path`、`input_path` 和 `limit=3`。不要自行传 `output_dir`。
    `input_path`、`script_path` 都直接使用 `/workspace/<dir>/<name>`；工具负责转换成
    平台内部路径，不要手工删除挂载前缀。
+   用户明确要求清洗完成后检查产物或继续处理时，设置 `continue_after_completion=true`。
+   提交后结束本轮，由后台检查任务状态并通知完成。
 3. 收到通用 callback 后，从最近一次工具 Observation 取得 `run_id` 和
    `output_dir`（Storage 路径，如 `/workspace/runs/xxx`），直接读该目录下的 `report.json` 和
    `output.jsonl`。

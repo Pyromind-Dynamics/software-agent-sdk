@@ -197,6 +197,7 @@ class ExternalTaskState(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     task_id: str = Field(min_length=1)
+    x_cluster: str | None = None
     kind: Literal[
         "historical_experience",
         "data_cleaning",

@@ -61,7 +61,10 @@ from pyromind_common.tools.label_studio import (
     LABEL_STUDIO_TOKEN_SECRET,
     LabelStudioProjectTool,
 )
-from pyromind_common.tools.pyromind_cleaning import RunDatasetCleaningTool
+from pyromind_common.tools.pyromind_cleaning import (
+    RunDatasetCleaningAction,
+    RunDatasetCleaningTool,
+)
 from pyromind_common.tools.pyromind_dataset import (
     GetStorageUrlTool,
     UploadFileToPyromindTool,
@@ -541,7 +544,17 @@ class PyromindBusinessToolHost:
                                     "public_data/workflow_canvas/workflow.py, or an "
                                     "existing /workspace/<path> Storage file."
                                 ),
-                            }
+                            },
+                            "continue_after_completion": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Set true only when the user explicitly asks "
+                                    "for result analysis or further work after "
+                                    "completion. The host resumes the agent then; "
+                                    "never wait or poll in this turn."
+                                ),
+                            },
                         },
                         "required": ["workflow_path"],
                         "additionalProperties": False,
@@ -640,6 +653,11 @@ class PyromindBusinessToolHost:
             workflow_path = arguments.get("workflow_path")
             if not isinstance(workflow_path, str) or not workflow_path.strip():
                 raise ValueError("workflow_path is required")
+            continue_after_completion = arguments.get(
+                "continue_after_completion", False
+            )
+            if not isinstance(continue_after_completion, bool):
+                raise ValueError("continue_after_completion must be a boolean")
             try:
                 storage_path = _workflow_storage_path(context, workflow_path)
                 prepared = await self._workflow_preparer(
@@ -648,6 +666,7 @@ class PyromindBusinessToolHost:
                     context.request_context,
                     request_id=tool_call_id,
                     workflow_storage_path=storage_path,
+                    continue_after_completion=continue_after_completion,
                     **({"origin": origin} if origin.type == "subagent" else {}),
                 )
                 return BusinessToolResult(
@@ -750,6 +769,13 @@ class PyromindBusinessToolHost:
                 ),
             )
         tool = factory(context)
+        policy = resolve_tool_output_policy(tool.meta)
+        policy_source = (
+            "tool_meta"
+            if tool.meta is not None and "output_policy" in tool.meta
+            else "platform_default"
+        )
+        action = tool.action_type.model_validate(arguments)
         if (
             self.execution_call is not None
             and tool.executor is not None
@@ -769,18 +795,14 @@ class PyromindBusinessToolHost:
                     context.request_context,
                     asyncio.get_running_loop(),
                     graph_run_id=origin_run_id,
+                    continue_after_completion=(
+                        isinstance(action, RunDatasetCleaningAction)
+                        and action.continue_after_completion
+                    ),
                 ),
             )
 
-        policy = resolve_tool_output_policy(tool.meta)
-        policy_source = (
-            "tool_meta"
-            if tool.meta is not None and "output_policy" in tool.meta
-            else "platform_default"
-        )
-
         async def invoke() -> BusinessToolResult:
-            action = tool.action_type.model_validate(arguments)
             files = PiSessionFiles(context.workspace_root)
             facade = _ToolConversationFacade(context, files.load_business_state())
             key = (context.conversation_id, tool_call_id or name)

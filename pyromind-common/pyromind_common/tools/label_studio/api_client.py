@@ -5,6 +5,20 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, Field, StrictInt, TypeAdapter, ValidationError
+
+
+class _AnnotationResult(BaseModel):
+    from_name: str = ""
+
+
+class _ResultSet(BaseModel):
+    result: list[_AnnotationResult]
+
+
+class _TaskResults(BaseModel):
+    annotations: list[_ResultSet] = Field(default_factory=list)
+    predictions: list[StrictInt | _ResultSet] = Field(default_factory=list)
 
 
 class LabelStudioAPIError(ValueError):
@@ -199,12 +213,28 @@ class LabelStudioAPIClient:
 
     def get_annotation_from_names(self, project_id: int) -> set[str]:
         """Collect all ``from_name`` values referenced by existing annotations."""
+        try:
+            tasks = TypeAdapter(list[_TaskResults]).validate_python(
+                self.export_annotations(project_id)
+            )
+        except ValidationError as exc:
+            raise LabelStudioAPIError(
+                "Label Studio export returned invalid annotations or predictions"
+            ) from exc
         names: set[str] = set()
-        for task in self.export_annotations(project_id):
-            for key in ("annotations", "predictions"):
-                for item in task.get(key, []):
-                    for result in item.get("result", []):
-                        name = result.get("from_name", "")
-                        if name:
-                            names.add(name)
+        for task in tasks:
+            for item in (*task.annotations, *task.predictions):
+                if isinstance(item, int):
+                    # Direct exports contain prediction IDs unless expanded.
+                    prediction_id = item
+                    detail = self._request("GET", f"/api/predictions/{prediction_id}/")
+                    try:
+                        item = _ResultSet.model_validate(detail)
+                    except ValidationError as exc:
+                        raise LabelStudioAPIError(
+                            f"Prediction {prediction_id} returned invalid results"
+                        ) from exc
+                names.update(
+                    result.from_name for result in item.result if result.from_name
+                )
         return names

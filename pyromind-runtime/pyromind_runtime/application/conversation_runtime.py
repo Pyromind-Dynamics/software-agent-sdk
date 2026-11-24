@@ -78,6 +78,7 @@ from pyromind_runtime.application.reward_workflows import (
     validate_reward_workflow,
 )
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
+from pyromind_runtime.application.task_monitor import TaskMonitor
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.application.workflow_completion import WorkflowCompletionHook
@@ -319,6 +320,8 @@ class ConversationRuntime:
         self.echomind_chat = EchoMindChat(self)
         self.echomind_notices = EchoMindNotices(self)
         self._external_tasks = external_tasks
+        self.task_monitor: TaskMonitor | None = None
+        self._task_contexts: dict[str, RequestContext] = {}
         self._workflow_submission = workflow_submission
         self.versions = versions
         self._experiment_index = experiment_index
@@ -542,6 +545,8 @@ class ConversationRuntime:
                     )
                     return
                 for task in snapshot.external_tasks:
+                    if self.task_monitor is not None and self.task_monitor.tracks(task):
+                        continue
                     if not _pollable_external_task(task):
                         continue
                     try:
@@ -1890,6 +1895,7 @@ class ConversationRuntime:
         context: RequestContext,
         graph_run_id: str | None = None,
         correlation: TaskCorrelation | None = None,
+        continue_after_completion: bool = False,
     ) -> dict[str, Any]:
         """Submit an already-authorized tool action through the durable product path."""
         store = self._store(conversation_id)
@@ -1915,7 +1921,10 @@ class ConversationRuntime:
         if previous is not None:
             if previous.correlation is not None and previous.correlation != correlation:
                 raise PermissionError("request belongs to another task origin")
-            if previous.fingerprint != digest:
+            if (
+                previous.fingerprint != digest
+                or previous.continue_after_completion != continue_after_completion
+            ):
                 raise ValueError("request id already used with different execution")
             if previous.task_id:
                 if graph_run_id:
@@ -1959,6 +1968,7 @@ class ConversationRuntime:
             fingerprint=digest,
             workflow=effective,
             summary={"name": str(workflow.get("name", "workflow"))},
+            continue_after_completion=continue_after_completion,
             status="submitting",
         )
         store.save_workflow_execution_request(request, expected_revision=None)
@@ -1990,6 +2000,7 @@ class ConversationRuntime:
                 "correlation": correlation.model_dump(mode="json", exclude_none=True),
                 "run_id": graph_run_id or identity,
                 "graph_run_id": graph_run_id,
+                "resume_auto_run": bool(graph_run_id) or continue_after_completion,
                 "status": "pending",
                 "submitted_at": datetime.now().astimezone().isoformat(),
                 "updated_at": datetime.now().astimezone().isoformat(),
@@ -3525,6 +3536,7 @@ class ConversationRuntime:
                 conversation_id, command, context, store
             )
         store = await self._ensure_active(conversation_id, context)
+        self._task_contexts[conversation_id] = context
         store.save_x_cluster(context.x_cluster)
         receipt, claimed = store.claim_command(command)
         if not claimed:
@@ -3816,6 +3828,7 @@ class ConversationRuntime:
         request_id: str | None = None,
         workflow_storage_path: str | None = None,
         origin: TaskOrigin | None = None,
+        continue_after_completion: bool = False,
     ) -> dict[str, Any]:
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
@@ -3823,6 +3836,10 @@ class ConversationRuntime:
         if self._workflow_submission is None:
             raise ValueError("workflow submission is unavailable")
         store.require_command("workflow_execution")
+        # A task bound to an approved plan resumes its owning plan after completion.
+        continue_after_completion = continue_after_completion or bool(
+            context.plan_task_id
+        )
         correlation = TaskCorrelation(
             conversation_id=conversation_id,
             task_kind="workflow_run",
@@ -3836,7 +3853,10 @@ class ConversationRuntime:
         if previous is not None:
             if previous.correlation is not None and previous.correlation != correlation:
                 raise PermissionError("request belongs to another task origin")
-            if previous.workflow_path != workflow_path:
+            if (
+                previous.workflow_path != workflow_path
+                or previous.continue_after_completion != continue_after_completion
+            ):
                 raise ValueError("request id already belongs to another workflow")
             return {
                 "request_id": previous.request_id,
@@ -3895,6 +3915,7 @@ class ConversationRuntime:
             fingerprint=fingerprint,
             workflow=workflow,
             summary=summary,
+            continue_after_completion=continue_after_completion,
         )
         admitted, created = store.save_workflow_execution_request(
             request, expected_revision=None, reuse_duplicate=True
@@ -3982,6 +4003,7 @@ class ConversationRuntime:
             "submitted_at": now,
             "updated_at": now,
             "resume_pending": False,
+            "resume_auto_run": request.continue_after_completion,
         }
         self.register_external_task(request.conversation_id, payload)
         store.save_workflow_execution_request(
@@ -4226,6 +4248,8 @@ class ConversationRuntime:
         if task is None:
             raise ValueError(f"unknown external task: {task_id}")
         normalized = _normalize_external_status(status)
+        if task.kind == "workflow_run":
+            auto_run = auto_run and task.resume_auto_run
         terminal = normalized in _TERMINAL_EXTERNAL_TASK_STATUSES
         # A parked run is not finished, but the agent still has to act on it: the
         # human gate needs a person, and only the agent can tell the user what to do.
@@ -4242,7 +4266,9 @@ class ConversationRuntime:
             **task.model_dump(mode="json"),
             "status": normalized,
             "updated_at": datetime.now().astimezone().isoformat(),
-            "resume_pending": (terminal or deferred or blocked) and not retired,
+            "resume_pending": (terminal or deferred or blocked)
+            and not retired
+            and (auto_run or task.kind != "workflow_run"),
             "resume_auto_run": auto_run and not retired,
             "completion_result": {**task.completion_result, **completion_result}
             if completion_result is not None
@@ -4261,6 +4287,17 @@ class ConversationRuntime:
         )
         before_seq = snapshot.through_seq
         persisted, updated_snapshot = store.append(event)
+        if updated_snapshot.through_seq != before_seq:
+            self._publish(persisted)
+        if (
+            updated_snapshot.through_seq != before_seq
+            and terminal
+            and task.kind == "workflow_run"
+            and not auto_run
+        ):
+            persisted_status = persisted.payload.get("status")
+            if isinstance(persisted_status, str):
+                self._emit_task_completion_notice(store, task_id, persisted_status)
         task = next(
             (
                 item
@@ -4282,7 +4319,6 @@ class ConversationRuntime:
                     "Could not update external task registry for %s", task_id
                 )
         if retired:
-            self._publish(persisted)
             return persisted
         if terminal:
             await self.reconcile_versions(
@@ -4297,7 +4333,6 @@ class ConversationRuntime:
                 normalized,
             )
             return persisted
-        self._publish(persisted)
         # Use persisted policy at the decision point: cancellation may have been
         # persisted while this task was waiting, after the earlier blocked check.
         if notify and self._suspends_auto_execution(conversation_id):
@@ -4444,9 +4479,85 @@ class ConversationRuntime:
             return None
         return self._external_tasks.owner(task_id)
 
+    def task_monitor_context(self, conversation_id: str) -> RequestContext | None:
+        context = self._task_contexts.get(conversation_id)
+        if context is None or not (context.cookie or context.authorization):
+            return None
+        store = self._store(conversation_id)
+        store.authorize(context.user_id, context.profile_id)
+        return replace(context, x_cluster=store.load_x_cluster())
+
+    def task_monitor_state(
+        self, conversation_id: str, task_id: str
+    ) -> ExternalTaskState | None:
+        store = self._store(conversation_id)
+        task = next(
+            (
+                task
+                for task in store.load_snapshot().external_tasks
+                if task.task_id == task_id
+            ),
+            None,
+        )
+        if task is not None and task.kind == "workflow_run":
+            requested = any(
+                request.task_id == task_id and request.continue_after_completion
+                for request in store.load_workflow_execution_requests().values()
+            )
+            return task.model_copy(
+                update={"resume_auto_run": task.resume_auto_run and requested}
+            )
+        return task
+
+    async def resume_monitored_task(self, conversation_id: str) -> None:
+        store = self._store(conversation_id)
+        context = self.task_monitor_context(conversation_id)
+        if context is None or self._closing:
+            return
+        snapshot = await asyncio.to_thread(store.load_snapshot)
+        if not snapshot.automatic_turns_suspended and self._has_pending_external_work(
+            snapshot, context
+        ):
+            await self._ensure_active(conversation_id, context)
+
+    def _monitor_external_task(self, conversation_id: str, task_id: str) -> None:
+        if self.task_monitor is not None:
+            task = self.task_monitor_state(conversation_id, task_id)
+            if task is not None:
+                self.task_monitor.register(conversation_id, task)
+
+    def _emit_task_completion_notice(
+        self, store: FileProductStore, task_id: str, status: str
+    ) -> None:
+        label = {
+            "succeeded": "已完成",
+            "failed": "失败",
+            "terminated": "已终止",
+            "stopped": "已停止",
+        }[status]
+        message_id = f"external-task:{task_id}:notice"
+        payload = {
+            "message_id": message_id,
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"工作流任务 {task_id} {label}。"}],
+        }
+        for kind in ("message.started", "message.completed"):
+            event, _ = store.append(
+                ProductEvent(
+                    event_id=f"{message_id}:{kind}",
+                    conversation_id=store.load_snapshot().conversation_id,
+                    type=kind,
+                    payload=payload,
+                )
+            )
+            self._publish(event)
+
     def register_external_task(
         self, conversation_id: str, payload: dict[str, Any]
     ) -> ProductEvent:
+        context = self._task_contexts.get(conversation_id)
+        if context is not None:
+            payload = {"x_cluster": context.x_cluster, **payload}
         store = self._store(conversation_id)
         snapshot = store.load_snapshot()
         task_id = str(payload.get("task_id") or "")
@@ -4500,6 +4611,7 @@ class ConversationRuntime:
         if updated.through_seq != snapshot.through_seq:
             self._publish(persisted)
         self._schedule_observation_replay(conversation_id, task_id)
+        self._monitor_external_task(conversation_id, task_id)
         registration = self._pending_task_registrations.get(task_id)
         if registration is not None:
             registration.set()
@@ -4569,6 +4681,7 @@ class ConversationRuntime:
             self._execution_event_task.cancel()
             await asyncio.gather(self._execution_event_task, return_exceptions=True)
             self._execution_event_task = None
+        self._task_contexts.clear()
         for wakeup in self._auto_execution_wakeups.values():
             wakeup.set()
         await asyncio.gather(*tuple(self._input_response_tasks), return_exceptions=True)
@@ -4702,6 +4815,7 @@ class ConversationRuntime:
         """
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
+        self._task_contexts[conversation_id] = context
         if store.harness_id() not in self.adapters:
             return store
         adapter = self._adapter(store.harness_id())
@@ -5098,6 +5212,7 @@ class ConversationRuntime:
         store: FileProductStore,
         context: RequestContext,
     ) -> _ActiveConversation:
+        self._task_contexts[handle.session_id] = context
         ready = asyncio.Event()
         task = asyncio.create_task(
             self._pump(handle, adapter, store, ready),
@@ -5202,6 +5317,17 @@ class ConversationRuntime:
                 )
                 if product_event is None:
                     continue
+                if product_event.type == "external_task.submitted":
+                    context = self._task_contexts.get(handle.session_id)
+                    if context is not None:
+                        product_event = product_event.model_copy(
+                            update={
+                                "payload": {
+                                    "x_cluster": context.x_cluster,
+                                    **product_event.payload,
+                                }
+                            }
+                        )
                 if product_event.type == "input.resolved":
                     await self._user_input.resolve_event(store, product_event)
                     continue
@@ -5274,6 +5400,9 @@ class ConversationRuntime:
                             handle.session_id, active.context
                         )
                 if product_event.type == "external_task.submitted":
+                    self._monitor_external_task(
+                        handle.session_id, str(product_event.payload["task_id"])
+                    )
                     self._schedule_observation_replay(
                         handle.session_id, str(product_event.payload["task_id"])
                     )
@@ -5893,7 +6022,10 @@ def _build_external_task_notification(
             else:
                 instruction = (
                     f"Production workflow task {task.task_id} succeeded without "
-                    "a training node. Report completion without W&B analysis."
+                    "a training node. Continue only the follow-up explicitly "
+                    "requested by the user. For dataset cleaning, use the "
+                    "submission tool's output directory to inspect report.json "
+                    "and output.jsonl. Do not rerun automatically."
                 )
         else:
             instruction = (

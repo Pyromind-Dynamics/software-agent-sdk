@@ -7,6 +7,8 @@ description: Formally run an existing Pyromind Storage workflow and follow its t
 
 Call `submit_workflow` with the actual workflow path. For the generated file, use the conversation path `public_data/workflow_canvas/workflow.py`; for an existing Storage workflow, use its actual `/workspace/.../workflow.py` path. Do not upload or copy a conversation file first, and do not invent a filename. The tool resolves the execution location, validates a frozen definition and submits it directly, returning the platform `taskId` without a confirmation dialog. While the task is pending, end the turn. Do not call `workflow_debug` or submit the same workflow through another tool. Reuse an existing receipt; if the submission outcome is uncertain, check the platform before retrying.
 
+Set `continue_after_completion=true` on `submit_workflow` only when the user explicitly requests result analysis or further actions after completion. Otherwise leave it false: the host reports completion without starting another agent turn.
+
 For flat Vision training with the default collator, verify the image references in the final bound train/validation manifests using the training mount. DSL validation checks the workflow definition. A successful check against a separate source root does not establish that the serialized paths can be opened.
 
 On the terminal callback, use the submitted taskId:

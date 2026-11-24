@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,14 @@ def _ensure_wandb_runtime_dirs(creds: dict[str, str]) -> None:
     os.environ.setdefault("WANDB_CONFIG_DIR", str(path / "config"))
 
 
+def _use_system_https_proxy() -> None:
+    if "HTTPS_PROXY" in os.environ or "https_proxy" in os.environ:
+        return
+    proxy = urllib.request.getproxies().get("https")
+    if proxy:
+        os.environ["HTTPS_PROXY"] = proxy
+
+
 class WandbDataSource:
     """W&B 数据源:平台节点凭证 → wandb SDK → RunData。"""
 
@@ -76,7 +85,7 @@ class WandbDataSource:
     ) -> dict[str, str] | None:
         """从平台节点提取 WANDB_* 凭证;识别不到返回 None(探测时自动跳过)。
 
-        client/task_id 存在时,节点 config 未含凭证则回退查
+        client/task_id 存在时,节点 config 未含已解析的凭证则回退查
         WandbConfigBuilderNode 的输出接口。
         """
         creds: dict[str, str] = {}
@@ -84,15 +93,15 @@ class WandbDataSource:
             data = node.get("data")
             if isinstance(data, dict) and isinstance(data.get("config"), dict):
                 creds.update(self._collect_config_env(data["config"]))
-            if creds:
+            if creds.get("WANDB_API_KEY"):
                 break
 
-        if not creds and client is not None and task_id:
+        if not creds.get("WANDB_API_KEY") and client is not None and task_id:
             for node in nodes:
                 node_id = self._node_identifier(node)
                 if WANDB_NODE_TYPE in self._node_type(node) and node_id:
-                    creds = self._collect_output_env(
-                        client.node_output(node_id, task_id)
+                    creds.update(
+                        self._collect_output_env(client.node_output(node_id, task_id))
                     )
                     break
 
@@ -100,7 +109,11 @@ class WandbDataSource:
 
     def _collect_config_env(self, config: dict[str, Any]) -> dict[str, str]:
         """从节点 data.config 提取 wandb 相关环境变量。"""
-        return self._collect_wandb_env(config)
+        # The Builder input names a Secret; the node output resolves its value.
+        resolved = {
+            key: value for key, value in config.items() if key != "wandb_api_key"
+        }
+        return self._collect_wandb_env(resolved)
 
     def _collect_wandb_env(self, output: dict[str, Any]) -> dict[str, str]:
         """从节点输出/config 提取 WANDB_* 环境变量,覆盖多种真实形态。"""
@@ -206,6 +219,7 @@ class WandbDataSource:
         """用凭证初始化 wandb.Api(WANDB_SILENT 抑制日志噪音)。"""
         os.environ.setdefault("WANDB_SILENT", "true")
         _ensure_wandb_runtime_dirs(creds)
+        _use_system_https_proxy()
         from wandb import Api
 
         api_key = creds.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY", "")

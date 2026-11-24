@@ -132,6 +132,7 @@ class ExecutionCall(Protocol):
         context: RequestContext,
         graph_run_id: str | None,
         correlation: TaskCorrelation | None = None,
+        continue_after_completion: bool = False,
     ) -> Coroutine[Any, Any, dict[str, Any]]: ...
 
 
@@ -142,6 +143,8 @@ def submission_bridge(
     context: RequestContext,
     loop: asyncio.AbstractEventLoop,
     graph_run_id: str | None = None,
+    *,
+    continue_after_completion: bool = False,
 ):
     from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
@@ -158,6 +161,7 @@ def submission_bridge(
                 context,
                 graph_run_id,
                 current_task_correlation(),
+                continue_after_completion,
             ),
             loop,
         ).result()

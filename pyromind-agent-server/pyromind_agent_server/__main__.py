@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import uvicorn
 from pyromind_common.sdk.logger import DEBUG
@@ -23,6 +24,14 @@ def main() -> None:
     parser.add_argument("--port", default=8000, type=int)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
+    internal_host = args.host
+    if internal_host in {"0.0.0.0", "::"}:
+        internal_host = "127.0.0.1"
+    elif ":" in internal_host:
+        internal_host = f"[{internal_host}]"
+    os.environ.setdefault(
+        "OH_INTERNAL_SERVER_URL", f"http://{internal_host}:{args.port}"
+    )
     enforce_storage_quota_preflight()
     uvicorn.run(
         "pyromind_agent_server.app:api",
