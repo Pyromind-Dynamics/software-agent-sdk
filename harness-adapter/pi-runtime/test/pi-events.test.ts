@@ -160,3 +160,19 @@ test("only the opted-in public reply and publish-tool argument stream", () => {
   assert.equal(tool("publish_echomind_update", "A🚀")[0]?.payload.text, "🚀");
   assert.deepEqual(tool("publish_echomind_update", "A🚀<think>private"), []);
 });
+
+test("only a direct preparation turn exposes the Main answer", () => {
+  for (const [preparation, taskId, expected] of [
+    [true, undefined, "15"], [false, undefined, undefined], [true, "stage-task", undefined],
+  ] as const) {
+    const normalizer = new PiEventNormalizer("manager", "run", ["user-command"], new Map(), taskId);
+    normalizer.translate({ type: "message_start", message: { role: "user", content: "7+8?", timestamp: 1 } } as AgentSessionEvent);
+    const message = {
+      role: "assistant", stopReason: "stop",
+      content: [{ type: "thinking", thinking: "private" }, { type: "text", text: "[[echomind:reply]]15" }],
+      usage: { input: 1, output: 1, cacheRead: 0, cost: { total: 0 } },
+    };
+    const [completed] = normalizer.translate({ type: "message_end", message } as unknown as AgentSessionEvent, false, preparation);
+    assert.equal(completed!.payload.preparation_reply, expected);
+  }
+});

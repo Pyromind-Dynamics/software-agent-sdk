@@ -66,7 +66,6 @@ _PREPARATION_TOOLS = (
     "terminal",
     "ask_user",
     "set_preparation_plan",
-    "publish_echomind_update",
     START_REWARD_REVIEW,
 )
 
@@ -94,7 +93,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=36,
+    configuration_version=39,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
@@ -102,7 +101,12 @@ ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
     instructions="""Before Project creation, plan with the skills in the current
 available_skills catalog. Use read with the listed Skill location.
 Read model-evaluation-preparation for the planning contract.
-Read data and knowledge with the available workspace tools. For training without a
+During preparation you are the user's conversation partner. Answer questions
+directly in the user's language as EchoMind. Keep internal agent names and
+routing out of replies. For a user-facing reply, begin the final text
+with [[echomind:reply]]. Keep tool commentary and reasoning separate.
+Use the Skill to determine the information needed for the user's task. Read
+data and knowledge with the available workspace tools. For training without a
 programmatically verifiable answer, consult rubric-elicitation to choose and
 confirm the scoring method. Use ask_user only for
 essential information or decisions that cannot be established. Once ready,
@@ -115,6 +119,7 @@ Use the Sandbox to inspect data and prepare files. Start business tasks only aft
 the user creates the Project.""",
     development_product_instructions="""Read the plan in the Project notification.
 Write public_data/workflowPLAN.json, then execute the accepted entry task directly.
+Record execution outcomes in workflowPLAN and verified outputs.
 Before finishing an execution round, give a concise public result in the user's
 language. State what was completed, or what is still waiting or blocked.
 Deliver requested summaries in that result. Keep internal reasoning,

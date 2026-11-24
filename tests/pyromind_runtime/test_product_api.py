@@ -311,6 +311,21 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     payload={**assistant, "content": blocks},
                 )
             )
+            public_answer = "visible preparation answer"
+            for task_id in (None, "execution-task"):
+                store.append(
+                    ProductEvent(
+                        conversation_id=conversation_id,
+                        task_id=task_id,
+                        type="message.completed",
+                        payload={
+                            "role": "assistant",
+                            "message_id": task_id or "preparation",
+                            "content": blocks,
+                            "preparation_reply": private if task_id else public_answer,
+                        },
+                    )
+                )
             store.append(
                 ProductEvent(
                     conversation_id=conversation_id,
@@ -334,7 +349,10 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
             assert view.status_code == 200
             assert private not in view.text
             assert safe in view.text
-            assert all(item["kind"] != "message" for item in view.json()["timeline"])
+            messages = [i for i in view.json()["timeline"] if i["kind"] == "message"]
+            assert [m["content"] for m in messages] == [
+                [{"type": "text", "text": public_answer}]
+            ]
             assert store.load_snapshot().timeline[0].kind == "message"
             context = RequestContext(user_id="42", profile_id=profile.profile_id)
             events = _sse_stream(
@@ -348,6 +366,7 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     assert f"id: {seq}\n" in frame
                     assert private not in frame
                     frames.append(frame)
+                assert any(public_answer in frame for frame in frames)
                 assert safe in frames[-1]
             finally:
                 await events.aclose()

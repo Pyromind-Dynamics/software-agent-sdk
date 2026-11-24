@@ -559,7 +559,6 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "terminal",
         "ask_user",
         "get_storage_url",
-        "publish_echomind_update",
         "get_project_reward",
         "df_submit_evaluation",
         "df_submit_pipeline",
