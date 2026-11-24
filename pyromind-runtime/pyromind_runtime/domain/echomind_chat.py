@@ -8,9 +8,20 @@ CHAT_PREFIX = CHAT_PROFILE + "-"
 CHAT_REQUIREMENT_COMMAND_PREFIX = "chat:"
 MANAGER_PROFILE = "echomind"
 
+PUBLISH_UPDATE = "publish_echomind_update"
+PUBLIC_UPDATE_PREFIX = "echomind-update:"
+
 GET_STATUS = "get_echomind_status"
 READ_REPORT = "read_echomind_report"
 ENQUEUE = "queue_echomind_requirement"
+
+
+class PublishUpdate(ContractModel):
+    """Send a verified milestone directly to the current user's chat now."""
+
+    message: str = Field(
+        min_length=1, description="Exact public Markdown and deliverable links."
+    )
 
 
 class GetStatus(ContractModel):

@@ -8,8 +8,10 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.application.echomind_chat import completed_chat_turns
 from pyromind_runtime.application.echomind_notices import (
     candidate_for,
-    public_summary_excerpt,
+    manager_messages,
+    public_blocks,
     resolved_submission_notices,
+    visible_chat_event,
 )
 from pyromind_runtime.application.plan_execution import PLAN_PATH, next_approved_task
 from pyromind_runtime.application.preparation import Preparations
@@ -107,46 +109,37 @@ def test_rejected_submission_can_retry_without_requesting_a_user_decision():
     assert candidate_for(event, settled, set()) is not None
 
 
-def test_readable_fallback_only_uses_the_final_summary_section():
-    summary = (
-        "## Working notes\n- These notes must stay private.\n"
-        "## 中文总结\n- 共 15 张图片，约 1 MB。\n"
-        "- 内部指令包含私有内容。\n## Raw output\n- Ignore this section."
-    )
-    assert public_summary_excerpt(summary) == "## 中文总结\n- 共 15 张图片，约 1 MB。"
-    assert public_summary_excerpt("## Working notes\n- Nothing public.") is None
+def test_stage_and_final_messages_use_public_boundaries():
+    report = "[评测报告](https://example.org/r?x=1&y=2)\n\n格式示例 `<think>`。"
 
+    def blocks(text: str):
+        return (TextContent(text=text),)
 
-def test_final_result_accepts_report_prose_without_requiring_fixed_headings():
-    result = "共 5 条记录，其中训练 3 条、验证 2 条，共 15 张图片。"
-    assert public_summary_excerpt(result) == result
-    assert (
-        public_summary_excerpt(
-            f"## 目录概况\n45 个文件。\n## 简单总结\n{result}\n- 清洗通过 5 条。"
+    for final in (False, True):
+        assert not public_blocks(
+            blocks('private prefix with "<think>example" and private notes</think>\n'),
+            publish=final,
         )
-        == f"## 目录概况\n45 个文件。\n## 简单总结\n{result}\n- 清洗通过 5 条。"
+        assert not public_blocks(blocks("private prefix</think>"), publish=final)
+        assert not public_blocks(blocks("<think>unfinished"), publish=final)
+    assert not public_blocks(
+        blocks("arbitrary unmarked tool commentary"), publish=False
     )
-    assert (
-        public_summary_excerpt(f"~~~md\n## 总结\n- private fixture\n~~~\n{result}")
-        == result
+    assert public_blocks(blocks("private</think>" + report), publish=True) == blocks(
+        report
     )
-    assert public_summary_excerpt("## 内部推理结果\nprivate fixture") is None
-    assert public_summary_excerpt("Working notes: private fixture") is None
-
-
-def test_arbitrary_report_sections_keep_findings_and_exclude_private_subsections():
-    evidence = (
-        "## 目录概览\n**规模**\n45 个文件、13 个目录，15 张图片。\n"
-        "## 工作笔记\n### 样本\nprivate fixture\n"
-        "## 数据用途\n适合做流程验证。\n"
-        "## 文件清单\n| 类型 | 数量 |\n| JPG | 15 |"
+    assert public_blocks(blocks(report), publish=True) == blocks(report)
+    sample = report + '\n~~~json\n{"format":"<think>example</think>"}\n~~~\n'
+    assert public_blocks(blocks(sample), publish=True) == blocks(sample)
+    event = ProductEvent(
+        conversation_id="chat",
+        type="message.completed",
+        payload={
+            "content": [{"type": "text", "text": "old leaked copy"}],
+            "execution_notice": {"source_message_id": "legacy"},
+        },
     )
-    result = public_summary_excerpt(evidence)
-    assert result and all(
-        fact in result
-        for fact in ("45 个文件", "15 张图片", "流程验证", "| JPG | 15 |")
-    )
-    assert "private fixture" not in result
+    assert visible_chat_event(event).payload["content"] == []
 
 
 def test_approved_continuation_requires_proven_local_outputs():
@@ -511,9 +504,18 @@ async def test_direct_project_resume_requires_a_receipt_bound_to_the_original_pr
         )
 
     result = notice(op)
-    assert (
-        result and result.link.origin_turn_id == "original" and result.link.has_result
+    assert result and result.link.origin_turn_id == "original"
+    chat = snapshot.model_copy(
+        update={"conversation_id": "echomind-chat-test", "timeline": ()}
     )
+    original, _ = manager_messages(
+        snapshot.model_copy(update={"timeline": (op, message)}),
+        chat,
+        7,
+        0,
+        frozenset({direct}),
+    )
+    assert original[7].payload["content"] == [message.content[0].model_dump()]
     assert notice(op.model_copy(update={"details": {"task_id": "another"}})) is None
     assert notice(op.model_copy(update={"status": "failed"})) is None
 
@@ -905,6 +907,7 @@ async def test_unacknowledged_platform_callback_is_retried_before_new_requiremen
         "本轮执行已结束。可查看原任务中的执行详情。",
         "本轮执行已结束，执行记录中没有可展示的结果正文。",
         "This round ended without a recorded user-facing result.",
+        "此前经过裁剪的报告正文",
     ),
 )
 async def test_ordinary_execution_completion_delivers_one_readable_result(
@@ -937,50 +940,66 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
         chat = await runtime.echomind_chat.open(cid, {}, context)
         manager = runtime._store(cid)
         chat_store = runtime._store(chat.conversation_id)
-        for index, evidence in enumerate(
-            (
-                "发现 15 张图片。token=fixture-value",
-                "数据格式举例 `<think>`。\n<think>internal marker `</think>`",
-                "## 目录概况\n有图片。\n## 简单总结\n共 5 条记录、15 张图片。",
-                "样本使用 `<think>` 标签。\n"
-                "<think>internal marker</think>3 条训练记录、2 条验证记录。",
-            ),
-            1,
-        ):
-            task = f"requirement:chat:{index}"
-            run = f"analysis-{index}"
-            runtime._queue_task(
-                manager,
-                cid,
-                task,
-                "requirement",
-                "Inspect files",
-                origin_turn_id="user-turn",
-            )
-            events: tuple[tuple[ProductEventType, JsonObject], ...] = (
-                (
-                    "message.completed",
-                    {
-                        "role": "assistant",
-                        "message_id": run,
-                        "content": [{"type": "text", "text": evidence}],
-                    },
-                ),
-                ("status.changed", {"status": "idle"}),
-            )
-            for kind, payload in events:
-                event, _ = manager.append(
-                    ProductEvent(
-                        conversation_id=cid,
-                        type=kind,
-                        run_id=run,
-                        task_id=task,
-                        payload=payload,
-                    )
+        task = "requirement:chat:live"
+        run = "analysis"
+        runtime._queue_task(
+            manager, cid, task, "requirement", "Inspect", origin_turn_id="user-turn"
+        )
+        evidence = "  ## 交付物\n[HTML](https://example.org/report?signature=abc)\n\n```json\n{}\n```\n"
+        blocks: list = [
+            {"type": "text", "text": evidence},
+            {"type": "image_url", "url": "https://example.org/figure.png"},
+        ]
+
+        def publish(kind: ProductEventType, payload: JsonObject):
+            event, _ = manager.append(
+                ProductEvent(
+                    conversation_id=cid,
+                    type=kind,
+                    run_id=run,
+                    task_id=task,
+                    payload=payload,
                 )
-                runtime._publish(event)
-                runtime._publish(event)
-            await wait_for(lambda: not runtime.echomind_notices.workers)
+            )
+            runtime._publish(event)
+            runtime._publish(event)
+
+        publish("status.changed", {"status": "running"})
+        publish(
+            "message.completed",
+            {"role": "assistant", "message_id": "empty", "content": []},
+        )
+        publish(
+            "message.completed",
+            {
+                "role": "assistant",
+                "message_id": "echomind-update:analysis:milestone",
+                "content": blocks,
+            },
+        )
+        await wait_for(lambda: not runtime.echomind_notices.workers)
+        [first] = [
+            i
+            for i in chat_store.load_snapshot().timeline
+            if isinstance(i, TimelineMessage)
+        ]
+        assert manager.load_snapshot().status == "running"
+        assert [block.model_dump() for block in first.content] == blocks
+        assert (
+            first.execution_notice
+            and first.execution_notice.source_message_id
+            == "echomind-update:analysis:milestone"
+        )
+        publish(
+            "message.completed",
+            {
+                "role": "assistant",
+                "message_id": "final",
+                "content": [{"type": "text", "text": "最终结论"}],
+            },
+        )
+        publish("status.changed", {"status": "idle"})
+        await wait_for(lambda: not runtime.echomind_notices.workers)
         run = "historical-run"
         origin = "historical-turn"
         task = "requirement:chat:historical"
@@ -1054,10 +1073,12 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
             for item in chat_store.load_snapshot().timeline
             if isinstance(item, TimelineMessage)
         ]
-        assert len(messages) == 5
+        assert len(messages) == 3
         assert messages[-1].item_id == identity
         assert messages[-1].content == (
-            TextContent(text="## 目录概览\n样本使用 `think` 标签。\n图片共有 15 张。"),
+            TextContent(
+                text="## 目录概览\n样本使用 `<think>` 标签。\n图片共有 15 张。"
+            ),
         )
         assert (
             messages[-1].execution_notice
@@ -1068,15 +1089,8 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
             and item.execution_notice.origin_turn_id == "user-turn"
             for item in messages[:-1]
         )
-        assert "15 张图片" in messages[0].content[0].model_dump()["text"]
-        assert "internal marker" not in json.dumps(outcomes, ensure_ascii=False)
-        assert "fixture-value" not in str(messages)
-        assert "没有可展示的结果正文" in messages[1].content[0].model_dump()["text"]
+        assert messages[1].content == (TextContent(text="最终结论"),)
         assert not outcomes
-        assert "共 5 条记录、15 张图片。" in messages[2].content[0].model_dump()["text"]
-        assert messages[3].content == (
-            TextContent(text="样本使用 `think` 标签。\n3 条训练记录、2 条验证记录。"),
-        )
     finally:
         await runtime.close()
 

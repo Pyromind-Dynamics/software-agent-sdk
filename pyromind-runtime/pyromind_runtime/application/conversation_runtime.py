@@ -15,7 +15,12 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pyromind_runtime.application.echomind_chat import EchoMindChat
-from pyromind_runtime.application.echomind_notices import EchoMindNotices, latest_origin
+from pyromind_runtime.application.echomind_notices import (
+    EchoMindNotices,
+    latest_origin,
+    visible_chat_event,
+    visible_chat_snapshot,
+)
 from pyromind_runtime.application.evaluation_annotations import (
     EvaluationAnnotationService,
     EvaluationLockRegistry,
@@ -91,6 +96,7 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
+    CHAT_PREFIX,
     CHAT_PROFILE,
     CHAT_REQUIREMENT_COMMAND_PREFIX,
     MANAGER_PROFILE,
@@ -3065,7 +3071,11 @@ class ConversationRuntime:
                 await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
             self._schedule_read_recovery(conversation_id, store, context)
             result = "ok"
-            return snapshot
+            return (
+                visible_chat_snapshot(snapshot)
+                if conversation_id.startswith(CHAT_PREFIX)
+                else snapshot
+            )
         finally:
             self._log_timing(
                 "snapshot_ms", started, profile_id=context.profile_id, result=result
@@ -4514,13 +4524,21 @@ class ConversationRuntime:
             self._schedule_read_recovery(conversation_id, store, context)
             for event in await asyncio.to_thread(store.replay, after_seq):
                 cursor = event.seq
-                yield event
+                yield (
+                    visible_chat_event(event)
+                    if conversation_id.startswith(CHAT_PREFIX)
+                    else event
+                )
             while True:
                 event = await queue.get()
                 if event.seq <= cursor:
                     continue
                 cursor = event.seq
-                yield event
+                yield (
+                    visible_chat_event(event)
+                    if conversation_id.startswith(CHAT_PREFIX)
+                    else event
+                )
         finally:
             subscribers = self._subscribers.get(conversation_id)
             if subscribers is not None:

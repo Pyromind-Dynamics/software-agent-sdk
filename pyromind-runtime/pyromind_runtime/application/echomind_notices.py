@@ -8,12 +8,13 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from pyromind_runtime.domain.content import JsonObject, TextContent
+from pyromind_runtime.domain.content import ContentBlock, JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
     CHAT_PREFIX,
     CHAT_PROFILE,
     MANAGER_PROFILE,
+    PUBLIC_UPDATE_PREFIX,
 )
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import (
@@ -45,13 +46,8 @@ _NOTICE_EVENTS = frozenset(
 )
 _EXECUTION_STATES = frozenset({"waiting_analysis", "succeeded"})
 _PLATFORM_STATES = frozenset({"succeeded", "failed", "terminated", "stopped"})
-_ROUND_END = "本轮执行已结束。可查看原任务中的执行详情。"
-_ROUND_END_EN = "This execution round has ended. Open the original task for details."
 _NO_RESULT = "本轮执行已结束，执行记录中没有可展示的结果正文。"
 _NO_RESULT_EN = "This round ended without a recorded user-facing result."
-_QUOTED_REASONING_TAG = re.compile(
-    r"(?<!`)`<(/?(?:think|thinking|reasoning|analysis))>`(?!`)", re.IGNORECASE
-)
 
 
 @runtime_checkable
@@ -68,7 +64,6 @@ class Candidate:
     link: ExecutionNoticeLink
     chinese_text: str | None = None
     english_text: str | None = None
-    report_excerpt: str | None = None
 
     def current(self, snapshot: ConversationSnapshot) -> bool:
         if self.link.action == "plan":
@@ -168,87 +163,6 @@ def report_save_operation(
         ),
         None,
     )
-
-
-def completion_summary(
-    snapshot: ConversationSnapshot, event: ProductEvent
-) -> str | None:
-    final = max(
-        (
-            item
-            for item in snapshot.timeline
-            if isinstance(item, (TimelineMessage, TimelineOperation))
-            and item.run_id == event.run_id
-            and (item.completed_seq or item.started_seq) < event.seq
-        ),
-        key=lambda item: item.completed_seq or item.started_seq,
-        default=None,
-    )
-    if (
-        not isinstance(final, TimelineMessage)
-        or final.role != "assistant"
-        or final.status != "completed"
-    ):
-        return None
-    text = "\n".join(
-        block.text.strip() for block in final.content if isinstance(block, TextContent)
-    ).strip()
-    # A standalone tag quoted as inline code names a data format in the report.
-    text = _QUOTED_REASONING_TAG.sub(r"`\1`", text)
-    text = re.sub(
-        r"<(think|thinking|analysis|reasoning)\b[^>]*>.*?</\1\s*>",
-        "",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    ).strip()
-    if not text or re.search(
-        r"<\s*/?\s*(?:think|thinking|analysis|reasoning)\b", text, re.IGNORECASE
-    ):
-        return None
-    text = re.sub(r"https?://\S+", "[link omitted]", text)
-    text = re.sub(r"\b[A-Za-z0-9_+=-]{24,}\b", "[redacted]", text)
-    text = re.sub(
-        r"(?i)((?:api.?key|password|token|cookie|authorization|secret|密钥|密码)\s*[:=]\s*)[^\n]+",
-        "",
-        text,
-    )
-    return text
-
-
-def public_summary_excerpt(evidence: str) -> str | None:
-    # Fenced examples and tool transcripts can contain apparent Markdown headings.
-    prose = re.sub(
-        r"^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*\1[ \t]*$|\Z)",
-        "",
-        evidence,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    private_section = re.compile(
-        r"working notes|chain of thought|reasoning|internal notes|raw output"
-        r"|工作笔记|推理过程|内部|原始工具输出",
-        re.IGNORECASE,
-    )
-    unsafe_line = re.compile(
-        r"[<>]|\]\(|\[redacted\]|\[link omitted\]|\b(?:main|chat)\s+agent\b"
-        r"|内部指令|密钥|密码",
-        re.IGNORECASE,
-    )
-    hidden_depth = None
-    visible = []
-    for line in prose.splitlines():
-        heading = re.match(r"^ {0,3}(#{1,6})[ \t]+(.+)$", line)
-        if heading:
-            depth = len(heading[1])
-            if hidden_depth is not None and depth > hidden_depth:
-                continue
-            hidden_depth = depth if private_section.search(heading[2]) else None
-        elif private_section.match(line.strip("* :：\t")):
-            hidden_depth = hidden_depth or 6
-        if hidden_depth is None and not unsafe_line.search(line):
-            visible.append(line)
-    if not any(line.strip() and not line.lstrip().startswith("#") for line in visible):
-        return None
-    return "\n".join(visible).strip() or None
 
 
 def _authorization_failure(event: ProductEvent) -> bool:
@@ -586,7 +500,6 @@ def round_completion_candidate(
         origin = direct[0] if direct and direct[1] < event.seq else None
         linked = bool(origin)
     if linked and origin:
-        evidence = completion_summary(snapshot, event)
         followup = any(
             item.get("kind") == "project_continue"
             and item.get("origin_turn_id") == origin
@@ -601,18 +514,205 @@ def round_completion_candidate(
                 for task in snapshot.external_tasks
             ),
         }
-        excerpt = public_summary_excerpt(evidence) if evidence else None
         return Candidate(
             f"round:{event.run_id}",
             facts,
-            ExecutionNoticeLink(origin_turn_id=origin, has_result=bool(excerpt)),
+            ExecutionNoticeLink(origin_turn_id=origin, has_result=False),
             "本轮执行已结束，已排队继续下一步。" if followup else _NO_RESULT,
             "This round has ended and the next step is queued."
             if followup
             else _NO_RESULT_EN,
-            report_excerpt=excerpt,
         )
     return None
+
+
+# Backticks quote literal tag names in public format documentation. A bare
+# closing tag can end a provider reasoning prefix whose opening tag was lost.
+_REASONING_TAG = re.compile(
+    r"(?P<literal>^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n"
+    r".*?^[ \t]{0,3}(?P=fence)[ \t]*$"
+    r"|(?<!`)(?P<ticks>`+)(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`))"
+    r"|<(?P<close>/)?(?:think|thinking|analysis|reasoning)\b[^>]*>",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+
+
+def public_blocks(
+    blocks: tuple[ContentBlock, ...], *, publish: bool
+) -> tuple[ContentBlock, ...]:
+    if not publish:
+        return ()
+    visible: list[ContentBlock] = []
+    hidden = False
+    for block in blocks:
+        if not isinstance(block, TextContent):
+            if not hidden:
+                visible.append(block)
+            continue
+        start = 0
+        for tag in _REASONING_TAG.finditer(block.text):
+            if tag["literal"]:
+                continue
+            if tag["close"]:
+                # Even an apparent opener can be an example inside an unmarked
+                # reasoning prefix. Only the suffix after a close is public.
+                visible.clear()
+                hidden = False
+            else:
+                if not hidden and block.text[start : tag.start()].strip():
+                    visible.append(TextContent(text=block.text[start : tag.start()]))
+                hidden = True
+            start = tag.end()
+        if not hidden and block.text[start:]:
+            visible.append(TextContent(text=block.text[start:]))
+    if (
+        hidden
+        or not visible
+        or not any(
+            not isinstance(block, TextContent) or block.text.strip()
+            for block in visible
+        )
+    ):
+        return ()
+    return tuple(visible)
+
+
+def visible_chat_snapshot(snapshot: ConversationSnapshot) -> ConversationSnapshot:
+    return snapshot.model_copy(
+        update={
+            "timeline": tuple(
+                item
+                for item in snapshot.timeline
+                if not (
+                    isinstance(item, TimelineMessage)
+                    and item.execution_notice
+                    and item.execution_notice.source_message_id
+                    and (not item.execution_notice.public_copy or not item.content)
+                )
+            )
+        }
+    )
+
+
+def visible_chat_event(event: ProductEvent) -> ProductEvent:
+    link = event.payload.get("execution_notice")
+    if (
+        isinstance(link, dict)
+        and link.get("source_message_id")
+        and not link.get("public_copy")
+    ):
+        return event.model_copy(update={"payload": {**event.payload, "content": []}})
+    return event
+
+
+def manager_messages(
+    manager: ConversationSnapshot,
+    chat: ConversationSnapshot,
+    through_seq: int,
+    previous_cursor: int,
+    ended_runs: frozenset[str] = frozenset(),
+) -> tuple[dict[int, ProductEvent], set[str]]:
+    """Mirror completed assistant messages and reuse legacy round bubbles."""
+    messages = sorted(
+        (
+            item
+            for item in manager.timeline
+            if isinstance(item, TimelineMessage)
+            and item.role == "assistant"
+            and item.run_id
+            and item.status == "completed"
+            and item.completed_seq is not None
+            and item.completed_seq <= through_seq
+            and any(
+                not isinstance(block, TextContent) or block.text.strip()
+                for block in item.content
+            )
+        ),
+        key=lambda item: item.completed_seq or 0,
+    )
+    latest = {item.run_id: item.item_id for item in messages}
+    existing = {
+        item.item_id: item
+        for item in chat.timeline
+        if isinstance(item, TimelineMessage) and item.execution_notice
+    }
+    copies = {
+        item.execution_notice.source_message_id: item
+        for item in existing.values()
+        if item.execution_notice and item.execution_notice.source_message_id
+    }
+    last_event: dict[str, int] = {}
+    for entry in manager.timeline:
+        if isinstance(entry, (TimelineMessage, TimelineOperation)) and entry.run_id:
+            last_event[entry.run_id] = max(
+                last_event.get(entry.run_id, 0),
+                entry.completed_seq or entry.started_seq,
+            )
+    direct = direct_project_receipts(manager)
+    spoken = set()
+    updates = {}
+    for item in messages:
+        assert item.run_id and item.completed_seq
+        run = (manager.task_runs or {}).get(item.run_id)
+        legacy = _NOTICE_PREFIX + sha256(f"round:{item.run_id}".encode()).hexdigest()
+        terminal = (
+            (item.run_id in ended_runs)
+            or (run and run.seq <= through_seq and run.status in {"idle", "finished"})
+            or (legacy in existing)
+            or (item.run_id in direct and manager.status in {"idle", "finished"})
+        )
+        final = bool(terminal and item.completed_seq == last_event[item.run_id])
+        prior = copies.get(item.item_id)
+        if prior and prior.execution_notice and prior.execution_notice.public_copy:
+            if prior.content:
+                spoken.add(item.run_id)
+                continue
+            if not final:
+                continue
+        content = public_blocks(
+            item.content, publish=final or item.item_id.startswith(PUBLIC_UPDATE_PREFIX)
+        )
+        if content:
+            spoken.add(item.run_id)
+        elif prior and prior.execution_notice and prior.execution_notice.public_copy:
+            continue
+        if not content and prior is None:
+            continue
+        key = ("public-message:" if content else "withdraw-message:") + item.item_id
+        event_id = _NOTICE_PREFIX + sha256(key.encode()).hexdigest()
+        message_id = prior.item_id if prior else event_id
+        origin = origin_for(manager, item.task_id, item.run_id)
+        if not prior and latest[item.run_id] == item.item_id:
+            prior_round = existing.get(legacy)
+            if (
+                prior_round
+                and prior_round.execution_notice
+                and not prior_round.execution_notice.source_message_id
+            ):
+                message_id = legacy
+                origin = prior_round.execution_notice.origin_turn_id or origin
+        link = ExecutionNoticeLink(
+            origin_turn_id=origin,
+            public_copy=True,
+            has_result=bool(content),
+            source_message_id=item.item_id,
+            history_timestamp=item.started_at
+            if (item.completed_seq or 0) <= previous_cursor
+            else None,
+        )
+        updates[item.completed_seq or 0] = ProductEvent(
+            conversation_id=chat.conversation_id,
+            event_id=event_id,
+            type="message.completed",
+            run_id=item.run_id,
+            payload={
+                "role": "assistant",
+                "message_id": message_id,
+                "content": [block.model_dump(mode="json") for block in content],
+                "execution_notice": link.model_dump(mode="json", exclude_none=True),
+            },
+        )
+    return updates, spoken
 
 
 def safe_question(prompt: str) -> str | None:
@@ -661,7 +761,16 @@ class EchoMindNotices:
         manager_id = event.conversation_id
         if (
             not self.closed
-            and (event.type in _NOTICE_EVENTS or _authorization_failure(event))
+            and (
+                event.type in _NOTICE_EVENTS
+                or _authorization_failure(event)
+                or (
+                    event.type == "message.completed"
+                    and event.run_id
+                    and event.payload.get("role", "assistant") == "assistant"
+                    and event.payload.get("content", True)
+                )
+            )
             and not manager_id.startswith(CHAT_PREFIX)
             and self.runtime._store(CHAT_PREFIX + manager_id).metadata_path.is_file()
         ):
@@ -694,90 +803,36 @@ class EchoMindNotices:
             )
             baseline = max(0, first_observed - 1)
             cursor = await asyncio.to_thread(chat.execution_notice_cursor, baseline)
-            historical: dict[int, ProductEvent] = {}
             if manager_id not in self.observed and snapshot.task_runs:
                 chat_snapshot = await asyncio.to_thread(chat.load_snapshot)
                 for update in resolved_submission_notices(snapshot, chat_snapshot):
                     saved, _ = await asyncio.to_thread(chat.append, update)
                     self.runtime._publish(saved)
-                missing: set[str] = set()
-                no_result: set[str] = set()
-                for item in chat_snapshot.timeline:
-                    if (
-                        isinstance(item, TimelineMessage)
-                        and item.execution_notice
-                        and item.run_id
-                        and item.run_id in snapshot.task_runs
-                        and len(item.content) == 1
-                        and isinstance(block := item.content[0], TextContent)
-                    ):
-                        if block.text in (_ROUND_END, _ROUND_END_EN):
-                            missing.add(item.run_id)
-                        elif block.text in (_NO_RESULT, _NO_RESULT_EN):
-                            no_result.add(item.run_id)
-                # A genuine no-result notice needs no replay. Check only runs
-                # whose previous result may have contained a quoted tag.
-                if no_result:
-                    missing.update(
-                        item.run_id
-                        for item in snapshot.timeline
-                        if isinstance(item, TimelineMessage)
-                        and item.run_id
-                        and item.run_id in no_result
-                        and item.role == "assistant"
-                        and any(
-                            isinstance(block, TextContent)
-                            and _QUOTED_REASONING_TAG.search(block.text)
-                            for block in item.content
-                        )
-                    )
-                starts = {run: snapshot.task_runs[run].seq for run in missing}
-                delivered = {
-                    item.run_id
-                    for item in chat_snapshot.timeline
-                    if isinstance(item, TimelineMessage)
-                    and item.execution_notice
-                    and (
-                        item.execution_notice.has_result
-                        or item.execution_notice.action == "report"
-                    )
-                }
-                for run, (_, seq) in direct_project_receipts(snapshot).items():
-                    if run not in delivered and run != snapshot.active_run_id:
-                        starts[run] = seq
-                if starts:
-                    missing.update(starts)
-                    first = min(starts.values())
-                    historical = {
-                        e.seq: e
-                        for e in await asyncio.to_thread(manager.replay, first - 1)
-                        if e.run_id in missing
-                        and e.seq <= cursor
-                        and e.type == "status.changed"
-                        and e.payload.get("status") in {"idle", "finished"}
-                    }
             while True:
                 events = await asyncio.to_thread(manager.replay, cursor)
                 fresh = self.observed.pop(manager_id, {})
-                replayed_rounds = set(historical)
-                fresh.update(historical)
-                historical.clear()
                 fresh.update(
                     (event.seq, event)
                     for event in events
                     if event.type in _NOTICE_EVENTS or _authorization_failure(event)
                 )
-                candidates = [fresh[seq] for seq in sorted(fresh)]
-                if candidates:
-                    await self._deliver(
-                        manager,
-                        chat,
-                        candidates,
-                        manager_id,
-                        chat_id,
-                        context,
-                        replayed_rounds,
-                    )
+                through_seq = events[-1].seq if events else cursor
+                candidates = [
+                    event for seq, event in fresh.items() if seq <= through_seq
+                ]
+                for seq, event in fresh.items():
+                    if seq > through_seq:
+                        self.observed.setdefault(manager_id, {})[seq] = event
+                await self._deliver(
+                    manager,
+                    chat,
+                    candidates,
+                    manager_id,
+                    chat_id,
+                    context,
+                    through_seq,
+                    cursor,
+                )
                 if events:
                     cursor = events[-1].seq
                     await asyncio.to_thread(chat.save_execution_notice_cursor, cursor)
@@ -797,7 +852,8 @@ class EchoMindNotices:
         manager_id: str,
         chat_id: str,
         context: RequestContext,
-        replayed_rounds: set[int],
+        through_seq: int,
+        previous_cursor: int,
     ) -> None:
         snapshot = await self.runtime._load_saved_snapshot(
             manager_id, manager, context, recover_inputs=False
@@ -817,7 +873,26 @@ class EchoMindNotices:
             )
             else set()
         )
-        chat_events = await asyncio.to_thread(chat.replay)
+        chat_snapshot = await asyncio.to_thread(chat.load_snapshot)
+        messages, spoken_runs = manager_messages(
+            snapshot,
+            chat_snapshot,
+            through_seq,
+            previous_cursor,
+            frozenset(
+                e.run_id
+                for e in events
+                if e.type == "status.changed"
+                and e.payload.get("status") in ("idle", "finished")
+                and e.run_id
+            ),
+        )
+        milestones = {
+            event.seq: event for event in events if event.type != "message.completed"
+        }
+        if not milestones and not messages:
+            return
+        chat_events = await asyncio.to_thread(chat.replay) if milestones else ()
         considered = {
             event.event_id: event
             for event in chat_events
@@ -831,29 +906,22 @@ class EchoMindNotices:
             and isinstance(link := event.payload.get("execution_notice"), dict)
             and link.get("action") == "report"
         }
-        for event in events:
-            candidate = (
-                round_completion_candidate(event, snapshot)
-                if event.seq in replayed_rounds
-                else candidate_for(event, snapshot, readable_reports)
-            )
+        for seq in sorted(messages.keys() | milestones.keys()):
+            if original := messages.get(seq):
+                persisted, _ = await asyncio.to_thread(chat.append, original)
+                self.runtime._publish(persisted)
+                continue
+            event = milestones[seq]
+            candidate = candidate_for(event, snapshot, readable_reports)
             if candidate is None or not candidate.current(snapshot):
                 continue
-            if candidate.key.startswith("round:") and event.run_id in delivered_runs:
+            if candidate.key.startswith("round:") and (
+                event.run_id in delivered_runs or event.run_id in spoken_runs
+            ):
                 continue
             identity = _NOTICE_PREFIX + sha256(candidate.key.encode()).hexdigest()
-            message_id = identity
-            if prior := considered.get(identity):
-                if not candidate.report_excerpt or prior.payload.get("content") not in (
-                    [{"type": "text", "text": _ROUND_END}],
-                    [{"type": "text", "text": _ROUND_END_EN}],
-                    [{"type": "text", "text": _NO_RESULT}],
-                    [{"type": "text", "text": _NO_RESULT_EN}],
-                ):
-                    continue
-                identity += ":readable-report"
-                if identity in considered:
-                    continue
+            if identity in considered:
+                continue
             chat_snapshot = await asyncio.to_thread(chat.load_snapshot)
             users = [
                 item
@@ -881,28 +949,13 @@ class EchoMindNotices:
                     for block in user.content
                 )
             )
-            fallback = candidate.report_excerpt or (
-                candidate.english_text if english else candidate.chinese_text
-            )
+            fallback = candidate.english_text if english else candidate.chinese_text
             facts: JsonObject = {
                 **candidate.facts,
                 "language": "English" if english else "Chinese",
                 "notification_required": fallback is not None,
             }
-            excerpt = candidate.report_excerpt
-            if excerpt:
-                text = excerpt
-                if facts.get("continuation_queued"):
-                    text += "\n\n" + (
-                        "The next step is queued." if english else "下一步已排队。"
-                    )
-                elif facts.get("waiting_for_platform"):
-                    text += "\n\n" + (
-                        "Waiting for the platform result."
-                        if english
-                        else "正在等待平台结果。"
-                    )
-            elif candidate.key.startswith(("round:", "sandbox-auth:")):
+            if candidate.key.startswith(("round:", "sandbox-auth:")):
                 text = fallback
             else:
                 text = await self._compose(chat_id, context, facts) or fallback
@@ -919,7 +972,7 @@ class EchoMindNotices:
                 type="message.completed" if text else "chat.notification.skipped",
                 payload={
                     "role": "assistant",
-                    "message_id": message_id,
+                    "message_id": identity,
                     "content": [{"type": "text", "text": text}],
                     "execution_notice": candidate.link.model_dump(
                         mode="json", exclude_none=True

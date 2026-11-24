@@ -44,6 +44,15 @@ class TimelineEntry(ContractModel):
 
 
 class ExecutionNoticeLink(ContractModel):
+    public_copy: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    history_timestamp: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    source_message_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     has_result: bool | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

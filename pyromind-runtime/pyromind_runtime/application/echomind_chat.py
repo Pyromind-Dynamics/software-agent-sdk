@@ -64,6 +64,8 @@ def completed_chat_turns(
         if not text:
             continue
         if link := item.execution_notice:
+            if link.source_message_id and not link.public_copy:
+                continue
             origin = link.origin_turn_id
             if not origin or origin == current:
                 continue

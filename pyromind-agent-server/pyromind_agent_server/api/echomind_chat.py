@@ -19,11 +19,13 @@ from pyromind_agent_server.api.router import (
     _product_error,
     _resolve_cursor,
     _sse_stream,
+    configure_session,
     get_product_runtime,
 )
 from pyromind_agent_server.api.schemas import AgentLLMConfig
 from pyromind_agent_server.auth_context import request_context
 from pyromind_agent_server.dependencies import check_session_api_key
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.domain.commands import (
     CancelCommand,
     CommandReceipt,
@@ -51,6 +53,7 @@ async def open_chat(
 ) -> ConversationSnapshot:
     runtime = get_product_runtime(request)
     try:
+        await configure_session(request, manager_id, ECHOMIND_PRODUCT_PROFILE)
         return await runtime.echomind_chat.open(
             manager_id, model.model_dump(mode="json"), request_context(request)
         )
@@ -87,6 +90,8 @@ async def chat_command(
         context = await runtime.echomind_chat.route(
             manager_id, request_context(request)
         )
+        if isinstance(command, UserMessageCommand):
+            await configure_session(request, manager_id, ECHOMIND_PRODUCT_PROFILE)
         return await runtime.submit_command(chat_id, command, context)
     except CommandConflictError as exc:
         raise HTTPException(409, detail=str(exc)) from exc
