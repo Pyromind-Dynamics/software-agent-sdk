@@ -216,6 +216,51 @@ async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
     await runtime.close()
 
 
+async def test_authenticated_snapshot_updates_old_profile_after_active_turn(tmp_path):
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    app = _app(tmp_path, runtime)
+    prefix = "/api/profile/conversations"
+    app.include_router(
+        create_product_router(
+            ConversationProfile(route_prefix=prefix, configuration_version=37)
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {"x-pyromind-debug-user-id": "42"}
+    authenticated = {"Authorization": "Bearer test-credential"}
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=headers
+        ) as client:
+            created = await client.post(prefix, json={"llm": {"model": "test-model"}})
+            cid = created.raise_for_status().json()["conversation_id"]
+            store = FileProductStore(conversations / cid)
+            path = f"{prefix}/{cid}/snapshot"
+            initial_version = store.configuration_version()
+            assert initial_version < 37
+            (await client.get(path)).raise_for_status()
+            assert store.configuration_version() == initial_version
+
+            for status in ("running", "idle"):
+                store.append(
+                    ProductEvent(
+                        conversation_id=cid,
+                        type="status.changed",
+                        payload={"status": status},
+                    )
+                )
+                (await client.get(path, headers=authenticated)).raise_for_status()
+                expected_version = 37 if status == "idle" else initial_version
+                assert store.configuration_version() == expected_version
+            (await client.get(path, headers=authenticated)).raise_for_status()
+            assert len(adapter.session_policies) == 1
+    finally:
+        await runtime.close()
+
+
 async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
     tmp_path,
 ) -> None:

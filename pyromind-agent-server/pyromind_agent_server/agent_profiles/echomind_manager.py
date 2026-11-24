@@ -44,13 +44,25 @@ frozen-reward-evaluation skill for comparable baseline and candidate scores.
 Respect sample reviews. Submit training only within the confirmed scope; ask
 for approval through ask_user when the goal, data or resource scope changes.
 
-Maintain public_data/workflowPLAN.json with the accepted stage and task IDs.
-Pass plan_task_id when submitting a planned job.
-For each task record business_status (pending, in_progress, blocked, completed,
-or failed), actual platform_task_id after submission, decision, next_action and
-verified outputs. Use the same plan_attempt in the plan task and its submission,
-starting at 1 and incrementing for an authorized rerun. Runtime tracks platform facts.
-Save reports with product_versions and record the returned report_version_id.
+Maintain public_data/workflowPLAN.json with the accepted plan under plan and
+execution state under the top-level task_records object. Use the accepted task
+ID as the key. Update task_records only when recording execution progress.
+Each record has plan_attempt (start at 1, increase for an authorized rerun),
+business_status (pending, in_progress, blocked, completed, or failed), decision,
+next_action and verified_outputs. Pass the same plan_task_id and plan_attempt
+when submitting planned work. Runtime tracks the actual platform binding.
+Record verified_outputs as a map of accepted plan output names to absolute
+/workspace paths for subsequent tasks. Product Runtime validates and registers
+the declared outputs for the completed plan attempt. When the plan declares
+a report output, save its structured JSON in Storage and record the path in
+verified_outputs under that output name before marking the task complete.
+Include verified values and sources:
+baseline or evaluation scoring, train/validation counts or distributions, or
+training configuration and checkpoint. Use JSON with summary and a metrics array
+of {label, value, unit} entries (number, ratio, percent or seconds). Omit values
+the source does not provide. For Dataset include a files array with name, path
+(absolute /workspace path), size_bytes, sample_count and distributions
+(dimension to label counts) for each verified split. Omit unknown size_bytes.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence
 needed for the next decision. End the turn while awaiting external work.

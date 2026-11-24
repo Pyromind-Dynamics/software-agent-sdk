@@ -32,7 +32,10 @@ from harness_adapter.pi_adapter.event_translator import (
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
-from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
+from harness_adapter.pi_adapter.protocol import (
+    PROTOCOL_VERSION,
+    SandboxAuthorizationRequired,
+)
 from harness_adapter.pi_adapter.runner import (
     PiRunnerError,
     PiRunnerExit,
@@ -443,6 +446,50 @@ class PiAdapter:
         self._preparation_call = callback
         self._preparation_revision = revision
         self._preparation_review = review
+
+    async def analyze_project_stage(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject:
+        session = self._session(handle.session_id)
+        if (session.context.user_id, session.context.profile_id) != (
+            context.user_id,
+            context.profile_id,
+        ):
+            raise PermissionError(
+                "Stage evidence belongs to another conversation owner"
+            )
+
+        async def deny(_method: str, _params: dict[str, Any]) -> Any:
+            raise PermissionError("Stage analysis has no tool access")
+
+        async def ignore(_value: Any) -> None:
+            pass
+
+        runner = PiRunnerProcess(
+            request_handler=deny, event_handler=ignore, exit_handler=ignore
+        )
+        try:
+            async with asyncio.timeout(55):
+                result = await runner.start(
+                    {
+                        "mode": "stage_analysis",
+                        "role": role,
+                        "model": {
+                            **session.config["model"],
+                            "api_key": _api_key(session.model_configuration),
+                        },
+                        "evidence": evidence,
+                    }
+                )
+            if not isinstance(result, dict):
+                raise ValueError("Invalid stage analysis response")
+            return result
+        finally:
+            await runner.close()
 
     async def read_submission_receipt(
         self,
@@ -1994,9 +2041,10 @@ class PiAdapter:
                 not in (session.config.get("tool_allowlist") or ())
             ):
                 raise PermissionError("tool is not enabled for this conversation")
-            arguments = params.get("arguments")
-            if not isinstance(arguments, dict):
+            tool_arguments = params.get("arguments")
+            if not isinstance(tool_arguments, dict):
                 raise ValueError("tool arguments must be an object")
+            arguments = dict(tool_arguments)
             if tool_name == PUBLISH_UPDATE:
                 inflight = session.files.load_inflight() or {}
                 run_id = inflight.get("run_id")
@@ -2116,7 +2164,6 @@ class PiAdapter:
                 self._emit_tool_signals(session, tool_name, result)
                 return result
 
-            arguments = dict(arguments)
             binding = (arguments.pop("plan_task_id"), arguments.pop("plan_attempt", 1))
             assert self._plan_submission is not None
             async with session.submission_lock:
@@ -2542,7 +2589,7 @@ class PiAdapter:
         if dsl is None and not snapshot_error:
             try:
                 dsl = await self._read_workflow(session)
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, RuntimeError, SandboxAuthorizationRequired):
                 dsl = None
                 snapshot_error = True
         normalized: JsonObject = {

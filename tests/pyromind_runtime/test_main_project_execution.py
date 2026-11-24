@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestServer
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.train_observer import ObservationCursor, TrainObserver
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.commands import (
     CreateProjectCommand,
@@ -20,6 +21,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.observations import MetricPoint, SourcePage
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy, SetPreparationPlan
 from pyromind_runtime.domain.session_policy import SessionPolicy
@@ -39,8 +41,9 @@ from .test_preparation import (
 from .test_workflow_execution import FakeSubmission
 
 
-async def test_main_runs_baseline_training_and_evaluation_without_child_sessions(
-    preparation_setup, tmp_path, monkeypatch
+@pytest.mark.parametrize("state_format", ["task_records", "tasks"])
+async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
+    preparation_setup, tmp_path, monkeypatch, state_format
 ):
     preparation, owner, _ = preparation_setup
     scope = owner.conversation_id
@@ -56,13 +59,38 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         FileArtifactSnapshots(tmp_path / "storage"),
     )
     studio = FakeSubmission()
+
+    class Metrics:
+        async def read(
+            self, binding, _metrics, start, _count, _context, *, previous_source=""
+        ):
+            assert binding.task_id == "task-123"
+            return SourcePage(
+                points=(
+                    MetricPoint(
+                        key="loss",
+                        value=0.25,
+                        unit="number",
+                        source_point_id=f"point:{start}",
+                        source_run_id="source",
+                        log_step=start,
+                        training_step=start,
+                    ),
+                ),
+                source_run_id="source",
+                next_step=start + 1,
+            )
+
     runtime = ConversationRuntime(
         root,
         adapter,
         preparation_store=preparation,
         versions=versions,
         workflow_submission=studio,
+        train_observer=TrainObserver(Metrics(), ObservationCursor(b"test-only")),
     )
+    for _ in range(4):
+        await runtime._stage_analysis_capacity.acquire()
     adapter.set_version_handler(runtime.version_call)
     adapter.set_preparation_handler(
         runtime.preparation_call, runtime.preparation_revision
@@ -153,13 +181,21 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         "model_path": "/workspace/model",
         "operation": "inference",
     }
+    evidence = json.dumps(
+        {
+            "summary": "Final evidence",
+            "metrics": [{"label": "通过率", "value": 0.75, "unit": "ratio"}],
+        }
+    )
     report = {
         "action": "save",
         "command_id": "report",
         "arguments": {
             "kind": "report",
-            "logical_key": "summary",
-            "source": {"text": "Final evidence", "filename": "report.md"},
+            "logical_key": "candidate/evidence",
+            "plan_task_id": "candidate",
+            "plan_attempt": 1,
+            "source": {"text": evidence, "filename": "report.json"},
         },
     }
     actions = [
@@ -199,12 +235,37 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         None,
     ]
     requests = []
+    analysis_requests = []
+    reviewed = asyncio.Event()
     review_started = asyncio.Event()
     finish_review = asyncio.Event()
     finish_plan_turn = asyncio.Event()
 
     async def respond(http_request):
         body = await http_request.json()
+        system = body["messages"][0]["content"]
+        if "Summarize the candidate evaluation" in system:
+            assert reviewed.is_set()
+            assert not body.get("tools")
+            analysis_requests.append(body)
+            content = json.dumps({"summary": "评估已完成", "findings": []})
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]
+            return web.Response(
+                text="".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+                + "data: [DONE]\n\n",
+                content_type="text/event-stream",
+            )
         requests.append(body)
         if not actions and not review_started.is_set():
             review_started.set()
@@ -223,11 +284,27 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             rows[1]["plan_attempt"] = 3
             rows[-1]["report_version_id"] = artifact.id
             rows[-1]["business_status"] = "in_progress"
+            plan_file: dict[str, object] = {"tasks": rows}
+            if state_format == "task_records":
+                plan_file = {
+                    "plan": plan,
+                    "task_records": {
+                        row["id"]: {
+                            "plan_attempt": 1,
+                            **{
+                                name: value
+                                for name, value in row.items()
+                                if name not in {"id", "stage_id"}
+                            },
+                        }
+                        for row in rows
+                    },
+                }
             action = (
                 "write",
                 {
                     "path": "public_data/workflowPLAN.json",
-                    "content": json.dumps({"tasks": rows}),
+                    "content": json.dumps(plan_file),
                 },
             )
         elif action and action[0] == "edit":
@@ -237,6 +314,8 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                     for r in s.experiment_executions or ()
                 )
             )
+            assert not analysis_requests
+            reviewed.set()
             action = (
                 "edit",
                 {
@@ -299,6 +378,28 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             )
             receipt = await runtime.submit_command(scope, create, context)
             assert receipt == await runtime.submit_command(scope, create, context)
+            missing_binding = {
+                "kind": "report",
+                "logical_key": "candidate/evidence",
+                "source": {"text": evidence, "filename": "report.json"},
+            }
+            with pytest.raises(ValueError, match="arguments.plan_task_id"):
+                await runtime.version_call(
+                    scope,
+                    VersionToolRequest(action="save", arguments=missing_binding),
+                    "missing-binding",
+                    context,
+                )
+            with pytest.raises(ValueError, match="conflicts"):
+                await runtime.version_call(
+                    scope,
+                    VersionToolRequest(
+                        action="save",
+                        arguments={**missing_binding, "plan_task_id": "baseline"},
+                    ),
+                    "wrong-binding",
+                    context,
+                )
             for i, platform_id in enumerate(
                 ["evaluation-1", "task-123", "evaluation-2"]
             ):
@@ -317,6 +418,49 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                     )
                     == stages[i][0]
                 )
+                if i == 1:
+                    assert snapshot.project is not None
+                    project_id = snapshot.project.project_id
+                    overview = await runtime.get_project_observations(
+                        scope, project_id, context
+                    )
+                    (binding,) = overview.bindings
+                    assert binding.project_node_id == "training"
+                    for wrong_node in ("baseline", "candidate"):
+                        with pytest.raises(ValueError, match="not bound"):
+                            await runtime.get_project_training_series(
+                                scope,
+                                project_id,
+                                wrong_node,
+                                binding.run_id,
+                                (),
+                                None,
+                                100,
+                                context,
+                            )
+                    first = await runtime.get_project_training_series(
+                        scope,
+                        project_id,
+                        "training",
+                        binding.run_id,
+                        ("loss",),
+                        None,
+                        100,
+                        context,
+                    )
+                    second = await runtime.get_project_training_series(
+                        scope,
+                        project_id,
+                        "training",
+                        binding.run_id,
+                        ("loss",),
+                        first.next_cursor,
+                        100,
+                        context,
+                    )
+                    assert [
+                        point.log_step for point in first.points + second.points
+                    ] == [0, 1]
                 for _ in range(2):
                     await runtime.deliver_external_task_status(
                         scope, task_id=platform_id, status="succeeded"
@@ -333,7 +477,32 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 )
             )
             finish_plan_turn.set()
-            await wait_for(lambda s: s.status != "running")
+            await wait_for(
+                lambda s: (
+                    s.status != "running"
+                    and any(job.status == "queued" for job in s.stage_analyses)
+                )
+            )
+            assert runtime._active[scope].inflight > 0
+            assert not await runtime._release(scope, reason="test-capacity")
+            for _ in range(4):
+                runtime._stage_analysis_capacity.release()
+            snapshot = await wait_for(
+                lambda s: (
+                    s.status != "running"
+                    and any(job.status == "ready" for job in s.stage_analyses)
+                )
+            )
+            (job,) = snapshot.stage_analyses
+            assert job.stage_id == "candidate" and job.role == "evaluation_analysis"
+            assert job.result is not None
+            assert job.result.metrics[0].value == 0.75
+            assert len(analysis_requests) == 1
+            assert snapshot.project is not None
+            overview = await runtime.get_project_observations(
+                scope, snapshot.project.project_id, context
+            )
+            assert overview.stage_analyses == (job,)
             await runtime.submit_command(
                 scope,
                 create.model_copy(update={"command_id": "approve-again"}),
@@ -354,18 +523,26 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             (artifact_id,) = [
                 e.payload["artifact_id"]
                 for e in events
-                if e.type == "artifact.registered" and e.payload["kind"] == "report"
+                if e.type == "artifact.registered"
+                and e.payload["kind"] == "report"
+                and e.payload["artifact_id"] != job.report_version_id
             ]
             read = VersionToolRequest(
                 action="read", arguments={"artifact_id": artifact_id}
             )
             assert (await runtime.version_call(scope, read, "lookup", context))[
                 "text"
-            ] == "Final evidence"
+            ] == evidence
             with pytest.raises(PermissionError):
                 await runtime.version_call(
                     scope, read, "foreign", replace(context, profile_id="other")
                 )
+            old_request = VersionToolRequest(action="save", arguments=missing_binding)
+            legacy = versions.call(scope, old_request, "legacy-save", context)
+            replay = await runtime.version_call(
+                scope, old_request, "legacy-save", context
+            )
+            assert replay["id"] == legacy["id"]
             assert len(studio.submissions) == 1 and len(jobs) == 2
             assert not (root / scope / "pi" / "subagents").exists()
             assert all(

@@ -244,3 +244,14 @@ class SubmissionReceiptReader(Protocol):
         operation_id: str,
         context: RequestContext,
     ) -> JsonObject | None: ...
+
+
+@runtime_checkable
+class ProjectStageAnalyzer(Protocol):
+    async def analyze_project_stage(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject: ...

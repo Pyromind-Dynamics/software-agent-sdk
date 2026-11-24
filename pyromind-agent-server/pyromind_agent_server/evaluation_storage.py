@@ -20,6 +20,7 @@ from pyromind_common.tools.utils.platform_env import (
     platform_headers,
     platform_portal_url,
 )
+from pyromind_runtime.application.evaluation_annotations import RUN_MANIFEST_NAME
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
@@ -56,20 +57,30 @@ class PyromindEvaluationStorage(EvaluationStorage):
         headers: dict[str, str],
         timeout: float = STORAGE_TIMEOUT_SECONDS,
         max_read_bytes: int = REPORT_MAX_BYTES,
+        read_attempts: int = 3,
+        max_manifest_bytes: int | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._headers = headers
         self._timeout = timeout
         self._max_read_bytes = max_read_bytes
+        self._read_attempts = read_attempts
+        self._max_manifest_bytes = max_manifest_bytes
 
     def read(self, path: str) -> bytes:
+        max_bytes = self._max_read_bytes
+        if self._max_manifest_bytes is not None and path.endswith(
+            f"/{RUN_MANIFEST_NAME}"
+        ):
+            max_bytes = self._max_manifest_bytes
         try:
             return download_file_from_pyromind(
                 storage_path=path,
                 storage_base_url=self._base_url,
                 headers=self._headers,
                 timeout=self._timeout,
-                max_bytes=self._max_read_bytes,
+                max_bytes=max_bytes,
+                attempts=self._read_attempts,
             )
         except StorageFileNotFoundError as exc:
             raise EvaluationStorageMissingError(
@@ -117,7 +128,12 @@ class PyromindEvaluationStorage(EvaluationStorage):
         except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
             logger.error("storage file_list failed for %s: %s", prefix, exc)
             raise EvaluationStorageUnavailableError(
-                f"storage listing failed for {prefix}"
+                f"storage listing failed for {prefix}",
+                retryable=isinstance(exc, httpx.RequestError)
+                or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in {408, 429, 502, 503, 504}
+                ),
             ) from exc
         if not isinstance(payload, dict):
             raise EvaluationStorageUnavailableError(
@@ -146,7 +162,14 @@ class PyromindEvaluationStorage(EvaluationStorage):
         return names
 
 
-def build_evaluation_storage(context: RequestContext) -> EvaluationStorage:
+def build_evaluation_storage(
+    context: RequestContext,
+    *,
+    timeout: float = STORAGE_TIMEOUT_SECONDS,
+    max_read_bytes: int = REPORT_MAX_BYTES,
+    read_attempts: int = 3,
+    max_manifest_bytes: int | None = None,
+) -> EvaluationStorage:
     headers = {"accept": "*/*"}
     if context.cookie:
         headers["cookie"] = context.cookie
@@ -155,5 +178,20 @@ def build_evaluation_storage(context: RequestContext) -> EvaluationStorage:
     headers = platform_headers(headers, route=context.x_cluster)
     base_url = os.getenv("PYROMIND_STORAGE_BASE_URL") or _default_storage_base_url()
     return PyromindEvaluationStorage(
-        base_url=platform_portal_url(base_url, headers), headers=headers
+        base_url=platform_portal_url(base_url, headers),
+        headers=headers,
+        timeout=timeout,
+        max_read_bytes=max_read_bytes,
+        read_attempts=read_attempts,
+        max_manifest_bytes=max_manifest_bytes,
+    )
+
+
+def build_observation_evaluation_storage(context: RequestContext) -> EvaluationStorage:
+    return build_evaluation_storage(
+        context,
+        timeout=5,
+        max_read_bytes=48 * 1024,
+        max_manifest_bytes=4 * 1024 * 1024,
+        read_attempts=2,
     )
