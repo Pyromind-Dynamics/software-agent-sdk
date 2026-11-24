@@ -377,3 +377,43 @@ test("a file API error the sandbox returned is not answered over the terminal", 
   await assert.rejects(client.read("public_data/missing.txt"), /404/);
   assert.deepEqual(terminal.reads, []);
 });
+
+test("project plan writes and edits only acknowledge complete, persisted JSON", async () => {
+  const path = "/workspace/conversation/public_data/workflowPLAN.json";
+  let persisted = "";
+  let truncate = true;
+  let staleReads = 0;
+  let writes = 0;
+  const client = {
+    read: async () => Buffer.from(staleReads-- > 0 ? "{}" : persisted),
+    access: async () => {},
+    write: async (_path: string, content: string | Buffer) => {
+      writes++;
+      persisted = truncate ? content.toString().slice(0, -1) : content.toString();
+    },
+  };
+  const operations = createSandboxFileOperations(client);
+  const intended = '{"阶段":"训练完成"}';
+  await assert.rejects(operations.edit.writeFile(path, '{"阶段":'), /invalid JSON/);
+  assert.equal(persisted, "");
+  await assert.rejects(operations.write.writeFile(path, intended), /saved workflow plan differs/);
+  truncate = false;
+  staleReads = 1;
+  await operations.edit.writeFile(path, intended);
+  assert.equal(persisted, intended);
+  assert.equal(writes, 2);
+});
+
+test("the project plan always uses the mounted workspace even if the portal serves a stale prefix", async () => {
+  const path = "/workspace/demo/public_data/workflowPLAN.json";
+  const api = new RecordingFileClient('{"阶段":');
+  const terminal = new RecordingFileClient('{"阶段":"完成"}');
+  const client = new FallbackSandboxFileClient(api, terminal);
+  await client.access(path);
+  assert.equal((await client.read(path)).toString(), '{"阶段":"完成"}');
+  await client.write(path, '{"阶段":"评测"}');
+  assert.deepEqual(api.reads, []);
+  assert.deepEqual(api.writes, []);
+  assert.deepEqual(terminal.accesses, [path]);
+  assert.deepEqual(terminal.writes, [path + ':{"阶段":"评测"}']);
+});

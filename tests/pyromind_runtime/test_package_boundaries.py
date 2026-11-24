@@ -513,6 +513,17 @@ def test_preparation_policy_is_trusted_profile_configuration():
     assert policy is not None
     roles = ECHOMIND_PRODUCT_PROFILE.delegated_roles
     assert roles == policy.allowed_roles == ()
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    eval_tasks = {
+        task.id: task.evaluation_target
+        for node in policy.workflow_nodes
+        if node.id == "eval"
+        for task in node.tasks
+    }
+    assert eval_tasks["model_eval"] == "model"
+    assert eval_tasks["analysis"] is None
+    assert DEFAULT_PRODUCT_PROFILE.preparation_policy is None
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
     review_tool = "request_reward_bundle_review"
     assert review_tool in tools
@@ -522,7 +533,9 @@ def test_preparation_policy_is_trusted_profile_configuration():
     )
     assert review_tool not in (DEFAULT_PRODUCT_PROFILE.tool_allowlist or ())
     assert "get_project_reward" not in tools
-    assert "get_project_reward" in ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist
+    assert "get_project_reward" in (
+        ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()
+    )
     assert "set_preparation_plan" in tools
     assert not {"get_preparation", "update_preparation", "inspect_resource"} & tools
     assert {"read", "write", "edit", "terminal"} <= tools
@@ -542,6 +555,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "terminal",
         "ask_user",
         "get_storage_url",
+        "publish_echomind_update",
         "get_project_reward",
         "df_submit_evaluation",
         "df_submit_pipeline",
@@ -644,7 +658,7 @@ def test_execution_capabilities_are_profile_owned_and_cannot_be_model_supplied()
         "eval",
     }
     assert DEFAULT_PRODUCT_PROFILE.delegated_roles is None
-    assert "enqueue_task" in ECHOMIND_PRODUCT_PROFILE.command_allowlist
+    assert "enqueue_task" in (ECHOMIND_PRODUCT_PROFILE.command_allowlist or ())
     for name in ("init", "dataset", "train", "eval"):
         assert not (ROOT / "harness-adapter/pi-runtime/agents" / f"{name}.md").exists()
     obsolete = {

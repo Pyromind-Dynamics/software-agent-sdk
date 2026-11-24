@@ -59,7 +59,9 @@ export class JsonlRpcPeer {
       const pending = this.pending.get(frame.requestId);
       if (!pending) return;
       this.pending.delete(frame.requestId);
-      if (frame.error) pending.reject(new Error(`${frame.error.code}: ${frame.error.message}`));
+      if (frame.error) pending.reject(Object.assign(
+        new Error(`${frame.error.code}: ${frame.error.message}`), { code: frame.error.code },
+      ));
       else pending.resolve(frame.result ?? null);
       return;
     }

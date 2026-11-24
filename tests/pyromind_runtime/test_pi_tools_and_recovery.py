@@ -555,8 +555,9 @@ async def test_stale_runner_exit_does_not_clear_replacement_or_emit_error(
     await adapter.close(handle)
 
 
+@pytest.mark.parametrize("legacy", [True, False], ids=["legacy", "parallel-owned"])
 async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy
 ) -> None:
     _LifecycleFakeRunner.instances.clear()
     monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
@@ -578,19 +579,29 @@ async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
     history = await session.queue.get()
     assert history is not None
     assert history.type == "history.synced"
-    session.files.save_inflight(
-        {"run_id": "run-interrupted", "operation_id": "tool-interrupted"}
-    )
+    if legacy:
+        expected = {"tool-interrupted": None}
+        interrupted = {"run_id": "run-interrupted", "operation_id": "tool-interrupted"}
+        task_id = None
+        turn_id = None
+    else:
+        expected = {"first-tool": "first-turn", "second-tool": "second-turn"}
+        task_id = "original-task"
+        turn_id = "second-turn"
+        interrupted = {
+            "run_id": "run-interrupted",
+            "operations": expected,
+            "task_id": task_id,
+            "turn_id": turn_id,
+        }
+    session.files.save_inflight(interrupted)
 
     runner.running = False
     await runner.exit_handler(PiRunnerExit(returncode=0, reason="shutdown"))
 
     assert session.runner is None
     assert session.queue.empty()
-    assert session.files.load_inflight() == {
-        "run_id": "run-interrupted",
-        "operation_id": "tool-interrupted",
-    }
+    assert session.files.load_inflight() == interrupted
     await adapter.close(handle)
 
     restarted = PiAdapter(conversations, terminal_backend="os-sandbox")
@@ -603,11 +614,16 @@ async def test_planned_shutdown_preserves_inflight_for_attach_recovery(
         recovered.append(restarted_session.queue.get_nowait())
 
     failures = [event for event in recovered if event.type == "operation.failed"]
-    assert len(failures) == 1
-    assert failures[0].run_id == "run-interrupted"
-    assert failures[0].payload["error_code"] == "runner_restarted"
+    assert {
+        event.payload["operation_id"]: event.turn_id for event in failures
+    } == expected
+    assert all(event.run_id == "run-interrupted" for event in failures)
+    assert all(event.task_id == task_id for event in failures)
+    assert all(event.payload["error_code"] == "runner_restarted" for event in failures)
     completion = next(event for event in recovered if event.type == "run.finished")
     assert completion.payload["status"] == "paused"
+    assert completion.task_id == task_id
+    assert completion.turn_id == turn_id
     inflight = restarted_session.files.load_inflight()
     assert inflight is not None and inflight["completion"]
     await restarted.finalize_run(restarted_handle, completion, None)
@@ -2273,6 +2289,26 @@ async def test_sandbox_reads_project_request_through_workspace_port(
             RequestContext(user_id="42"),
         )
         is None
+    )
+
+    # The sandbox API can expose an earlier byte count, splitting multibyte text.
+    plan_path = "public_data/workflowPLAN.json"
+    (root / plan_path).write_bytes('{"阶段":"完成"}'.encode()[:-3])
+
+    def download(**kwargs):
+        assert kwargs["storage_path"] == f"/.pyromind-agent/conversation-1/{plan_path}"
+        assert kwargs["max_bytes"] == 2048
+        return '{"阶段":"完成"}'.encode()
+
+    monkeypatch.setattr(pi_adapter_module, "download_file_from_pyromind", download)
+    assert (
+        await adapter.read_workspace_text(
+            adapter._handle(session),
+            plan_path,
+            RequestContext(user_id="42", cookie="auth_token=fixture"),
+            max_bytes=2048,
+        )
+        == '{"阶段":"完成"}'
     )
 
 

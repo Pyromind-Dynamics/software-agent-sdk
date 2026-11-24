@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from pyromind_agent_server.api.execution_view import execution_event, execution_snapshot
 from pyromind_agent_server.api.schemas import (
     CreateConversationRequest,
     ForkConversationRequest,
@@ -112,6 +113,9 @@ def create_product_router(
 ) -> APIRouter:
     def context_for(request: Request):
         return context_for_profile(request, profile)
+
+    def public_snapshot(snapshot: ConversationSnapshot) -> ConversationSnapshot:
+        return execution_snapshot(snapshot) if profile.execution_only else snapshot
 
     router = APIRouter(
         prefix=profile.route_prefix,
@@ -238,7 +242,7 @@ def create_product_router(
             _write_profile_marker(
                 get_conversation_service(request), snapshot.conversation_id, profile
             )
-            return snapshot
+            return public_snapshot(snapshot)
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
 
@@ -258,9 +262,10 @@ def create_product_router(
     @router.get("", response_model=tuple[ConversationSnapshot, ...])
     async def list_conversations(request: Request) -> tuple[ConversationSnapshot, ...]:
         ids = await asyncio.to_thread(profile_conversation_ids, request)
-        return await get_product_runtime(request).list_snapshots(
+        snapshots = await get_product_runtime(request).list_snapshots(
             context_for(request), conversation_ids=ids
         )
+        return tuple(map(public_snapshot, snapshots))
 
     @router.get("/summaries", response_model=tuple[ConversationSummary, ...])
     async def list_summaries(request: Request) -> tuple[ConversationSummary, ...]:
@@ -276,9 +281,10 @@ def create_product_router(
     ) -> ConversationSnapshot:
         await asyncio.to_thread(_require_profile, request, conversation_id, profile)
         try:
-            return await get_product_runtime(request).get_snapshot(
+            snapshot = await get_product_runtime(request).get_snapshot(
                 conversation_id, context_for(request)
             )
+            return public_snapshot(snapshot)
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
         except (
@@ -367,7 +373,14 @@ def create_product_router(
         ) as exc:
             raise _not_found(conversation_id) from exc
         return StreamingResponse(
-            _sse_stream(runtime, conversation_id, cursor, context, started),
+            _sse_stream(
+                runtime,
+                conversation_id,
+                cursor,
+                context,
+                started,
+                execution_only=profile.execution_only,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -455,7 +468,7 @@ def create_product_router(
             _write_profile_marker(
                 get_conversation_service(request), snapshot.conversation_id, profile
             )
-            return snapshot
+            return public_snapshot(snapshot)
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
         except (
@@ -585,6 +598,8 @@ async def _sse_stream(
     after_seq: int,
     context,
     started: float | None = None,
+    *,
+    execution_only: bool = False,
 ) -> AsyncGenerator[str]:
     events = runtime.stream_events(conversation_id, after_seq, context)
     if started is not None:
@@ -608,6 +623,8 @@ async def _sse_stream(
                 event = pending.result()
             except StopAsyncIteration:
                 return
+            if execution_only:
+                event = execution_event(event)
             yield (
                 f"id: {event.seq}\n"
                 f"event: {event.type}\n"

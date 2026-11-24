@@ -88,8 +88,9 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    放在**同一目录** —— input 行保留的是相对图片路径，只有同目录才能解析
    回原图（绝对路径会被 pipeline 以"必须是相对 POSIX 路径"拒绝）。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。
-   面向训练的交付使用对应训练格式（多模态 SFT 为 messages JSONL），图片顺序和引用
-   必须能被训练环境解析；统计与审计单独保存。返回实际 Storage 文件路径，
+   生成平铺 Vision 数据准备脚本时，train 和 val 共用同一导出逻辑：写每行 JSON 前，
+   按该样本的源图片根将图片列转换为训练容器可读的 `/workspace/...` 绝对路径，
+   保留图片顺序和监督字段。复用格式转换 playbook 的 `training_image_record`；统计与审计单独保存。返回实际 Storage 文件路径，
    下游训练直接使用这些文件，不要求再次复制或登记 Dataset Version。
    图片预览用 `get_storage_url` 取完整签名 URL 并以 Markdown 嵌入对话，让用户
    直接看图；保留完整签名 URL，不放进代码块。非图片产物（CSV/JSON/报告等）同样

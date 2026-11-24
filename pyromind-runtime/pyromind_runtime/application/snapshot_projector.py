@@ -16,10 +16,13 @@ from pyromind_runtime.domain.experiment_execution import (
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
+    ConversationStatus,
+    ExecutionNoticeLink,
     ExternalTaskState,
     OperationActivity,
     PendingPermission,
     PlanState,
+    TaskRunProgress,
     TimelineCompaction,
     TimelineMessage,
     TimelineNotice,
@@ -267,7 +270,20 @@ class SnapshotProjector:
         queue = snapshot.experiment_queue or ()
         if any(item.get("task_id") == event.payload["task_id"] for item in queue):
             return snapshot
-        return snapshot.model_copy(update={"experiment_queue": (*queue, event.payload)})
+        task_id = self._string(event.payload, "task_id")
+        origin = self._optional_string(event.payload, "origin_turn_id")
+        origins = snapshot.task_origins
+        if origin and task_id not in origins:
+            origins = {**origins, task_id: origin}
+        return snapshot.model_copy(
+            update={
+                "experiment_queue": (*queue, event.payload),
+                "task_origins": origins,
+                "task_runs": snapshot.task_runs
+                if snapshot.task_runs is not None
+                else ({} if origins else None),
+            }
+        )
 
     def _on_task_dispatched(
         self, snapshot: ConversationSnapshot, event: ProductEvent
@@ -308,6 +324,19 @@ class SnapshotProjector:
                 event,
                 code="unsupported_status",
                 message=f"Unsupported conversation status: {status}",
+            )
+        if snapshot.task_origins and event.run_id and event.task_id:
+            snapshot = snapshot.model_copy(
+                update={
+                    "task_runs": {
+                        **(snapshot.task_runs or {}),
+                        event.run_id: TaskRunProgress(
+                            task_id=event.task_id,
+                            status=cast(ConversationStatus, status),
+                            seq=event.seq,
+                        ),
+                    }
+                }
             )
         if (
             status != "running"
@@ -350,9 +379,12 @@ class SnapshotProjector:
         message = TimelineMessage(
             item_id=message_id,
             started_seq=event.seq,
+            started_at=event.occurred_at,
             role=cast(_MessageRole, role),
             content=self._content(event.payload),
             run_id=event.run_id,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
         )
         command_id = event.payload.get("command_id")
         if isinstance(command_id, str):
@@ -368,8 +400,11 @@ class SnapshotProjector:
             item = TimelineMessage(
                 item_id=message_id,
                 started_seq=event.seq,
+                started_at=event.occurred_at,
                 role="assistant",
                 run_id=event.run_id,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
             )
             snapshot = self._append(snapshot, item)
         text = self._string(event.payload, "text", allow_empty=True)
@@ -395,8 +430,11 @@ class SnapshotProjector:
             item = TimelineMessage(
                 item_id=message_id,
                 started_seq=event.seq,
+                started_at=event.occurred_at,
                 role=cast(_MessageRole, role),
                 run_id=event.run_id,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
             )
             snapshot = self._append(snapshot, item)
         update: dict[str, object] = {
@@ -408,6 +446,8 @@ class SnapshotProjector:
             update["command_id"] = command_id
         if "content" in event.payload:
             update["content"] = self._content(event.payload)
+        if (notice := event.payload.get("execution_notice")) is not None:
+            update["execution_notice"] = ExecutionNoticeLink.model_validate(notice)
         return self._replace(snapshot, item.model_copy(update=update))
 
     def _on_operation_started(
@@ -436,6 +476,8 @@ class SnapshotProjector:
             if event.payload.get("execution") is not None
             else None,
             run_id=event.run_id,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
         )
         return self._append(snapshot, operation)
 
@@ -471,6 +513,8 @@ class SnapshotProjector:
                 name=self._string(event.payload, "name", default="operation"),
                 category="observation",
                 run_id=event.run_id,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
             )
             snapshot = self._append(snapshot, item)
         update: dict[str, object] = {}
@@ -732,6 +776,8 @@ class SnapshotProjector:
                 event.payload, "compaction_id", default=event.event_id
             ),
             started_seq=event.seq,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
             status=cast(_CompactionStatus, status),
             summary=self._optional_string(event.payload, "summary"),
         )
@@ -746,6 +792,8 @@ class SnapshotProjector:
         item = TimelineWorkflow(
             item_id=event.event_id,
             started_seq=event.seq,
+            turn_id=event.turn_id,
+            task_id=event.task_id,
             workflow=workflow,
         )
         return self._append(snapshot, item).model_copy(
@@ -883,6 +931,8 @@ class SnapshotProjector:
             TimelineNotice(
                 item_id=event.event_id,
                 started_seq=event.seq,
+                turn_id=event.turn_id,
+                task_id=event.task_id,
                 severity=cast(_NoticeSeverity, severity),
                 code=code,
                 message=message,

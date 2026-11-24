@@ -210,6 +210,15 @@ class HarnessAdapter(Protocol):
 
 
 @runtime_checkable
+class BackgroundExecutionContext(Protocol):
+    def can_recover_on_read(self, context: RequestContext) -> bool: ...
+
+    def refresh_execution_context(
+        self, handle: SessionHandle, context: RequestContext
+    ) -> None: ...
+
+
+@runtime_checkable
 class SessionLivenessAdapter(Protocol):
     async def has_pending_session_work(self, handle: SessionHandle) -> bool: ...
 

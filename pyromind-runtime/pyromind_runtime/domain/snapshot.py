@@ -38,19 +38,48 @@ type ConversationStatus = Literal[
 ]
 
 
-class TimelineMessage(ContractModel):
+class TimelineEntry(ContractModel):
+    turn_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    task_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ExecutionNoticeLink(ContractModel):
+    public_copy: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    history_timestamp: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    source_message_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    has_result: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    origin_turn_id: str | None = None
+    action: Literal["plan", "confirmation", "report"] | None = None
+    target_id: str | None = None
+
+
+class TimelineMessage(TimelineEntry):
     kind: Literal["message"] = "message"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
+    started_at: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     completed_seq: int | None = Field(default=None, ge=1)
     role: Literal["user", "assistant", "system"]
     content: tuple[ContentBlock, ...] = ()
     status: Literal["streaming", "completed", "failed"] = "streaming"
     run_id: str | None = None
     command_id: str | None = None
+    execution_notice: ExecutionNoticeLink | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
-class TimelineOperation(ContractModel):
+class TimelineOperation(TimelineEntry):
     activity: OperationActivity | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -99,14 +128,14 @@ class WorkflowState(ContractModel):
     canvas: JsonObject | None = None
 
 
-class TimelineWorkflow(ContractModel):
+class TimelineWorkflow(TimelineEntry):
     kind: Literal["workflow"] = "workflow"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
     workflow: WorkflowState
 
 
-class TimelineCompaction(ContractModel):
+class TimelineCompaction(TimelineEntry):
     kind: Literal["compaction"] = "compaction"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -114,7 +143,7 @@ class TimelineCompaction(ContractModel):
     summary: str | None = None
 
 
-class TimelineNotice(ContractModel):
+class TimelineNotice(TimelineEntry):
     kind: Literal["notice"] = "notice"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -204,6 +233,12 @@ class ExternalTaskState(ContractModel):
     error_summary: str | None = None
 
 
+class TaskRunProgress(ContractModel):
+    task_id: str
+    status: ConversationStatus
+    seq: int = Field(ge=1)
+
+
 class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
@@ -225,6 +260,12 @@ class ConversationSnapshot(ContractModel):
     experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None
     experiment_queue: tuple[JsonObject, ...] | None = None
+    task_origins: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    task_runs: dict[str, TaskRunProgress] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     pending_permissions: tuple[PendingPermission, ...] = ()
     pending_inputs: tuple[PendingUserInput, ...] = ()
     # Automatic-turn suspension is separate from display status and is released by

@@ -112,3 +112,22 @@ test("signed URL restoration is scoped to successful tool results and the same r
   }
   assert.deepEqual(completed(new PiEventNormalizer("s2", "r1"), link(shortened)), [{ type: "text", text: link(shortened) }]);
 });
+
+test("a late tool result retains the original turn and task after steering", () => {
+  const normalizer = new PiEventNormalizer("session", "execution-run", ["turn-a", "turn-b"], new Map(), "parent-task");
+  const user = (text: string) => ({
+    type: "message_start", message: { role: "user", content: text, timestamp: 1 },
+  } as AgentSessionEvent);
+  normalizer.translate(user("first"));
+  const start = normalizer.translate({
+    type: "tool_execution_start", toolCallId: "call", toolName: "read", args: {},
+  } as unknown as AgentSessionEvent)[0]!;
+  assert.equal(start.turnId, "turn-a");
+  normalizer.translate(user("second"));
+  const result = normalizer.translate({
+    type: "tool_execution_end", toolCallId: "call", toolName: "read",
+    result: { content: [] }, isError: false,
+  } as unknown as AgentSessionEvent)[0]!;
+  assert.equal(result.turnId, "turn-a");
+  assert.equal(result.taskId, "parent-task");
+});

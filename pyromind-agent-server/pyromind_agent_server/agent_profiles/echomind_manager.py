@@ -1,4 +1,5 @@
 from pyromind_agent_server.agent_profiles.spec import AgentProfileSpec
+from pyromind_runtime.domain.echomind_chat import PUBLISH_UPDATE
 
 
 ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
@@ -8,6 +9,7 @@ ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
     "terminal",
     "ask_user",
     "get_storage_url",
+    PUBLISH_UPDATE,
     "get_project_reward",
     "df_submit_evaluation",
     "df_submit_pipeline",
@@ -46,14 +48,22 @@ Maintain public_data/workflowPLAN.json with the accepted stage and task IDs.
 Pass plan_task_id when submitting a planned job.
 For each task record business_status (pending, in_progress, blocked, completed,
 or failed), actual platform_task_id after submission, decision, next_action and
-verified outputs. Pass plan_attempt and increment attempt (starting at 1) for an
-authorized rerun. Runtime tracks platform facts.
+verified outputs. Use the same plan_attempt in the plan task and its submission,
+starting at 1 and incrementing for an authorized rerun. Runtime tracks platform facts.
 Save reports with product_versions and record the returned report_version_id.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence
 needed for the next decision. End the turn while awaiting external work.
 Accept results against the goal before marking a task or stage complete.
-Use get_storage_url for user-facing artifact links. Use the user's language.""",
+Speak directly to the user in an assistant message when you verify a meaningful
+milestone, produce a deliverable, or need a decision. Give the concrete outcome
+and available artifact links before continuing with the next tool or stage.
+You MUST call publish_echomind_update(message=...) to send a stage report while
+continuing execution. Ordinary text alongside a tool call is private. Pass the
+exact public Markdown including working artifact links in the message argument.
+Keep deliberation in the reasoning channel. Final replies use ordinary Markdown.
+Keep routine tool activity in the execution details. Use get_storage_url for
+user-facing artifact links. Use the user's language.""",
     tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
     skill_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_SKILLS,
 )

@@ -7,10 +7,15 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
+from pydantic import JsonValue
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 from harness_adapter.pi_adapter import PiAdapter
-from pyromind_agent_server.api.router import _resolve_cursor, _sse_stream
+from pyromind_agent_server.api.router import (
+    _resolve_cursor,
+    _sse_stream,
+    create_product_router,
+)
 from pyromind_agent_server.app import create_app
 from pyromind_agent_server.bootstrap import install_product_api
 from pyromind_agent_server.config import Config
@@ -19,6 +24,7 @@ from pyromind_agent_server.profiles import (
 )
 from pyromind_agent_server.service_context import ProductServiceContext
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
@@ -208,6 +214,100 @@ async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
         ).status_code == 404
 
     await runtime.close()
+
+
+async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
+    tmp_path,
+) -> None:
+    root = tmp_path / "conversations"
+    root.mkdir()
+    runtime = ConversationRuntime(root, FakeAdapter())
+    app = _app(tmp_path, runtime)
+    profile = ConversationProfile(
+        route_prefix="/api/execution/conversations",
+        profile_id="execution",
+        execution_only=True,
+    )
+    app.include_router(create_product_router(profile))
+    user = {"x-pyromind-debug-user-id": "42"}
+    private = "internal reasoning not for display"
+    safe = "task completed"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test", headers=user
+        ) as client:
+            created = await client.post(
+                profile.route_prefix, json={"llm": {"model": "test"}}
+            )
+            assert created.status_code == 201
+            conversation_id = created.json()["conversation_id"]
+            store = FileProductStore(root / conversation_id)
+            after_seq = store.load_snapshot().through_seq
+            assistant: JsonObject = {"message_id": "assistant", "role": "assistant"}
+            blocks: list[JsonValue] = [{"type": "text", "text": private}]
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="message.started",
+                    payload=assistant,
+                )
+            )
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="message.delta",
+                    payload={"message_id": "assistant", "text": private},
+                )
+            )
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="message.completed",
+                    payload={**assistant, "content": blocks},
+                )
+            )
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="operation.started",
+                    payload={
+                        "operation_id": "operation",
+                        "name": "write",
+                        "thought": blocks,
+                    },
+                )
+            )
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    type="notice.raised",
+                    payload={"code": "test", "message": safe},
+                )
+            )
+            path = f"{profile.route_prefix}/{conversation_id}/snapshot"
+            view = await client.get(path)
+            assert view.status_code == 200
+            assert private not in view.text
+            assert safe in view.text
+            assert all(item["kind"] != "message" for item in view.json()["timeline"])
+            assert store.load_snapshot().timeline[0].kind == "message"
+            context = RequestContext(user_id="42", profile_id=profile.profile_id)
+            events = _sse_stream(
+                runtime, conversation_id, after_seq, context, execution_only=True
+            )
+            try:
+                assert await anext(events) == ": connected\n\n"
+                frames = []
+                for seq in range(after_seq + 1, store.load_snapshot().through_seq + 1):
+                    frame = await asyncio.wait_for(anext(events), 1)
+                    assert f"id: {seq}\n" in frame
+                    assert private not in frame
+                    frames.append(frame)
+                assert safe in frames[-1]
+            finally:
+                await events.aclose()
+    finally:
+        await runtime.close()
 
 
 async def test_http_workflow_execution_submits_without_confirmation(

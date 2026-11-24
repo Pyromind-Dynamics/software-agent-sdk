@@ -24,3 +24,4 @@ class RequestContext:
     task_origin: TaskOrigin | None = None
     execution_trace: ExecutionTrace | None = None
     preparation_revision: int | None = None
+    plan_task_id: str | None = None

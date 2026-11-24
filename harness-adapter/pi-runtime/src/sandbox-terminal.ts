@@ -1668,7 +1668,8 @@ export class LazySandboxTerminalOperations implements BashOperations {
       {
         execution_id: randomUUID().replace(/-/g, ""), remote_run_dir: "",
         phase: "connecting", started: false, stopped: true,
-        error_code: isTimeout(error) ? "startup_timeout"
+        error_code: needsSandboxAuthorization(error) ? "sandbox_authorization_required"
+          : isTimeout(error) ? "startup_timeout"
           : isAborted(error) ? "aborted" : "connection_lost",
       },
       { cause: error },
@@ -1722,15 +1723,13 @@ function isAborted(error: unknown): boolean {
   return error instanceof Error && error.message === "aborted";
 }
 
-/**
- * Whether an endpoint resolution may be asked for again.
- *
- * A rejected request is what a sandbox recorded before its preparation
- * finished looks like, so it is retryable. A spent resolve budget and an
- * aborted call are final: retrying either would spin until the caller gives up.
- */
+function needsSandboxAuthorization(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "sandbox_authorization_required";
+}
+
+/** Transient failures during sandbox preparation can be retried on this call. */
 function isRetryableResolve(error: unknown, signal: AbortSignal | undefined): boolean {
-  if (isTimeout(error) || isAborted(error)) return false;
+  if (isTimeout(error) || isAborted(error) || needsSandboxAuthorization(error)) return false;
   return !(signal?.aborted ?? false);
 }
 

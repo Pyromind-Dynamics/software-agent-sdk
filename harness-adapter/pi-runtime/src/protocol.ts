@@ -37,6 +37,8 @@ export interface RunnerEvent {
   eventId: string;
   sessionId: string;
   runId: string;
+  turnId?: string;
+  taskId?: string;
   occurredAt: string;
   kind: RunnerEventKind;
   payload: JsonObject;

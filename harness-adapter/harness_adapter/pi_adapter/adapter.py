@@ -22,10 +22,14 @@ from uuid import uuid4
 from harness_adapter.pi_adapter.business_tool_host import (
     PyromindBusinessToolHost,
     ToolExecutionContext,
+    _auth_token,
     _forward_headers,
 )
 from harness_adapter.pi_adapter.business_tools import ProjectRewardReader
-from harness_adapter.pi_adapter.event_translator import translate_runner_event
+from harness_adapter.pi_adapter.event_translator import (
+    tool_operation_id,
+    translate_runner_event,
+)
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
@@ -76,6 +80,13 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.echomind_chat import (
+    CHAT_TOOLS,
+    MANAGER_PROFILE,
+    PUBLIC_UPDATE_PREFIX,
+    PUBLISH_UPDATE,
+    PublishUpdate,
+)
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.preparation import (
@@ -271,6 +282,16 @@ class PiAdapter:
             repository = Path(__file__).parents[3]
         self._workflow_call = workflow_call
         self._plan_submission: Callable[..., Awaitable[str | None]] | None = None
+        self._echo_chat_call: (
+            Callable[
+                [str, str, JsonObject, str, RequestContext, str | None],
+                Awaitable[JsonObject],
+            ]
+            | None
+        ) = None
+        self._chat_history: (
+            Callable[[str, str, RequestContext], Awaitable[list[JsonObject]]] | None
+        ) = None
         self._preparation_call: Any = None
         self._preparation_revision: Any = None
         self._preparation_review: (
@@ -398,6 +419,18 @@ class PiAdapter:
             and "enqueue_task" in (session.config.get("command_allowlist") or ())
         )
 
+    def set_echo_chat_handler(
+        self,
+        callback: Callable[
+            [str, str, JsonObject, str, RequestContext, str | None],
+            Awaitable[JsonObject],
+        ],
+        history: Callable[[str, str, RequestContext], Awaitable[list[JsonObject]]]
+        | None = None,
+    ) -> None:
+        self._chat_history = history
+        self._echo_chat_call = callback
+
     def set_preparation_handler(
         self,
         callback: Any,
@@ -474,6 +507,31 @@ class PiAdapter:
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
+        if session.config.get("profile_id") == MANAGER_PROFILE and PUBLISH_UPDATE in (
+            session.config.get("tool_allowlist") or ()
+        ):
+            specs.append(
+                {
+                    "name": PUBLISH_UPDATE,
+                    "description": (
+                        "Send a verified stage result to the user's chat now. "
+                        "Include deliverable links in the exact public Markdown. "
+                        "Use this tool before continuing to the next step. "
+                        "Text alongside a tool call is private."
+                    ),
+                    "input_schema": PublishUpdate.model_json_schema(),
+                }
+            )
+        if self._echo_chat_call is not None:
+            specs += [
+                {
+                    "name": name,
+                    "description": description,
+                    "input_schema": model.model_json_schema(),
+                }
+                for name, (model, description) in CHAT_TOOLS.items()
+                if name in (session.config.get("tool_allowlist") or ())
+            ]
         if self._preparation_review is not None and session.user_input_enabled:
             specs += [
                 {
@@ -708,11 +766,17 @@ class PiAdapter:
                 require_api_key=False,
             )
         else:
-            session.context = context
-        if self._terminal_backend == "sandbox" and not self._has_execution_workspace(
-            session
-        ):
-            return await self._read_stored_workspace_text(session, path, max_bytes)
+            # An observational read must not replace the live runner's login.
+            session = replace(session, context=context)
+        if self._terminal_backend == "sandbox":
+            # The sandbox file API can serve an old byte length for a replaced
+            # file, even cutting a UTF-8 character in half. Read the durable
+            # control document through Storage instead of projecting that prefix.
+            if not self._has_execution_workspace(session) or (
+                PurePosixPath(path) == PurePosixPath("public_data/workflowPLAN.json")
+                and (context.cookie or context.authorization)
+            ):
+                return await self._read_stored_workspace_text(session, path, max_bytes)
         workspace = await self._workspace(session)
         try:
             return await asyncio.to_thread(
@@ -860,6 +924,26 @@ class PiAdapter:
             else:
                 _remove_created_workspace(root, self._conversation_root)
             raise
+
+    def can_recover_on_read(self, context: RequestContext) -> bool:
+        return self._terminal_backend != "sandbox" or bool(_auth_token(context))
+
+    def refresh_execution_context(
+        self, handle: SessionHandle, context: RequestContext
+    ) -> None:
+        session = self._sessions.get(handle.session_id)
+        if (
+            session
+            and session.context.user_id == context.user_id
+            and session.context.profile_id == context.profile_id
+            and _auth_token(context)
+        ):
+            session.context = replace(
+                session.context,
+                authorization=context.authorization,
+                cookie=context.cookie,
+                x_cluster=context.x_cluster or session.context.x_cluster,
+            )
 
     async def attach_session(
         self,
@@ -1422,6 +1506,17 @@ class PiAdapter:
             )
             raise
 
+    async def compose_execution_notice(
+        self, handle: SessionHandle, facts: JsonObject
+    ) -> str:
+        session = self._session(handle.session_id)
+        await self._ensure_runner(session)
+        assert session.runner is not None
+        result = await session.runner.request("chat.compose_execution_notice", facts)
+        if not isinstance(result, str):
+            raise ValueError("execution notice model did not return text")
+        return result
+
     async def notify_external_task(
         self,
         handle: SessionHandle,
@@ -1635,6 +1730,7 @@ class PiAdapter:
                     runner.pid,
                 )
                 return
+            self._finish_inflight_items(session, inflight, "runner_exited")
             await self._runner_event(
                 session,
                 {
@@ -1643,6 +1739,8 @@ class PiAdapter:
                     "eventId": uuid4().hex,
                     "sessionId": session.session_id,
                     "runId": run_id_value,
+                    "turnId": inflight.get("turn_id"),
+                    "taskId": inflight.get("task_id"),
                     "occurredAt": datetime.now().astimezone().isoformat(),
                     "kind": "run.finished",
                     "payload": {
@@ -1676,6 +1774,8 @@ class PiAdapter:
             {
                 "session_id": session.session_id,
                 "workflows_enabled": self._workflow_call is not None,
+                "chat_turn_history": self._chat_history is not None
+                and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),
                 "execution_policy": {
                     "automatic_turns_suspended": bool(
@@ -1865,6 +1965,18 @@ class PiAdapter:
                     raise ValueError("execution belongs to another conversation")
                 await sink(params)
             return {}
+        if method == "chat.turn_history":
+            command_id = params.get("command_id")
+            if (
+                self._chat_history is None
+                or session.config.get("profile_id") != "echomind-chat"
+                or not isinstance(command_id, str)
+                or not command_id
+            ):
+                raise PermissionError("Chat history requires an active chat turn")
+            return await self._chat_history(
+                session.session_id, command_id, session.context
+            )
         if method == "preparation.version":
             if (
                 not self._tool_allowed(session, "set_preparation_plan")
@@ -1885,6 +1997,65 @@ class PiAdapter:
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
+            if tool_name == PUBLISH_UPDATE:
+                inflight = session.files.load_inflight() or {}
+                run_id = inflight.get("run_id")
+                call_id = params.get("tool_call_id")
+                if (
+                    session.config.get("profile_id") != MANAGER_PROFILE
+                    or PUBLISH_UPDATE
+                    not in (session.config.get("tool_allowlist") or ())
+                    or params.get("origin") is not None
+                    or not isinstance(run_id, str)
+                    or not run_id
+                    or not isinstance(call_id, str)
+                    or not call_id
+                ):
+                    raise PermissionError(
+                        "Publishing requires an active EchoMind manager run"
+                    )
+                message = PublishUpdate.model_validate(arguments).message
+                if not message.strip():
+                    raise ValueError("The public update must contain a message")
+                identity = f"{PUBLIC_UPDATE_PREFIX}{run_id}:{call_id}"
+                session.queue.put_nowait(
+                    HarnessEvent(
+                        session_id=session.session_id,
+                        event_id=identity,
+                        run_id=run_id,
+                        task_id=inflight.get("task_id"),
+                        turn_id=inflight.get("turn_id"),
+                        type="message.completed",
+                        payload={
+                            "role": "assistant",
+                            "message_id": identity,
+                            "content": [{"type": "text", "text": message}],
+                        },
+                    )
+                )
+                return {
+                    "content": [{"type": "text", "text": "Progress message recorded."}],
+                    "is_error": False,
+                }
+            if tool_name in CHAT_TOOLS:
+                tool_call_id = params.get("tool_call_id")
+                if self._echo_chat_call is None or not isinstance(tool_call_id, str):
+                    raise ValueError("EchoMind Chat Agent tool is unavailable")
+                origin = params.get("origin_command_id")
+                result = await self._echo_chat_call(
+                    session.session_id,
+                    tool_name,
+                    arguments,
+                    tool_call_id,
+                    session.context,
+                    origin if isinstance(origin, str) else None,
+                )
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                    ],
+                    "is_error": False,
+                }
             if tool_name in PREPARATION_TOOLS:
                 if self._preparation_call is None:
                     raise ValueError("plan tools are not configured")
@@ -1920,10 +2091,10 @@ class PiAdapter:
                     request_context=replace(session.context, task_origin=origin),
                 )
 
-            async def execute() -> JsonObject:
+            async def execute(tool_arguments: dict[str, Any]) -> JsonObject:
                 return await self._business_tools.execute(
                     tool_name,
-                    arguments,
+                    tool_arguments,
                     tool_context,
                     tool_call_id=(
                         params.get("tool_call_id")
@@ -1941,7 +2112,7 @@ class PiAdapter:
                 not self._tracks_submission(session, tool_name)
                 or "plan_task_id" not in arguments
             ):
-                result = await execute()
+                result = await execute(arguments)
                 self._emit_tool_signals(session, tool_name, result)
                 return result
 
@@ -1950,7 +2121,11 @@ class PiAdapter:
             assert self._plan_submission is not None
             async with session.submission_lock:
                 previous = await self._plan_submission(
-                    session.session_id, *binding, session.context
+                    session.session_id,
+                    *binding,
+                    session.context,
+                    tool_name=tool_name,
+                    arguments=arguments,
                 )
                 if previous:
                     receipt = {"task_id": previous, "already_submitted": True}
@@ -1959,15 +2134,25 @@ class PiAdapter:
                         "is_error": False,
                         "content": [{"type": "text", "text": json.dumps(receipt)}],
                     }
-                result = await execute()
+                tool_context = replace(
+                    tool_context,
+                    request_context=replace(
+                        tool_context.request_context, plan_task_id=binding[0]
+                    ),
+                )
+                result = await execute(arguments)
                 self._emit_tool_signals(session, tool_name, result)
-                details = result.get("details") or {}
-                platform_id = details.get("task_id")
+                details = result.get("details")
+                platform_id = (
+                    details.get("task_id") if isinstance(details, dict) else None
+                )
                 assert self._plan_submission is not None
                 await self._plan_submission(
                     session.session_id,
                     *binding,
                     session.context,
+                    tool_name=tool_name,
+                    arguments=arguments,
                     platform_task_id=platform_id
                     if isinstance(platform_id, str)
                     else None,
@@ -2282,7 +2467,13 @@ class PiAdapter:
             return
         if kind == "agent.started":
             session.running = True
-            session.files.save_inflight({"run_id": run_id})
+            session.files.save_inflight(
+                {
+                    "run_id": run_id,
+                    "turn_id": frame.get("turnId"),
+                    "task_id": frame.get("taskId"),
+                }
+            )
         elif kind == "run.finished":
             active_run = session.files.load_inflight() or {}
             if session.running and active_run.get("run_id") not in {None, run_id}:
@@ -2316,7 +2507,7 @@ class PiAdapter:
             )
             return
         else:
-            self._record_inflight(session, kind, payload, run_id)
+            self._record_inflight(session, kind, payload, frame, run_id)
         for event in translate_runner_event(frame):
             session.queue.put_nowait(event)
         if kind == "tool.completed" and _is_workflow_mutation(
@@ -2368,6 +2559,8 @@ class PiAdapter:
         return HarnessEvent(
             session_id=session.session_id,
             run_id=run_id,
+            turn_id=frame.get("turnId"),
+            task_id=frame.get("taskId"),
             event_id=f"{session.session_id}:{run_id}:finished",
             source_event_id=str(frame.get("eventId") or run_id),
             type="run.finished",
@@ -2375,18 +2568,71 @@ class PiAdapter:
         )
 
     def _record_inflight(
-        self, session: _PiSession, kind: Any, payload: dict[str, Any], run_id: str
+        self,
+        session: _PiSession,
+        kind: Any,
+        payload: dict[str, Any],
+        frame: dict[str, Any],
+        run_id: str,
     ) -> None:
         inflight = session.files.load_inflight() or {"run_id": run_id}
-        if kind == "message.started" and payload.get("role") == "assistant":
-            inflight["message_id"] = payload.get("message_id")
+        if kind == "message.started":
+            if isinstance(frame.get("turnId"), str):
+                inflight["turn_id"] = frame["turnId"]
+            if payload.get("role") == "assistant":
+                inflight["message_id"] = payload.get("message_id")
         elif kind == "message.completed":
             inflight.pop("message_id", None)
-        elif kind == "tool.started":
-            inflight["operation_id"] = payload.get("tool_call_id")
-        elif kind in {"tool.completed", "tool.failed"}:
-            inflight.pop("operation_id", None)
+        elif kind in {"tool.started", "tool.completed", "tool.failed"}:
+            operation_id = tool_operation_id(payload, frame.get("turnId"))
+            if isinstance(operation_id, str):
+                operations = self._inflight_operations(inflight)
+                if kind == "tool.started":
+                    operations[operation_id] = frame.get("turnId")
+                else:
+                    operations.pop(operation_id, None)
+                inflight.pop("operation_id", None)
+                inflight["operations"] = operations
         session.files.save_inflight(inflight)
+
+    @staticmethod
+    def _inflight_operations(inflight: dict[str, Any]) -> dict[str, str | None]:
+        operations = dict(inflight.get("operations") or {})
+        operation_id = inflight.get("operation_id")
+        if isinstance(operation_id, str):
+            operations.setdefault(operation_id, inflight.get("turn_id"))
+        return operations
+
+    def _finish_inflight_items(
+        self, session: _PiSession, inflight: dict[str, Any], error_code: str
+    ) -> None:
+        run_id = str(inflight.get("run_id") or "")
+        task_id = inflight.get("task_id")
+        message_id = inflight.get("message_id")
+        if isinstance(message_id, str):
+            session.queue.put_nowait(
+                HarnessEvent(
+                    event_id=f"{run_id}:interrupted-message:{message_id}",
+                    session_id=session.session_id,
+                    type="message.completed",
+                    run_id=run_id,
+                    turn_id=inflight.get("turn_id"),
+                    task_id=task_id,
+                    payload={"message_id": message_id, "role": "assistant"},
+                )
+            )
+        for operation_id, turn_id in self._inflight_operations(inflight).items():
+            session.queue.put_nowait(
+                HarnessEvent(
+                    event_id=f"{run_id}:interrupted-operation:{operation_id}",
+                    session_id=session.session_id,
+                    type="operation.failed",
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    task_id=task_id,
+                    payload={"operation_id": operation_id, "error_code": error_code},
+                )
+            )
 
     async def _recover_inflight(self, session: _PiSession) -> None:
         pending = session.files.load_pending_completions()
@@ -2428,31 +2674,7 @@ class PiAdapter:
         if isinstance(saved_completion, dict):
             session.queue.put_nowait(HarnessEvent.model_validate(saved_completion))
             return
-        message_id = inflight.get("message_id")
-        if isinstance(message_id, str):
-            session.queue.put_nowait(
-                HarnessEvent(
-                    session_id=session.session_id,
-                    type="message.completed",
-                    run_id=run_id,
-                    payload={"message_id": message_id, "role": "assistant"},
-                )
-            )
-        operation_id = inflight.get("operation_id")
-        if isinstance(operation_id, str):
-            session.queue.put_nowait(
-                HarnessEvent(
-                    session_id=session.session_id,
-                    type="operation.failed",
-                    run_id=run_id,
-                    payload={
-                        "operation_id": operation_id,
-                        "name": "operation",
-                        "details": None,
-                        "error_code": "runner_restarted",
-                    },
-                )
-            )
+        self._finish_inflight_items(session, inflight, "runner_restarted")
         permission_id = inflight.get("permission_id")
         if isinstance(permission_id, str):
             session.queue.put_nowait(
@@ -2460,6 +2682,8 @@ class PiAdapter:
                     session_id=session.session_id,
                     type="permission.resolved",
                     run_id=run_id,
+                    turn_id=inflight.get("turn_id"),
+                    task_id=inflight.get("task_id"),
                     payload={"permission_id": permission_id, "decision": "deny"},
                 )
             )
@@ -2467,6 +2691,8 @@ class PiAdapter:
             session,
             {
                 "runId": run_id,
+                "turnId": inflight.get("turn_id"),
+                "taskId": inflight.get("task_id"),
                 "eventId": f"{run_id}:recovered",
                 "kind": "run.finished",
                 "sessionId": session.session_id,

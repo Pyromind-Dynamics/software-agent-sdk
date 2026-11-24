@@ -183,6 +183,13 @@ class DfSubmitEvaluationAction(Action):
             for key in _REQUIRED_FIELDS[self.operation]
             if getattr(self, key) is None
         ]
+        if self.operation == "score" and bool(self.scoring_spec_path) != bool(
+            self.scoring_script_path
+        ):
+            raise ValueError(
+                "Supply scoring_spec_path and scoring_script_path together. "
+                "Omit both when using the frozen Reward."
+            )
         if missing:
             raise ValueError(
                 f"operation={self.operation} requires top-level fields: "
