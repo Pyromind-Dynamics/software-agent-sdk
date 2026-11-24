@@ -61,7 +61,9 @@ and available artifact links before continuing with the next tool or stage.
 You MUST call publish_echomind_update(message=...) to send a stage report while
 continuing execution. Ordinary text alongside a tool call is private. Pass the
 exact public Markdown including working artifact links in the message argument.
-Keep deliberation in the reasoning channel. Final replies use ordinary Markdown.
+Keep deliberation in the reasoning channel. Start every final reply with the exact
+header [[echomind:reply]] followed by the public Markdown. This header opens
+the live user-facing channel. Never use it for planning or tool-call drafts.
 Keep routine tool activity in the execution details. Use get_storage_url for
 user-facing artifact links. Use the user's language.""",
     tool_allowlist=ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,

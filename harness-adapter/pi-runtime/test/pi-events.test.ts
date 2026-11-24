@@ -131,3 +131,32 @@ test("a late tool result retains the original turn and task after steering", () 
   assert.equal(result.turnId, "turn-a");
   assert.equal(result.taskId, "parent-task");
 });
+
+test("only the opted-in public reply and publish-tool argument stream", () => {
+  const normalize = new PiEventNormalizer("s", "run");
+  const start = () => normalize.translate({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as AgentSessionEvent);
+  const update = (data: unknown, enabled = true) => normalize.translate({
+    type: "message_update", assistantMessageEvent: data,
+  } as AgentSessionEvent, enabled);
+  const text = (delta: string) => update({ type: "text_delta", delta })[0]?.payload.public_delta;
+  start();
+  assert.equal(text("ordinary draft"), undefined);
+  assert.equal(text("[[echomind:reply]]"), undefined);
+  start();
+  assert.equal(text(" [[echo"), undefined);
+  assert.equal(text("mind:reply]]First"), "First");
+  assert.equal(text(" part<th"), " part");
+  assert.equal(text("ink>private"), undefined);
+  assert.deepEqual(update({ type: "thinking_delta", delta: "private" }), []);
+  const tool = (name: string, message: string, enabled = true) => update({
+    type: "toolcall_delta", contentIndex: 0,
+    partial: { content: [{ id: "a", type: "toolCall", name, arguments: { message } }] },
+  }, enabled);
+  assert.deepEqual(tool("write", "private"), []);
+  assert.deepEqual(tool("publish_echomind_update", "A", false), []);
+  assert.deepEqual(tool("publish_echomind_update", "A")[0]?.payload,
+    { message_id: "echomind-update:run:a", text: "A", public_delta: "A" });
+  assert.deepEqual(tool("publish_echomind_update", "A"), []);
+  assert.equal(tool("publish_echomind_update", "A🚀")[0]?.payload.text, "🚀");
+  assert.deepEqual(tool("publish_echomind_update", "A🚀<think>private"), []);
+});

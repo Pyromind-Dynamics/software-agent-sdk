@@ -44,6 +44,9 @@ class TimelineEntry(ContractModel):
 
 
 class ExecutionNoticeLink(ContractModel):
+    source_seq: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
     public_copy: bool | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

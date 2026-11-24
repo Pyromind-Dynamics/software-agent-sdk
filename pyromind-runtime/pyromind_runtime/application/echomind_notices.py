@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -28,6 +29,7 @@ from pyromind_runtime.ports.harness import SessionHandle
 
 if TYPE_CHECKING:
     from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+    from pyromind_runtime.domain.versions import ArtifactVersion
     from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 
@@ -141,9 +143,44 @@ def report_candidate(artifact_id: str, origin: str | None) -> Candidate:
         ExecutionNoticeLink(
             origin_turn_id=origin, action="report", target_id=artifact_id
         ),
-        "报告已生成，点击「查看报告」阅读。",
-        "The report is ready. Select View report to read it.",
+        "报告已生成。",
+        "The report is ready.",
     )
+
+
+def previous_report_revision(
+    chat: ConversationSnapshot,
+    link: ExecutionNoticeLink,
+    run_id: str | None,
+    reports: dict[str, ArtifactVersion],
+) -> TimelineMessage | None:
+    if not (
+        run_id
+        and link.origin_turn_id
+        and link.action == "report"
+        and link.target_id in reports
+    ):
+        return None
+    previous = next(
+        (
+            item
+            for item in reversed(chat.timeline)
+            if isinstance(item, TimelineMessage) and item.content
+        ),
+        None,
+    )
+    if not previous or previous.run_id != run_id or not previous.execution_notice:
+        return None
+    old = previous.execution_notice
+    if (
+        old.action != "report"
+        or old.origin_turn_id != link.origin_turn_id
+        or old.target_id not in reports
+    ):
+        return None
+    assert link.target_id and old.target_id
+    before, after = reports[old.target_id], reports[link.target_id]
+    return previous if before.logical_key == after.logical_key else None
 
 
 def report_save_operation(
@@ -173,7 +210,9 @@ def _authorization_failure(event: ProductEvent) -> bool:
 
 
 def candidate_for(
-    event: ProductEvent, snapshot: ConversationSnapshot, readable_reports: set[str]
+    event: ProductEvent,
+    snapshot: ConversationSnapshot,
+    readable_reports: Collection[str],
 ) -> Candidate | None:
     run = (snapshot.task_runs or {}).get(event.run_id) if event.run_id else None
     task_id = event.task_id or (run.task_id if run else None)
@@ -310,11 +349,11 @@ def candidate_for(
             artifacts = execution.get("artifacts")
             if isinstance(artifacts, list):
                 matching = [
-                    item["artifact_id"]
+                    artifact_id
                     for item in artifacts
                     if isinstance(item, dict)
-                    and isinstance(item.get("artifact_id"), str)
-                    and item["artifact_id"] in readable_reports
+                    and isinstance(artifact_id := item.get("artifact_id"), str)
+                    and artifact_id in readable_reports
                     and (
                         not execution.get("report_uri")
                         or item.get("uri") == execution["report_uri"]
@@ -577,6 +616,31 @@ def public_blocks(
     return tuple(visible)
 
 
+_PUBLIC_REPLY_HEADER = "[[echomind:reply]]"
+
+
+def public_reply_header(blocks: tuple[ContentBlock, ...]) -> bool:
+    return bool(
+        blocks
+        and isinstance(blocks[0], TextContent)
+        and blocks[0].text.lstrip().startswith(_PUBLIC_REPLY_HEADER)
+    )
+
+
+def public_delta(event: ProductEvent) -> bool:
+    return bool(
+        event.type == "message.delta"
+        and event.run_id
+        and isinstance(event.payload.get("message_id"), str)
+        and isinstance(event.payload.get("public_delta"), str)
+        and event.payload["public_delta"]
+    )
+
+
+def public_message_id(source: str) -> str:
+    return _NOTICE_PREFIX + sha256(("public-message:" + source).encode()).hexdigest()
+
+
 def visible_chat_snapshot(snapshot: ConversationSnapshot) -> ConversationSnapshot:
     return snapshot.model_copy(
         update={
@@ -663,23 +727,45 @@ def manager_messages(
         )
         final = bool(terminal and item.completed_seq == last_event[item.run_id])
         prior = copies.get(item.item_id)
-        if prior and prior.execution_notice and prior.execution_notice.public_copy:
+        if (
+            prior
+            and prior.status == "completed"
+            and prior.execution_notice
+            and prior.execution_notice.public_copy
+        ):
             if prior.content:
                 spoken.add(item.run_id)
                 continue
             if not final:
                 continue
-        content = public_blocks(
-            item.content, publish=final or item.item_id.startswith(PUBLIC_UPDATE_PREFIX)
-        )
+        stage = item.item_id.startswith(PUBLIC_UPDATE_PREFIX)
+        if prior and prior.status == "streaming" and not (final or stage):
+            continue
+        content = public_blocks(item.content, publish=final or stage)
+        if not stage and public_reply_header(content):
+            first = content[0]
+            assert isinstance(first, TextContent)
+            text = first.text.lstrip().removeprefix(_PUBLIC_REPLY_HEADER)
+            content = ((TextContent(text=text),) if text.strip() else ()) + content[1:]
         if content:
             spoken.add(item.run_id)
-        elif prior and prior.execution_notice and prior.execution_notice.public_copy:
+        elif (
+            prior
+            and prior.status == "completed"
+            and prior.execution_notice
+            and prior.execution_notice.public_copy
+        ):
             continue
         if not content and prior is None:
             continue
-        key = ("public-message:" if content else "withdraw-message:") + item.item_id
-        event_id = _NOTICE_PREFIX + sha256(key.encode()).hexdigest()
+        event_id = (
+            public_message_id(item.item_id)
+            if content
+            else (
+                _NOTICE_PREFIX
+                + sha256(("withdraw-message:" + item.item_id).encode()).hexdigest()
+            )
+        )
         message_id = prior.item_id if prior else event_id
         origin = origin_for(manager, item.task_id, item.run_id)
         if not prior and latest[item.run_id] == item.item_id:
@@ -764,6 +850,7 @@ class EchoMindNotices:
             and (
                 event.type in _NOTICE_EVENTS
                 or _authorization_failure(event)
+                or public_delta(event)
                 or (
                     event.type == "message.completed"
                     and event.run_id
@@ -814,7 +901,9 @@ class EchoMindNotices:
                 fresh.update(
                     (event.seq, event)
                     for event in events
-                    if event.type in _NOTICE_EVENTS or _authorization_failure(event)
+                    if event.type in _NOTICE_EVENTS
+                    or _authorization_failure(event)
+                    or public_delta(event)
                 )
                 through_seq = events[-1].seq if events else cursor
                 candidates = [
@@ -855,13 +944,17 @@ class EchoMindNotices:
         through_seq: int,
         previous_cursor: int,
     ) -> None:
-        snapshot = await self.runtime._load_saved_snapshot(
-            manager_id, manager, context, recover_inputs=False
-        )
-        snapshot = await self.runtime._project_execution_status(snapshot, manager)
+        only_deltas = bool(events) and all(public_delta(e) for e in events)
+        if only_deltas:
+            snapshot = await asyncio.to_thread(manager.load_snapshot)
+        else:
+            snapshot = await self.runtime._load_saved_snapshot(
+                manager_id, manager, context, recover_inputs=False
+            )
+            snapshot = await self.runtime._project_execution_status(snapshot, manager)
         readable_reports = (
             {
-                version.id
+                version.id: version
                 for version in await asyncio.to_thread(
                     self.runtime._artifact_versions, manager_id, context
                 )
@@ -871,7 +964,7 @@ class EchoMindNotices:
                 event.type in {"artifact.registered", "experiment_execution.changed"}
                 for event in events
             )
-            else set()
+            else {}
         )
         chat_snapshot = await asyncio.to_thread(chat.load_snapshot)
         messages, spoken_runs = manager_messages(
@@ -890,9 +983,11 @@ class EchoMindNotices:
         milestones = {
             event.seq: event for event in events if event.type != "message.completed"
         }
-        if not milestones and not messages:
-            return
-        chat_events = await asyncio.to_thread(chat.replay) if milestones else ()
+        chat_events = (
+            await asyncio.to_thread(chat.replay)
+            if any(not public_delta(e) for e in milestones.values())
+            else ()
+        )
         considered = {
             event.event_id: event
             for event in chat_events
@@ -906,12 +1001,57 @@ class EchoMindNotices:
             and isinstance(link := event.payload.get("execution_notice"), dict)
             and link.get("action") == "report"
         }
+        copies = {
+            m.item_id: m
+            for m in chat_snapshot.timeline
+            if isinstance(m, TimelineMessage) and m.execution_notice
+        }
+        finished = {key for key, item in copies.items() if item.status == "completed"}
         for seq in sorted(messages.keys() | milestones.keys()):
             if original := messages.get(seq):
-                persisted, _ = await asyncio.to_thread(chat.append, original)
+                persisted, chat_snapshot = await asyncio.to_thread(
+                    chat.append, original
+                )
                 self.runtime._publish(persisted)
+                finalized = original.payload.get("message_id")
+                if isinstance(finalized, str):
+                    finished.add(finalized)
                 continue
             event = milestones[seq]
+            if public_delta(event):
+                source = event.payload["message_id"]
+                assert isinstance(source, str)
+                message_id = public_message_id(source)
+                identity = _NOTICE_PREFIX + "delta:" + event.event_id
+                prior = copies.get(message_id)
+                if message_id in finished or (
+                    prior
+                    and prior.execution_notice
+                    and (prior.execution_notice.source_seq or 0) >= seq
+                ):
+                    continue
+                link = ExecutionNoticeLink(
+                    origin_turn_id=origin_for(snapshot, event.task_id, event.run_id),
+                    source_message_id=source,
+                    source_seq=seq,
+                    public_copy=True,
+                )
+                delta = ProductEvent(
+                    conversation_id=chat_id,
+                    event_id=identity,
+                    run_id=event.run_id,
+                    type="message.delta",
+                    payload={
+                        "message_id": message_id,
+                        "text": event.payload["public_delta"],
+                        "execution_notice": link.model_dump(
+                            mode="json", exclude_none=True
+                        ),
+                    },
+                )
+                saved, chat_snapshot = await asyncio.to_thread(chat.append, delta)
+                self.runtime._publish(saved)
+                continue
             candidate = candidate_for(event, snapshot, readable_reports)
             if candidate is None or not candidate.current(snapshot):
                 continue
@@ -955,7 +1095,7 @@ class EchoMindNotices:
                 "language": "English" if english else "Chinese",
                 "notification_required": fallback is not None,
             }
-            if candidate.key.startswith(("round:", "sandbox-auth:")):
+            if candidate.key.startswith(("round:", "sandbox-auth:", "report:")):
                 text = fallback
             else:
                 text = await self._compose(chat_id, context, facts) or fallback
@@ -965,6 +1105,29 @@ class EchoMindNotices:
                 )
                 if not candidate.current(latest):
                     continue
+            message_id = identity
+            if prior_report := previous_report_revision(
+                chat_snapshot, candidate.link, event.run_id, readable_reports
+            ):
+                assert (
+                    candidate.link.target_id
+                    and prior_report.execution_notice
+                    and prior_report.execution_notice.target_id
+                )
+                version = readable_reports[candidate.link.target_id].version_no
+                if (
+                    version
+                    <= readable_reports[
+                        prior_report.execution_notice.target_id
+                    ].version_no
+                ):
+                    continue
+                message_id = prior_report.item_id
+                text = (
+                    f"Report updated to version {version}."
+                    if english
+                    else f"报告已更新，最新为第 {version} 版。"
+                )
             notice = ProductEvent(
                 conversation_id=chat_id,
                 event_id=identity,
@@ -972,7 +1135,7 @@ class EchoMindNotices:
                 type="message.completed" if text else "chat.notification.skipped",
                 payload={
                     "role": "assistant",
-                    "message_id": identity,
+                    "message_id": message_id,
                     "content": [{"type": "text", "text": text}],
                     "execution_notice": candidate.link.model_dump(
                         mode="json", exclude_none=True
@@ -981,11 +1144,53 @@ class EchoMindNotices:
                 if text
                 else {},
             )
-            persisted, _ = await asyncio.to_thread(chat.append, notice)
+            persisted, chat_snapshot = await asyncio.to_thread(chat.append, notice)
             self.runtime._publish(persisted)
             considered[identity] = persisted
             if text and candidate.link.action == "report" and event.run_id:
                 delivered_runs.add(event.run_id)
+
+        # A rejected tool call or an interrupted generation can leave a preview
+        # without an authoritative message.completed from the manager.
+        closed_runs = {
+            e.run_id
+            for e in events
+            if e.type == "status.changed"
+            and e.payload.get("status")
+            in {"idle", "finished", "error", "paused", "stuck"}
+        }
+        closed_runs.update(
+            k
+            for k, r in (snapshot.task_runs or {}).items()
+            if r.seq <= through_seq
+            and r.status in {"idle", "finished", "error", "paused", "stuck"}
+        )
+        if closed_runs:
+            for m in chat_snapshot.timeline:
+                if not (
+                    isinstance(m, TimelineMessage)
+                    and m.status == "streaming"
+                    and m.execution_notice
+                    and m.execution_notice.public_copy
+                    and m.run_id in closed_runs
+                ):
+                    continue
+                stop = ProductEvent(
+                    conversation_id=chat_id,
+                    run_id=m.run_id,
+                    event_id=m.item_id + ":interrupted",
+                    type="message.completed",
+                    payload={
+                        "message_id": m.item_id,
+                        "role": "assistant",
+                        "content": [],
+                        "execution_notice": m.execution_notice.model_dump(
+                            mode="json", exclude_none=True
+                        ),
+                    },
+                )
+                saved, _ = await asyncio.to_thread(chat.append, stop)
+                self.runtime._publish(saved)
 
     async def _compose(
         self, chat_id: str, context: RequestContext, facts: JsonObject

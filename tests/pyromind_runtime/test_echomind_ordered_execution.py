@@ -965,6 +965,33 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
             runtime._publish(event)
 
         publish("status.changed", {"status": "running"})
+        source = "echomind-update:analysis:milestone"
+        publish("message.delta", {"message_id": "draft", "text": "internal only"})
+        for fragment in ("  ## ", "交付物"):
+            publish(
+                "message.delta",
+                {"message_id": source, "text": fragment, "public_delta": fragment},
+            )
+            await wait_for(lambda: not runtime.echomind_notices.workers)
+        [preview] = [
+            i
+            for i in chat_store.load_snapshot().timeline
+            if isinstance(i, TimelineMessage)
+        ]
+        assert preview.status == "streaming" and preview.content == (
+            TextContent(text="  ## 交付物"),
+        )
+        assert (
+            preview.execution_notice
+            and preview.execution_notice.origin_turn_id == "user-turn"
+        )
+        # Reconnect after writing a preview but before saving the worker cursor.
+        chat_store.save_execution_notice_cursor(1)
+        runtime.echomind_notices.schedule(cid)
+        await wait_for(lambda: not runtime.echomind_notices.workers)
+        assert [
+            e.payload["text"] for e in chat_store.replay() if e.type == "message.delta"
+        ] == ["  ## ", "交付物"]
         publish(
             "message.completed",
             {"role": "assistant", "message_id": "empty", "content": []},
@@ -991,15 +1018,41 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
             == "echomind-update:analysis:milestone"
         )
         publish(
+            "message.delta",
+            {
+                "message_id": "final",
+                "text": "[[echomind:reply]]最终",
+                "public_delta": "最终",
+            },
+        )
+        publish(
+            "message.delta",
+            {
+                "message_id": "echomind-update:analysis:aborted",
+                "text": "incomplete",
+                "public_delta": "incomplete",
+            },
+        )
+        await wait_for(lambda: not runtime.echomind_notices.workers)
+        publish(
             "message.completed",
             {
                 "role": "assistant",
                 "message_id": "final",
-                "content": [{"type": "text", "text": "最终结论"}],
+                "content": [{"type": "text", "text": "[[echomind:reply]]最终结论"}],
             },
         )
         publish("status.changed", {"status": "idle"})
         await wait_for(lambda: not runtime.echomind_notices.workers)
+        messages = {
+            i.execution_notice.source_message_id: i
+            for i in chat_store.load_snapshot().timeline
+            if isinstance(i, TimelineMessage) and i.execution_notice
+        }
+        assert messages[source].item_id == preview.item_id
+        assert messages["final"].content == (TextContent(text="最终结论"),)
+        assert messages["echomind-update:analysis:aborted"].status == "completed"
+        assert not messages["echomind-update:analysis:aborted"].content
         run = "historical-run"
         origin = "historical-turn"
         task = "requirement:chat:historical"
@@ -1068,10 +1121,10 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
         for _ in range(2):
             await runtime.echomind_chat.snapshot(cid, context)
             await wait_for(lambda: not runtime.echomind_notices.workers)
+        visible = await runtime.echomind_chat.snapshot(cid, context)
+        assert visible
         messages = [
-            item
-            for item in chat_store.load_snapshot().timeline
-            if isinstance(item, TimelineMessage)
+            item for item in visible.timeline if isinstance(item, TimelineMessage)
         ]
         assert len(messages) == 3
         assert messages[-1].item_id == identity
