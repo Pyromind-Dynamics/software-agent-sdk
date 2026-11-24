@@ -143,6 +143,33 @@ async def test_standalone_saved_report_delivers_readable_link_once(
             == 1
         )
 
+        revised = await runtime.version_call(
+            manager_id,
+            VersionToolRequest(
+                action="save",
+                arguments={
+                    **request.arguments,
+                    "source": {"text": "Updated summary", "filename": "summary.md"},
+                },
+            ),
+            "save-report-revision",
+            context,
+        )
+        async with asyncio.timeout(5):
+            while runtime.echomind_notices.workers:
+                await asyncio.sleep(0.02)
+        [updated] = [
+            m
+            for m in chat_store.load_snapshot().timeline
+            if isinstance(m, TimelineMessage)
+        ]
+        assert updated.item_id == first.item_id
+        assert (
+            updated.execution_notice
+            and updated.execution_notice.target_id == revised["id"]
+        )
+        assert updated.content == (TextContent(text="报告已更新，最新为第 2 版。"),)
+
         url = f"/api/v2/echomind/conversations/{manager_id}/chat/reports/{artifact_id}"
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=api),

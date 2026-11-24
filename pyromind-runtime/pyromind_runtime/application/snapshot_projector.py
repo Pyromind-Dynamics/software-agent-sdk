@@ -414,7 +414,10 @@ class SnapshotProjector:
             content = (*content[:-1], merged)
         else:
             content = (*content, TextContent(text=text))
-        return self._replace(snapshot, item.model_copy(update={"content": content}))
+        update: dict[str, object] = {"content": content}
+        if (notice := event.payload.get("execution_notice")) is not None:
+            update["execution_notice"] = ExecutionNoticeLink.model_validate(notice)
+        return self._replace(snapshot, item.model_copy(update=update))
 
     def _on_message_completed(
         self, snapshot: ConversationSnapshot, event: ProductEvent
