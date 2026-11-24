@@ -88,7 +88,6 @@ RUN set -eux; \
 FROM node:22-bookworm-slim AS pi-runtime-builder
 WORKDIR /pi-runtime
 COPY harness-adapter/pi-runtime/package.json harness-adapter/pi-runtime/package-lock.json ./
-COPY harness-adapter/pi-runtime/vendor ./vendor
 RUN npm ci --no-audit --no-fund
 COPY harness-adapter/pi-runtime/tsconfig.json ./
 COPY harness-adapter/pi-runtime/src ./src

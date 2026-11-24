@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
+
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.task_status_query import PlatformTaskStatusQuery
@@ -26,6 +26,7 @@ from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.task_monitor_worker import TOKEN_ENV
 from pyromind_agent_server.workflow_status import set_workflow_status_dispatcher
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -44,9 +45,6 @@ from pyromind_runtime.infrastructure.sqlite_task_monitor_store import (
 )
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
-from pyromind_runtime.ports.workflows import WorkflowEventSink
-
-from pyromind_agent_server.task_monitor_worker import TOKEN_ENV
 
 
 logger = logging.getLogger(__name__)
@@ -151,7 +149,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             continue_after_completion=continue_after_completion,
         )
 
-    terminal_backend: str | None = None
     external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
 
     def pipeline_runs(conversation_id: str) -> PipelineRuns:
@@ -162,29 +159,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             versions=versions,
         )
 
-    workflows = None
-    workflow_enabled = os.getenv("PYROMIND_AGENTGENOME_ENABLED", "0") == "1"
-
-    async def workflow_call(
-        scope: str,
-        action: str,
-        arguments: JsonObject,
-        request_id: str,
-        context: RequestContext,
-        origin_run_id: str | None,
-    ) -> JsonObject:
-        assert isinstance(runtime, ConversationRuntime)
-        return await runtime.workflow_call(
-            scope, action, arguments, request_id, context, origin_run_id
-        )
-
     terminal_backend = resolve_pi_terminal_backend()
     pi_adapter = PiAdapter(
         service.conversations_dir,
         terminal_backend=terminal_backend,
         apply_workspace_quota=ensure_conversation_quota,
         pipeline_runs=pipeline_runs,
-        workflow_call=workflow_call if workflow_enabled else None,
     )
     pi_adapter.set_version_handler(version_call, execution_call)
 
@@ -194,22 +174,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
 
     pi_adapter.set_training_artifact_hook(record_training_artifacts)
     adapters: dict[str, HarnessAdapter] = {"pi": pi_adapter}
-    if workflow_enabled:
-
-        def execution_host(scope: str) -> ExecutionHost:
-            def subscribe(execution_id: str, sink: WorkflowEventSink | None) -> None:
-                pi_adapter.execution_subscribe(scope, execution_id, sink)
-
-            return ExecutionHost(
-                pi_adapter.execution_request(scope),
-                subscribe,
-                service.conversations_dir / scope,
-            )
-
-        workflows = AgentGenomeBackend(
-            agentgenome_home(service.conversations_dir),
-            execution_host,
-        )
     idle_eviction_seconds = int(
         os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "300")
     )
@@ -260,7 +224,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         resource_retention_seconds=resource_retention_seconds,
         max_active_conversations=max_active_conversations,
         resource_limits=resource_limits_from_environment(),
-        workflows=workflows,
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
@@ -295,7 +258,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         backend,
         raw_backend if raw_backend is not None else "<unset, defaulting to pi>",
         sorted(adapters),
-        terminal_backend or "-",
+        terminal_backend,
         idle_eviction_seconds,
         release_grace_seconds,
         resource_retention_seconds,

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { createTools, type SandboxTools } from "../src/tools.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -358,7 +357,7 @@ test("agent lanes in one sandbox use separate PTYs and isolate concurrent enviro
   assert.ok(address && typeof address !== "string");
   let resolves = 0;
   let sandbox!: SandboxTools;
-  await createTools({} as JsonlRpcPeer, new NodeExecutionEnv({ cwd: root }), root, "sandbox", [], undefined, undefined, [], {
+  await createTools({} as JsonlRpcPeer, root, "sandbox", [], undefined, undefined, [], {
     terminalConnect: connect,
     scriptChunkChars: 512,
     terminalTimeouts: { startupTimeoutMs: 5000 },

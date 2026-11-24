@@ -67,9 +67,22 @@ class _Metadata(ContractModel):
     skill_allowlist: tuple[str, ...] | None = None
     development_tool_allowlist: tuple[str, ...] | None = None
     development_skill_allowlist: tuple[str, ...] | None = None
+    development_product_instructions: str | None = None
+    development_prompt_active: bool = False
     command_allowlist: tuple[str, ...] | None = None
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
+
+    def development_policy(self) -> SessionPolicy:
+        return SessionPolicy(
+            product_instructions=self.development_product_instructions,
+            tool_allowlist=self.development_tool_allowlist
+            if self.development_tool_allowlist is not None
+            else self.tool_allowlist,
+            skill_allowlist=self.development_skill_allowlist
+            if self.development_skill_allowlist is not None
+            else self.skill_allowlist,
+        )
 
 
 class CommandIntent(ContractModel):
@@ -152,6 +165,7 @@ class FileProductStore:
         skill_allowlist: tuple[str, ...] | None = None,
         development_tool_allowlist: tuple[str, ...] | None = None,
         development_skill_allowlist: tuple[str, ...] | None = None,
+        development_product_instructions: str | None = None,
         command_allowlist: tuple[str, ...] | None = None,
         preparation_policy: PreparationPolicy | None = None,
         delegated_roles: tuple[str, ...] | None = None,
@@ -178,6 +192,7 @@ class FileProductStore:
             skill_allowlist=skill_allowlist,
             development_tool_allowlist=development_tool_allowlist,
             development_skill_allowlist=development_skill_allowlist,
+            development_product_instructions=development_product_instructions,
             command_allowlist=command_allowlist,
             preparation_policy=preparation_policy,
             delegated_roles=delegated_roles,
@@ -227,45 +242,37 @@ class FileProductStore:
             if seq > current:
                 self._atomic_write(path, str(seq))
 
-    def development_policy(self) -> SessionPolicy:
+    def needs_development_policy(self) -> bool:
         metadata = self._load_metadata()
-        return SessionPolicy(
-            tool_allowlist=metadata.development_tool_allowlist
-            if metadata.development_tool_allowlist is not None
-            else metadata.tool_allowlist,
-            skill_allowlist=metadata.development_skill_allowlist
-            if metadata.development_skill_allowlist is not None
-            else metadata.skill_allowlist,
+        target = metadata.development_policy()
+        return (
+            target.tool_allowlist != metadata.tool_allowlist
+            or target.skill_allowlist != metadata.skill_allowlist
+            or (
+                target.product_instructions is not None
+                and not metadata.development_prompt_active
+            )
         )
+
+    def development_policy(self) -> SessionPolicy:
+        return self._load_metadata().development_policy()
 
     def activate_development_policy(self) -> SessionPolicy:
         with self._lock():
             metadata = self._load_metadata()
-            tool_allowlist = (
-                metadata.development_tool_allowlist
-                if metadata.development_tool_allowlist is not None
-                else metadata.tool_allowlist
+            policy = metadata.development_policy()
+            updated = metadata.model_copy(
+                update={
+                    "tool_allowlist": policy.tool_allowlist,
+                    "skill_allowlist": policy.skill_allowlist,
+                    "development_prompt_active": policy.product_instructions
+                    is not None,
+                }
             )
-            skill_allowlist = (
-                metadata.development_skill_allowlist
-                if metadata.development_skill_allowlist is not None
-                else metadata.skill_allowlist
-            )
-            if (
-                metadata.tool_allowlist != tool_allowlist
-                or metadata.skill_allowlist != skill_allowlist
-            ):
-                metadata = metadata.model_copy(
-                    update={
-                        "tool_allowlist": tool_allowlist,
-                        "skill_allowlist": skill_allowlist,
-                    }
-                )
-                self._atomic_write(self.metadata_path, metadata.model_dump_json())
-            return SessionPolicy(
-                tool_allowlist=tool_allowlist,
-                skill_allowlist=skill_allowlist,
-            )
+            if updated != metadata:
+                self._atomic_write(self.metadata_path, updated.model_dump_json())
+
+            return policy
 
     def access_policy(self) -> dict:
         metadata = self._load_metadata()
@@ -287,6 +294,7 @@ class FileProductStore:
     def apply_configuration(self, policy: SessionPolicy) -> None:
         with self._lock():
             metadata = self._load_metadata()
+            development_prompt = policy.development_product_instructions
             updated = metadata.model_copy(
                 update={
                     "configuration_version": policy.configuration_version,
@@ -302,6 +310,9 @@ class FileProductStore:
                     "command_allowlist": policy.command_allowlist,
                     "development_tool_allowlist": policy.development_tool_allowlist,
                     "development_skill_allowlist": policy.development_skill_allowlist,
+                    "development_product_instructions": development_prompt,
+                    "development_prompt_active": policy.product_instructions is not None
+                    and policy.product_instructions == development_prompt,
                 }
             )
             self._atomic_write(self.metadata_path, updated.model_dump_json())

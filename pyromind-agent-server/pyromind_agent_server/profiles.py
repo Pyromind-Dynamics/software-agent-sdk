@@ -26,6 +26,7 @@ class ConversationProfile:
     skill_allowlist: tuple[str, ...] | None = None
     development_tool_allowlist: tuple[str, ...] | None = None
     development_skill_allowlist: tuple[str, ...] | None = None
+    development_product_instructions: str | None = None
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     conversation_marker: str | None = None
@@ -93,14 +94,15 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=35,
+    configuration_version=36,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
     harness_id="pi",
-    instructions="""Before Project creation only, read model-evaluation-preparation.
-Use the Skill to determine the information needed for the user's task. Read
-data and knowledge with the available workspace tools. For training without a
+    instructions="""Before Project creation, plan with the skills in the current
+available_skills catalog. Use read with the listed Skill location.
+Read model-evaluation-preparation for the planning contract.
+Read data and knowledge with the available workspace tools. For training without a
 programmatically verifiable answer, consult rubric-elicitation to choose and
 confirm the scoring method. Use ask_user only for
 essential information or decisions that cannot be established. Once ready,
@@ -110,10 +112,9 @@ before ending the turn, even when the saved draft does not need changes.
 Include confirmed inputs and constraints in the plan, not a separate Checklist.
 The user may revise it in chat and creates/starts the Project with the UI button.
 Use the Sandbox to inspect data and prepare files. Start business tasks only after
-the user creates the Project.
-After creation, preparation is finished. Use the accepted plan supplied in the
-Project notification to create public_data/workflowPLAN.json with write, then
-execute the accepted entry task directly.
+the user creates the Project.""",
+    development_product_instructions="""Read the plan in the Project notification.
+Write public_data/workflowPLAN.json, then execute the accepted entry task directly.
 Before finishing an execution round, give a concise public result in the user's
 language. State what was completed, or what is still waiting or blocked.
 Deliver requested summaries in that result. Keep internal reasoning,

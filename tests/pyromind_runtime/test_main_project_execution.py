@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from dataclasses import replace
 from uuid import uuid4
 
@@ -39,8 +40,9 @@ from .test_preparation import (
 from .test_workflow_execution import FakeSubmission
 
 
+@pytest.mark.parametrize("queued_preparation", [False, True], ids=["user", "queue"])
 async def test_main_runs_baseline_training_and_evaluation_without_child_sessions(
-    preparation_setup, tmp_path, monkeypatch
+    preparation_setup, tmp_path, monkeypatch, queued_preparation
 ):
     preparation, owner, _ = preparation_setup
     scope = owner.conversation_id
@@ -48,6 +50,8 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         user_id=owner.user_id, profile_id=owner.profile_id, x_cluster="test"
     )
     profile = ECHOMIND_PRODUCT_PROFILE
+    assert profile.skill_allowlist and profile.development_skill_allowlist
+    assert profile.development_product_instructions
     root = tmp_path / "conversations"
     monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
     adapter = PiAdapter(root, terminal_backend="os-sandbox")
@@ -206,6 +210,12 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
     async def respond(http_request):
         body = await http_request.json()
         requests.append(body)
+        if len(requests) == 1:
+            return stream(
+                "set_preparation_plan", request.model_dump(mode="json"), "plan"
+            )
+        if len(requests) == 2:
+            return stream()
         if not actions and not review_started.is_set():
             review_started.set()
             await asyncio.wait_for(finish_review.wait(), timeout=10)
@@ -277,6 +287,7 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                     skill_allowlist=profile.skill_allowlist,
                     development_tool_allowlist=profile.development_tool_allowlist,
                     development_skill_allowlist=profile.development_skill_allowlist,
+                    development_product_instructions=profile.development_product_instructions,
                     delegated_roles=(),
                     command_allowlist=profile.command_allowlist,
                     product_instructions=profile.instructions,
@@ -288,14 +299,46 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 ),
                 context,
             )
-            await runtime.preparation_call(
-                scope,
-                "set_preparation_plan",
-                request.model_dump(mode="json"),
-                replace(context, preparation_revision=0),
+            if queued_preparation:
+                await runtime.enqueue_chat_requirement(
+                    scope,
+                    EnqueueTaskCommand(
+                        command_id="prepare", instruction="Review the dataset."
+                    ),
+                    context,
+                )
+            else:
+                await runtime.submit_command(
+                    scope,
+                    UserMessageCommand.model_validate(
+                        {
+                            "command_id": "prepare",
+                            "content": [
+                                {"type": "text", "text": "Review the dataset."}
+                            ],
+                        }
+                    ),
+                    context,
+                )
+            prepared = await wait_for(
+                lambda s: (
+                    s.preparation
+                    and s.preparation.plan
+                    and not s.experiment_queue
+                    and s.status != "running"
+                )
             )
+            assert prepared.preparation
+            preparation_prompt = requests[0]["messages"][0]["content"]
+            assert profile.instructions in preparation_prompt
+            assert profile.development_product_instructions not in preparation_prompt
+            assert set(re.findall(r"<name>([^<]+)</name>", preparation_prompt)) == set(
+                profile.skill_allowlist
+            )
+            assert "frozen-reward-evaluation" not in preparation_prompt
             create = CreateProjectCommand(
-                command_id="approve", expected_preparation_revision=1
+                command_id="approve",
+                expected_preparation_revision=prepared.preparation.revision,
             )
             receipt = await runtime.submit_command(scope, create, context)
             assert receipt == await runtime.submit_command(scope, create, context)
@@ -343,6 +386,12 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             assert all(
                 r.state == "succeeded" for r in snapshot.experiment_executions or ()
             )
+            execution_prompt = requests[2]["messages"][0]["content"]
+            assert profile.development_product_instructions in execution_prompt
+            assert profile.instructions not in execution_prompt
+            assert set(re.findall(r"<name>([^<]+)</name>", execution_prompt)) == set(
+                profile.development_skill_allowlist
+            )
             (training,) = (
                 r
                 for r in snapshot.experiment_executions or ()
@@ -369,7 +418,9 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             assert len(studio.submissions) == 1 and len(jobs) == 2
             assert not (root / scope / "pi" / "subagents").exists()
             assert all(
-                "subagent" not in {t["function"]["name"] for t in r["tools"]}
+                {"subagent", "ls", "find", "grep"}.isdisjoint(
+                    t["function"]["name"] for t in r["tools"]
+                )
                 for r in requests
             )
             assert all(e.payload.get("category") != "subagent" for e in events)
@@ -382,17 +433,15 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 )
             await runtime.submit_command(scope, queued, context)
             await runtime.submit_command(scope, queued, context)
-            assert (
-                len(
-                    [
-                        e
-                        for e in runtime._store(scope).replay()
-                        if e.type == "task.queued"
-                        and e.payload["kind"] == "requirement"
-                    ]
-                )
-                == 1
-            )
+            queued_requirements = [
+                e.payload["task_id"]
+                for e in runtime._store(scope).replay()
+                if e.type == "task.queued" and e.payload["kind"] == "requirement"
+            ]
+            expected = ["requirement:additional"]
+            if queued_preparation:
+                expected.insert(0, "requirement:prepare")
+            assert queued_requirements == expected
             await asyncio.wait_for(review_started.wait(), timeout=10)
             follow_up = UserMessageCommand.model_validate(
                 {
@@ -432,7 +481,8 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
     runtime = ConversationRuntime(root, adapter, preparation_store=preparation)
     policy = SessionPolicy(
         configuration_version=2,
-        product_instructions="Execute the approved plan directly.",
+        product_instructions="Review the plan.",
+        development_product_instructions="Execute the approved plan directly.",
         preparation_policy=PreparationPolicy(
             workflow_nodes=tuple(
                 node.model_copy(update={"roles": ()})
@@ -491,6 +541,9 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
             )
         )
         assert await runtime.apply_session_configuration(scope, policy, context)
+        assert adapter.session_policies[-1][1].product_instructions == (
+            policy.development_product_instructions
+        )
         assert store.access_policy()["delegated_roles"] == ()
         snapshot = await runtime.get_snapshot(scope, context)
         assert snapshot.project is not None

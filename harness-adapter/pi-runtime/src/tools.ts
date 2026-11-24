@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
   type AgentTool,
-  type ExecutionEnv,
 } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type TextContent, type TSchema } from "@earendil-works/pi-ai";
 import {
@@ -96,7 +95,6 @@ export interface SandboxTools {
 
 export async function createTools(
   peer: JsonlRpcPeer,
-  env: ExecutionEnv,
   workspaceRoot: string,
   terminalBackend: PiTerminalBackend,
   skillRoots: SkillRootConfig[],

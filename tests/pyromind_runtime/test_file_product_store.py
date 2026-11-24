@@ -14,6 +14,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import (
     CommandConflictError,
@@ -53,6 +54,24 @@ def test_store_lives_inside_conversation_and_rebuilds_snapshot(tmp_path: Path) -
     )
     store.snapshot_path.write_text("broken", encoding="utf-8")
     assert store.load_snapshot().status == "running"
+
+
+def test_older_store_can_switch_only_the_prompt_and_resume(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    legacy = json.loads(store.metadata_path.read_text())
+    del legacy["development_prompt_active"], legacy["development_product_instructions"]
+    store.metadata_path.write_text(json.dumps(legacy))
+    assert not store.needs_development_policy()
+    store.apply_configuration(
+        SessionPolicy(
+            product_instructions="Prepare.", development_product_instructions="Execute."
+        )
+    )
+    assert store.needs_development_policy()
+    assert store.activate_development_policy().product_instructions == "Execute."
+    restored = FileProductStore(store.conversation_dir)
+    assert restored.development_policy().product_instructions == "Execute."
+    assert not restored.needs_development_policy()
 
 
 def test_historical_message_time_is_recovered_from_the_start_event(

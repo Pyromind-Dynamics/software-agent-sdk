@@ -97,6 +97,7 @@ async def configure_session(
                 skill_allowlist=profile.skill_allowlist,
                 development_tool_allowlist=profile.development_tool_allowlist,
                 development_skill_allowlist=profile.development_skill_allowlist,
+                development_product_instructions=profile.development_product_instructions,
                 product_instructions=profile.instructions,
                 delegated_roles=tuple(
                     role.model_dump(mode="json")
@@ -233,6 +234,7 @@ def create_product_router(
             skill_allowlist=profile.skill_allowlist,
             development_tool_allowlist=profile.development_tool_allowlist,
             development_skill_allowlist=profile.development_skill_allowlist,
+            development_product_instructions=profile.development_product_instructions,
             command_allowlist=profile.command_allowlist,
             delegated_roles=profile.delegated_roles,
             preparation_policy=profile.preparation_policy,

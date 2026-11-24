@@ -11,6 +11,7 @@ class SessionPolicy(ContractModel):
     skill_allowlist: tuple[str, ...] | None = None
     development_tool_allowlist: tuple[str, ...] | None = None
     development_skill_allowlist: tuple[str, ...] | None = None
+    development_product_instructions: str | None = None
     configuration_version: int = 0
     product_instructions: str | None = None
     delegated_roles: tuple[JsonObject, ...] | None = None

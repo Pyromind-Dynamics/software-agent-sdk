@@ -424,6 +424,9 @@ class ConversationRuntime:
                         )
                         for run in history.experiment_executions or ():
                             self._record_execution(store, run)
+                instructions = policy.product_instructions
+                if active and policy.development_product_instructions is not None:
+                    instructions = policy.development_product_instructions
                 policy = policy.model_copy(
                     update={
                         "tool_allowlist": policy.development_tool_allowlist
@@ -432,7 +435,7 @@ class ConversationRuntime:
                         "skill_allowlist": policy.development_skill_allowlist
                         if active and policy.development_skill_allowlist is not None
                         else policy.skill_allowlist,
-                        "product_instructions": policy.product_instructions
+                        "product_instructions": instructions
                         if refreshed_roles or retire_roles
                         else None,
                         "delegated_roles": () if retire_roles else refreshed_roles,
@@ -801,19 +804,22 @@ class ConversationRuntime:
         store: FileProductStore,
         context: RequestContext,
     ) -> None:
-        policy = store.development_policy()
-        if policy.tool_allowlist is None and policy.skill_allowlist is None:
-            return
-        snapshot = store.load_snapshot()
-        harness_id = store.harness_id()
-        handle = SessionHandle(
-            session_id=conversation_id,
-            adapter_session_ref=conversation_id,
-            harness_id=harness_id,
-            capabilities=snapshot.capabilities,
-        )
-        await self._adapter(harness_id).update_session_policy(handle, policy, context)
-        store.activate_development_policy()
+        async with self._activation_locks.setdefault(conversation_id, asyncio.Lock()):
+            if not store.needs_development_policy():
+                return
+            policy = store.development_policy()
+            snapshot = store.load_snapshot()
+            harness_id = store.harness_id()
+            handle = SessionHandle(
+                session_id=conversation_id,
+                adapter_session_ref=conversation_id,
+                harness_id=harness_id,
+                capabilities=snapshot.capabilities,
+            )
+            await self._adapter(harness_id).update_session_policy(
+                handle, policy, context
+            )
+            store.activate_development_policy()
 
     def _notify_preparation(
         self,
@@ -939,11 +945,7 @@ class ConversationRuntime:
                     owner,
                     cluster=cluster,
                 )
-            if (
-                store.access_policy()["tool_allowlist"]
-                != store.development_policy().tool_allowlist
-            ):
-                await self._activate_development_policy(conversation_id, store, context)
+            await self._activate_development_policy(conversation_id, store, context)
             preparation = await self.get_preparation(conversation_id, context)
             if preparation.entry_task is not None and not already_started:
                 entry = preparation.entry_task
@@ -3021,6 +3023,7 @@ class ConversationRuntime:
                 skill_allowlist=spec.skill_allowlist,
                 development_tool_allowlist=spec.development_tool_allowlist,
                 development_skill_allowlist=spec.development_skill_allowlist,
+                development_product_instructions=spec.development_product_instructions,
                 command_allowlist=spec.command_allowlist,
                 preparation_policy=spec.preparation_policy,
                 delegated_roles=tuple(role.name for role in spec.delegated_roles)
@@ -3445,12 +3448,7 @@ class ConversationRuntime:
                 conversation_id, store, command, context
             )
         if store.preparation_policy() is not None:
-            current = store.access_policy()
-            development = store.development_policy()
-            if (
-                current["tool_allowlist"] != development.tool_allowlist
-                or current["skill_allowlist"] != development.skill_allowlist
-            ):
+            if store.needs_development_policy():
                 project = await self.get_project(conversation_id, context)
                 if project is not None and project.reward_bundle is None:
                     await self._activate_development_policy(

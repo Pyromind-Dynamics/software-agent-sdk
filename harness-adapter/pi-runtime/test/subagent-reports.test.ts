@@ -5,7 +5,6 @@ import { basename, join } from "node:path";
 import test from "node:test";
 import { SubagentReports } from "../src/subagent-reports.js";
 import { createTools } from "../src/tools.js";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { ToolCoordinator } from "../src/tool-coordinator.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 
@@ -16,7 +15,7 @@ async function fixture(t: test.TestContext) {
   await mkdir(join(root, 'pi', 'terminal-output'), { recursive: true });
   await mkdir(join(root, 'public_data'));
   const peer = { request: async () => ({allow:true}) } as unknown as JsonlRpcPeer;
-  const tools = await createTools(peer, new NodeExecutionEnv({cwd:root}), root, 'os-sandbox', [], undefined, undefined, []);
+  const tools = await createTools(peer, root, 'os-sandbox', [], undefined, undefined, []);
   const nativeWriter = new ToolCoordinator().wrap(tools.find(tool => tool.name === 'write')!, peer);
   let writes = 0; let fail = false;
   const writer = {...nativeWriter, execute: async (...args: Parameters<typeof nativeWriter.execute>) => {

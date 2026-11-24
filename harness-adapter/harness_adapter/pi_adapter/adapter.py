@@ -1773,7 +1773,6 @@ class PiAdapter:
         await runner.start(
             {
                 "session_id": session.session_id,
-                "workflows_enabled": self._workflow_call is not None,
                 "chat_turn_history": self._chat_history is not None
                 and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),

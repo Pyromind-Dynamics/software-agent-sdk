@@ -55,7 +55,7 @@ for (const endpoint of ["https://openrouter.ai/api/v1", "https://api.openai.com/
       else process.env.PYROMIND_PI_MAX_OUTPUT_TOKENS = previous;
     });
     const { modelRuntime, model } = await createPiModelRuntime({
-      provider: "openai", modelId: "gpt-4o", apiKey: "test-key",
+      provider: "openai", modelId: "gpt-4o", apiKey: "sk-test",
       baseUrl: endpoint, api: "openai-completions", contextWindow: 128_000,
     });
     assert.equal(model.contextWindow, 128_000);

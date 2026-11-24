@@ -46,6 +46,7 @@ class SessionSpec(ContractModel):
     skill_allowlist: tuple[str, ...] | None = None
     development_tool_allowlist: tuple[str, ...] | None = None
     development_skill_allowlist: tuple[str, ...] | None = None
+    development_product_instructions: str | None = None
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     preparation_policy: PreparationPolicy | None = None

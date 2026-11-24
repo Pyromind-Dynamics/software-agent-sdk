@@ -1,7 +1,7 @@
 # Pi 重复生成保护
 
 检测与中断复用 [pi-no-spin](https://github.com/wilhg/pi-no-spin) 1.0.2 的原始扩展工厂，
-不复制或修改检测算法。Pi SDK 保持 0.87.0；使用显式依赖 jiti 2.7.0 加载插件发布的
+不复制或修改检测算法。Pi SDK 使用 1.2.0；使用显式依赖 jiti 2.7.0 加载插件发布的
 TypeScript，支持编译后的 Node 服务。
 
 ## 行为和边界

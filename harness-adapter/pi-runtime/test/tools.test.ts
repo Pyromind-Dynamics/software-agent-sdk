@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { restrictSkillReads } from "../src/session-policy.js";
 import {
@@ -89,7 +88,6 @@ test("sandbox read resolves the remote endpoint for Storage paths", async (conte
   let ensures = 0;
   const tools = await createTools(
     {} as JsonlRpcPeer,
-    new NodeExecutionEnv({ cwd: root }),
     root,
     "sandbox",
     [],
@@ -138,7 +136,6 @@ test("sandbox lanes resolve logical task paths without changing Storage paths", 
   let sandbox!: SandboxTools;
   await createTools(
     {} as JsonlRpcPeer,
-    new NodeExecutionEnv({ cwd: root }),
     root,
     "sandbox",
     [],

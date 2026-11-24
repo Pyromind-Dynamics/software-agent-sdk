@@ -5,8 +5,6 @@
 # Usage:
 #   chmod +x start_inference.sh
 #   ./start_inference.sh
-#   ./start_inference.sh --agentgenome       # enable workflow tools
-#   ./start_inference.sh --test-agentgenome  # validate without model keys
 # ============================================================
 
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -67,7 +65,6 @@ export PYROMIND_RUN_ARCHIVES_ENABLED=1
 # Studio, Storage and Sandbox route by this environment and the request region.
 export APP_ENV="${APP_ENV:-prod}"
 export PYROMIND_PI_TERMINAL_BACKEND="${PYROMIND_PI_TERMINAL_BACKEND:-sandbox}"
-export PYROMIND_AGENTGENOME_ENABLED=1
 export PYROMIND_PUBLIC_API_BASE="${PYROMIND_PUBLIC_API_BASE:-http://localhost:5173}"
 export PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET
 
@@ -301,7 +298,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 console.log(`Pi runtime ready (Node ${process.versions.node}):`);
-for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents", "@agentgenome/pi-extension"]) {
+for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents"]) {
   const manifest = JSON.parse(readFileSync(join(process.argv[2], "node_modules", name, "package.json"), "utf8"));
   console.log(`  ${name}@${manifest.version}`);
 }
