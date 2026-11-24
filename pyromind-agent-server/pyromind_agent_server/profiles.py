@@ -93,7 +93,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=35,
+    configuration_version=36,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
