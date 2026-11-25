@@ -159,6 +159,68 @@ def test_dataset_summary_registers_against_the_single_declared_training_file():
         _read_report(storage, "dataset", {**outputs, "val": "/run/val.jsonl"})
 
 
+def test_merged_dataset_summary_uses_only_the_declared_train_and_validation_files():
+    summary = {
+        "output_dir": "/workspace/run/merged",
+        "n_train": 390,
+        "n_val": 66,
+        "train_labels": {"defect": 130, "fail": 130, "pass": 130},
+        "val_labels": {"defect": 22, "fail": 22, "pass": 22},
+    }
+    storage = cast(
+        EvaluationStorage,
+        SimpleNamespace(read=lambda _: json.dumps(summary).encode()),
+    )
+    outputs = {
+        "train_messages": "/run/merged/train.jsonl",
+        "val_messages": "/run/merged/val.jsonl",
+        "data_report": "/run/merged/data_report.json",
+    }
+    assert _read_report(storage, "dataset", outputs)["files"] == [
+        {
+            "name": f"{split}_messages",
+            "path": f"/workspace/run/merged/{split}.jsonl",
+            "size_bytes": None,
+            "sample_count": summary[f"n_{split}"],
+            "distributions": {"label": summary[f"{split}_labels"]},
+        }
+        for split in ("train", "val")
+    ]
+    with pytest.raises(InvalidPlanDelivery, match="invalid_report"):
+        _read_report(
+            storage, "dataset", {**outputs, "val_messages": "/other/val.jsonl"}
+        )
+
+
+def test_evaluation_comparison_preserves_measured_metric_deltas():
+    body = {
+        "metrics": [
+            {"label": "result_accuracy", "value": 0.47, "unit": "ratio"},
+            {
+                "label": "result_accuracy_delta",
+                "baseline": 0.55,
+                "candidate": 0.47,
+                "delta": -0.08,
+                "unit": "ratio",
+            },
+            {
+                "label": "invalid_delta",
+                "baseline": 0.5,
+                "candidate": 0.4,
+                "delta": "unknown",
+            },
+        ]
+    }
+    storage = cast(
+        EvaluationStorage, SimpleNamespace(read=lambda _: json.dumps(body).encode())
+    )
+    document = _read_report(storage, "eval", {"final_report": "/run/final_report.json"})
+    assert document["metrics"] == [
+        {"label": "result_accuracy", "value": 0.47, "unit": "ratio"},
+        {"label": "result_accuracy_delta", "value": -0.08, "unit": "ratio"},
+    ]
+
+
 @pytest.mark.parametrize(
     ("stage", "outputs"),
     [

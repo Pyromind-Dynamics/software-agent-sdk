@@ -20,6 +20,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import ExperimentTask
 from pyromind_runtime.domain.observations import ObservationDatasetFile
+from pyromind_runtime.domain.stage_analysis import StageAnalysisMetric
 from pyromind_runtime.domain.storage_paths import (
     normalize_workspace_path,
     to_storage_api_path,
@@ -37,6 +38,8 @@ from pyromind_runtime.ports.storage import EvaluationStorage
 
 
 DELIVERY_STAGE_KINDS = frozenset({"init", "dataset", "train", "eval"})
+DATASET_REPORT_FORMAT_VERSION = 1
+MERGED_DATASET_OUTPUTS = {"train_messages": "train", "val_messages": "val"}
 
 
 class InvalidPlanDelivery(ValueError):
@@ -219,6 +222,8 @@ def _read_report(
             raise InvalidPlanDelivery("invalid_report")
         body = source
     metrics = report_metrics(body)
+    if stage == "eval":
+        metrics = [*metrics, *_comparison_report_metrics(body)][:24]
     if not metrics and stage in ("init", "eval"):
         metrics = baseline_evaluation_metrics(body)
     document: JsonObject = {
@@ -235,6 +240,8 @@ def _read_report(
             for name, path in outputs.items()
             if path.endswith((".jsonl", ".csv", ".parquet"))
         ]
+        if not files:
+            files = _merged_dataset_report_files(body, dict(dataset_outputs))
         if not files and len(dataset_outputs) == 1:
             name, path = dataset_outputs[0]
             records = body.get("n_train_records")
@@ -268,3 +275,58 @@ def _read_report(
             ]
         document["files"] = [item.model_dump(mode="json") for item in files]
     return document
+
+
+def _comparison_report_metrics(body: dict) -> list[StageAnalysisMetric]:
+    rows = body.get("metrics")
+    if not isinstance(rows, list):
+        return []
+    return report_metrics(
+        {
+            "metrics": [
+                {
+                    "label": row.get("label"),
+                    "value": row["delta"],
+                    "unit": row.get("unit", "number"),
+                }
+                for row in rows[:24]
+                if isinstance(row, dict)
+                and "value" not in row
+                and {"baseline", "candidate", "delta"} <= row.keys()
+            ]
+        }
+    )
+
+
+def _merged_dataset_report_files(
+    body: dict, outputs: dict[str, str]
+) -> list[ObservationDatasetFile]:
+    directory = body.get("output_dir")
+    if (
+        not isinstance(directory, str)
+        or outputs.keys() != MERGED_DATASET_OUTPUTS.keys()
+    ):
+        return []
+    try:
+        output_dir = PurePosixPath(
+            to_storage_api_path(normalize_workspace_path(directory))
+        )
+    except ValueError:
+        return []
+    if len(set(outputs.values())) != len(outputs):
+        return []
+    files = []
+    for name, split in MERGED_DATASET_OUTPUTS.items():
+        path = PurePosixPath(outputs[name])
+        records = body.get(f"n_{split}")
+        if path.parent != output_dir or type(records) is not int or records < 0:
+            return []
+        files.append(
+            {
+                "name": name,
+                "path": f"/workspace{path}",
+                "sample_count": records,
+                "distributions": {"label": body.get(f"{split}_labels")},
+            }
+        )
+    return dataset_report_files({"files": files})

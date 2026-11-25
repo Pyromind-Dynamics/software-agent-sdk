@@ -151,6 +151,7 @@ export class PiAgentRuntime {
     this.recorder = recorder;
     this.execution = execution;
     this.subagents = subagents;
+    const preparation = params.preparation_dialogue === true;
     const publicUpdates = Array.isArray(params.tools) && params.tools.some(tool => isObject(tool) && tool.name === "publish_echomind_update");
     session.subscribe((event) => {
       if (event.type === "agent_start" && !this.normalizer) {
@@ -188,7 +189,7 @@ export class PiAgentRuntime {
           this.latestUserCommandId = this.pendingCommandIds[0];
         }
       }
-      for (const translated of this.normalizer.translate(event, publicUpdates)) {
+      for (const translated of this.normalizer.translate(event, publicUpdates, preparation)) {
         if (translated.kind !== "usage.updated") this.peer.emit(translated);
       }
     });

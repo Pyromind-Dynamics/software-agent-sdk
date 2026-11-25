@@ -261,6 +261,9 @@ class SnapshotProjector:
         return updated.model_copy(
             update={
                 "through_seq": event.seq,
+                "created_at": event.occurred_at
+                if event.seq == 1
+                else snapshot.created_at,
                 "updated_at": _latest(snapshot.updated_at, event.occurred_at),
             }
         )
@@ -428,6 +431,8 @@ class SnapshotProjector:
         else:
             content = (*content, TextContent(text=text))
         update: dict[str, object] = {"content": content}
+        if isinstance(delta := event.payload.get("preparation_reply_delta"), str):
+            update["preparation_reply"] = (item.preparation_reply or "") + delta
         if (notice := event.payload.get("execution_notice")) is not None:
             update["execution_notice"] = ExecutionNoticeLink.model_validate(notice)
         return self._replace(snapshot, item.model_copy(update=update))
@@ -460,6 +465,8 @@ class SnapshotProjector:
         command_id = event.payload.get("command_id")
         if isinstance(command_id, str):
             update["command_id"] = command_id
+        if isinstance(reply := event.payload.get("preparation_reply"), str):
+            update["preparation_reply"] = reply
         if "content" in event.payload:
             update["content"] = self._content(event.payload)
         if (notice := event.payload.get("execution_notice")) is not None:

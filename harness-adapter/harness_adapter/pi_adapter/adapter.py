@@ -85,10 +85,6 @@ from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
     CHAT_TOOLS,
-    MANAGER_PROFILE,
-    PUBLIC_UPDATE_PREFIX,
-    PUBLISH_UPDATE,
-    PublishUpdate,
 )
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
@@ -554,21 +550,6 @@ class PiAdapter:
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
-        if session.config.get("profile_id") == MANAGER_PROFILE and PUBLISH_UPDATE in (
-            session.config.get("tool_allowlist") or ()
-        ):
-            specs.append(
-                {
-                    "name": PUBLISH_UPDATE,
-                    "description": (
-                        "Send a verified stage result to the user's chat now. "
-                        "Include deliverable links in the exact public Markdown. "
-                        "Use this tool before continuing to the next step. "
-                        "Text alongside a tool call is private."
-                    ),
-                    "input_schema": PublishUpdate.model_json_schema(),
-                }
-            )
         if self._echo_chat_call is not None:
             specs += [
                 {
@@ -1820,6 +1801,9 @@ class PiAdapter:
         await runner.start(
             {
                 "session_id": session.session_id,
+                "preparation_dialogue": session.config.get("profile_id") == "echomind"
+                and "set_preparation_plan"
+                in (session.config.get("tool_allowlist") or ()),
                 "chat_turn_history": self._chat_history is not None
                 and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),
@@ -2044,46 +2028,6 @@ class PiAdapter:
             if not isinstance(tool_arguments, dict):
                 raise ValueError("tool arguments must be an object")
             arguments = dict(tool_arguments)
-            if tool_name == PUBLISH_UPDATE:
-                inflight = session.files.load_inflight() or {}
-                run_id = inflight.get("run_id")
-                call_id = params.get("tool_call_id")
-                if (
-                    session.config.get("profile_id") != MANAGER_PROFILE
-                    or PUBLISH_UPDATE
-                    not in (session.config.get("tool_allowlist") or ())
-                    or params.get("origin") is not None
-                    or not isinstance(run_id, str)
-                    or not run_id
-                    or not isinstance(call_id, str)
-                    or not call_id
-                ):
-                    raise PermissionError(
-                        "Publishing requires an active EchoMind manager run"
-                    )
-                message = PublishUpdate.model_validate(arguments).message
-                if not message.strip():
-                    raise ValueError("The public update must contain a message")
-                identity = f"{PUBLIC_UPDATE_PREFIX}{run_id}:{call_id}"
-                session.queue.put_nowait(
-                    HarnessEvent(
-                        session_id=session.session_id,
-                        event_id=identity,
-                        run_id=run_id,
-                        task_id=inflight.get("task_id"),
-                        turn_id=inflight.get("turn_id"),
-                        type="message.completed",
-                        payload={
-                            "role": "assistant",
-                            "message_id": identity,
-                            "content": [{"type": "text", "text": message}],
-                        },
-                    )
-                )
-                return {
-                    "content": [{"type": "text", "text": "Progress message recorded."}],
-                    "is_error": False,
-                }
             if tool_name in CHAT_TOOLS:
                 tool_call_id = params.get("tool_call_id")
                 if self._echo_chat_call is None or not isinstance(tool_call_id, str):

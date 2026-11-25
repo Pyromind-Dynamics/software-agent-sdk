@@ -950,6 +950,15 @@ class FileProductStore:
         ):
             # Older snapshots omitted message times. The original events retain them.
             return None
+        if snapshot.created_at is None and snapshot.through_seq:
+            # Pre-existing snapshots can recover the start without replaying the log.
+            try:
+                with self.events_path.open("rb") as stream:
+                    first = ProductEvent.model_validate_json(stream.readline())
+            except (OSError, ValueError):
+                return snapshot
+            if first.seq == 1 and first.conversation_id == snapshot.conversation_id:
+                return snapshot.model_copy(update={"created_at": first.occurred_at})
         return snapshot
 
     @staticmethod
