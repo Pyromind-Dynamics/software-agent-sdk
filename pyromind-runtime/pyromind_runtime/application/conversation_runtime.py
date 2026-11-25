@@ -55,6 +55,7 @@ from pyromind_runtime.application.plan_artifact_delivery import (
     InvalidPlanDelivery,
     delivery_key,
     delivery_report,
+    rebuild_legacy_report,
     register_plan_delivery,
 )
 from pyromind_runtime.application.plan_execution import (
@@ -1574,20 +1575,26 @@ class ConversationRuntime:
                         )
                     ):
                         row = rows_by_task[run.task_id]
-                        report = delivery_report(run, row, artifacts, producers)
+                        task = plan_tasks[run.task_id]
+                        report = delivery_report(
+                            run,
+                            row,
+                            artifacts,
+                            producers,
+                            declared_report=task.report_output is not None,
+                        )
                         if report:
                             row["report_version_id"] = report.id
                             run = with_plan_report(run, report)
                         elif (
-                            not plan_tasks[run.task_id].outputs
-                            and run.stage_id not in stages_with_outputs
+                            not task.outputs and run.stage_id not in stages_with_outputs
                         ):
                             run = self._delivery_failed(run, "missing_output")
                         elif not self._closing:
                             run = self._schedule_plan_delivery(
                                 active,
                                 store,
-                                plan_tasks[run.task_id],
+                                task,
                                 run,
                                 row,
                                 previous,
@@ -2335,7 +2342,9 @@ class ConversationRuntime:
         project_id: str,
         node_id: str,
         context: RequestContext,
-    ) -> None:
+        *,
+        report_version_id: str | None = None,
+    ) -> str | None:
         store = self._store(conversation_id)
         store.authorize(context.user_id, context.profile_id)
         if not (context.cookie or context.authorization):
@@ -2349,6 +2358,57 @@ class ConversationRuntime:
             ),
             None,
         )
+        if report_version_id is not None:
+            versions = self.versions
+            factory = self._observation_storage_factory
+            if (
+                snapshot.capabilities.read_only
+                or node is None
+                or node.type != "init"
+                or versions is None
+                or factory is None
+                or snapshot.project is None
+            ):
+                raise ValueError("This stage has no rebuildable baseline report")
+            await self._ensure_active(conversation_id, context)
+            async with self._active[conversation_id].plan_projection_lock:
+                current = await self._load_saved_snapshot(
+                    conversation_id, store, context, recover_inputs=False
+                )
+                project = current.project
+                current_node = next(
+                    (
+                        item
+                        for item in project_observations(current, project_id).nodes
+                        if item.id == node_id and item.type == "init"
+                    ),
+                    None,
+                )
+                if (
+                    current.capabilities.read_only
+                    or project is None
+                    or current_node is None
+                ):
+                    raise ValueError("This stage has no rebuildable baseline report")
+                runs = tuple(
+                    run
+                    for run in current.experiment_executions or ()
+                    if run.run_id in current_node.current_run_ids
+                    and run.state == "succeeded"
+                    and run.report_state == "ready"
+                )
+                run, report = await asyncio.to_thread(
+                    rebuild_legacy_report,
+                    versions,
+                    factory(context),
+                    {task.id: task for task in project.plan.tasks},
+                    runs,
+                    report_version_id,
+                    conversation_id,
+                    context,
+                )
+                self._record_execution(store, with_plan_report(run, report))
+            return report.id
         if (
             snapshot.capabilities.read_only
             or node is None
@@ -2361,6 +2421,7 @@ class ConversationRuntime:
         )
         if rows is None:
             raise ValueError("The current execution record is unavailable")
+        return None
 
     async def get_project_observation_report(
         self,

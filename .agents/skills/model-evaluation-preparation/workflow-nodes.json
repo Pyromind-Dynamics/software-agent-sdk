@@ -10,11 +10,13 @@
       "tasks": [
         {
           "id": "bench",
-          "description": "使用基模或已有预测生成 baseline 指标、逐样本结果与报告。"
+          "description": "使用基模或已有预测生成 baseline 指标、逐样本结果与报告。",
+          "requires_report": true
         },
         {
           "id": "analysis",
-          "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
+          "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。",
+          "requires_report": true
         }
       ]
     },
@@ -37,7 +39,8 @@
       "tasks": [
         {
           "id": "train_run",
-          "description": "训练并登记模型与 checkpoint 产物。"
+          "description": "训练并登记模型与 checkpoint 产物。",
+          "requires_report": true
         }
       ],
       "roles": []
@@ -51,16 +54,19 @@
         {
           "id": "model_eval",
           "description": "对一个模型和一套评测集执行一次推理和评分，输入名为 model 和 dataset。多套评测集各建一个任务。",
-          "evaluation_target": "model"
+          "evaluation_target": "model",
+          "requires_report": true
         },
         {
           "id": "checkpoint_eval",
           "description": "兼容已有候选评测计划。新计划评测模型选 model_eval，复用预测评分或选模选 analysis。",
-          "evaluation_target": "model_or_predictions"
+          "evaluation_target": "model_or_predictions",
+          "requires_report": true
         },
         {
           "id": "analysis",
-          "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。"
+          "description": "基于已有评测或导入结果进行统计、badcase 分析与报告。",
+          "requires_report": true
         }
       ]
     },

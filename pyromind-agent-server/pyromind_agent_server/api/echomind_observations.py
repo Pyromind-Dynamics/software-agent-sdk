@@ -11,6 +11,10 @@ from pyromind_runtime.domain.observations import (
     ObservationReportDetails,
     SeriesPage,
 )
+from pyromind_runtime.ports.storage import (
+    EvaluationStorageMissingError,
+    EvaluationStorageUnavailableError,
+)
 
 
 def _no_store(response: Response) -> None:
@@ -41,6 +45,7 @@ async def overview(project_id: str, request: Request) -> ObservationOverview:
 
 class ArtifactDeliveryRetry(BaseModel):
     project_node_id: str = Field(min_length=1, max_length=128)
+    report_version_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 @router.post("/retry-artifact-delivery", status_code=202)
@@ -49,19 +54,26 @@ async def retry_artifact_delivery(
 ) -> dict[str, str]:
     context, info, _ = _load_project(request, project_id, require_cluster=True)
     try:
-        await get_product_runtime(request).retry_project_artifact_delivery(
+        report_id = await get_product_runtime(request).retry_project_artifact_delivery(
             info.project.conversation_id,
             info.project.project_id,
             payload.project_node_id,
             context,
+            report_version_id=payload.report_version_id,
         )
     except PermissionError as exc:
         raise HTTPException(403, "Storage authorization required") from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(404, "Project conversation is unavailable") from exc
-    except ValueError as exc:
+    except (FileNotFoundError, EvaluationStorageMissingError) as exc:
+        raise HTTPException(
+            404, "Project conversation or report source is unavailable"
+        ) from exc
+    except (OSError, ValueError, EvaluationStorageUnavailableError) as exc:
         raise HTTPException(409, "Artifact delivery cannot be retried") from exc
-    return {"status": "accepted"}
+    return (
+        {"status": "accepted", "report_version_id": report_id}
+        if report_id is not None
+        else {"status": "accepted"}
+    )
 
 
 @router.get("/report-details")

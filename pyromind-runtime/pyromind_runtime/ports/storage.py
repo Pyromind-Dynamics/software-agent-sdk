@@ -31,6 +31,10 @@ class EvaluationStorageUnavailableError(RuntimeError):
         self.retryable = retryable
 
 
+class EvaluationStorageTooLargeError(EvaluationStorageUnavailableError):
+    """An object could not be downloaded within the read limit."""
+
+
 class EvaluationStorage(Protocol):
     """Byte-level access to one run's Storage output directory.
 

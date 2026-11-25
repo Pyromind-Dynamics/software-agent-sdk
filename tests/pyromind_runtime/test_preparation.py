@@ -14,10 +14,17 @@ from sqlalchemy import event
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.application.preparation import Preparations
+from pyromind_runtime.application.preparation import (
+    Preparations,
+    validate_workflow_catalog,
+)
 from pyromind_runtime.domain.commands import CreateProjectCommand
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.experiment_plans import PlanConflictError, PlanOwner
+from pyromind_runtime.domain.experiment_plans import (
+    ExperimentContext,
+    PlanConflictError,
+    PlanOwner,
+)
 from pyromind_runtime.domain.preparation import (
     PREPARATION_TOOLS,
     PreparationPolicy,
@@ -34,6 +41,33 @@ from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
 
 from .fake_adapter import FakeAdapter
 from .test_product_api import _app
+
+
+def test_report_required_tasks_validate_typed_primary_outputs():
+    policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
+    assert policy is not None
+    body = {
+        "stages": [{"id": "baseline", "kind": "init", "name": "Baseline"}],
+        "tasks": [
+            {
+                "id": "score",
+                "kind": "bench",
+                "stage_id": "baseline",
+                "name": "Score predictions",
+                "outputs": [{"name": "baseline_results"}],
+            }
+        ],
+    }
+    legacy = ExperimentContext.model_validate(body)
+    assert "kind" not in legacy.tasks[0].model_dump(mode="json")["outputs"][0]
+    with pytest.raises(ValueError, match="declare an output with kind='report'"):
+        validate_workflow_catalog(policy, legacy)
+    body["tasks"][0]["outputs"][0]["kind"] = "report"
+    declared = ExperimentContext.model_validate(body)
+    validate_workflow_catalog(policy, declared)
+    body["tasks"][0]["outputs"].append({"name": "duplicate", "kind": "report"})
+    with pytest.raises(ValueError, match="only one primary report"):
+        ExperimentContext.model_validate(body)
 
 
 @pytest.fixture

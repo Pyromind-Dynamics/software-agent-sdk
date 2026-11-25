@@ -65,6 +65,10 @@ class StorageFileNotFoundError(ValueError):
     """
 
 
+class StorageFileTooLargeError(ValueError):
+    """A download exceeded its configured byte limit."""
+
+
 class StorageReadError(ValueError):
     """Sanitized read failure with a bounded retry decision."""
 
@@ -572,7 +576,7 @@ def _download_file_once(
                 raise StorageReadError("download", status_code=download.status_code)
             for chunk in download.iter_bytes():
                 if len(content) + len(chunk) > max_bytes:
-                    raise ValueError(
+                    raise StorageFileTooLargeError(
                         f"Storage file exceeds the {max_bytes}-byte preflight limit."
                     )
                 content.extend(chunk)

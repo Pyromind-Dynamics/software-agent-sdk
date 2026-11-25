@@ -33,6 +33,10 @@ Init 合并基模评测与基线解读；Eval 用于训练后候选评测。未�
 每个 model_eval 对应一次推理提交。按模型和评测集的组合分别建任务，输入名固定为 model 和 dataset，用各自的 resource_id 或 task_id/output_name 绑定来源。
 实例 ID 保持稳定，edges 连接 stage ID；下游任务用 task_id/output_name 引用上游产物。
 
+任务类型标记 requires_report 时，在 outputs 中声明一个 kind 为 report 的主报告，
+例如 {"name":"baseline_results","kind":"report"}。产物名用于任务间引用。
+报告为 JSON，metrics 是包含 label、数值 value 和 unit 的非空数组。
+
 计划写明目标、真实输入、已确认约束、任务目的与交付物；实现细节留到执行时决定。
 entry_task_id 选择首先执行的任务，它必须通过 resource_id 引用有实际位置的资源。
 重要信息放入 constraints 或任务 description，不再复制另一份 facts。

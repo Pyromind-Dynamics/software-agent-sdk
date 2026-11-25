@@ -11,6 +11,7 @@ import httpx
 
 from pyromind_common.tools.pyromind_dataset.definition import (
     StorageFileNotFoundError,
+    StorageFileTooLargeError,
     _default_storage_base_url,
     _extract_api_data,
     download_file_from_pyromind,
@@ -25,6 +26,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
+    EvaluationStorageTooLargeError,
     EvaluationStorageUnavailableError,
 )
 
@@ -85,6 +87,10 @@ class PyromindEvaluationStorage(EvaluationStorage):
         except StorageFileNotFoundError as exc:
             raise EvaluationStorageMissingError(
                 f"storage object {path} does not exist"
+            ) from exc
+        except StorageFileTooLargeError as exc:
+            raise EvaluationStorageTooLargeError(
+                "Storage object exceeds the read limit", retryable=False
             ) from exc
         except Exception as exc:
             logger.error("evaluation storage read failed for %s: %s", path, exc)

@@ -4,8 +4,12 @@ import httpx
 import pytest
 
 from pyromind_agent_server import evaluation_storage
+from pyromind_common.tools.pyromind_dataset.definition import StorageFileTooLargeError
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.ports.storage import EvaluationStorageUnavailableError
+from pyromind_runtime.ports.storage import (
+    EvaluationStorageTooLargeError,
+    EvaluationStorageUnavailableError,
+)
 
 
 @pytest.mark.parametrize(("status", "retryable"), [(502, True), (403, False)])
@@ -32,7 +36,7 @@ def test_observation_storage_reads_large_run_manifest_with_bounded_metrics(monke
         assert attempts == 2
         payload = files[storage_path]
         if len(payload) > max_bytes:
-            raise ValueError("file exceeds download limit")
+            raise StorageFileTooLargeError("file exceeds download limit")
         return payload
 
     monkeypatch.setattr(evaluation_storage, "download_file_from_pyromind", download)
@@ -44,5 +48,6 @@ def test_observation_storage_reads_large_run_manifest_with_bounded_metrics(monke
     assert storage.read("/run/metrics.json") == metrics
 
     files["/run/metrics.json"] = manifest
-    with pytest.raises(EvaluationStorageUnavailableError):
+    with pytest.raises(EvaluationStorageTooLargeError) as error:
         storage.read("/run/metrics.json")
+    assert error.value.retryable is False

@@ -12,7 +12,9 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.application.plan_artifact_delivery import (
     InvalidPlanDelivery,
     _read_report,
+    delivery_key,
     delivery_report,
+    rebuild_legacy_report,
     register_plan_delivery,
 )
 from pyromind_runtime.application.plan_execution import (
@@ -26,11 +28,13 @@ from pyromind_runtime.application.project_observations import (
 )
 from pyromind_runtime.application.stage_analysis import ready_stage_analyses
 from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
-from pyromind_runtime.domain.experiment_plans import ExperimentTask
+from pyromind_runtime.domain.experiment_plans import ExperimentTask, PlanOutput
 from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
+from pyromind_runtime.domain.versions import SaveVersion, SnapshotSource, VersionParent
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
@@ -38,10 +42,141 @@ from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionSt
 from pyromind_runtime.ports.harness import SessionSpec
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
+    EvaluationStorageTooLargeError,
     EvaluationStorageUnavailableError,
 )
 
 from .fake_adapter import FakeAdapter
+
+
+def test_primary_report_is_selected_by_type_and_validates_metrics():
+    outputs = {"baseline_results": "/run/results.data", "notes": "/run/notes.json"}
+    read = Mock(return_value=b'{"metrics":[{"label":"accuracy","value":0.55}]}')
+    storage = cast(EvaluationStorage, SimpleNamespace(read=read))
+    document = _read_report(storage, "init", outputs, report_name="baseline_results")
+    read.assert_called_once_with("/run/results.data")
+    assert document["metrics"] == [
+        {"label": "accuracy", "value": 0.55, "unit": "number"}
+    ]
+    read.return_value = b'{"metrics":[{"label":"accuracy","value":"unknown"}]}'
+    with pytest.raises(InvalidPlanDelivery, match="invalid_report_metrics"):
+        _read_report(storage, "init", outputs, report_name="baseline_results")
+    read.return_value = b'{"metrics":[]}'
+    with pytest.raises(InvalidPlanDelivery, match="invalid_report_metrics"):
+        _read_report(storage, "init", outputs, report_name="baseline_results")
+
+
+def test_legacy_detection_preserves_summary_reports_and_skips_oversized_non_reports():
+    def read(path):
+        if path == "/run/config.json":
+            raise EvaluationStorageTooLargeError("file exceeds download limit")
+        if path == "/run/baseline.json":
+            return b'{"metrics":[{"label":"accuracy","value":0.55}]}'
+        return b'{"summary":"The original verification result."}'
+
+    storage = cast(EvaluationStorage, SimpleNamespace(read=read))
+    outputs = {"model_config": "/run/config.json", "report": "/run/report.json"}
+    assert _read_report(storage, "init", outputs) == {
+        "summary": "The original verification result.",
+        "metrics": [],
+    }
+    assert _read_report(
+        storage, "init", {**outputs, "baseline_results": "/run/baseline.json"}
+    )["metrics"] == [{"label": "accuracy", "value": 0.55, "unit": "number"}]
+    with pytest.raises(InvalidPlanDelivery, match="invalid_report"):
+        _read_report(storage, "init", outputs, report_name="model_config")
+
+
+def test_legacy_report_rebuild_reuses_owned_source_and_keeps_the_previous_version(
+    tmp_path,
+):
+    context = RequestContext(user_id="42")
+    snapshots = FileArtifactSnapshots(tmp_path / "storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    project = versions.project("session", context)
+    assert project is not None
+    task = ExperimentTask(
+        id="baseline",
+        stage_id="init",
+        name="Evaluate",
+        outputs=(PlanOutput(name="baseline_results"),),
+    )
+    initial_run = ExperimentExecutionView(
+        project_id="project",
+        plan_sequence=1,
+        run_id="project:baseline:1",
+        task_id=task.id,
+        task_name=task.name,
+        stage_id="init",
+        role_id="main",
+        state="succeeded",
+        report_state="not_started",
+        stage_snapshot={"kind": "init"},
+    )
+    bound: JsonObject = {"plan_execution": [1, initial_run.run_id]}
+    path = "/run/baseline.json"
+    source = snapshots.path(path, context)
+    source.parent.mkdir(parents=True)
+    source.write_text('{"metrics":[{"label":"accuracy","value":0.55}]}')
+    original = versions.save(
+        project,
+        delivery_key(initial_run, "output:baseline_results"),
+        SaveVersion(
+            kind="config",
+            logical_key="baseline/baseline_results",
+            source=SnapshotSource(storage_ref=path, reference_only=True),
+            summary=bound,
+        ),
+        context,
+    )
+    previous = versions.save(
+        project,
+        delivery_key(initial_run, "report"),
+        SaveVersion(
+            kind="report",
+            logical_key="baseline/delivery-report",
+            source=SnapshotSource(text='{"metrics": []}', filename="report.json"),
+            parents=[
+                VersionParent(version_id=original.id, relation="baseline_results")
+            ],
+            summary=bound,
+        ),
+        context,
+    )
+    run = with_plan_report(initial_run, previous)
+    read = Mock(return_value=b'{"metrics":[{"label":"accuracy","value":0.55}]}')
+    storage = cast(EvaluationStorage, SimpleNamespace(read=read))
+    _, report = rebuild_legacy_report(
+        versions, storage, {task.id: task}, (run,), previous.id, "session", context
+    )
+    read.assert_called_once_with(path)
+    assert report.id != previous.id and report.version_no == previous.version_no + 1
+    assert report.manifest.parents[-1] == VersionParent(
+        version_id=previous.id, relation="supersedes"
+    )
+    assert versions.store.get_version(project.id, previous.id) == previous
+    with pytest.raises(InvalidPlanDelivery, match="invalid_output"):
+        rebuild_legacy_report(
+            versions, storage, {}, (run,), previous.id, "session", context
+        )
+    assert (
+        rebuild_legacy_report(
+            versions,
+            storage,
+            {task.id: task},
+            (with_plan_report(run, report),),
+            previous.id,
+            "session",
+            context,
+        )[1]
+        == report
+    )
+    saved = tuple(versions.store.list_versions(project.id))
+    assert delivery_report(run, {"report_version_id": previous.id}, saved, {}) == report
+    with pytest.raises(InvalidPlanDelivery, match="ambiguous_report"):
+        _read_report(
+            storage, "init", {"baseline_results": path, "other": "/run/other.json"}
+        )
 
 
 async def test_delivery_recovers_after_sign_in_and_a_storage_gateway_error(

@@ -167,6 +167,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                 "kind": kind,
                 "stage_id": key,
                 "name": key,
+                "outputs": [{"name": "primary_results", "kind": "report"}],
                 "inputs": [
                     {"name": "model", "resource_id": "merged"},
                     {"name": "dataset", "resource_id": "data"},
@@ -293,6 +294,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             ]
             rows[1]["plan_attempt"] = 3
             rows[-1]["report_version_id"] = artifact.id
+            rows[-1]["verified_outputs"] = {"primary_results": artifact.id}
             rows[-1]["business_status"] = "in_progress"
             plan_file: dict[str, object] = {"tasks": rows}
             if state_format == "task_records":
