@@ -524,6 +524,22 @@ class ConversationRuntime:
         snapshot = await self.get_snapshot(conversation_id, context)
         return snapshot.experiment_executions or ()
 
+    async def read_input_html(
+        self, conversation_id: str, request_id: str, context: RequestContext
+    ) -> str:
+        import hashlib
+
+        store = await self._read_store(conversation_id, context)
+        pending = next((item for item in store.load_snapshot().pending_inputs
+                        if item.request_id == request_id), None)
+        artifact = pending.presentation.html_artifact if pending and pending.presentation else None
+        if artifact is None:
+            raise FileNotFoundError("pending HTML presentation not found")
+        html = await self.read_workspace_text(conversation_id, artifact.path, context, max_bytes=4 * 1024 * 1024)
+        if html is None or hashlib.sha256(html.encode()).hexdigest() != artifact.sha256:
+            raise ValueError("HTML presentation is missing or has changed")
+        return html
+
     async def read_input_media(
         self,
         conversation_id: str,

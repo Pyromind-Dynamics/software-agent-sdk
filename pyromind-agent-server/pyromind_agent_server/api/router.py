@@ -429,6 +429,18 @@ def create_product_router(
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
 
+    @router.get("/{conversation_id}/pending-inputs/{request_id}/html")
+    async def read_input_html(conversation_id: str, request_id: str, request: Request):
+        try:
+            html = await get_product_runtime(request).read_input_html(
+                conversation_id, request_id, context_for(request)
+            )
+            return JSONResponse({"html": html}, headers={"Cache-Control": "private, no-store"})
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+
     @router.get(
         "/{conversation_id}/pending-inputs/{request_id}/media/{content_index}/{image_index}"
     )
