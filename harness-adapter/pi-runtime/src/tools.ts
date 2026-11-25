@@ -11,7 +11,7 @@ import {
   createReadTool as createCodingReadTool,
   createWriteTool as createCodingWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { isRecord, type JsonObject } from "./protocol.js";
+import { decodeObjectArgument, isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 import {
   createSandboxFileOperations,
@@ -394,6 +394,9 @@ export function businessTool(peer: JsonlRpcPeer, config: BusinessToolConfig, rol
   };
   return { name: config.name, label: config.name, description: config.description,
     parameters: config.inputSchema as TSchema, executeChild,
+    ...(config.name === "set_preparation_plan" && {
+      prepareArguments: (args: unknown) => decodeObjectArgument(args, "plan"),
+    }),
     execute: (id, args, signal) => executeChild(id, args, signal),
   };
 }

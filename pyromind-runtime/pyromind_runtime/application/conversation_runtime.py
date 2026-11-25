@@ -93,7 +93,6 @@ from pyromind_runtime.application.reward_workflows import (
     validate_reward_workflow,
 )
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
-from pyromind_runtime.application.task_monitor import TaskMonitor
 from pyromind_runtime.application.stage_analysis import (
     existing_stage_analysis,
     ready_stage_analyses,
@@ -101,6 +100,7 @@ from pyromind_runtime.application.stage_analysis import (
     stage_analysis_evidence,
     validate_stage_analysis,
 )
+from pyromind_runtime.application.task_monitor import TaskMonitor
 from pyromind_runtime.application.train_observer import TrainObserver
 from pyromind_runtime.application.user_input_coordinator import UserInputCoordinator
 from pyromind_runtime.application.versions import Versions, VersionSnapshotError
@@ -4012,8 +4012,9 @@ class ConversationRuntime:
                     await self._recover_saved_project_step(
                         store, snapshot, recovery_context
                     )
-                if recover_execution and self._has_pending_external_work(
-                    snapshot, context
+                if recover_execution and (
+                    (active is None and self._has_interrupted_turn(snapshot))
+                    or self._has_pending_external_work(snapshot, context)
                 ):
                     try:
                         if active is None:
@@ -5612,9 +5613,8 @@ class ConversationRuntime:
     ) -> FileProductStore:
         """Return the store for a read without materialising a harness session.
 
-        A read is how a dormant conversation is woken for a platform task that
-        finished while nobody was watching, so it attaches only when such work
-        is waiting. Attaching on every read would undo each release: clients
+        Attach when an interrupted turn needs reconciliation or a platform task
+        needs attention. Attaching on every read would undo each release: clients
         poll snapshots and re-open event streams while a conversation sits idle.
         """
         store = self._store(conversation_id)
@@ -5629,9 +5629,13 @@ class ConversationRuntime:
             and not adapter.can_recover_on_read(context)
         ):
             return store
-        if conversation_id in self._active or self._has_pending_external_work(
-            await asyncio.to_thread(store.load_snapshot), context
-        ):
+        needs_attach = conversation_id in self._active
+        if not needs_attach:
+            snapshot = await asyncio.to_thread(store.load_snapshot)
+            needs_attach = self._has_interrupted_turn(
+                snapshot
+            ) or self._has_pending_external_work(snapshot, context)
+        if needs_attach:
             store = await self._ensure_active(conversation_id, context)
         else:
             # No live execution in this process: leftover inputs belong to a
@@ -5639,6 +5643,16 @@ class ConversationRuntime:
             await self._user_input.coordinate_recovery(store, conversation_id)
         store.save_x_cluster(context.x_cluster)
         return store
+
+    @staticmethod
+    def _has_interrupted_turn(snapshot: ConversationSnapshot) -> bool:
+        # With no live session, the adapter reconciles the persisted run on attach.
+        return (
+            snapshot.status == "running"
+            and bool(snapshot.active_run_id)
+            and not snapshot.pending_inputs
+            and not snapshot.pending_permissions
+        )
 
     def _has_pending_external_work(
         self, snapshot: ConversationSnapshot, context: RequestContext

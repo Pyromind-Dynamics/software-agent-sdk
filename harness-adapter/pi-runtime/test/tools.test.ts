@@ -24,7 +24,14 @@ test("business tools carry trusted context separately from model arguments", asy
   const config = { name: "set_preparation_plan", description: "", inputSchema: {} };
   const tool = businessTool(peer, config, undefined, () => ({preparation_revision: 5}));
   const args = {entry_task_id: "first", plan: {}};
-  await tool.execute("call", args, undefined);
+  assert.ok(tool.prepareArguments);
+  assert.equal(tool.prepareArguments(args), args);
+  for (const plan of ["[]", "null", "incomplete {"]) {
+    const invalid = { ...args, plan };
+    assert.equal(tool.prepareArguments(invalid), invalid);
+  }
+  const prepared = tool.prepareArguments({ ...args, plan: JSON.stringify(args.plan) });
+  await tool.execute("call", prepared, undefined);
   assert.deepEqual(request, {
     preparation_revision: 5, tool_call_id: "call",
     tool_name: "set_preparation_plan", arguments: args,

@@ -50,7 +50,7 @@
       "tasks": [
         {
           "id": "model_eval",
-          "description": "对指定模型执行推理和评分。model 输入绑定目标模型，dataset 输入绑定评测集。",
+          "description": "对一个模型和一套评测集执行一次推理和评分，输入名为 model 和 dataset。多套评测集各建一个任务。",
           "evaluation_target": "model"
         },
         {

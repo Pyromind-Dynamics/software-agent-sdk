@@ -95,8 +95,8 @@ fi
 # LLM Configuration
 # ----------------------------------------------------------
 # LiteLLM requires a provider prefix (e.g. openai/) for custom OpenAI-compatible endpoints.
-default_model="openai/deepseek-v4-pro-0813"
-default_base_url="https://pre-token-plan-cn-east-1.pyromind.ai/v1"
+default_model="openai/glm-5.3"
+default_base_url="https://token-plan-cn-east-1.pyromind.ai/v1"
 export LLM_MODEL="${LLM_MODEL:-${default_model}}"
 export LLM_BASE_URL="${LLM_BASE_URL:-${default_base_url}}"
 
