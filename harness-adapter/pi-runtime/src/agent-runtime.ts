@@ -361,6 +361,7 @@ export class PiAgentRuntime {
 
   private async runPrompt(runId: string, prompt: ParsedPrompt, trace?: JsonValue): Promise<void> {
     try {
+      if (this.finishedRuns.has(runId)) return;
       if (this.cancelledRuns.has(runId)) return this.finishRun(runId, { status: "cancelled" });
       const session = this.requireSession();
       this.recorder?.begin(runId, trace);
@@ -376,9 +377,13 @@ export class PiAgentRuntime {
       });
     } finally {
       this.discardCommand(runId);
-      this.normalizer = undefined;
-      this.drainNotifications();
+      this.releaseRunNormalizer(runId);
     }
+  }
+
+  private releaseRunNormalizer(runId: string): void {
+    if (this.normalizer?.runId === runId) this.normalizer = undefined;
+    this.drainNotifications();
   }
 
   private finishRun(runId: string, outcome: RunOutcome): void {
@@ -423,11 +428,19 @@ export class PiAgentRuntime {
       this.executionSuspended = true;
       this.suspensionRevision++;
     }
-    if (this.activeRunId) this.cancelledRuns.add(this.activeRunId);
+    const runId = this.activeRunId;
+    if (runId) this.cancelledRuns.add(runId);
     try {
       await Promise.all([this.subagents?.stopAll(), this.requireSession().abort()]);
-      return { cancelled: true };
+      if (runId && this.activeRunId === runId) {
+        this.finishRun(runId, { status: "cancelled", stop_reason: "aborted" });
+        this.discardCommand(runId);
+        if (this.autonomousRunId === runId) this.autonomousRunId = undefined;
+        this.releaseRunNormalizer(runId);
+      }
     } finally { this.cancelling = false; }
+    this.drainNotifications();
+    return { cancelled: true };
   }
 
   private suspendRepetitiveGeneration(): void {
@@ -543,10 +556,10 @@ export class PiAgentRuntime {
     message: { customType: string; content: string; display: boolean; details: JsonObject },
     notificationId: string,
   ): Promise<void> {
-    if (this.cancelledRuns.has(runId)) {
+    if (this.cancelledRuns.has(runId) || this.finishedRuns.has(runId)) {
       this.pendingNotifications.unshift({ runId: notificationId, message });
       this.finishRun(runId, { status: "cancelled" });
-      this.normalizer = undefined;
+      this.releaseRunNormalizer(runId);
       return;
     }
     let outcome: RunOutcome = {status: "failed", error_code: "interrupted"};
@@ -555,7 +568,7 @@ export class PiAgentRuntime {
       await session.sendCustomMessage(message, {
         triggerTurn: true,
       });
-      outcome = this.outcome.normalize(session.messages);
+      outcome = this.finishedRuns.has(runId) ? { status: "cancelled" } : this.outcome.normalize(session.messages);
       this.finishRun(runId, outcome);
     } catch (error) {
       this.finishRun(runId, {
@@ -565,8 +578,7 @@ export class PiAgentRuntime {
       });
     } finally {
       this.requireSession().sessionManager.appendCustomEntry("pyromind.notification.finished", { runId: notificationId, execution_run_id: runId, status: outcome.status });
-      this.normalizer = undefined;
-      this.drainNotifications();
+      this.releaseRunNormalizer(runId);
     }
   }
 
@@ -603,10 +615,10 @@ export class PiAgentRuntime {
     const stage = this.stages.get(id)!;
     let result: RunOutcome;
     try {
-      if (this.cancelledRuns.has(stage.executionId)) {
+      if (this.cancelledRuns.has(stage.executionId) || this.finishedRuns.has(stage.executionId)) {
         this.finishRun(stage.executionId, { status: "cancelled" });
         stage.state = "finished";
-        this.normalizer = undefined;
+        this.releaseRunNormalizer(stage.executionId);
         stage.resolve({ status: "cancelled", execution_id: stage.executionId });
         return;
       }
@@ -618,12 +630,11 @@ export class PiAgentRuntime {
     } catch (error) {
       result = { status: "failed", message: error instanceof Error ? error.message : "stage failed" };
     }
-    if (this.cancelledRuns.has(stage.executionId)) result = { status: "cancelled" };
+    if (this.cancelledRuns.has(stage.executionId) || this.finishedRuns.has(stage.executionId)) result = { status: "cancelled" };
     this.finishRun(stage.executionId, result);
     stage.state = "finished";
-    this.normalizer = undefined;
     stage.resolve({ status: result.status, execution_id: stage.executionId });
-    this.drainNotifications();
+    this.releaseRunNormalizer(stage.executionId);
   }
 
   private drainNotifications(): void {
