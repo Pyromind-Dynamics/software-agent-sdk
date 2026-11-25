@@ -1804,6 +1804,8 @@ class PiAdapter:
                 "preparation_dialogue": session.config.get("profile_id") == "echomind"
                 and "set_preparation_plan"
                 in (session.config.get("tool_allowlist") or ()),
+                "project_dialogue": session.config.get("profile_id") == "echomind"
+                and self._queues_messages(session),
                 "chat_turn_history": self._chat_history is not None
                 and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),

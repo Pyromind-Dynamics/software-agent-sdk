@@ -326,6 +326,38 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                         },
                     )
                 )
+            project_answer = "Project evaluation is complete"
+            first_chunk = "Project evaluation"
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    task_id="execution-task",
+                    type="message.delta",
+                    payload={
+                        "message_id": "project-answer",
+                        "text": private,
+                        "project_reply_delta": first_chunk,
+                    },
+                )
+            )
+            path = f"{profile.route_prefix}/{conversation_id}/snapshot"
+            partial = await client.get(path)
+            assert partial.status_code == 200
+            assert private not in partial.text
+            assert first_chunk in partial.text
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    task_id="execution-task",
+                    type="message.completed",
+                    payload={
+                        "role": "assistant",
+                        "message_id": "project-answer",
+                        "content": blocks,
+                        "project_reply": project_answer,
+                    },
+                )
+            )
             store.append(
                 ProductEvent(
                     conversation_id=conversation_id,
@@ -344,14 +376,14 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     payload={"code": "test", "message": safe},
                 )
             )
-            path = f"{profile.route_prefix}/{conversation_id}/snapshot"
             view = await client.get(path)
             assert view.status_code == 200
             assert private not in view.text
             assert safe in view.text
             messages = [i for i in view.json()["timeline"] if i["kind"] == "message"]
             assert [m["content"] for m in messages] == [
-                [{"type": "text", "text": public_answer}]
+                [{"type": "text", "text": public_answer}],
+                [{"type": "text", "text": project_answer}],
             ]
             assert store.load_snapshot().timeline[0].kind == "message"
             context = RequestContext(user_id="42", profile_id=profile.profile_id)
@@ -367,6 +399,11 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     assert private not in frame
                     frames.append(frame)
                 assert any(public_answer in frame for frame in frames)
+                assert any(
+                    "event: message.delta" in frame and first_chunk in frame
+                    for frame in frames
+                )
+                assert any(project_answer in frame for frame in frames)
                 assert safe in frames[-1]
             finally:
                 await events.aclose()

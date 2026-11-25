@@ -37,11 +37,16 @@ def execution_snapshot(snapshot: ConversationSnapshot) -> ConversationSnapshot:
                 }
             )
         elif isinstance(item, TimelineMessage) and item.role != "user":
-            if item.task_id or item.role != "assistant" or not item.preparation_reply:
+            if item.role != "assistant":
+                continue
+            reply = item.project_reply or (
+                item.preparation_reply if not item.task_id else None
+            )
+            if not reply:
                 continue
             item = item.model_copy(
                 update={
-                    "content": (TextContent(text=item.preparation_reply),),
+                    "content": (TextContent(text=reply),),
                     "preparation_reply": None,
                 }
             )
@@ -55,6 +60,40 @@ def execution_event(event: ProductEvent) -> ProductEvent:
         event.type in {"message.started", "message.completed"}
         and payload.get("role") != "user"
     ):
+        if (
+            event.type == "message.delta"
+            and isinstance(project_delta := payload.get("project_reply_delta"), str)
+            and project_delta
+        ):
+            return event.model_copy(
+                update={
+                    "payload": {
+                        "message_id": payload["message_id"],
+                        "role": "assistant",
+                        "text": project_delta,
+                        "project_reply_delta": project_delta,
+                    }
+                }
+            )
+        if (
+            event.type == "message.completed"
+            and payload.get("role") == "assistant"
+            and "project_reply" in payload
+        ):
+            reply = payload["project_reply"]
+            if reply is None or isinstance(reply, str):
+                return event.model_copy(
+                    update={
+                        "payload": {
+                            "message_id": payload["message_id"],
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": reply}]
+                            if reply
+                            else [],
+                            "project_reply": reply,
+                        }
+                    }
+                )
         if not event.task_id:
             key = (
                 "preparation_reply_delta"

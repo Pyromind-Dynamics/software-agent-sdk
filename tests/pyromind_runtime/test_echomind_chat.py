@@ -1,6 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -21,10 +22,12 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
+    CHAT_PREFIX,
     CHAT_PROFILE,
     CHAT_TOOLS,
     ENQUEUE,
     GET_STATUS,
+    MANAGER_PROFILE,
     READ_REPORT,
 )
 from pyromind_runtime.domain.errors import ProductRuntimeError
@@ -45,6 +48,56 @@ from .test_preparation import (
     ready_request as ready_request,
 )
 from .test_product_api import _app
+
+
+async def test_manager_summaries_rank_newer_saved_chat_activity(tmp_path):
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42", profile_id=MANAGER_PROFILE)
+    try:
+        for manager_id in ("chat-first", "main-first"):
+            await runtime.create_conversation(
+                SessionSpec(
+                    conversation_id=manager_id,
+                    user_id=context.user_id,
+                    workspace_root=str(tmp_path / manager_id),
+                    profile_id=MANAGER_PROFILE,
+                ),
+                context,
+            )
+        chat_id = f"{CHAT_PREFIX}chat-first"
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=chat_id,
+                user_id=context.user_id,
+                workspace_root=str(tmp_path / chat_id),
+                profile_id=CHAT_PROFILE,
+            ),
+            replace(context, profile_id=CHAT_PROFILE),
+        )
+        main_time = datetime(2090, 1, 1, tzinfo=UTC)
+        chat_time = datetime(2090, 1, 2, tzinfo=UTC)
+        for conversation_id, at in (
+            ("main-first", main_time),
+            (chat_id, chat_time),
+        ):
+            runtime._store(conversation_id).append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    occurred_at=at,
+                    type="status.changed",
+                    payload={"status": "idle"},
+                )
+            )
+        summaries = await runtime.list_summaries(context)
+        assert [(item.conversation_id, item.updated_at) for item in summaries] == [
+            ("chat-first", chat_time),
+            ("main-first", main_time),
+        ]
+        assert (
+            await runtime.echomind_chat.saved_updated_at("chat-first", "other") is None
+        )
+    finally:
+        await runtime.close()
 
 
 async def test_saved_report_remains_readable_without_chat_delivery(

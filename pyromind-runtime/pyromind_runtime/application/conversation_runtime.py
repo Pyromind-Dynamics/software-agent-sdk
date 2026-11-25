@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -5601,14 +5601,32 @@ class ConversationRuntime:
         started = time.perf_counter()
         result = "error"
         try:
-            summaries = tuple(
-                ConversationSummary.from_snapshot(snapshot)
-                for snapshot in await self.list_snapshots(
-                    context, conversation_ids=conversation_ids
-                )
+            snapshots = await self.list_snapshots(
+                context, conversation_ids=conversation_ids
             )
+            summaries = []
+            for snapshot in snapshots:
+                summary = ConversationSummary.from_snapshot(snapshot)
+                if context.profile_id == MANAGER_PROFILE:
+                    chat_updated_at = await self.echomind_chat.saved_updated_at(
+                        snapshot.conversation_id, context.user_id
+                    )
+                    if chat_updated_at is not None and (
+                        summary.updated_at is None
+                        or chat_updated_at > summary.updated_at
+                    ):
+                        summary = summary.model_copy(
+                            update={"updated_at": chat_updated_at}
+                        )
+                summaries.append(summary)
+            if context.profile_id == MANAGER_PROFILE:
+                unknown = datetime.min.replace(tzinfo=UTC)
+                summaries.sort(
+                    key=lambda item: item.updated_at or item.created_at or unknown,
+                    reverse=True,
+                )
             result = "ok"
-            return summaries
+            return tuple(summaries)
         finally:
             self._log_timing(
                 "conversation_summaries_ms",

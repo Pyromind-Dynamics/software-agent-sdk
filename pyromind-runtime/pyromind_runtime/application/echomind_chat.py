@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from datetime import datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,7 @@ from pyromind_runtime.domain.snapshot import (
     TimelineOperation,
 )
 from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.infrastructure.file_product_store import ProductStoreError
 from pyromind_runtime.ports.harness import SessionSpec
 
 
@@ -121,6 +123,20 @@ class EchoMindChat:
         if not self._runtime._store(chat_id).metadata_path.is_file():
             return None
         return await self._runtime.get_snapshot(chat_id, context)
+
+    async def saved_updated_at(self, manager_id: str, user_id: str) -> datetime | None:
+        store = self._runtime._store(CHAT_PREFIX + manager_id)
+        if not store.metadata_path.is_file():
+            return None
+
+        def load_updated_at() -> datetime | None:
+            try:
+                store.authorize(user_id, CHAT_PROFILE)
+                return store.load_snapshot().updated_at
+            except (OSError, ValueError, ProductStoreError):
+                return None
+
+        return await asyncio.to_thread(load_updated_at)
 
     async def open(
         self, manager_id: str, model: JsonObject, context: RequestContext

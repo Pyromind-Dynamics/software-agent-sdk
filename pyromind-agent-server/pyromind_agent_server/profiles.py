@@ -93,7 +93,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=39,
+    configuration_version=40,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
@@ -121,7 +121,10 @@ the user creates the Project.""",
 Write public_data/workflowPLAN.json, then execute the accepted entry task directly.
 Record execution outcomes in workflowPLAN and verified outputs.
 Before finishing an execution round, give a concise public result in the user's
-language. State what was completed, or what is still waiting or blocked.
+language. Begin the final public text with [[echomind:reply]] before any other
+text so the workbench can display it as it arrives. Use this marker only for
+final user-facing output. State what was completed, or what is still waiting
+or blocked.
 Deliver requested summaries in that result. Keep internal reasoning,
 credentials and tool transcripts out of the result.
 """

@@ -433,6 +433,8 @@ class SnapshotProjector:
         update: dict[str, object] = {"content": content}
         if isinstance(delta := event.payload.get("preparation_reply_delta"), str):
             update["preparation_reply"] = (item.preparation_reply or "") + delta
+        if isinstance(project_delta := event.payload.get("project_reply_delta"), str):
+            update["project_reply"] = (item.project_reply or "") + project_delta
         if (notice := event.payload.get("execution_notice")) is not None:
             update["execution_notice"] = ExecutionNoticeLink.model_validate(notice)
         return self._replace(snapshot, item.model_copy(update=update))
@@ -467,6 +469,10 @@ class SnapshotProjector:
             update["command_id"] = command_id
         if isinstance(reply := event.payload.get("preparation_reply"), str):
             update["preparation_reply"] = reply
+        if "project_reply" in event.payload:
+            project_reply = event.payload["project_reply"]
+            if isinstance(project_reply, str) or project_reply is None:
+                update["project_reply"] = project_reply
         if "content" in event.payload:
             update["content"] = self._content(event.payload)
         if (notice := event.payload.get("execution_notice")) is not None:

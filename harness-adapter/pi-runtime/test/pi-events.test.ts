@@ -176,3 +176,45 @@ test("only a direct preparation turn exposes the Main answer", () => {
     assert.equal(completed!.payload.preparation_reply, expected);
   }
 });
+
+test("project rounds publish the final answer without tool commentary or reasoning", () => {
+  const normalizer = new PiEventNormalizer("manager", "run", [], new Map(), "stage-task");
+  const complete = (content: unknown[], projectDialogue = true) => {
+    const message = { role: "assistant", stopReason: "stop", content,
+      usage: { input: 1, output: 1, cacheRead: 0, cost: { total: 0 } } };
+    return normalizer.translate({ type: "message_end", message } as unknown as AgentSessionEvent,
+      false, false, projectDialogue)[0]!.payload.project_reply;
+  };
+  const answer = { type: "text", text: "评估已完成" };
+  assert.equal(complete([{ type: "thinking", thinking: "private" }, answer]), "评估已完成");
+  assert.equal(complete([answer, { type: "toolCall", id: "tool", name: "read", arguments: {} }]), undefined);
+  assert.equal(complete([{ type: "text", text: "<think>private</think>" }, answer]), undefined);
+  assert.equal(complete([answer], false), undefined);
+});
+
+test("a marked project reply streams safe fragments with the final message identity", () => {
+  const normalizer = new PiEventNormalizer("manager", "run", [], new Map(), "stage-task");
+  const start = () => normalizer.translate({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as AgentSessionEvent, false, false, true)[0]!;
+  const delta = (text: string) => normalizer.translate({ type: "message_update",
+    assistantMessageEvent: { type: "text_delta", delta: text } } as AgentSessionEvent, false, false, true)[0]!;
+  const finish = (text: string) => normalizer.translate({ type: "message_end", message: {
+    role: "assistant", stopReason: "stop", content: [{ type: "text", text }],
+    usage: { input: 1, output: 1, cacheRead: 0, cost: { total: 0 } },
+  } } as unknown as AgentSessionEvent, false, false, true)[0]!;
+
+  start();
+  assert.equal(delta("internal draft").payload.project_reply_delta, undefined);
+  const begun = start();
+  assert.equal(delta("[[echomind:").payload.project_reply_delta, undefined);
+  const first = delta("reply]]评估");
+  const second = delta("已完成。");
+  const end = finish("[[echomind:reply]]评估已完成。");
+  assert.deepEqual([first.payload.project_reply_delta, second.payload.project_reply_delta], ["评估", "已完成。"]);
+  assert.deepEqual([first, second, end].map(event => event.payload.message_id), Array(3).fill(begun.payload.message_id));
+  assert.equal(end.payload.project_reply, "评估已完成。");
+
+  start();
+  assert.equal(delta("[[echomind:reply]]公开前缀<thi").payload.project_reply_delta, "公开前缀");
+  assert.equal(delta("nk>internal").payload.project_reply_delta, undefined);
+  assert.equal(finish("[[echomind:reply]]公开前缀<think>internal").payload.project_reply, null);
+});

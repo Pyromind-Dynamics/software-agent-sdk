@@ -19,9 +19,10 @@ export class PiEventNormalizer {
 
   private publicHeader: string | null = "";
   private pendingTag = "";
+  private streamedProjectReply = false;
   private readonly publishedArguments = new Map<string, string>();
 
-  translate(event: AgentSessionEvent, publicUpdates = false, preparation = false): RunnerEvent[] {
+  translate(event: AgentSessionEvent, publicUpdates = false, preparation = false, projectDialogue = false): RunnerEvent[] {
     const directReply = preparation && !!this.turnId && !this.taskId;
     switch (event.type) {
       case "agent_start": return [this.make("agent.started", {})];
@@ -49,12 +50,18 @@ export class PiEventNormalizer {
         }
         if (update.type !== "text_delta" || !this.messageId || this.messageRole !== "assistant") return [];
         const text = update.delta;
-        const visible = publicUpdates || directReply ? this.publicReplyDelta(text) : "";
+        const visible = publicUpdates || directReply || projectDialogue ? this.publicReplyDelta(text) : "";
         const payload: JsonObject = { message_id: this.messageId, text };
-        if (visible) payload[directReply ? "preparation_reply_delta" : "public_delta"] = visible;
+        if (visible) {
+          if (directReply) payload.preparation_reply_delta = visible;
+          else if (projectDialogue) {
+            payload.project_reply_delta = visible;
+            this.streamedProjectReply = true;
+          } else payload.public_delta = visible;
+        }
         return [this.make("message.delta", payload)];
       }
-      case "message_end": return this.endMessage(event.message, directReply);
+      case "message_end": return this.endMessage(event.message, directReply, projectDialogue);
       case "tool_execution_start":
         this.toolArguments.set(event.toolCallId, { args: sanitizeJson(event.args), turnId: this.turnId });
         return [this.make("tool.started", {
@@ -116,6 +123,7 @@ export class PiEventNormalizer {
     if (message.role !== "user" && message.role !== "assistant") return [];
     this.publicHeader = "";
     this.pendingTag = "";
+    this.streamedProjectReply = false;
     this.publishedArguments.clear();
     this.messageId = randomUUID();
     this.messageRole = message.role;
@@ -124,7 +132,7 @@ export class PiEventNormalizer {
     return [this.make("message.started", { message_id: this.messageId, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content: messageContent(message) })];
   }
 
-  private endMessage(message: AgentMessage, directReply: boolean): RunnerEvent[] {
+  private endMessage(message: AgentMessage, directReply: boolean, projectDialogue: boolean): RunnerEvent[] {
     if (message.role !== "user" && message.role !== "assistant") return [];
     const id = this.messageRole === message.role && this.messageId ? this.messageId : randomUUID();
     this.messageId = undefined;
@@ -133,15 +141,19 @@ export class PiEventNormalizer {
       ? (text) => text.replace(MARKDOWN_LINK_PATTERN, (_link, label: string, url: string) =>
           `${label}${this.storageUrls.get(signedUrlIdentity(url) ?? "") ?? url})`)
       : undefined);
-    // Native thinking and tool calls are separate blocks. Only publish a final answer
-    // from a direct preparation turn; intermediate tool commentary stays internal.
+    // A final answer contains no tool calls. Intermediate tool commentary stays internal.
     let reply: string | undefined;
-    if (directReply && message.role === "assistant" && message.stopReason === "stop"
+    if ((directReply || projectDialogue) && message.role === "assistant" && message.stopReason === "stop"
       && !message.content.some(block => block.type === "toolCall")) {
       const text = content.flatMap(block => isRecord(block) && typeof block.text === "string" ? [block.text] : []).join("\n");
       if (!REASONING_TAG.test(text)) reply = text.trimStart().replace(/^\[\[echomind:reply\]\]/, "").trim();
     }
-    const events = [this.make("message.completed", { message_id: id, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content, ...(reply !== undefined ? { preparation_reply: reply } : {}) })];
+    const events = [this.make("message.completed", {
+      message_id: id, role: message.role, ...(this.commandId ? { command_id: this.commandId } : {}), content,
+      ...(directReply && reply !== undefined ? { preparation_reply: reply } : {}),
+      ...(projectDialogue && message.role === "assistant" && (reply || this.streamedProjectReply)
+        ? { project_reply: reply || null } : {}),
+    })];
     this.commandId = undefined;
     if (message.role === "assistant") {
       events.push(this.make("usage.updated", usagePayload(message.usage)));
