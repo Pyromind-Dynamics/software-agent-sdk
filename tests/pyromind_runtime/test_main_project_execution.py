@@ -488,7 +488,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                         project_id,
                         "training",
                         binding.run_id,
-                        ("loss",),
+                        ("loss", "unconfigured_metric"),
                         None,
                         100,
                         context,
@@ -506,6 +506,8 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                     assert [
                         point.log_step for point in first.points + second.points
                     ] == [0, 1]
+                    assert first.ignored_keys == ("unconfigured_metric",)
+                    assert not second.ignored_keys
                 for _ in range(2):
                     await runtime.deliver_external_task_status(
                         scope, task_id=platform_id, status="succeeded"

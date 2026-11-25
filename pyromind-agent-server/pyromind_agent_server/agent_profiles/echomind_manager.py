@@ -57,10 +57,12 @@ verified_outputs under that output name before marking the task complete.
 Include verified values and sources:
 baseline or evaluation scoring, train/validation counts or distributions, or
 training configuration and checkpoint. Use JSON with summary and a metrics array
-of {label, value, unit} entries (number, ratio, percent or seconds). Omit values
-the source does not provide. For Dataset include a files array with name, path
+of {label, value, unit} entries. Use count for counts, ratio for fractions, and
+percent for values already scaled by 100. Omit unavailable values. For Dataset
+include a files array with name, path
 (absolute /workspace path), size_bytes, sample_count and distributions
 (dimension to label counts) for each verified split. Omit unknown size_bytes.
+Dataset metrics are optional; record boolean verification outcomes under checks.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence
 needed for the next decision. End the turn while awaiting external work.

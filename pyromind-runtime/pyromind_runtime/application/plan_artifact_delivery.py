@@ -6,10 +6,9 @@ import json
 from collections.abc import Mapping
 from pathlib import PurePosixPath
 
-from pydantic import ValidationError
-
 from pyromind_runtime.application.project_observations import (
     baseline_evaluation_metrics,
+    dataset_report_checks,
     dataset_report_files,
 )
 from pyromind_runtime.application.stage_analysis import (
@@ -22,7 +21,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import ExperimentTask
 from pyromind_runtime.domain.observations import ObservationDatasetFile
-from pyromind_runtime.domain.stage_analysis import StageAnalysisMetric
+from pyromind_runtime.domain.stage_analysis import ReportIssue
 from pyromind_runtime.domain.storage_paths import (
     normalize_workspace_path,
     to_storage_api_path,
@@ -43,15 +42,16 @@ from pyromind_runtime.ports.storage import (
 
 
 DELIVERY_STAGE_KINDS = frozenset({"init", "dataset", "train", "eval"})
-DATASET_REPORT_FORMAT_VERSION = 1
+DATASET_REPORT_FORMAT_VERSION = 2
 MERGED_DATASET_OUTPUTS = {"train_messages": "train", "val_messages": "val"}
 REBUILT_REPORT = "report:rebuild"
 
 
 class InvalidPlanDelivery(ValueError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, field: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.field = field
 
 
 def delivery_key(run: ExperimentExecutionView, name: str) -> str:
@@ -125,7 +125,9 @@ def register_plan_delivery(
     for output in task.outputs:
         value = outputs.get(output.name)
         if not isinstance(value, str) or not value:
-            raise InvalidPlanDelivery("missing_output")
+            raise InvalidPlanDelivery(
+                "missing_output", f"verified_outputs.{output.name}"[:240]
+            )
         if value in owned:
             artifact = owned[value]
             replacements[output.name] = artifact
@@ -301,14 +303,18 @@ def _read_report(
 ) -> JsonObject:
     if report_name is not None:
         body = _read_report_body(storage, outputs[report_name])
-        raw = body.get("metrics")
-        if not isinstance(raw, list) or not raw:
-            raise InvalidPlanDelivery("invalid_report_metrics")
-        try:
-            metrics = [StageAnalysisMetric.model_validate(item) for item in raw]
-        except ValidationError as exc:
-            raise InvalidPlanDelivery("invalid_report_metrics") from exc
-        return _report_document(body, metrics, stage, outputs)
+        document = _report_document(body, stage, outputs)
+        if stage == "dataset":
+            if not document.get("files"):
+                raise InvalidPlanDelivery("invalid_report", "files")
+        elif not document["metrics"]:
+            issues = document.get("issues")
+            first = issues[0] if isinstance(issues, list) and issues else None
+            field = first.get("field") if isinstance(first, dict) else None
+            raise InvalidPlanDelivery(
+                "invalid_report_metrics", field if isinstance(field, str) else "metrics"
+            )
+        return document
 
     untyped_outputs = {
         name: path
@@ -339,8 +345,7 @@ def _read_report(
             body = _read_report_body(storage, path)
         except InvalidPlanDelivery:
             continue
-        metrics = _legacy_report_metrics(body, stage)
-        document = _report_document(body, metrics, stage, outputs)
+        document = _report_document(body, stage, outputs, legacy=True)
         if path == legacy_path:
             legacy_document = document
         if document.get("files") or (
@@ -378,15 +383,6 @@ def _read_report_body(storage: EvaluationStorage, path: str) -> dict:
     return body
 
 
-def _legacy_report_metrics(body: dict, stage: object) -> list[StageAnalysisMetric]:
-    metrics = report_metrics(body)
-    if stage == "eval":
-        metrics = [*metrics, *_comparison_report_metrics(body)][:24]
-    if not metrics and stage in ("init", "eval"):
-        metrics = baseline_evaluation_metrics(body)
-    return metrics
-
-
 def _dataset_paths(outputs: dict[str, str]) -> dict[str, str]:
     return {
         name: path
@@ -397,19 +393,27 @@ def _dataset_paths(outputs: dict[str, str]) -> dict[str, str]:
 
 def _report_document(
     body: dict,
-    metrics: list[StageAnalysisMetric],
     stage: object,
     outputs: dict[str, str],
+    *,
+    legacy: bool = False,
 ) -> JsonObject:
+    issues: list[ReportIssue] = []
+    checks = dataset_report_checks(body) if stage == "dataset" else None
+    metrics = report_metrics(
+        body, issues=issues, checks=checks, allow_comparisons=stage == "eval"
+    )
+    if legacy and not metrics and stage in ("init", "eval"):
+        metrics = baseline_evaluation_metrics(body)
     document: JsonObject = {
-        "metrics": [item.model_dump(mode="json") for item in metrics[:24]]
+        "metrics": [item.model_dump(mode="json") for item in metrics]
     }
     if isinstance(summary := body.get("summary"), str):
         summary = summary.strip()
         if 0 < len(summary) <= 900:
             document["summary"] = summary
     if stage == "dataset":
-        files = dataset_report_files(body)
+        files = dataset_report_files(body, issues=issues)
         dataset_outputs = _dataset_paths(outputs)
         if not files:
             files = _merged_dataset_report_files(body, dataset_outputs)
@@ -438,28 +442,11 @@ def _report_document(
                     }
                 )
         document["files"] = [item.model_dump(mode="json") for item in files]
+    if checks:
+        document["checks"] = {name: passed for name, passed in checks.items()}
+    if issues:
+        document["issues"] = [item.model_dump(mode="json") for item in issues[:32]]
     return document
-
-
-def _comparison_report_metrics(body: dict) -> list[StageAnalysisMetric]:
-    rows = body.get("metrics")
-    if not isinstance(rows, list):
-        return []
-    return report_metrics(
-        {
-            "metrics": [
-                {
-                    "label": row.get("label"),
-                    "value": row["delta"],
-                    "unit": row.get("unit", "number"),
-                }
-                for row in rows[:24]
-                if isinstance(row, dict)
-                and "value" not in row
-                and {"baseline", "candidate", "delta"} <= row.keys()
-            ]
-        }
-    )
 
 
 def _merged_dataset_report_files(

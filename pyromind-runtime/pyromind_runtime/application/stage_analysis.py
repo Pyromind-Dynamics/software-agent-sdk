@@ -13,6 +13,7 @@ from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.snapshot import ExternalTaskState
 from pyromind_runtime.domain.stage_analysis import (
+    ReportIssue,
     StageAnalysisArtifact,
     StageAnalysisJob,
     StageAnalysisMetric,
@@ -273,15 +274,64 @@ def validate_stage_analysis(
     )
 
 
-def report_metrics(body: object) -> list[StageAnalysisMetric]:
+def report_metrics(
+    body: object,
+    *,
+    issues: list[ReportIssue] | None = None,
+    checks: dict[str, bool] | None = None,
+    allow_comparisons: bool = False,
+) -> list[StageAnalysisMetric]:
     values = body.get("metrics") if isinstance(body, dict) else None
-    metrics = []
-    if isinstance(values, list):
-        for value in values[:24]:
-            try:
-                metrics.append(StageAnalysisMetric.model_validate(value))
-            except ValidationError:
+    if not isinstance(values, list):
+        if issues is not None and values is not None:
+            issues.append(ReportIssue(field="metrics", code="invalid_metric"))
+        return []
+    metrics: list[StageAnalysisMetric] = []
+    for index, value in enumerate(values):
+        field = f"metrics[{index}]"
+        if isinstance(value, dict):
+            if value.get("unit") == "bool":
+                label, result = value.get("label"), value.get("value")
+                if (
+                    isinstance(label, str)
+                    and 0 < len(label) <= 100
+                    and (
+                        type(result) is bool
+                        or (type(result) in (int, float) and result in (0, 1))
+                    )
+                ):
+                    if checks is not None and len(checks) < 32:
+                        checks.setdefault(label, bool(result))
+                elif issues is not None:
+                    issues.append(ReportIssue(field=field, code="invalid_check"))
                 continue
+            if (
+                allow_comparisons
+                and "value" not in value
+                and {"baseline", "candidate", "delta"} <= value.keys()
+            ):
+                value = {
+                    "label": value.get("label"),
+                    "value": value["delta"],
+                    "unit": value.get("unit", "number"),
+                }
+        try:
+            metric = StageAnalysisMetric.model_validate(value)
+        except ValidationError as exc:
+            if issues is not None:
+                location = ".".join(str(key) for key in exc.errors()[0]["loc"])
+                issues.append(
+                    ReportIssue(
+                        field=f"{field}.{location}"[:240] if location else field,
+                        code="invalid_metric",
+                    )
+                )
+            continue
+        if len(metrics) == 24:
+            if issues is not None:
+                issues.append(ReportIssue(field="metrics", code="truncated"))
+            break
+        metrics.append(metric)
     return metrics
 
 

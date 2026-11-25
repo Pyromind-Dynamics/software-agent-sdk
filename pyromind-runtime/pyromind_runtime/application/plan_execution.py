@@ -141,6 +141,7 @@ def with_plan_report(
         update={
             "report_state": "ready",
             "delivery_error": None,
+            "delivery_error_field": None,
             "report_uri": report.manifest.storage_ref,
             "artifacts": (
                 {

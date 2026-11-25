@@ -28,7 +28,7 @@ from pyromind_runtime.domain.observations import (
     RunBinding,
 )
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
-from pyromind_runtime.domain.stage_analysis import StageAnalysisMetric
+from pyromind_runtime.domain.stage_analysis import ReportIssue, StageAnalysisMetric
 from pyromind_runtime.domain.storage_paths import (
     normalize_workspace_path,
     to_storage_api_path,
@@ -162,17 +162,19 @@ def project_observations(
             if stage.kind in ROLES
             else {}
         )
-        delivery_error = next(
+        failed_delivery = next(
             (
-                run.delivery_error
+                run
                 for _, run in stage_runs
-                if run and run.report_state == "registration_failed"
+                if run
+                and run.report_state == "registration_failed"
+                and run.delivery_error
             ),
             None,
         )
         delivery_status = (
             "failed"
-            if delivery_error
+            if failed_delivery
             else "registering"
             if any(run and run.report_state == "registering" for _, run in stage_runs)
             else None
@@ -184,7 +186,12 @@ def project_observations(
                 type=stage.kind or "",
                 business_status=status,
                 delivery_status=delivery_status,
-                delivery_error=delivery_error,
+                delivery_error=failed_delivery.delivery_error
+                if failed_delivery
+                else None,
+                delivery_error_field=failed_delivery.delivery_error_field
+                if failed_delivery
+                else None,
                 current_run_ids=tuple(run.run_id for _, run in stage_runs if run),
                 report_version_ids=report_ids,
                 historical_report_version_ids=tuple(
@@ -359,6 +366,9 @@ def observation_report_details(
     metrics: list[StageAnalysisMetric] = []
     summaries: list[str] = []
     files: dict[str, ObservationDatasetFile] = {}
+    checks: dict[str, bool] = {}
+    issues: list[ReportIssue] = []
+    read_errors: list[Exception] = []
     baseline_task_ids: set[str] = set()
     readable = []
     for identity in report_ids:
@@ -396,38 +406,68 @@ def observation_report_details(
         readable.append(artifact)
         if node.type == "init" and run is not None and run.platform_task_id:
             baseline_task_ids.add(run.platform_task_id)
+
+    def read_report(artifact: ArtifactVersion) -> str | Exception:
+        try:
+            return versions.snapshots.read_text(snapshot_result(artifact), context)
+        except (OSError, ValueError) as exc:
+            return exc
+
     with ThreadPoolExecutor(max_workers=4) as pool:
         baseline = (
             pool.submit(load_baseline_metrics, next(iter(baseline_task_ids)))
             if load_baseline_metrics and len(baseline_task_ids) == 1
             else None
         )
-        contents = pool.map(
-            lambda artifact: versions.snapshots.read_text(
-                snapshot_result(artifact), context
-            ),
-            readable,
-        )
+        contents = pool.map(read_report, readable)
         for artifact, text in zip(readable, contents, strict=True):
-            if len(text.encode()) > 48 * 1024:
+            field = f"reports.{artifact.id}"
+            if isinstance(text, Exception):
+                read_errors.append(text)
+                issues.append(ReportIssue(field=field, code="unreadable_report"))
                 continue
-            read_ids.append(artifact.id)
+            if len(text.encode()) > 48 * 1024:
+                issues.append(ReportIssue(field=field, code="invalid_report"))
+                continue
             try:
                 body = json.loads(text)
             except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                issues.append(ReportIssue(field=field, code="invalid_report"))
                 continue
-            for metric in report_metrics(body):
+            read_ids.append(artifact.id)
+            collected: list[ReportIssue] = []
+            report_checks = (
+                dataset_report_checks(body) if node.type == "dataset" else None
+            )
+            for metric in report_metrics(
+                body,
+                issues=collected,
+                checks=report_checks,
+                allow_comparisons=node.type == "eval",
+            ):
                 if metric not in metrics:
                     metrics.append(metric)
-            if isinstance(body, dict):
-                if node.type == "dataset":
-                    files.update(
-                        (file.path, file) for file in dataset_report_files(body)
-                    )
-                elif isinstance(summary := body.get("summary"), str):
-                    summary = summary.strip()
-                    if 0 < len(summary) <= 900 and summary not in summaries:
-                        summaries.append(summary)
+            if node.type == "dataset":
+                files.update(
+                    (file.path, file)
+                    for file in dataset_report_files(body, issues=collected)
+                )
+                if report_checks:
+                    checks.update(report_checks)
+            elif isinstance(summary := body.get("summary"), str):
+                summary = summary.strip()
+                if 0 < len(summary) <= 900 and summary not in summaries:
+                    summaries.append(summary)
+            saved_issues = body.get("issues")
+            if isinstance(saved_issues, list):
+                for issue in saved_issues[:32]:
+                    try:
+                        collected.append(ReportIssue.model_validate(issue))
+                    except ValueError:
+                        continue
+            issues.extend(collected)
         if baseline is not None and read_ids:
             registered_labels = {metric.label for metric in metrics}
             metrics.extend(
@@ -435,7 +475,11 @@ def observation_report_details(
                 for metric in baseline.result()
                 if metric.label not in registered_labels
             )
+    if not read_ids and read_errors:
+        raise read_errors[0]
     if report_version_id is not None and not read_ids:
+        if issues:
+            raise ValueError("Selected observation report is invalid")
         raise FileNotFoundError("Observation stage report is unavailable")
     file_entries = tuple(files.values())[:32]
     missing_sizes = {
@@ -460,6 +504,8 @@ def observation_report_details(
         metrics=tuple(metrics[:24]),
         files=file_entries,
         summaries=tuple(summaries[:8]),
+        checks=dict(list(checks.items())[:32]),
+        issues=tuple(dict.fromkeys(issues))[:32],
     )
 
 
@@ -503,20 +549,49 @@ def baseline_evaluation_metrics(body: object) -> list[StageAnalysisMetric]:
     return report_metrics({"metrics": results})
 
 
-def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
-    def count(value: object) -> int | None:
+def dataset_report_checks(body: dict) -> dict[str, bool]:
+    raw = body.get("checks")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: value
+        for key, value in list(raw.items())[:32]
+        if isinstance(key, str) and 0 < len(key) <= 100 and isinstance(value, bool)
+    }
+
+
+def dataset_report_files(
+    body: dict, *, issues: list[ReportIssue] | None = None
+) -> list[ObservationDatasetFile]:
+    def count(value: object, field: str) -> int | None:
         if type(value) is int and value >= 0:
             return value
+        if type(value) is float and value >= 0 and value.is_integer():
+            return int(value)
+        if (
+            isinstance(value, str)
+            and len(value) <= 20
+            and value.isascii()
+            and value.isdecimal()
+        ):
+            return int(value)
+        if issues is not None and value is not None:
+            issues.append(ReportIssue(field=field[:240], code="invalid_count"))
         return None
 
-    def make_file(item: dict) -> ObservationDatasetFile | None:
+    def make_file(item: object, field: str) -> ObservationDatasetFile | None:
+        item = item if isinstance(item, dict) else {}
         path = item.get("path")
         if not isinstance(path, str) or len(path) > 2048:
+            if issues is not None:
+                issues.append(ReportIssue(field=f"{field}.path", code="invalid_file"))
             return None
         try:
             path = normalize_workspace_path(path)
             to_storage_api_path(path)
         except ValueError:
+            if issues is not None:
+                issues.append(ReportIssue(field=f"{field}.path", code="invalid_file"))
             return None
         name = item.get("name")
         raw = item.get("distributions")
@@ -527,7 +602,12 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
                     counts = {
                         label: hits
                         for label, value in list(labels.items())[:100]
-                        if (hits := count(value)) is not None
+                        if (
+                            hits := count(
+                                value, f"{field}.distributions.{group}.{label}"
+                            )
+                        )
+                        is not None
                     }
                     if counts:
                         distributions[group] = counts
@@ -536,8 +616,8 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
             if isinstance(name, str) and name
             else PurePosixPath(path).name,
             path=path,
-            size_bytes=count(item.get("size_bytes")),
-            sample_count=count(item.get("sample_count")),
+            size_bytes=count(item.get("size_bytes"), f"{field}.size_bytes"),
+            sample_count=count(item.get("sample_count"), f"{field}.sample_count"),
             distributions=distributions,
         )
 
@@ -545,8 +625,8 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
     if isinstance(entries, list):
         explicit_files = [
             file
-            for item in entries[:32]
-            if isinstance(item, dict) and (file := make_file(item))
+            for index, item in enumerate(entries[:32])
+            if (file := make_file(item, f"files[{index}]"))
         ]
         if explicit_files:
             return explicit_files
@@ -554,7 +634,7 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
     if isinstance(splits, dict):
         split_files = [
             file
-            for name, item in list(splits.items())[:32]
+            for index, (name, item) in enumerate(list(splits.items())[:32])
             if isinstance(item, dict)
             and (
                 file := make_file(
@@ -567,7 +647,8 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
                             "label": item.get("labels"),
                             "category": item.get("categories"),
                         },
-                    }
+                    },
+                    f"splits[{index}]",
                 )
             )
         ]
@@ -580,7 +661,9 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
     metrics = {
         metric.label: int(metric.value)
         for metric in report_metrics(body)
-        if metric.unit == "number" and metric.value >= 0 and metric.value.is_integer()
+        if metric.unit in {"number", "count"}
+        and metric.value >= 0
+        and metric.value.is_integer()
     }
     files = []
     for split in ("train", "val"):
@@ -588,6 +671,9 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
         if source is None and split == "val":
             source = sources.get("validation")
         metadata = source if isinstance(source, dict) else {"path": source}
+        path = train_data.get(f"{split}_jsonl") or metadata.get("path")
+        if path is None:
+            continue
         labels = {
             label: metrics[key]
             for label in ("pass", "defect", "fail")
@@ -596,7 +682,7 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
         file = make_file(
             {
                 "name": split,
-                "path": train_data.get(f"{split}_jsonl") or metadata.get("path"),
+                "path": path,
                 "size_bytes": train_data.get(
                     f"{split}_size_bytes", metadata.get("size_bytes")
                 ),
@@ -604,7 +690,8 @@ def dataset_report_files(body: dict) -> list[ObservationDatasetFile]:
                     "sample_count", metrics.get(f"{split}_records")
                 ),
                 "distributions": metadata.get("distributions", {"label": labels}),
-            }
+            },
+            split,
         )
         if file:
             files.append(file)

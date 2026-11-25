@@ -51,7 +51,6 @@ from pyromind_runtime.application.model_evaluation_plan import (
 from pyromind_runtime.application.plan_artifact_delivery import (
     DATASET_REPORT_FORMAT_VERSION,
     DELIVERY_STAGE_KINDS,
-    MERGED_DATASET_OUTPUTS,
     InvalidPlanDelivery,
     delivery_key,
     delivery_report,
@@ -1657,12 +1656,11 @@ class ConversationRuntime:
         has_storage_credentials = bool(context.cookie or context.authorization)
         if previous and previous.report_state == "registration_failed" and not retry:
             format_changed = (
-                previous.delivery_error == "invalid_report"
-                and (run.stage_snapshot or {}).get("kind") == "dataset"
-                and MERGED_DATASET_OUTPUTS.keys()
-                <= {output.name for output in task.outputs}
+                (run.stage_snapshot or {}).get("kind") == "dataset"
                 and (previous.dataset_report_format_version or 0)
                 < DATASET_REPORT_FORMAT_VERSION
+                and previous.delivery_error
+                in {"invalid_report", "invalid_report_metrics"}
             )
             if not has_storage_credentials or not (
                 previous.delivery_error == "credentials_required" or format_changed
@@ -1685,6 +1683,7 @@ class ConversationRuntime:
                 "report_uri": None,
                 "artifacts": (),
                 "delivery_error": None,
+                "delivery_error_field": None,
             }
         )
         if job_id not in self._stage_analysis_workers:
@@ -1719,6 +1718,7 @@ class ConversationRuntime:
                 if not claimed:
                     return
                 error_code = "storage_unavailable"
+                error_field = None
                 for delay in (0, 1, 4):
                     if delay:
                         await asyncio.sleep(delay)
@@ -1735,6 +1735,7 @@ class ConversationRuntime:
                         )
                     except InvalidPlanDelivery as exc:
                         error_code = exc.code
+                        error_field = exc.field
                         break
                     except (EvaluationStorageMissingError, FileNotFoundError):
                         error_code = "missing_output"
@@ -1773,11 +1774,13 @@ class ConversationRuntime:
                         finally:
                             self._schedule_stage_analysis_recheck(scope, active, store)
                         return
-                self._record_execution(store, self._delivery_failed(run, error_code))
+                self._record_execution(
+                    store, self._delivery_failed(run, error_code, error_field)
+                )
 
     @staticmethod
     def _delivery_failed(
-        run: ExperimentExecutionView, code: str
+        run: ExperimentExecutionView, code: str, field: str | None = None
     ) -> ExperimentExecutionView:
         return run.model_copy(
             update={
@@ -1785,8 +1788,9 @@ class ConversationRuntime:
                 "report_uri": None,
                 "artifacts": (),
                 "delivery_error": code,
+                "delivery_error_field": field,
                 "dataset_report_format_version": DATASET_REPORT_FORMAT_VERSION
-                if code == "invalid_report"
+                if code in {"invalid_report", "invalid_report_metrics"}
                 and (run.stage_snapshot or {}).get("kind") == "dataset"
                 else None,
             }
@@ -2518,9 +2522,13 @@ class ConversationRuntime:
         metrics = tuple(
             metric for metric in panel.metrics if not keys or metric.key in keys
         )
-        if keys and {metric.key for metric in metrics} != set(keys):
-            raise ValueError("Unknown training metric")
-        return await self._train_observer.series(
+        known = {metric.key for metric in metrics}
+        ignored = tuple(dict.fromkeys(key for key in keys if key not in known))
+        if keys and not metrics:
+            raise ValueError(
+                "Unknown training metrics: " + ", ".join(key[:128] for key in ignored)
+            )
+        page = await self._train_observer.series(
             project_id=project_id,
             config_version=overview.config_version,
             binding=binding,
@@ -2529,6 +2537,7 @@ class ConversationRuntime:
             cursor=cursor,
             limit=limit,
         )
+        return page.model_copy(update={"ignored_keys": ignored}) if ignored else page
 
     async def get_experiments(
         self, conversation_id: str, context: RequestContext

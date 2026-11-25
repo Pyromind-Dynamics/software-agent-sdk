@@ -66,6 +66,56 @@ def test_primary_report_is_selected_by_type_and_validates_metrics():
         _read_report(storage, "init", outputs, report_name="baseline_results")
 
 
+def test_primary_dataset_report_registers_files_despite_bad_auxiliary_values():
+    outputs = {"prepare_report": "/run/report.json", "train": "/run/train.jsonl"}
+    body = {
+        "files": [
+            {
+                "path": "/workspace/run/train.jsonl",
+                "sample_count": "390",
+                "size_bytes": 1024.0,
+                "distributions": {
+                    "label": {"pass": "270", "fail": 120.0, "invalid": -1}
+                },
+            }
+        ],
+        "metrics": [
+            {"label": "train_records", "value": 390, "unit": "count"},
+            {"label": "reread_validation", "value": 1, "unit": "bool"},
+            {"label": "malformed", "value": "unavailable"},
+        ],
+    }
+    storage = cast(
+        EvaluationStorage, SimpleNamespace(read=lambda _: json.dumps(body).encode())
+    )
+    report = _read_report(storage, "dataset", outputs, report_name="prepare_report")
+    assert report["metrics"] == [
+        {"label": "train_records", "value": 390, "unit": "count"}
+    ]
+    assert report["checks"] == {"reread_validation": True}
+    assert report["files"] == [
+        {
+            "name": "train.jsonl",
+            "path": "/workspace/run/train.jsonl",
+            "sample_count": 390,
+            "size_bytes": 1024,
+            "distributions": {"label": {"pass": 270, "fail": 120}},
+        }
+    ]
+    assert report["issues"] == [
+        {"field": "metrics[2].value", "code": "invalid_metric"},
+        {"field": "files[0].distributions.label.invalid", "code": "invalid_count"},
+    ]
+    body.pop("metrics")
+    assert _read_report(storage, "dataset", outputs, report_name="prepare_report")[
+        "files"
+    ]
+    body["files"] = []
+    with pytest.raises(InvalidPlanDelivery, match="invalid_report") as exc:
+        _read_report(storage, "dataset", outputs, report_name="prepare_report")
+    assert exc.value.field == "files"
+
+
 def test_legacy_detection_preserves_summary_reports_and_skips_oversized_non_reports():
     def read(path):
         if path == "/run/config.json":
@@ -327,7 +377,8 @@ def test_merged_dataset_summary_uses_only_the_declared_train_and_validation_file
         )
 
 
-def test_evaluation_comparison_preserves_measured_metric_deltas():
+@pytest.mark.parametrize("report_name", [None, "final_report"])
+def test_evaluation_comparison_preserves_measured_metric_deltas(report_name):
     body = {
         "metrics": [
             {"label": "result_accuracy", "value": 0.47, "unit": "ratio"},
@@ -349,10 +400,18 @@ def test_evaluation_comparison_preserves_measured_metric_deltas():
     storage = cast(
         EvaluationStorage, SimpleNamespace(read=lambda _: json.dumps(body).encode())
     )
-    document = _read_report(storage, "eval", {"final_report": "/run/final_report.json"})
+    document = _read_report(
+        storage,
+        "eval",
+        {"final_report": "/run/final_report.json"},
+        report_name=report_name,
+    )
     assert document["metrics"] == [
         {"label": "result_accuracy", "value": 0.47, "unit": "ratio"},
         {"label": "result_accuracy_delta", "value": -0.08, "unit": "ratio"},
+    ]
+    assert document["issues"] == [
+        {"field": "metrics[2].value", "code": "invalid_metric"}
     ]
 
 

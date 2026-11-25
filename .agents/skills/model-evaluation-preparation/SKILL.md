@@ -35,7 +35,8 @@ Init 合并基模评测与基线解读；Eval 用于训练后候选评测。未�
 
 任务类型标记 requires_report 时，在 outputs 中声明一个 kind 为 report 的主报告，
 例如 {"name":"baseline_results","kind":"report"}。产物名用于任务间引用。
-报告为 JSON，metrics 是包含 label、数值 value 和 unit 的非空数组。
+报告为 JSON。Init、Train、Eval 的 metrics 是包含 label、数值 value 和 unit 的非空数组。
+Dataset 报告必须提供有效的 files 文件清单，样本数用整数，布尔校验写入 checks，metrics 可选。
 
 计划写明目标、真实输入、已确认约束、任务目的与交付物；实现细节留到执行时决定。
 entry_task_id 选择首先执行的任务，它必须通过 resource_id 引用有实际位置的资源。

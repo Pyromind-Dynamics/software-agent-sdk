@@ -18,7 +18,7 @@ from pyromind_runtime.application.stage_analysis import (
     ready_stage_analyses,
     validate_stage_analysis,
 )
-from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.observations import ObservationsConfig
@@ -550,6 +550,95 @@ def test_observation_details_read_bound_business_reports_before_analysis(tmp_pat
     assert not observation_report_details(
         wrong, "project", "base", None, versions, context
     ).report_version_ids
+
+
+def test_report_details_preserve_other_reports_when_one_is_unreadable(
+    tmp_path, monkeypatch
+):
+    context = RequestContext(user_id="owner")
+    snapshots = FileArtifactSnapshots(tmp_path / "storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    scope = versions.project("conversation", context)
+    assert scope is not None
+    project = ProjectView.model_validate(
+        {
+            "project_id": "project",
+            "conversation_id": "conversation",
+            "plan_sequence": 1,
+            "creation_command_id": "create",
+            "plan": {
+                "stages": [{"id": "eval", "kind": "eval", "name": "Eval"}],
+                "tasks": [
+                    {"id": task, "stage_id": "eval", "name": task}
+                    for task in ("a", "b")
+                ],
+            },
+        }
+    )
+    artifacts = tuple(
+        versions.save(
+            scope,
+            task,
+            SaveVersion(
+                kind="report",
+                logical_key=task,
+                summary={"plan_execution": [1, f"project:{task}:1"]},
+                source=SnapshotSource(
+                    text='{"metrics":[{"label":"items","value":390,"unit":"count"}]}',
+                    filename="report.json",
+                ),
+            ),
+            context,
+        )
+        for task in ("a", "b")
+    )
+    rows = [
+        {
+            "id": task,
+            "stage_id": "eval",
+            "attempt": 1,
+            "business_status": "completed",
+            "report_version_id": artifact.id,
+        }
+        for task, artifact in zip(("a", "b"), artifacts, strict=True)
+    ]
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": "conversation",
+            "capabilities": {},
+            "project": project,
+            "experiment_executions": plan_executions(project, rows, artifacts),
+        }
+    )
+    good, bad = artifacts
+    original_read = snapshots.read_text
+
+    def read(snapshot, context):
+        if snapshot.storage_ref == snapshot_result(bad).storage_ref:
+            raise OSError("unreadable fixture")
+        return original_read(snapshot, context)
+
+    monkeypatch.setattr(snapshots, "read_text", read)
+    detail = observation_report_details(
+        snapshot, "project", "eval", None, versions, context
+    )
+    assert detail.report_version_ids == (good.id,)
+    assert [(metric.value, metric.unit) for metric in detail.metrics] == [
+        (390, "count")
+    ]
+    assert [(issue.field, issue.code) for issue in detail.issues] == [
+        (f"reports.{bad.id}", "unreadable_report")
+    ]
+    with pytest.raises(OSError, match="unreadable fixture"):
+        observation_report_details(
+            snapshot,
+            "project",
+            "eval",
+            None,
+            versions,
+            context,
+            report_version_id=bad.id,
+        )
 
 
 def test_legacy_dataset_requires_original_entry_save_receipt(tmp_path):

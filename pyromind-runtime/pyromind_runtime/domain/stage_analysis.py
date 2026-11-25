@@ -1,14 +1,38 @@
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from pyromind_runtime.domain.base import ContractModel
+
+
+MetricUnit = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=32,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+    ),
+]
+
+
+class ReportIssue(ContractModel):
+    field: str = Field(min_length=1, max_length=240)
+    code: Literal[
+        "invalid_metric",
+        "invalid_count",
+        "invalid_file",
+        "invalid_check",
+        "truncated",
+        "unreadable_report",
+        "invalid_report",
+    ]
 
 
 class StageAnalysisMetric(ContractModel):
     label: str = Field(min_length=1, max_length=100)
     value: Annotated[float, Field(allow_inf_nan=False, strict=True)]
-    unit: Literal["number", "ratio", "percent", "seconds"] = "number"
+    unit: MetricUnit = "number"
 
 
 class StageAnalysisArtifact(ContractModel):

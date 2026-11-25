@@ -93,7 +93,7 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=41,
+    configuration_version=42,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,
@@ -120,9 +120,11 @@ the user creates the Project.""",
     development_product_instructions="""Read the plan in the Project notification.
 Write public_data/workflowPLAN.json, then execute the accepted entry task directly.
 Record execution outcomes in workflowPLAN and verified outputs.
-For each declared kind=report output, write a JSON report with a nonempty metrics
-array of {label, value, unit} and record its path in verified_outputs by output
-name. For reused runs, normalize verified source metrics into the same format.
+For each declared kind=report output, write a JSON report and record its path
+in verified_outputs by output name. For Dataset, include a nonempty files list
+and put boolean verification outcomes in checks. For Init, Train, and Eval,
+include a nonempty metrics array of {label, numeric value, unit}. For reused
+runs, normalize verified source metrics into the same format.
 Before finishing an execution round, give a concise public result in the user's
 language. Begin the final public text with [[echomind:reply]] before any other
 text so the workbench can display it as it arrives. Use this marker only for

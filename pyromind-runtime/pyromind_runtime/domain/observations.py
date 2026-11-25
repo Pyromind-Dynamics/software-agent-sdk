@@ -5,13 +5,18 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from pyromind_runtime.domain.base import ContractModel
-from pyromind_runtime.domain.stage_analysis import StageAnalysisJob, StageAnalysisMetric
+from pyromind_runtime.domain.stage_analysis import (
+    MetricUnit,
+    ReportIssue,
+    StageAnalysisJob,
+    StageAnalysisMetric,
+)
 
 
 class MetricConfig(ContractModel):
     key: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=128)
-    unit: Literal["number", "ratio", "seconds", "percent"] = "number"
+    unit: MetricUnit = "number"
     axis: Literal["log_step", "training_step", "time"] = "log_step"
     axis_key: str | None = Field(default=None, min_length=1, max_length=128)
 
@@ -139,6 +144,9 @@ class ObservationNode(ContractModel):
     delivery_error: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    delivery_error_field: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     current_run_ids: tuple[str, ...] = ()
     report_version_ids: tuple[str, ...] = ()
     historical_report_version_ids: tuple[str, ...] = Field(
@@ -161,6 +169,12 @@ class ObservationReportDetails(ContractModel):
     metrics: tuple[StageAnalysisMetric, ...] = ()
     files: tuple[ObservationDatasetFile, ...] = ()
     summaries: tuple[str, ...] = ()
+    checks: dict[str, bool] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    issues: tuple[ReportIssue, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
 
 
 class RunBinding(ContractModel):
@@ -220,3 +234,6 @@ class SeriesPage(ContractModel):
     analysis_status: Literal["not_requested"] = "not_requested"
     observed_at: str
     message: str | None = None
+    ignored_keys: tuple[str, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
