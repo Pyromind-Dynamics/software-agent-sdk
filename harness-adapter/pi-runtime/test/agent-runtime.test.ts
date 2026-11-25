@@ -233,6 +233,76 @@ test("recovery identifies callback delivery by its notification run ID", () => {
   assert.equal(notificationWasDelivered(completed.getBranch(), runId), true);
 });
 
+test("cancel publishes a terminal outcome before an interrupted prompt finishes unwinding", async () => {
+  const events: RunnerEvent[] = [];
+  const pending: Array<() => void> = [];
+  const session = {
+    sessionManager: SessionManager.inMemory(), isStreaming: false, messages: [assistant("stop")],
+    prompt: async () => { await new Promise<void>(resolve => pending.push(resolve)); },
+    abort: async () => {},
+  };
+  const runtime = new PiAgentRuntime({ emit: (event: RunnerEvent) => events.push(event) } as unknown as JsonlRpcPeer);
+  const state = runtime as unknown as { session: AgentSession; sessionId: string; terminalBackend: string };
+  state.session = session as unknown as AgentSession;
+  state.sessionId = "s";
+  state.terminalBackend = "sandbox";
+  const prompt = (id: string) => runtime.handle("prompt", { run_id: id, content: [{ type: "text", text: id }] });
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+  await prompt("interrupted");
+  await tick();
+  assert.equal(pending.length, 1);
+  assert.deepEqual(await runtime.handle("cancel", {}), { cancelled: true });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, "run.finished");
+  assert.equal(events[0].runId, "interrupted");
+  assert.deepEqual(events[0].payload.outcome, { status: "cancelled", stop_reason: "aborted" });
+  assert.equal(await runtime.handle("session.has_pending_work", {}), false);
+
+  await prompt("next");
+  await tick();
+  pending[0]();
+  await tick();
+  assert.equal(events.length, 1);
+  assert.equal(await runtime.handle("session.has_pending_work", {}), true);
+  pending[1]();
+  await tick();
+  assert.deepEqual(events.map(event => event.runId), ["interrupted", "next"]);
+});
+
+test("cancel drains queued notifications when automatic work stays enabled", async () => {
+  let finishPrompt!: () => void;
+  let delivered = 0;
+  const session = {
+    sessionManager: SessionManager.inMemory(), isStreaming: false, messages: [assistant("stop")],
+    prompt: async () => { await new Promise<void>(resolve => { finishPrompt = resolve; }); },
+    abort: async () => {},
+    sendCustomMessage: async () => { delivered++; },
+  };
+  const runtime = new PiAgentRuntime({ emit: () => {} } as unknown as JsonlRpcPeer);
+  const state = runtime as unknown as { session: AgentSession; sessionId: string; terminalBackend: string };
+  state.session = session as unknown as AgentSession;
+  state.sessionId = "s";
+  state.terminalBackend = "sandbox";
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+
+  await runtime.handle("prompt", { run_id: "interrupted", content: [{ type: "text", text: "work" }] });
+  await tick();
+  assert.deepEqual(await runtime.handle("notify", { run_id: "callback:result", content: "ready" }),
+    { accepted: true, queued: true });
+  assert.deepEqual(await runtime.handle("cancel", {}), { cancelled: true });
+  await tick();
+  finishPrompt();
+  await tick();
+  assert.equal(delivered, 1);
+
+  assert.deepEqual(await runtime.handle("notify", { run_id: "callback:next", content: "ready" }),
+    { accepted: true, queued: false });
+  await runtime.handle("cancel", {});
+  await tick();
+  await tick();
+  assert.equal(delivered, 2);
+});
+
 test("stage tasks queue behind replies, wait for their exact round, and cancel only their own work", async () => {
   let calls = 0, aborts = 0;
   let finish!: () => void;
