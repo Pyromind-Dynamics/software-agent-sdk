@@ -112,6 +112,7 @@ def save_script_compilation(
                 "train": context.evidence.train.task_id,
                 "eval": context.evidence.eval.task_id,
             },
+            approved_project=context.approved_project,
         )
         review = built.review(current, fresh)
         write_model(compilation_path(store, fresh), built)
@@ -134,7 +135,9 @@ def build_script_compilation(
         raise ValueError("配方与所选研发任务不匹配，请核对证据摘要。")
     evidence = context.evidence
     store = FileProductStore(conversations_root / evidence.conversation_id)
-    references = consolidation_references(store, evidence)
+    references = consolidation_references(
+        store, evidence, approved_project=context.approved_project
+    )
     dataset = _workflow_receipt(
         tuple(store.load_workflow_execution_requests().values()),
         evidence.dataset,

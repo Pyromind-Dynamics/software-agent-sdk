@@ -227,6 +227,7 @@ from pyromind_runtime.domain.versions import (
 from pyromind_runtime.domain.workflow_execution import (
     DatasetRecipeReceipt,
     WorkflowExecutionRequest,
+    workflow_contains_training_node,
 )
 from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
@@ -7735,8 +7736,18 @@ def _workflow_has_training_node(
 ) -> bool | None:
     if task.kind != "workflow_run":
         return None
-    request = store.load_workflow_execution_requests().get(task.run_id or "")
-    return request.summary.get("has_training_node") is True if request else None
+    requests = store.load_workflow_execution_requests()
+    request = requests.get(task.run_id or "") or requests.get("sdk:" + task.task_id)
+    if (
+        request is None
+        or request.task_id != task.task_id
+        or request.correlation != task.correlation
+    ):
+        return None
+    return workflow_contains_training_node(request.workflow) or (
+        not request.request_id.startswith("sdk:")
+        and request.summary.get("has_training_node") is True
+    )
 
 
 def _has_active_subagents(snapshot: ConversationSnapshot) -> bool:
