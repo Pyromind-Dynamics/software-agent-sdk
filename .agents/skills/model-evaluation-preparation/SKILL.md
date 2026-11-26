@@ -62,6 +62,7 @@ entry_task_id 选择首先执行的任务，它必须通过 resource_id 引用�
 ```
 
 提交成功后沿用聊天中的计划预览，用户可继续修改；只有用户点击“创建并启动”才开始工作。
-创建后按通知把接受的计划写入 public_data/workflowPLAN.json，由主会话执行已确认的入口任务。
+创建后将已批准的计划原样保存到 `public_data/workflowPLAN.json` 的 `plan` 字段，保留 `plan.tasks`，由主会话执行已确认的入口任务。
+执行中按任务 ID 更新 `runtime.tasks`。例如，任务 `clean` 完成交付后，对应记录包含 `business_status: "completed"`、当前 `attempt` 和 `verified_outputs`。产物按计划声明的名称记录已核验的绝对路径，平台任务同时记录实际 `platform_task_id`。
 核对报告和真实产物再推进后续阶段；继续或重试复用原子会话及已有产物。
 凭据只用当前运行环境，不写入计划、数据或报告。
