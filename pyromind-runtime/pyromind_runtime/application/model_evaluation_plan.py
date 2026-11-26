@@ -14,7 +14,7 @@ from pyromind_runtime.domain.storage_paths import StoragePathError, to_storage_a
 
 
 _MODEL_INPUTS = {"model", "merged_model", "checkpoint"}
-_DATA_INPUTS = {
+MODEL_EVALUATION_DATA_INPUTS = {
     "dataset",
     "val_dataset",
     "test_dataset",
@@ -26,7 +26,7 @@ _DATA_INPUTS = {
 
 def has_model_evaluation_inputs(task: ExperimentTask) -> bool:
     names = {item.name for item in task.inputs}
-    return "model" in names and bool(names & _DATA_INPUTS)
+    return "model" in names and bool(names & MODEL_EVALUATION_DATA_INPUTS)
 
 
 def model_evaluation_tasks(
@@ -91,7 +91,7 @@ def validate_evaluation_inputs(
 ) -> None:
     if require_bindings:
         names = {item.name for item in task.inputs}
-        if not names & _MODEL_INPUTS or not names & _DATA_INPUTS:
+        if not names & _MODEL_INPUTS or not names & MODEL_EVALUATION_DATA_INPUTS:
             raise ValueError("Model evaluation requires both model and dataset inputs")
     resources = {item.id: item.storage_path for item in project.plan.resources}
     outputs = {
@@ -102,7 +102,7 @@ def validate_evaluation_inputs(
     for item in task.inputs:
         if item.name in _MODEL_INPUTS:
             actual = model
-        elif item.name in _DATA_INPUTS:
+        elif item.name in MODEL_EVALUATION_DATA_INPUTS:
             actual = dataset
         else:
             continue

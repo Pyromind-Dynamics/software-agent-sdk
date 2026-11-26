@@ -41,6 +41,9 @@ from pyromind_runtime.application.consolidation_evidence import (
     ConsolidationEvidence,
     select_consolidation_evidence,
 )
+from pyromind_runtime.application.model_evaluation_plan import (
+    MODEL_EVALUATION_DATA_INPUTS,
+)
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.storage_paths import normalize_workspace_path
@@ -263,7 +266,7 @@ def consolidation_context(
         "base_model": _approved_path(by_type["train"], names={"base_model"}),
         "validation_dataset": _approved_path(
             by_type["evaluator"],
-            names={"eval_data", "validation_dataset", "evaluation_dataset"},
+            names=MODEL_EVALUATION_DATA_INPUTS,
         ),
     }
     fixed_train = _approved_path(
