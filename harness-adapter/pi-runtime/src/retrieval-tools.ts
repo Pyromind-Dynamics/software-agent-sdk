@@ -63,14 +63,25 @@ print(json.dumps({'lines':out,'truncated':truncated}))
 `;
 
 export function createRetrievalTools(access: ExecutionAccess, mirror?: SandboxReadMirror): AgentTool[] {
-  return ["grep", "find", "ls"].map((kind): AgentTool => ({
+  const descriptions = {
+    grep: "Search UTF-8 files up to 1 MiB for matching lines. Returns paths, 1-based line numbers and matching text.",
+    find: "Find files by name or relative path using a glob. Returns matching file paths.",
+    ls: "List the entries in one directory.",
+  };
+  return (["grep", "find", "ls"] as const).map((kind): AgentTool => ({
     name: kind, label: kind,
-    description: `${kind === "grep" ? "Search text with line numbers" : kind === "find" ? "Find file paths" : "List directory entries"} in an authorized Storage, knowledge/, .agents/skills/, or conversation path. Results are bounded; narrow the path when truncated.`,
+    description: `${descriptions[kind]} Use an authorized Storage, knowledge/, .agents/skills/, or conversation path. Narrow the path when results are truncated.`,
     parameters: { type: "object", properties: {
-      path: { type: "string", description: "Logical resource or workspace path; defaults to public_data/." },
-      ...(kind === "grep" ? { pattern: { type: "string" }, literal: { type: "boolean" }, ignoreCase: { type: "boolean" } } : {}),
-      ...(kind !== "ls" ? { glob: { type: "string" } } : {}),
-      limit: { type: "integer", minimum: 1, maximum: 200 },
+      path: { type: "string", description: "Path to search. Defaults to public_data/." },
+      ...(kind === "grep" ? {
+        pattern: { type: "string", description: "Python regular expression, or exact text when literal is true." },
+        literal: { type: "boolean", description: "Treat pattern as plain text. Defaults to false." },
+        ignoreCase: { type: "boolean", description: "Match case-insensitively. Defaults to false." },
+      } : {}),
+      ...(kind !== "ls" ? {
+        glob: { type: "string", description: "Match a filename or relative path, such as *.jsonl. Defaults to *." },
+      } : {}),
+      limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of results. Defaults to 100." },
     }, required: kind === "grep" ? ["pattern"] : [], additionalProperties: false } as TSchema,
     async execute(_id, args, signal) {
       if (!isRecord(args)) throw new Error("invalid search arguments");

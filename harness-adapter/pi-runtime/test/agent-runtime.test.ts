@@ -34,14 +34,14 @@ function models(catalog: Model<Api> | undefined, templates: Model<Api>[]): Model
 test("unknown model on a custom OpenAI-compatible URL defaults to chat completions", () => {
   const resolved = resolveModel(models(undefined, [model("gpt-5")]), {
     provider: "openai",
-    modelId: "deepseek-v4-flash-0731",
+    modelId: "custom-deepseek-v4-flash",
     baseUrl: "http://localhost:8000/v1",
     contextWindow: 200_000,
   });
 
   assert.equal(resolved.api, "openai-completions");
   assert.equal(resolved.provider, "openai");
-  assert.equal(resolved.id, "deepseek-v4-flash-0731");
+  assert.equal(resolved.id, "custom-deepseek-v4-flash");
   assert.equal(resolved.baseUrl, "http://localhost:8000/v1");
   assert.equal(resolved.contextWindow, 200_000);
   assert.equal(resolved.maxTokens, 200_000);

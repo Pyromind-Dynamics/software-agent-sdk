@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import sys
@@ -145,31 +146,21 @@ PI_CAPABILITIES = HarnessCapabilities(
     agent_stages=True,
     external_task_resume=True,
     user_input_reply=True,
-    native_workspace_tools=frozenset({"read", "write", "edit", "terminal"}),
+    native_workspace_tools=frozenset(
+        {"read", "find", "grep", "write", "edit", "terminal"}
+    ),
     enforced_limits=frozenset({"memory", "nproc"}),
 )
 
 ASK_USER_TOOL_DESCRIPTION = (
-    "Ask the user one to three structured questions when a decision or missing "
-    "information genuinely requires their input. Each question offers options "
-    "the user picks one of, or answers as free text; a question without options "
-    "is free text only. For choice questions, normally offer two to four "
-    "distinct, mutually exclusive options. The UI provides custom text input "
-    "automatically; do not add an 'Other' or catch-all option. "
-    "Batch independent questions needed for the next step in one call, never "
-    "more than three; prioritize blocking decisions and defer questions that "
-    "are not needed yet. Reuse information and answers already in the "
-    "conversation; ask again only to resolve a material ambiguity or conflict. "
-    "For low-impact, reversible choices, propose a reasonable default instead "
-    "of blocking on a question. Stop asking once you have enough information "
-    "for the user's requested next step; summarize or proceed within their "
-    "authorized scope. When you have a clear recommendation, put that option first, "
-    "mark its label as recommended in the user's language, and explain why in "
-    "its description. Do not invent a recommendation when there is no clear "
-    "preference. Use this tool only for requirement clarification, "
-    "preference selection, and decisions only the user can make; find anything "
-    "you can determine yourself with tools or context first. The tool waits "
-    "until the user answers or cancels; their answers arrive as the tool result."
+    "Ask one to three questions together when the next step needs the user's "
+    "decision or information. Check prior answers and available evidence first. "
+    "Use a reasonable default for minor, reversible choices. "
+    "Use stable question and option IDs. For a choice, offer two to four "
+    "mutually exclusive options and explain the tradeoff in each description. "
+    "If you recommend one, list it first and mark its label in the user's language. "
+    "Omit options for free text. The UI accepts custom text with every choice. "
+    "The tool waits for an answer or cancellation."
 )
 _PLANNED_SUBMISSIONS = {"df_submit_evaluation", "df_submit_pipeline", "submit_workflow"}
 _SDK_DIRECT_SUBMISSION_TOOLS = frozenset(
@@ -188,13 +179,14 @@ _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _MAX_WORKFLOW_DSL_BYTES = 2 * 1024 * 1024
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
 Prefer read for ordinary file inspection, write for file creation, and edit for
-targeted changes. Use terminal for searching, bulk computation, and executing saved
-scripts. Keep generated files
+targeted changes. Use terminal for shell commands and scripts. Keep generated files
 under public_data/. Every terminal call starts at the workspace root (`.`). You may
 use cd within one command, but never rely on a directory change from an earlier call.
 Workspace files use public_data/... paths; authorized absolute paths are also accepted.
 The read tool maps .agents/skills/ and knowledge/ to shared read-only resource
 directories outside the workspace; terminal commands use their absolute paths.
+"""
+_PLAN_TOOL_INSTRUCTIONS = """\
 Use update_plan for complex, multi-step work. Each call must contain the complete
 plan snapshot; keep at most one step in_progress, mark completed steps promptly,
 and do not use it for simple tasks.
@@ -1237,6 +1229,19 @@ class PiAdapter:
                 await self._discard_sandbox(session)
             raise
 
+    async def session_model_id(self, conversation_id: str) -> str | None:
+        session = self._sessions.get(conversation_id)
+        if session is None:
+            files = PiSessionFiles(self._safe_conversation_dir(conversation_id))
+            config = await asyncio.to_thread(files.load_session)
+        else:
+            config = session.config
+        model = config.get("model")
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            return None
+        provider = model.get("provider")
+        return f"{provider}/{model['id']}" if provider else model["id"]
+
     async def update_session_policy(
         self,
         handle: SessionHandle,
@@ -2049,9 +2054,11 @@ class PiAdapter:
         )
         session.runner = runner
         started_at = time.perf_counter()
-        system_prompt = (
-            _SYSTEM_PROMPT + "\n" + str(session.config.get("product_instructions", ""))
-        )
+        tools = self._tool_specs(session)
+        system_prompt = _SYSTEM_PROMPT
+        if any(tool["name"] == "update_plan" for tool in tools):
+            system_prompt += _PLAN_TOOL_INSTRUCTIONS
+        system_prompt += "\n" + str(session.config.get("product_instructions", ""))
         if self._platform_sdk_enabled(session):
             system_prompt += "\n" + PLATFORM_SDK_INSTRUCTIONS
         if self._terminal_backend == "sandbox":
@@ -2113,7 +2120,7 @@ class PiAdapter:
                 ),
                 "system_prompt": system_prompt,
                 "model": {**session.config["model"], "api_key": api_key},
-                "tools": self._tool_specs(session),
+                "tools": tools,
                 "tool_allowlist": tool_allowlist,
                 "skill_allowlist": session.config.get("skill_allowlist"),
                 "delegated_roles": self._delegated_definitions(session)
@@ -3376,6 +3383,12 @@ def _resolve_context_window(
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError("context_window must be a positive integer")
         return value
+    if re.fullmatch(
+        r"(?:deepseek/)?deepseek-(?:flash|v4(?:\.1)?-flash|v4-pro)(?:-\d{4,8})?",
+        model_id,
+        re.IGNORECASE,
+    ):
+        return 1_000_000
     if "deepseek-v4" in model_id.lower():
         return 200_000
     if base_url and (urlparse(base_url).hostname or "").lower() != "api.openai.com":

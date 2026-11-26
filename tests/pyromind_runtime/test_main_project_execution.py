@@ -42,10 +42,28 @@ from .test_preparation import (
 from .test_workflow_execution import FakeSubmission
 
 
-@pytest.mark.parametrize("queued_preparation", [False, True], ids=["user", "queue"])
+_GATEWAY_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+
+
+@pytest.mark.parametrize(
+    ("queued_preparation", "model_id", "legacy_control"),
+    [
+        (False, "test", False),
+        (True, "test", False),
+        (False, _GATEWAY_MODEL, True),
+        (False, _GATEWAY_MODEL, False),
+    ],
+    ids=["user", "queue", "deepseek-control", "deepseek"],
+)
 @pytest.mark.parametrize("state_format", ["task_records", "tasks"])
 async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
-    preparation_setup, tmp_path, monkeypatch, queued_preparation, state_format
+    preparation_setup,
+    tmp_path,
+    monkeypatch,
+    queued_preparation,
+    state_format,
+    model_id,
+    legacy_control,
 ):
     preparation, owner, _ = preparation_setup
     scope = owner.conversation_id
@@ -53,6 +71,8 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
         user_id=owner.user_id, profile_id=owner.profile_id, x_cluster="test"
     )
     profile = ECHOMIND_PRODUCT_PROFILE
+    if not legacy_control:
+        profile = profile.for_model(model_id)
     assert profile.skill_allowlist and profile.development_skill_allowlist
     assert profile.development_product_instructions
     root = tmp_path / "conversations"
@@ -373,7 +393,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                     command_allowlist=profile.command_allowlist,
                     product_instructions=profile.instructions,
                     model_configuration={
-                        "model": "test",
+                        "model": model_id,
                         "base_url": str(server.make_url("/v1")),
                         "api_key": "local-test-key",
                     },
@@ -413,6 +433,11 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             preparation_prompt = requests[0]["messages"][0]["content"]
             assert profile.instructions in preparation_prompt
             assert profile.development_product_instructions not in preparation_prompt
+            if model_id == _GATEWAY_MODEL and not legacy_control:
+                assert profile is not ECHOMIND_PRODUCT_PROFILE
+                assert ECHOMIND_PRODUCT_PROFILE.instructions not in preparation_prompt
+                assert preparation_prompt.count("[[echomind:reply]]") == 1
+                assert "update_plan" not in preparation_prompt
             assert set(re.findall(r"<name>([^<]+)</name>", preparation_prompt)) == set(
                 profile.skill_allowlist
             )
@@ -562,6 +587,13 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             execution_prompt = requests[2]["messages"][0]["content"]
             assert profile.development_product_instructions in execution_prompt
             assert profile.instructions not in execution_prompt
+            if model_id == _GATEWAY_MODEL and not legacy_control:
+                assert execution_prompt.count("[[echomind:reply]]") == 1
+                assert "update_plan" not in execution_prompt
+                assert (
+                    profile.development_product_instructions
+                    in requests[-1]["messages"][0]["content"]
+                )
             assert set(re.findall(r"<name>([^<]+)</name>", execution_prompt)) == set(
                 profile.development_skill_allowlist
             )
@@ -596,12 +628,10 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             assert replay["id"] == legacy["id"]
             assert len(studio.submissions) == 1 and len(jobs) == 2
             assert not (root / scope / "pi" / "subagents").exists()
-            assert all(
-                {"subagent", "ls", "find", "grep"}.isdisjoint(
-                    t["function"]["name"] for t in r["tools"]
-                )
-                for r in requests
-            )
+            for model_request in requests:
+                names = {tool["function"]["name"] for tool in model_request["tools"]}
+                assert {"find", "grep", "terminal"} <= names
+                assert {"subagent", "ls", "bash"}.isdisjoint(names)
             assert all(e.payload.get("category") != "subagent" for e in events)
             queued = EnqueueTaskCommand(
                 command_id="additional", instruction="Review the reports"

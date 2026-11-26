@@ -1944,7 +1944,7 @@ def test_session_config_persists_model_api_resolution() -> None:
                 "base_url": "http://localhost:8000/v1",
             }
         )["context_window"]
-        == 200_000
+        == 1_000_000
     )
     assert (
         model_config(

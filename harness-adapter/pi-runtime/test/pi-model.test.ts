@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { Context } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { createPiModelRuntime } from "../src/pi-model.js";
 
 for (const maxTokens of [undefined, 2048, 8192]) {
@@ -111,4 +113,60 @@ test("insufficient credits remain a model error without an explicit output cap",
   assert.equal(answer.stopReason, "error");
   assert.match(answer.errorMessage ?? "", /402/);
   assert.equal(requests, 1);
+});
+
+test("DeepSeek gateway replays reasoning across consecutive tool calls", async () => {
+  const { modelRuntime, model } = await createPiModelRuntime({
+    provider: "openai", modelId: "deepseek/deepseek-v4-flash-0731",
+    apiKey: "test-key", baseUrl: "http://gateway.invalid/v1",
+  });
+  assert.equal(model.contextWindow, 1_000_000);
+  assert.equal(model.maxTokens, 384_000);
+  const context: Context = {
+    messages: [{ role: "user", content: "Check both records.", timestamp: 1 }],
+    tools: [{ name: "lookup", description: "Look up a record", parameters: Type.Object({}) }],
+  };
+  for (const [index, maxTokens] of [undefined, 300_000, 500_000].entries()) {
+    const answer = await modelRuntime.streamSimple(model, context, {
+      ...(index > 0 ? { reasoning: "xhigh" as const } : {}), maxTokens, maxRetries: 0,
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        assert.deepEqual(body.thinking, { type: "enabled" });
+        assert.equal(body.reasoning_effort, index === 0 ? "high" : "max");
+        assert.equal(body.max_tokens, [256_000, 300_000, 384_000][index]);
+        const history = body.messages.filter((message: { role: string }) => message.role === "assistant");
+        assert.deepEqual(history.map((message: { reasoning_content?: string }) => message.reasoning_content),
+          ["look up the first record", ""].slice(0, index));
+        const delta = index === 2 ? { content: "done" } : {
+          ...(index === 0 ? { reasoning_content: "look up the first record" } : {}),
+          tool_calls: [{ index: 0, id: `call-${index}`, type: "function", function: { name: "lookup", arguments: "{}" } }],
+        };
+        const event = { choices: [{ index: 0, delta, finish_reason: index === 2 ? "stop" : "tool_calls" }] };
+        return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    }).result();
+    assert.equal(answer.stopReason, index === 2 ? "stop" : "toolUse", answer.errorMessage);
+    if (index < 2) context.messages.push(answer, {
+      role: "toolResult", toolCallId: `call-${index}`, toolName: "lookup",
+      content: [{ type: "text", text: "found" }], isError: false, timestamp: 2 + index,
+    });
+  }
+});
+
+test("DeepSeek routes retain the selected endpoint, model identity and modalities", async () => {
+  for (const config of [
+    { provider: "deepseek", modelId: "deepseek-v4-pro" },
+    { provider: "deepseek", modelId: "deepseek-v4-flash" },
+    { provider: "openai", modelId: "deepseek-v4.1-flash-1017", baseUrl: "http://gateway.invalid/v1" },
+    { provider: "openrouter", modelId: "deepseek/deepseek-v4-flash", baseUrl: "https://openrouter.ai/api/v1" },
+  ]) {
+    const { model } = await createPiModelRuntime({ ...config, apiKey: "test-key" });
+    assert.equal(model.id, config.modelId);
+    assert.equal(model.baseUrl, config.baseUrl ?? "https://api.deepseek.com");
+    assert.equal(model.compat?.thinkingFormat, config.provider === "openrouter" ? "openrouter" : "deepseek");
+    assert.equal(model.compat?.requiresReasoningContentOnAssistantMessages, true);
+    assert.deepEqual(model.input, config.modelId.includes("v4.1") ? ["text", "image"] : ["text"]);
+  }
 });

@@ -11,6 +11,8 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import event
 
+from harness_adapter.pi_adapter import PiAdapter
+from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from pyromind_agent_server.api.router import create_product_router
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -555,5 +557,97 @@ async def test_http_prepare_create_and_cross_profile_denial(
             assert (
                 await client.get(f"{profile.route_prefix}/{identity}/project")
             ).json() is None
+    finally:
+        await runtime.close()
+
+
+async def test_prompt_refresh_uses_the_saved_model_after_release(
+    preparation_setup, tmp_path, monkeypatch
+):
+    store, _, _ = preparation_setup
+    root = tmp_path / "conversations"
+    profile = ECHOMIND_PRODUCT_PROFILE
+    search_tools = {"find", "grep"}
+    old = replace(
+        profile,
+        route_prefix="/v42",
+        configuration_version=42,
+        model_prompts=None,
+        tool_allowlist=tuple(
+            tool for tool in profile.tool_allowlist or () if tool not in search_tools
+        ),
+        development_tool_allowlist=tuple(
+            tool
+            for tool in profile.development_tool_allowlist or ()
+            if tool not in search_tools
+        ),
+    )
+    model = "openai/deepseek-v4-flash-0731"
+    selected = profile.for_model(model)
+    assert selected is not profile
+    monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+    runtime = ConversationRuntime(
+        root,
+        PiAdapter(root, terminal_backend="os-sandbox"),
+        default_harness_id="pi",
+        preparation_store=store,
+    )
+    app = _app(tmp_path, runtime)
+    for version in (old, profile):
+        app.include_router(create_product_router(version))
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={
+                "x-pyromind-debug-user-id": "42",
+                "authorization": "Bearer local-test",
+            },
+        ) as client:
+            for version in (old, profile):
+                response = await client.post(
+                    version.route_prefix,
+                    json={
+                        "llm": {
+                            "model": model,
+                            "base_url": "http://localhost:8000/v1",
+                        }
+                    },
+                )
+                assert response.status_code == 201, response.text
+                conversation_id = response.json()["conversation_id"]
+                files = PiSessionFiles(root / conversation_id)
+                assert (
+                    files.load_session()["product_instructions"]
+                    == version.for_model(model).instructions
+                )
+                status = await client.get(
+                    f"{version.route_prefix}/{conversation_id}/snapshot"
+                )
+                assert status.status_code == 200
+                assert await runtime._release(conversation_id, reason="test-release")
+                with pytest.raises(PermissionError):
+                    await runtime.session_model_id(
+                        conversation_id, RequestContext(user_id="42")
+                    )
+                refreshed = await client.get(
+                    f"{profile.route_prefix}/{conversation_id}/snapshot"
+                )
+                assert refreshed.status_code == 200, refreshed.text
+                assert (
+                    files.load_session()["product_instructions"]
+                    == selected.instructions
+                )
+                saved = FileProductStore(root / conversation_id)
+                assert saved.configuration_version() == profile.configuration_version
+                assert search_tools <= set(files.load_session()["tool_allowlist"])
+                assert search_tools <= set(
+                    saved.development_policy().tool_allowlist or ()
+                )
+                assert (
+                    saved.development_policy().product_instructions
+                    == selected.development_product_instructions
+                )
     finally:
         await runtime.close()

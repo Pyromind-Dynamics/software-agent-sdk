@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import ExitStack, contextmanager
@@ -94,9 +95,17 @@ async def configure_session(
             get_conversation_service(request).conversations_dir / conversation_id
         )
         store.authorize(request_context(request).user_id, profile.profile_id)
-        if store.harness_id() not in runtime.adapters:
+        if (
+            store.harness_id() not in runtime.adapters
+            or store.configuration_version() >= profile.configuration_version
+        ):
             return
-        await get_product_runtime(request).apply_session_configuration(
+        context = context_for_profile(request, profile)
+        if profile.model_prompts is not None:
+            profile = profile.for_model(
+                await runtime.session_model_id(conversation_id, context)
+            )
+        await runtime.apply_session_configuration(
             conversation_id,
             SessionPolicy(
                 configuration_version=profile.configuration_version,
@@ -113,7 +122,7 @@ async def configure_session(
                 command_allowlist=profile.command_allowlist,
                 preparation_policy=profile.preparation_policy,
             ),
-            context_for_profile(request, profile),
+            context,
         )
 
 
@@ -224,6 +233,7 @@ def create_product_router(
                 raise HTTPException(422, detail="Workflow execution is not enabled")
         conversation_id = uuid4().hex
         conversations_dir = get_conversation_service(request).conversations_dir
+        selected = profile.for_model(body.llm.model or os.getenv("LLM_MODEL"))
         spec = SessionSpec(
             conversation_id=conversation_id,
             user_id=context.user_id,
@@ -236,12 +246,12 @@ def create_product_router(
             extra=body.extra,
             profile_id=profile.profile_id,
             harness_id=profile.harness_id,
-            product_instructions=profile.instructions,
+            product_instructions=selected.instructions,
             tool_allowlist=profile.tool_allowlist,
             skill_allowlist=profile.skill_allowlist,
             development_tool_allowlist=profile.development_tool_allowlist,
             development_skill_allowlist=profile.development_skill_allowlist,
-            development_product_instructions=profile.development_product_instructions,
+            development_product_instructions=selected.development_product_instructions,
             command_allowlist=profile.command_allowlist,
             delegated_roles=profile.delegated_roles,
             preparation_policy=profile.preparation_policy,

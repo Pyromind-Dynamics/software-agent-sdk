@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from re import Pattern
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPrompts:
+    model_ids: Pattern[str]
+    preparation: str
+    execution: str
 
 
 @dataclass(frozen=True, slots=True)

@@ -267,6 +267,7 @@ from pyromind_runtime.ports.harness import (
     RestoreWorkflowSpec,
     SessionHandle,
     SessionLivenessAdapter,
+    SessionModelReader,
     SessionSpec,
 )
 from pyromind_runtime.ports.observability import ExecutionObserver
@@ -584,6 +585,15 @@ class ConversationRuntime:
     async def project_flywheel_poll(self) -> None:
         if self._project_flywheel is not None:
             await asyncio.to_thread(self._project_flywheel.poll)
+
+    async def session_model_id(
+        self, conversation_id: str, context: RequestContext
+    ) -> str | None:
+        store = await self._authorized_store(conversation_id, context)
+        adapter = self._adapter(store.harness_id())
+        if isinstance(adapter, SessionModelReader):
+            return await adapter.session_model_id(conversation_id)
+        return None
 
     async def apply_session_configuration(
         self, conversation_id: str, policy: SessionPolicy, context: RequestContext

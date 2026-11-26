@@ -3,7 +3,7 @@ name: frozen-reward-evaluation
 description: 已激活的 rubric-RL Project 使用冻结 Reward 执行 Init 基线、候选重评分与独立测试。
 ---
 
-通过 `get_project_reward` 核对冻结版本。按 [inference-evaluation](../inference-evaluation/SKILL.md)
+通过 `get_project_reward` 核对冻结版本；Studio 评分使用该版本的唯一 Reward 条目，权重为 1。按 [inference-evaluation](../inference-evaluation/SKILL.md)
 保留预测、评分、报告与冻结版本的准备契约。SDK 解释器已部署轻量准备函数：
 使用 `pyromind_common.platform.evaluation_core.EvaluationOptions` 校验业务参数，
 将已授权的 Reward 快照作为 `frozen_reward` 传给

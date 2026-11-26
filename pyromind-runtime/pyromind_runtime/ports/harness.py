@@ -221,6 +221,13 @@ class BackgroundExecutionContext(Protocol):
 
 
 @runtime_checkable
+class SessionModelReader(Protocol):
+    async def session_model_id(self, conversation_id: str) -> str | None:
+        """Return the saved model identity without starting a session."""
+        ...
+
+
+@runtime_checkable
 class SessionLivenessAdapter(Protocol):
     async def has_pending_session_work(self, handle: SessionHandle) -> bool: ...
 
