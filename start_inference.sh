@@ -314,7 +314,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 console.log(`Pi runtime ready (Node ${process.versions.node}):`);
-for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents", "@agentgenome/pi-extension"]) {
+for (const name of ["@earendil-works/pi-coding-agent", "pi-subagents"]) {
   const manifest = JSON.parse(readFileSync(join(process.argv[2], "node_modules", name, "package.json"), "utf8"));
   console.log(`  ${name}@${manifest.version}`);
 }
