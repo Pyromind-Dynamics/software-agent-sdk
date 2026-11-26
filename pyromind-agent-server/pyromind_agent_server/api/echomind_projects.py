@@ -541,11 +541,27 @@ async def _load_consolidation_context(
     request: Request, project: ProjectInfo, task_ids: dict[str, str]
 ) -> ConsolidationContext:
     try:
+        conversation = project.project.conversation_id
+        root = get_conversation_service(request).conversations_dir
+        receipts = await asyncio.to_thread(
+            FileProductStore(root / conversation).load_workflow_execution_requests
+        )
+        approved = None
+        if any(
+            item.request_id.startswith("sdk:")
+            and item.correlation
+            and item.correlation.execution
+            for item in receipts.values()
+        ):
+            approved = await get_product_runtime(request).get_project(
+                conversation, context_for_profile(request, ECHOMIND_PRODUCT_PROFILE)
+            )
         return await asyncio.to_thread(
             consolidation_context,
             project,
-            get_conversation_service(request).conversations_dir,
+            root,
             task_ids=task_ids,
+            approved_project=approved,
         )
     except (FileNotFoundError, PermissionError) as exc:
         raise HTTPException(
@@ -971,6 +987,7 @@ async def request_echomind_consolidation(
                 get_conversation_service(request).conversations_dir / conversation_id
             ),
             consolidation.evidence,
+            approved_project=consolidation.approved_project,
         )
         train_reference = references.get("train")
         if isinstance(train_reference, dict) and "runtime_candidate" in train_reference:
@@ -1061,6 +1078,7 @@ async def apply_echomind_consolidation(
             task_ids=task_ids,
             proposal=proposal,
             expected_proposal_sha256=body.proposal_sha256,
+            approved_project=consolidation.approved_project,
             load_current_proposal=load_current_proposal
             if compilation is not None
             else None,

@@ -41,13 +41,18 @@ from pyromind_runtime.application.consolidation_evidence import (
     ConsolidationEvidence,
     select_consolidation_evidence,
 )
+from pyromind_runtime.application.model_evaluation_plan import (
+    MODEL_EVALUATION_DATA_INPUTS,
+)
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.storage_paths import normalize_workspace_path
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 
 class ConsolidationContext(BaseModel):
+    approved_project: ProjectView | None = Field(default=None, exclude=True, repr=False)
     project_id: str
     evidence: ConsolidationEvidence
     source_graph_sha256: str
@@ -234,11 +239,23 @@ def consolidation_context(
     conversations_root: Path,
     *,
     task_ids: Mapping[str, str] | None = None,
+    approved_project: ProjectView | None = None,
 ) -> ConsolidationContext:
+    if approved_project and (
+        approved_project.project_id.replace("-", "")
+        != project.project.project_id.replace("-", "")
+        or approved_project.conversation_id != project.project.conversation_id
+        or (
+            approved_project.cluster
+            and approved_project.cluster != project.project.cluster
+        )
+    ):
+        raise ValueError("The approved plan does not belong to this Project.")
     by_type = _stages(project)
     evidence = select_consolidation_evidence(
         FileProductStore(conversations_root / project.project.conversation_id),
         task_ids=task_ids,
+        approved_project=approved_project,
     )
     data = {
         "project_id": project.project.project_id,
@@ -263,7 +280,7 @@ def consolidation_context(
         "base_model": _approved_path(by_type["train"], names={"base_model"}),
         "validation_dataset": _approved_path(
             by_type["evaluator"],
-            names={"eval_data", "validation_dataset", "evaluation_dataset"},
+            names=MODEL_EVALUATION_DATA_INPUTS,
         ),
     }
     fixed_train = _approved_path(
@@ -278,7 +295,11 @@ def consolidation_context(
     if not str(data["validation_dataset"]).endswith(".jsonl"):
         raise ValueError("The approved fixed evaluation input must be JSONL.")
     return ConsolidationContext.model_validate(
-        {**data, "evidence_sha256": canonical_sha256(data)}
+        {
+            **data,
+            "evidence_sha256": canonical_sha256(data),
+            "approved_project": approved_project,
+        }
     )
 
 
@@ -558,6 +579,7 @@ def apply_consolidation(
     task_ids: Mapping[str, str],
     proposal: ConsolidationProposal,
     expected_proposal_sha256: str,
+    approved_project: ProjectView | None = None,
     load_current_proposal: Callable[
         [ConsolidationContext], ConsolidationProposal | None
     ]
@@ -566,7 +588,12 @@ def apply_consolidation(
     project_id = project.project.project_id
     with ProjectLease(store.root, project_id).acquire():
         current = store.load(project_id, owner_user_id=project.project.owner_user_id)
-        context = consolidation_context(current, conversations_root, task_ids=task_ids)
+        context = consolidation_context(
+            current,
+            conversations_root,
+            task_ids=task_ids,
+            approved_project=approved_project,
+        )
         if load_current_proposal is not None:
             latest = load_current_proposal(context)
             if latest is None:

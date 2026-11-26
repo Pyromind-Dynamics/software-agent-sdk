@@ -20,7 +20,9 @@ from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.preparation import PreparationPolicy, ProjectView
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, ExternalTaskState
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import (
@@ -34,10 +36,15 @@ from pyromind_runtime.domain.workflow_execution import (
     DatasetRecipeReceipt,
     WorkflowExecutionRequest,
 )
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.product_store import ProductStore
+
+from .test_sdk_merge_evaluation_receipts import inference_graph as inference_graph
 
 
 _CONVERSATION = "1d4ac155c318441b8ec8828f2d6a09c3"
+
+
 _NOW = "2026-01-01T00:00:00Z"
 
 
@@ -138,6 +145,180 @@ def test_selects_successful_receipts_without_serializing_payloads(evidence_store
     assert evidence.dataset.revision == 2
     assert evidence.dataset.definition_sha256.startswith("sha256:")
     assert "example-test-value" not in evidence.model_dump_json()
+
+
+@pytest.fixture
+def approved_evidence(evidence_store, request, inference_graph):
+    store = Mock(spec_set=FileProductStore)
+    store.verify_task_correlation.side_effect = lambda value: (
+        value.signature == "a" * 64
+    )
+    store.preparation_policy.return_value = PreparationPolicy.model_validate(
+        {
+            "workflow_nodes": [
+                {
+                    "id": "eval",
+                    "name": "Eval",
+                    "tasks": [
+                        {
+                            "id": "scoring",
+                            "evaluation_target": "model",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    project = ProjectView.model_validate(
+        {
+            "conversation_id": _CONVERSATION,
+            "project_id": "project",
+            "creation_command_id": "create",
+            "plan_sequence": 3,
+            "plan": {
+                "stages": [
+                    {"id": stage, "name": stage, "kind": stage}
+                    for stage in ("train", "eval")
+                ],
+                "tasks": [
+                    {"id": "train", "stage_id": "train", "name": "Train"},
+                    {
+                        "id": "scoring",
+                        "stage_id": "eval",
+                        "name": "Eval",
+                        "kind": "scoring",
+                        "inputs": [
+                            {"name": "model", "resource_id": "model"},
+                            {"name": "dataset", "resource_id": "data"},
+                        ],
+                    },
+                ],
+                "resources": [
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "storage_path": "/workspace/models/merged",
+                    },
+                    {
+                        "id": "data",
+                        "name": "Val",
+                        "storage_path": "/workspace/val.jsonl",
+                    },
+                ],
+            },
+        }
+    )
+    train_graph = {
+        "nodes": [
+            {"id": "t", "data": {"nodeType": "ModelTrainSFTNode"}},
+            {
+                "id": "w",
+                "data": {
+                    "nodeType": "PyroMindWandbConfigBuilderNode",
+                    "config": {"wandb_api_key": "WANDB_API_KEY"},
+                },
+            },
+        ],
+        "edges": [],
+    }
+    snapshot = evidence_store.load_snapshot.return_value
+    tasks = [snapshot.external_tasks[0]]
+    receipts = {"10": _workflow(tasks[0])}
+    runs = []
+    for item, stage, workflow, identifier, kind in [
+        ("train", "train", train_graph, "20", "workflow_run"),
+        ("scoring", "eval", inference_graph, "30", request.param),
+    ]:
+        correlation = TaskCorrelation.model_validate(
+            {
+                "conversation_id": _CONVERSATION,
+                "task_kind": kind,
+                "signature": "a" * 64,
+                "execution": {
+                    "project_id": "project",
+                    "task_id": item,
+                    "attempt": 1,
+                    "plan_sequence": 3,
+                },
+            }
+        )
+        task = _task(identifier, "workflow_run").model_copy(
+            update={"correlation": correlation, "kind": kind}
+        )
+        tasks.append(task)
+        receipt = _workflow(task).model_copy(
+            update={
+                "request_id": "sdk:" + identifier,
+                "workflow_path": "version://v42",
+                "summary": {"name": stage},
+                "workflow": workflow,
+            }
+        )
+        receipts[receipt.request_id] = receipt
+        runs.append(
+            ExperimentExecutionView(
+                run_id=f"project:{item}:1",
+                project_id="project",
+                plan_sequence=3,
+                plan_attempt=1,
+                stage_id=stage,
+                task_id=item,
+                task_name=item,
+                role_id="main",
+                state="succeeded",
+                report_state="ready",
+                intent="execute",
+                platform_task_id=identifier,
+                platform_task_ids=(identifier,),
+            )
+        )
+    store.load_snapshot.return_value = snapshot.model_copy(
+        update={"external_tasks": tuple(tasks), "experiment_executions": tuple(runs)}
+    )
+    store.load_workflow_execution_requests.return_value = receipts
+    store.load_pipeline_runs.return_value = {}
+    return store, project
+
+
+@pytest.mark.parametrize(
+    "approved_evidence", ["workflow_run", "evaluation"], indirect=True
+)
+def test_sdk_consolidation_uses_frozen_graph_and_scoped_primary_receipt(
+    approved_evidence,
+):
+    store, project = approved_evidence
+    evidence = select_consolidation_evidence(store, approved_project=project)
+    assert (evidence.train.task_id, evidence.eval.task_id, evidence.eval.source) == (
+        "20",
+        "30",
+        "workflow_execution_request",
+    )
+    refs = consolidation_references(store, evidence, approved_project=project)
+    train = refs["train"]
+    evaluation = refs["eval"]
+    assert isinstance(train, dict) and train["wandb_credential_task_id"] == "20"
+    assert isinstance(evaluation, dict) and "workflow" in evaluation
+    assert evaluation["workflow_path"] == "version://v42"
+    assert "runtime_candidate" not in evaluation
+    assert "runtime_blocker" in consolidation_evaluation_reference(
+        Mock(spec_set=Versions), evidence, RequestContext(user_id="42")
+    )
+
+    store.load_workflow_execution_requests.return_value["sdk:30"].workflow["nodes"][0][
+        "data"
+    ]["config"]["model_path"] = "/workspace/wrong"
+    with pytest.raises(ConsolidationEvidenceError, match="No verified successful eval"):
+        select_consolidation_evidence(
+            store, approved_project=project, task_ids={"eval": "30"}
+        )
+    store.verify_task_correlation.return_value = False
+    store.verify_task_correlation.side_effect = None
+    with pytest.raises(
+        ConsolidationEvidenceError, match="No verified successful train"
+    ):
+        select_consolidation_evidence(
+            store, approved_project=project, task_ids={"train": "20"}
+        )
 
 
 def test_replay_is_verification_evidence_for_original_dataset(evidence_store: Mock):

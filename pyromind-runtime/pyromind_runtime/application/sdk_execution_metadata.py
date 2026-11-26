@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from http.cookies import SimpleCookie
 from pathlib import PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from pyromind_runtime.application.model_evaluation_plan import sdk_inference_paths
+from pyromind_runtime.application.model_evaluation_plan import (
+    sdk_inference_paths,
+    validate_evaluation_inputs,
+)
+from pyromind_runtime.application.plan_execution import recover_plan_delivery_rows
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
     to_storage_api_path,
 )
-from pyromind_runtime.domain.versions import RunSource, fingerprint
+from pyromind_runtime.domain.versions import (
+    RunSource,
+    fingerprint,
+)
 from pyromind_runtime.domain.workflow_execution import (
     DatasetRecipeReceipt,
     WorkflowExecutionRequest,
@@ -36,9 +45,63 @@ class _ExecutionMetadata(BaseModel):
 
 
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"\b(?:DF_API_KEY|PYROMIND_API_KEY|PYROMIND_AUTH_TOKEN|LLM_AUTH_TOKEN)"
+    r"\b(?:WANDB_API_KEY|DF_API_KEY|PYROMIND_API_KEY|PYROMIND_AUTH_TOKEN|LLM_AUTH_TOKEN)"
     r"\s*=\s*(['\"]?)([^\s;'\"]+)"
 )
+
+
+def portable_sdk_workflow(workflow: JsonObject) -> JsonObject:
+    """Remove Studio's task annotations and resolved values of connected inputs."""
+    result = deepcopy(workflow)
+    nodes, edges = result.get("nodes"), result.get("edges")
+    if not isinstance(nodes, list) or not nodes or not isinstance(edges, list):
+        raise ValueError("Studio returned no executable graph")
+    configs = {}
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(data := node.get("data"), dict):
+            raise ValueError("Invalid Studio node")
+        node.pop("inputs_values", None)
+        node.pop("outputs_values", None)
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or not node_id or node_id in configs:
+            raise ValueError("Invalid Studio node identity")
+        if not isinstance(data.get("nodeType"), str):
+            raise ValueError("Missing Studio node type")
+        props = node.get("properties")
+        if isinstance(props, dict):
+            props.pop("dystatus", None)
+            if not props:
+                node.pop("properties")
+        config = data.get("config", {})
+        if not isinstance(config, dict):
+            raise ValueError("Invalid Studio node configuration")
+        configs[node_id] = config
+        if data["nodeType"] in {
+            "WandbConfigBuilderNode",
+            "PyroMindWandbConfigBuilderNode",
+        }:
+            key = config.get("wandb_api_key")
+            if key is not None and not isinstance(key, str):
+                raise ValueError("Invalid W&B credential reference")
+            if key:
+                config["wandb_api_key"] = "WANDB_API_KEY"
+    for edge in edges:
+        if (
+            not isinstance(edge, dict)
+            or edge.get("source") not in configs
+            or edge.get("target") not in configs
+        ):
+            raise ValueError("Invalid Studio edge")
+        handle = edge.get("targetHandle")
+        if isinstance(handle, str) and handle:
+            configs[edge["target"]].pop(handle, None)
+    extra = result.get("extra")
+    if isinstance(extra, dict):
+        extra.pop("customType", None)
+        extra.pop("taskId", None)
+        if not extra:
+            result.pop("extra")
+    return result
 
 
 def _validate_metadata(request: _ExecutionMetadata, context: RequestContext) -> None:
@@ -123,10 +186,26 @@ def bind_sdk_execution_metadata(
     versions: Versions,
     arguments: JsonObject,
     context: RequestContext,
+    *,
+    platform_archive: bool = False,
 ) -> tuple[WorkflowExecutionRequest, str | None]:
     """Record metadata only; a trusted callback must already establish ownership."""
     store.authorize(context.user_id, context.profile_id)
     request = _ExecutionMetadata.model_validate(arguments)
+    with store.lock_sdk_submission(request.task_id):
+        return _bind_sdk_metadata(store, versions, request, context, platform_archive)
+
+
+def _bind_sdk_metadata(
+    store: FileProductStore,
+    versions: Versions,
+    request: _ExecutionMetadata,
+    context: RequestContext,
+    platform_archive: bool,
+) -> tuple[WorkflowExecutionRequest, str | None]:
+    if platform_archive:
+        request.workflow = portable_sdk_workflow(request.workflow)
+        validate_persisted_payload(request.workflow)
     _validate_metadata(request, context)
     snapshot = store.load_snapshot()
     task = next(
@@ -178,45 +257,81 @@ def bind_sdk_execution_metadata(
     digest = fingerprint(request.model_dump(mode="json"))
     previous = store.load_workflow_execution_requests().get(identity)
     if previous is not None:
-        if previous.fingerprint != digest or previous.correlation != correlation:
+        if previous.correlation != correlation:
+            raise ValueError("SDK task association cannot change")
+        if platform_archive or previous.fingerprint == digest:
+            return previous, output_dir
+        if (
+            previous.summary.get("metadata_source") != "studio_task"
+            or portable_sdk_workflow(request.workflow) != previous.workflow
+        ):
             raise ValueError(
                 "SDK execution metadata is already frozen with different facts"
             )
-        return previous, output_dir
-    run = versions.prepare_run(
-        snapshot.conversation_id,
-        context,
-        identity,
-        RunSource(kind="workflow", source_id=identity, task_id=task.task_id),
-        request.workflow,
-        code=request.code,
-        resolved_inputs={},
-    )
+        if not (request.code or output_dir or request.dataset_recipe):
+            return previous, output_dir
+        request.workflow = previous.workflow
+    if platform_archive:
+        project = versions.project(snapshot.conversation_id, context)
+        assert project is not None
+        version = versions.save_run_config(
+            project, identity, "workflow", request.workflow, context
+        )
+        workflow_path = "version://" + version.id
+    else:
+        run = versions.prepare_run(
+            snapshot.conversation_id,
+            context,
+            identity,
+            RunSource(kind="workflow", source_id=identity, task_id=task.task_id),
+            request.workflow,
+            code=request.code,
+            resolved_inputs={},
+        )
+        workflow_path = "version://" + run.id
     receipt = WorkflowExecutionRequest(
         request_id=identity,
         conversation_id=snapshot.conversation_id,
-        workflow_path="version://" + run.id,
+        workflow_path=workflow_path,
         fingerprint=digest,
         workflow=request.workflow,
         dataset_recipe=request.dataset_recipe,
-        summary={"name": str(request.workflow.get("name", "workflow"))},
+        summary={
+            "name": str(request.workflow.get("name", "workflow")),
+            **({"metadata_source": "studio_task"} if platform_archive else {}),
+        },
         correlation=correlation,
         task_id=task.task_id,
         status="submitted",
+        revision=previous.revision + 1 if previous else 1,
     )
     saved, _ = store.save_workflow_execution_request(
-        receipt, expected_revision=None, reuse_duplicate=True
+        receipt,
+        expected_revision=previous.revision if previous else None,
+        reuse_duplicate=True,
     )
     return saved, output_dir
 
 
 def verified_sdk_inference_paths(
     store: FileProductStore,
+    project: ProjectView | None = None,
+    model_evals: set[str] | None = None,
 ) -> dict[str, tuple[str, str]]:
     """Read frozen inference graphs owned by their signed Project task/attempt."""
     snapshot = store.load_snapshot()
     tasks = {task.task_id: task for task in snapshot.external_tasks}
     paths = {}
+    approved = (
+        {
+            item.id: item
+            for item in project.plan.tasks
+            if model_evals and item.id in model_evals
+        }
+        if project
+        else {}
+    )
+    rows = None
     for receipt in store.load_workflow_execution_requests().values():
         correlation = receipt.correlation
         if correlation is None:
@@ -228,22 +343,50 @@ def verified_sdk_inference_paths(
             or receipt.conversation_id != snapshot.conversation_id
             or correlation.conversation_id != snapshot.conversation_id
             or correlation.type != "main"
-            or correlation.task_kind != "evaluation"
+            or correlation.task_kind not in {"evaluation", "workflow_run"}
             or reference is None
             or task is None
             or task.correlation != correlation
             or not store.verify_task_correlation(correlation)
         ):
             continue
-        if not any(
-            run.project_id == reference.project_id
-            and run.task_id == reference.task_id
-            and run.plan_sequence == reference.plan_sequence
-            and run.plan_attempt == reference.attempt
-            and task.task_id in (run.platform_task_ids or (run.platform_task_id,))
+        owners = [
+            run
             for run in snapshot.experiment_executions or ()
+            if task.task_id in (run.platform_task_ids or (run.platform_task_id,))
+        ]
+        if len(owners) != 1:
+            continue
+        owner = owners[0]
+        if (
+            owner.role_id != "main"
+            or owner.project_id != reference.project_id
+            or owner.task_id != reference.task_id
+            or owner.plan_sequence != reference.plan_sequence
+            or owner.plan_attempt != reference.attempt
         ):
             continue
-        if inference := sdk_inference_paths(receipt.workflow):
-            paths[task.task_id] = inference
+        inference = sdk_inference_paths(receipt.workflow)
+        if not inference:
+            continue
+        if correlation.task_kind == "workflow_run":
+            planned = approved.get(reference.task_id)
+            if (
+                project is None
+                or planned is None
+                or reference.project_id != project.project_id
+                or reference.plan_sequence != project.plan_sequence
+                or receipt.request_id != "sdk:" + task.task_id
+                or task.status != "succeeded"
+            ):
+                continue
+            if rows is None:
+                rows = recover_plan_delivery_rows(snapshot, project)
+            try:
+                validate_evaluation_inputs(
+                    project, planned, rows, *inference, require_bindings=True
+                )
+            except ValueError:
+                continue
+        paths[task.task_id] = inference
     return paths

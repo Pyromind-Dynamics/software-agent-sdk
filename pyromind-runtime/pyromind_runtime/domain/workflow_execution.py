@@ -14,6 +14,23 @@ DATASET_COMMAND_TEMPLATE_MAX_LENGTH = 20_000
 type BatchLabelSource = Literal["dataset", "collection"]
 
 
+def workflow_contains_training_node(workflow: JsonObject) -> bool:
+    nodes = workflow.get("nodes")
+    return isinstance(nodes, list) and any(
+        isinstance(node, dict)
+        and isinstance(data := node.get("data"), dict)
+        and data.get("nodeType")
+        in (
+            "ModelTrainSFTNode",
+            "ModelTrainDPONode",
+            "ModelTrainGRPONode",
+            "ModelTrainOPDNode",
+            "ModelTrainYoloNode",
+        )
+        for node in nodes
+    )
+
+
 class DatasetRecipeAsset(ContractModel):
     role: Literal["prepare", "pipeline", "export", "support_file", "verifier"]
     path: str

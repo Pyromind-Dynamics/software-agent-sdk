@@ -233,6 +233,23 @@ def _platform_task_ids(run: ExperimentExecutionView) -> set[str]:
     return ids
 
 
+def plan_delivery_source(
+    run: ExperimentExecutionView,
+    sdk_receipts: dict[str, tuple[str, str]] | None,
+) -> ExperimentExecutionView:
+    """Scope an SDK evaluation report to the latest selected inference receipt."""
+    selected = run.platform_task_id
+    if (
+        selected
+        and sdk_receipts
+        and selected in sdk_receipts
+        and len(run.platform_task_ids) > 1
+        and run.platform_task_ids[-1] == selected
+    ):
+        return run.model_copy(update={"platform_task_ids": (selected,)})
+    return run
+
+
 def platform_results_ready(
     run: ExperimentExecutionView, statuses: dict[str, str]
 ) -> bool:
@@ -320,7 +337,7 @@ def recover_plan_delivery_rows(
         document = json.loads(text)
         if not isinstance(document, dict):
             return []
-        plan = document.get("plan", document)
+        plan = document.get("plan", document.get("project_plan", document))
         if not isinstance(plan, dict) or plan.get("goal") != project.plan.goal:
             return []
         declarations = {
@@ -342,11 +359,18 @@ def recover_plan_delivery_rows(
             continue
         declaration = declarations.get(task.id, {})
         outputs = declaration.get("outputs")
-        if (
-            declaration.get("stage_id") != task.stage_id
-            or not isinstance(outputs, list)
-            or [out.get("name") for out in outputs if isinstance(out, dict)]
-            != [out.name for out in task.outputs]
+        if "tasks" in plan:
+            if (
+                declaration.get("stage_id") != task.stage_id
+                or not isinstance(outputs, list)
+                or [out.get("name") for out in outputs if isinstance(out, dict)]
+                != [out.name for out in task.outputs]
+            ):
+                continue
+        elif (
+            not row.get("platform_task_id")
+            or not isinstance(verified := row.get("verified_outputs"), dict)
+            or set(verified) != {out.name for out in task.outputs}
         ):
             continue
         run_id = _plan_run_id(
@@ -363,7 +387,9 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
     plan = json.loads(text)
     if not isinstance(plan, dict):
         raise ValueError("workflow plan requires a tasks array")
-    definition = plan if "tasks" in plan else plan.get("plan")
+    definition = (
+        plan if "tasks" in plan else plan.get("plan", plan.get("project_plan", {}))
+    )
     if "task_records" in plan:
         records = plan["task_records"]
         if not isinstance(records, dict):
@@ -383,28 +409,32 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
                 if isinstance(record := records.get(task.id), dict)
             ]
     runtime = plan.get("runtime")
-    runtime_records = runtime.get("tasks") if isinstance(runtime, dict) else None
-    if isinstance(definition, dict) and isinstance(definition.get("tasks"), list):
+    records = runtime.get("tasks") if isinstance(runtime, dict) else None
+    if definition is None and project and plan.get("project_id") == project.project_id:
+        definition = {}
+    if not isinstance(definition, dict):
+        raise ValueError("workflow plan requires a tasks array")
+    if isinstance(definition.get("tasks"), list):
         tasks = definition["tasks"]
     elif (
-        definition is None
-        and project is not None
-        and plan.get("project_id") == project.project_id
-        and isinstance(runtime_records, dict)
+        project is not None and "tasks" not in definition and isinstance(records, dict)
     ):
-        # Use the approved task definitions when the workspace has only records.
+        if plan.get("project_id", project.project_id) != project.project_id:
+            raise ValueError("workflow plan does not match the approved project ID")
+        if definition.get("goal", project.plan.goal) != project.plan.goal:
+            raise ValueError("workflow plan does not match the approved project goal")
         tasks = [
-            task.model_dump(mode="json")
+            task.model_dump(include={"id", "stage_id", "outputs"}, mode="json")
             for task in project.plan.tasks
-            if task.id in runtime_records
+            if isinstance(record := records.get(task.id), dict)
+            and record.get("id", task.id) == task.id
+            and record.get("plan_task_id", task.id) == task.id
+            and record.get("stage_id", task.stage_id) == task.stage_id
         ]
     else:
         raise ValueError("workflow plan requires a tasks array")
-    records = (
-        runtime_records
-        if isinstance(runtime_records, dict)
-        else plan.get("task_states", plan.get("task_records", {}))
-    )
+    if not isinstance(records, dict):
+        records = plan.get("task_states", plan.get("task_records", {}))
     merged = []
     for task in tasks:
         if not isinstance(task, dict):
@@ -713,6 +743,13 @@ def with_platform_states(
         identities = run.platform_task_ids or (
             (run.platform_task_id,) if run.platform_task_id else ()
         )
+        model_eval = (
+            run.role_id == "main" and model_evals and run.task_id in model_evals
+        )
+        if model_eval and run.state == "succeeded" and run.report_state == "ready":
+            identities = (
+                plan_delivery_source(run, sdk_receipts).platform_task_ids or identities
+            )
         platform = [tasks[identity] for identity in identities if identity in tasks]
         if platform and run.role_id == "main":
             if any(
@@ -732,7 +769,7 @@ def with_platform_states(
                 "queued",
             }:
                 run = run.model_copy(update={"state": "waiting_analysis"})
-        if run.role_id == "main" and model_evals and run.task_id in model_evals:
+        if model_eval:
             run = check_inference_receipt(run, receipts, sdk_receipts=sdk_receipts)
         runs.append(run)
     return (

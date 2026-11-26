@@ -861,6 +861,17 @@ class FileProductStore:
             return receipt
 
     @contextmanager
+    def lock_sdk_submission(self, task_id: str) -> Iterator[None]:
+        identity = hashlib.sha256(task_id.encode()).hexdigest()
+        path = self.directory / f"sdk-metadata-{identity}.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, _FILE_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    @contextmanager
     def claim_stage_analysis(self, job_id: str) -> Iterator[bool]:
         identity = hashlib.sha256(job_id.encode()).hexdigest()
         path = self.directory / f"stage-analysis-{identity}.lock"

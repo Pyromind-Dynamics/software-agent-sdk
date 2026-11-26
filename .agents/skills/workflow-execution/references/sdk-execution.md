@@ -234,6 +234,12 @@ Project 任务读取 `PYROMIND_PROJECT_EXECUTIONS`：它是包含
 任务和当前 attempt，再从该项的 `out_ids` 选择任务类型。不要用普通会话关联替代
 Project 关联；新业务尝试需要新的 attempt 上下文，旧 attempt 的迟到回调不代表新尝试完成。
 分片提交保留每片真实 `task_id`，不只保存最后一片。
+执行计划内的模型评测时，使用该评测任务当前尝试的 `out_ids["evaluation"]`，让工作台能将推理回执关联到对应的模型和验证集。
+
+核验产物后更新 `public_data/workflowPLAN.json`。保留获批的 `plan.tasks`，在
+`runtime.tasks[计划任务ID]` 记录当前 `attempt`、实际 `platform_task_id` 和
+`verified_outputs`（按声明的产物名映射到绝对路径）。产物齐备后将该记录的
+`business_status` 设为 `completed`。工作台按任务 ID 和执行轮次登记交付。
 
 `out_id` 仅用于关联，不是平台提交幂等键，也不是平台权限凭据。可信平台回调会核验
 服务端签名关联，然后补齐任务事实并通知原 Main；普通 HTTP 手工回调不能据此认领未知任务。
@@ -274,6 +280,7 @@ with PyroMindAPIClient(max_retries=0) as client:
 
 平台创建与 Project 元数据更新是两个动作。沿用现有 Project task/attempt、执行事件及
 元数据更新入口；绑定失败只重试绑定，保留真实任务 ID，不再次创建平台任务。
+对于计划内的 Train，Runtime 会根据签名回调的任务号，在项目所有者的登录态下从 Studio 读取实际执行图并归档。回调时缺少登录态，恢复原会话后可补登记同一任务。训练报告与工作流分别保存。
 SDK 查询、文件操作、停止任务不要求先创建 Project 或业务 execution。
 Dataset Recipe 的 task、实际工作流、代码、冻结配方及输出元数据在可信回调确认归属后，
 通过已有 `product_versions` 的 `bind_execution_metadata` 动作单独登记；不是提交前置

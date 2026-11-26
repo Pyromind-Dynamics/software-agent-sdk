@@ -34,13 +34,14 @@ from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
     from_storage_api_path,
 )
 from pyromind_runtime.domain.versions import VersionRun, canonical, fingerprint
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
-from pyromind_runtime.ports.product_store import ProductStore
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 
 _EMPTY_REQUEST = RequestContext(user_id="reference")
@@ -132,10 +133,14 @@ _PATH_FIELDS = {
 
 
 def consolidation_references(
-    store: ProductStore, evidence: ConsolidationEvidence
+    store: FileProductStore,
+    evidence: ConsolidationEvidence,
+    *,
+    approved_project: ProjectView | None = None,
 ) -> JsonObject:
     current = select_consolidation_evidence(
         store,
+        approved_project=approved_project,
         task_ids={
             "dataset": evidence.dataset.task_id,
             "train": evidence.train.task_id,
@@ -148,19 +153,32 @@ def consolidation_references(
     receipts = tuple(store.load_workflow_execution_requests().values())
     dataset = _workflow_receipt(receipts, evidence.dataset, evidence.conversation_id)
     train = _workflow_receipt(receipts, evidence.train, evidence.conversation_id)
-    evaluation = [
-        run
-        for run in store.load_pipeline_runs().values()
-        if run.task_id == evidence.eval.task_id
-        and run.submission_status == "submitted"
-        and run.conversation_id == evidence.conversation_id
-        and run.execution_revision == evidence.eval.revision
-        and consolidation_definition_sha256(run.definition)
-        == evidence.eval.definition_sha256
-    ]
-    if len(evaluation) != 1:
-        raise ConsolidationEvidenceError("Evaluation execution receipt changed")
-    (evaluation_run,) = evaluation
+    if evidence.eval.source == "workflow_execution_request":
+        receipt = _workflow_receipt(receipts, evidence.eval, evidence.conversation_id)
+        safe, _ = _xyflow_reference(receipt.workflow)
+        eval_reference: JsonObject = {
+            "workflow": safe,
+            "workflow_path": _source_path(receipt.workflow_path),
+        }
+    else:
+        evaluation = [
+            run
+            for run in store.load_pipeline_runs().values()
+            if run.task_id == evidence.eval.task_id
+            and run.submission_status == "submitted"
+            and run.conversation_id == evidence.conversation_id
+            and run.execution_revision == evidence.eval.revision
+            and consolidation_definition_sha256(run.definition)
+            == evidence.eval.definition_sha256
+        ]
+        if len(evaluation) != 1:
+            raise ConsolidationEvidenceError("Evaluation execution receipt changed")
+        (evaluation_run,) = evaluation
+
+        eval_reference = {
+            "definition": _project_fields(evaluation_run.definition, _EVAL_FIELDS),
+            "output_dir": from_storage_api_path(evaluation_run.output_dir),
+        }
 
     workflow, has_wandb_reference = _xyflow_reference(train.workflow)
     train_reference: JsonObject = {
@@ -181,10 +199,7 @@ def consolidation_references(
             "command_omitted": True,
         },
         "train": train_reference,
-        "eval": {
-            "definition": _project_fields(evaluation_run.definition, _EVAL_FIELDS),
-            "output_dir": from_storage_api_path(evaluation_run.output_dir),
-        },
+        "eval": eval_reference,
     }
 
 
@@ -195,6 +210,14 @@ def consolidation_evaluation_reference(
     *,
     runtime_dir: Path = _EVAL_RUNTIME_DIR,
 ) -> JsonObject:
+    if evidence.eval.source == "workflow_execution_request":
+        return {
+            "runtime_blocker": (
+                "The SDK Eval workflow is verified. Replay still requires "
+                "hash-pinned scoring code, dataset/evaluation configuration, "
+                "and report assets."
+            )
+        }
     project = versions.project(evidence.conversation_id, context, create=False)
     if project is None:
         return {"runtime_blocker": "No versioned Eval archive for this conversation."}
@@ -518,7 +541,7 @@ def _workflow_receipt(
 
 
 def _source_path(value: str) -> str | None:
-    if re.fullmatch(r"version://r[0-9]+", value):
+    if re.fullmatch(r"version://[rv][0-9]+", value):
         return value
     if not re.fullmatch(r"[\w./-]+", value) or ".." in PurePosixPath(value).parts:
         return None
@@ -559,7 +582,9 @@ def _xyflow_reference(workflow: JsonObject) -> tuple[JsonObject, bool]:
             archived_config, dict
         ):
             key = archived_config.get("wandb_api_key")
-            if isinstance(key, str) and _WANDB_KEY_PATTERN.fullmatch(key):
+            if isinstance(key, str) and (
+                key == _WANDB_KEY_MARKER or _WANDB_KEY_PATTERN.fullmatch(key)
+            ):
                 config["wandb_api_key"] = _WANDB_KEY_MARKER
                 has_wandb_reference = True
         nodes.append(

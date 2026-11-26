@@ -66,6 +66,7 @@ from pyromind_runtime.application.plan_execution import (
     completed_plan_write,
     delivery_rows,
     next_approved_task,
+    plan_delivery_source,
     plan_executions,
     platform_output_directories,
     platform_results_ready,
@@ -103,6 +104,10 @@ from pyromind_runtime.application.reward_workflows import (
 from pyromind_runtime.application.sdk_execution_metadata import (
     bind_sdk_execution_metadata,
     verified_sdk_inference_paths,
+)
+from pyromind_runtime.application.sdk_workflow_archive import (
+    AcceptedWorkflowReader,
+    SdkWorkflowArchive,
 )
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
 from pyromind_runtime.application.stage_analysis import (
@@ -238,6 +243,7 @@ from pyromind_runtime.domain.versions import (
 from pyromind_runtime.domain.workflow_execution import (
     DatasetRecipeReceipt,
     WorkflowExecutionRequest,
+    workflow_contains_training_node,
 )
 from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
@@ -365,6 +371,7 @@ class ConversationRuntime:
         default_harness_id: str = "pi",
         project_flywheel: ProjectFlywheel | None = None,
         external_task_query: ExternalTaskQueryPort | None = None,
+        accepted_workflow_reader: AcceptedWorkflowReader | None = None,
         preparation_store: PreparationStore | None = None,
         resource_media_reader: ResourceMediaReader | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
@@ -400,6 +407,11 @@ class ConversationRuntime:
         )
         self._resource_media_reader = resource_media_reader
         self._external_task_query = external_task_query
+        self._sdk_workflow_archive = (
+            SdkWorkflowArchive(accepted_workflow_reader, versions)
+            if accepted_workflow_reader and versions
+            else None
+        )
         self._execution_event_task: asyncio.Task[None] | None = None
         self._experiment_plan_project_binder = experiment_plan_project_binder
         self._observer = observer
@@ -2027,11 +2039,12 @@ class ConversationRuntime:
                 )
                 receipts = {p.task_id: p for p in pipelines.values() if p.task_id}
                 sdk_receipts = (
-                    await asyncio.to_thread(verified_sdk_inference_paths, store)
+                    await asyncio.to_thread(
+                        verified_sdk_inference_paths, store, project, required
+                    )
                     if required
                     else {}
                 )
-                previous_ids = {r.run_id: r.platform_task_id for r in registered}
                 for run in plan_executions(
                     project,
                     rows,
@@ -2062,19 +2075,26 @@ class ConversationRuntime:
                             }
                         )
                     if run.task_id in required:
-                        run = run.model_copy(
-                            update={"platform_task_id": previous_ids.get(run.run_id)}
+                        row = rows_by_task[run.task_id]
+                        selected = row.get("platform_task_id") or row.get(
+                            "actual_platform_task_id"
                         )
+                        if selected is not None:
+                            if previous is None or selected not in (
+                                previous.platform_task_id,
+                                *previous.platform_task_ids,
+                            ):
+                                continue
+                            run = run.model_copy(update={"platform_task_id": selected})
                         run = check_inference_receipt(
                             run, receipts, sdk_receipts=sdk_receipts
                         )
-                        identities = run.platform_task_ids or (
-                            (run.platform_task_id,) if run.platform_task_id else ()
+                        paths = (
+                            sdk_receipts.get(run.platform_task_id)
+                            if run.platform_task_id
+                            else None
                         )
-                        for identity in identities:
-                            paths = sdk_receipts.get(identity)
-                            if paths is None:
-                                continue
+                        if paths is not None:
                             try:
                                 validate_evaluation_inputs(
                                     project, plan_tasks[run.task_id], rows, *paths
@@ -2089,7 +2109,11 @@ class ConversationRuntime:
                                         "waiting_reason": str(exc),
                                     }
                                 )
-                                break
+                    source = (
+                        plan_delivery_source(run, sdk_receipts)
+                        if run.task_id in required
+                        else run
+                    )
                     attempt = run.run_id.rsplit(":", 1)[-1]
                     if (
                         self.versions
@@ -2099,12 +2123,12 @@ class ConversationRuntime:
                         in DELIVERY_STAGE_KINDS
                         and attempt.isdecimal()
                         and int(attempt) >= latest_attempts.get(run.task_id, 0)
-                        and platform_results_ready(run, external)
+                        and platform_results_ready(source, external)
                     ):
                         row = rows_by_task[run.task_id]
                         task = plan_tasks[run.task_id]
                         report = delivery_report(
-                            run,
+                            source,
                             row,
                             artifacts,
                             producers,
@@ -2146,6 +2170,7 @@ class ConversationRuntime:
                                     run,
                                     row,
                                     previous,
+                                    platform_task_ids=source.platform_task_ids,
                                     retry=retry_delivery_stage is not None
                                     and run.stage_id == retry_delivery_stage,
                                 )
@@ -2200,6 +2225,7 @@ class ConversationRuntime:
         previous: ExperimentExecutionView | None,
         *,
         retry: bool,
+        platform_task_ids: tuple[str, ...] | None = None,
     ) -> ExperimentExecutionView:
         context = active.context
         has_storage_credentials = bool(context.cookie or context.authorization)
@@ -2235,9 +2261,14 @@ class ConversationRuntime:
         )
         if not worker_running:
             active.inflight += 1
+            delivery = (
+                pending.model_copy(update={"platform_task_ids": platform_task_ids})
+                if platform_task_ids is not None
+                else pending
+            )
             worker = asyncio.create_task(
                 self._register_plan_delivery(
-                    active, store, task, pending, row, context, job_id
+                    active, store, task, delivery, row, context, job_id
                 )
             )
             self._stage_analysis_workers[job_id] = worker
@@ -3038,19 +3069,28 @@ class ConversationRuntime:
                 raise ValueError(
                     "plan delivery requires the current approved task attempt"
                 )
+            required = model_evaluation_tasks(project, policy)
+            sdk_receipts = (
+                await asyncio.to_thread(
+                    verified_sdk_inference_paths, store, project, required
+                )
+                if task.id in required and len(run.platform_task_ids) > 1
+                else None
+            )
             if request.validate_only:
+                source = plan_delivery_source(run, sdk_receipts)
                 try:
                     document = await asyncio.to_thread(
                         validate_plan_report,
                         self._observation_storage_factory(context),
                         task,
-                        run,
+                        source,
                         {
                             name: to_storage_api_path(path)
                             for name, path in outputs.items()
                         },
                         platform_output_dirs=platform_output_directories(
-                            run, snapshot.external_tasks
+                            source, snapshot.external_tasks
                         ),
                         require_schema_version=True,
                     )
@@ -3120,11 +3160,10 @@ class ConversationRuntime:
                 }
                 if (
                     run.state in {"failed", "cancelled", "needs_input"}
-                    or not platform_results_ready(run, statuses)
-                    or (
-                        task.id in model_evaluation_tasks(project, policy)
-                        and not run.platform_task_id
+                    or not platform_results_ready(
+                        plan_delivery_source(run, sdk_receipts), statuses
                     )
+                    or (task.id in required and not run.platform_task_id)
                 ):
                     raise ValueError("the task attempt is not ready for delivery")
                 if not same_request and run.report_state != "registering":
@@ -4902,6 +4941,14 @@ class ConversationRuntime:
             snapshot = await self._load_saved_snapshot(conversation_id, store, context)
             if snapshot.project and snapshot.project.cluster:
                 context = replace(context, x_cluster=snapshot.project.cluster)
+            if (
+                self._sdk_workflow_archive
+                and not self._closing
+                and not snapshot.capabilities.read_only
+            ):
+                self._sdk_workflow_archive.schedule(
+                    store, context, snapshot.external_tasks
+                )
             snapshot = await self._project_execution_status(snapshot, store)
             if not snapshot.capabilities.read_only:
                 await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
@@ -4933,7 +4980,9 @@ class ConversationRuntime:
             await asyncio.to_thread(store.load_pipeline_runs) if required else {}
         )
         sdk_receipts = (
-            await asyncio.to_thread(verified_sdk_inference_paths, store)
+            await asyncio.to_thread(
+                verified_sdk_inference_paths, store, project, required
+            )
             if required
             else {}
         )
@@ -6213,6 +6262,9 @@ class ConversationRuntime:
                     "SDK task status requires a trusted platform source"
                 )
             await self._bind_sdk_project_task(store, task_id, task.correlation)
+            context = self._task_contexts.get(conversation_id)
+            if self._sdk_workflow_archive and context and not self._closing:
+                self._sdk_workflow_archive.schedule(store, context, (task,))
         normalized = _normalize_external_status(status)
         if task.kind == "workflow_run":
             auto_run = auto_run and task.resume_auto_run
@@ -6713,6 +6765,8 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        if self._sdk_workflow_archive:
+            await self._sdk_workflow_archive.close()
         analysis_tasks = (
             *self._stage_analysis_rechecks.values(),
             *self._stage_analysis_workers.values(),
@@ -8246,8 +8300,18 @@ def _workflow_has_training_node(
 ) -> bool | None:
     if task.kind != "workflow_run":
         return None
-    request = store.load_workflow_execution_requests().get(task.run_id or "")
-    return request.summary.get("has_training_node") is True if request else None
+    requests = store.load_workflow_execution_requests()
+    request = requests.get(task.run_id or "") or requests.get("sdk:" + task.task_id)
+    if (
+        request is None
+        or request.task_id != task.task_id
+        or request.correlation != task.correlation
+    ):
+        return None
+    return workflow_contains_training_node(request.workflow) or (
+        not request.request_id.startswith("sdk:")
+        and request.summary.get("has_training_node") is True
+    )
 
 
 def _has_active_subagents(snapshot: ConversationSnapshot) -> bool:

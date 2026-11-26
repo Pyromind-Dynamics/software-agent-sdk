@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections.abc import Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, closing, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
@@ -43,7 +43,10 @@ from pyromind_common.tools.utils.platform_env import (
     platform_cluster_target,
 )
 from pyromind_common.tools.utils.pyromind_api_client import get_pyromind_api_client
-from pyromind_common.tools.utils.training_source import WANDB_BUILDER_NODE_TYPES
+from pyromind_common.tools.utils.training_source import (
+    WANDB_BUILDER_NODE_TYPES,
+    wandb_environment,
+)
 from pyromind_common.tools.workflow.task_submission import (
     create_workflow_api_client,
     submit_workflow_task,
@@ -51,6 +54,7 @@ from pyromind_common.tools.workflow.task_submission import (
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
+from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
@@ -63,7 +67,7 @@ _SUCCEEDED_TASK_STATUSES = frozenset({"succeeded", "success", "completed"})
 _FAILED_TASK_STATUSES = frozenset({"failed", "error"})
 _CANCELED_TASK_STATUSES = frozenset({"canceled", "cancelled", "terminated"})
 _WANDB_KEY_MARKER = "WANDB_API_KEY"
-_WANDB_KEY_PATTERN = re.compile(r"[0-9a-fA-F]{40}|wandb_[A-Za-z0-9_-]{20,}")
+_WANDB_KEY_PATTERN = re.compile(r"wandb_[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{40}")
 _suppress_sdk_logs = ContextVar("suppress_wandb_sdk_logs", default=False)
 
 
@@ -247,16 +251,33 @@ class PlatformTrainWorkflowBackend:
             raise TrainRuntimeError(
                 "The Train workflow has no W&B credential reference."
             )
-        keys: list[str] = []
+        keys = {
+            node_id: source_nodes.get(node_id, {}).get("wandb_api_key")
+            for node_id, _ in targets
+        }
+        remote = [
+            node_id for node_id, value in keys.items() if value == _WANDB_KEY_MARKER
+        ]
+        if remote:
+            with closing(
+                _client(
+                    spec=spec,
+                    request_context=request_context,
+                    access_key=self._access_key(spec, request_context),
+                )
+            ) as client:
+                for node_id in remote:
+                    keys[node_id] = _studio_wandb_key(client, task_id, node_id)
+        bound: list[str] = []
         for node_id, config in targets:
-            key = source_nodes.get(node_id, {}).get("wandb_api_key")
+            key = keys[node_id]
             if not isinstance(key, str) or not _WANDB_KEY_PATTERN.fullmatch(key):
                 raise TrainRuntimeError(
                     "The referenced task has no W&B credential for the matching node."
                 )
             config["wandb_api_key"] = key
-            keys.append(key)
-        return tuple(keys)
+            bound.append(key)
+        return tuple(bound)
 
     def _archived_credential_workflow(
         self,
@@ -282,7 +303,7 @@ class PlatformTrainWorkflowBackend:
             if store.load_x_cluster() != spec.cluster:
                 raise PermissionError("conversation cluster mismatch")
             archived = [
-                request.workflow
+                request
                 for request in store.load_workflow_execution_requests().values()
                 if request.task_id == task_id
                 and request.conversation_id == conversation_id
@@ -301,7 +322,16 @@ class PlatformTrainWorkflowBackend:
             ) from None
         if len(archived) != 1:
             raise TrainRuntimeError("The referenced credential task was not found.")
-        return archived[0]
+        receipt = archived[0]
+        if task_kind is None and (
+            receipt.request_id.startswith("sdk:")
+            or any(
+                config.get("wandb_api_key") == _WANDB_KEY_MARKER
+                for config in _wandb_builder_configs(receipt.workflow).values()
+            )
+        ):
+            _verify_train_credential_receipt(store, receipt, task_id, spec)
+        return receipt.workflow
 
     def query_task(
         self,
@@ -462,6 +492,87 @@ def _is_lora_adapter(files: set[str]) -> bool:
     return "adapter_config.json" in files and bool(
         files & {"adapter_model.safetensors", "adapter_model.bin"}
     )
+
+
+def _verify_train_credential_receipt(
+    store: FileProductStore,
+    receipt: WorkflowExecutionRequest,
+    task_id: str,
+    spec: TrainWorkflowSpec,
+) -> None:
+    correlation = receipt.correlation
+    if not (
+        correlation
+        and correlation.type == "main"
+        and correlation.execution
+        and correlation.conversation_id == receipt.conversation_id
+        and correlation.task_kind == "workflow_run"
+        and store.verify_task_correlation(correlation)
+    ):
+        raise TrainRuntimeError(
+            "The Train credential source has no signed Project receipt."
+        )
+    reference = correlation.execution
+    snapshot = store.load_snapshot()
+    if not any(
+        task.task_id == task_id
+        and task.correlation == correlation
+        and task.kind == "workflow_run"
+        and task.status == "succeeded"
+        and task.x_cluster == spec.cluster
+        for task in snapshot.external_tasks
+    ) or not any(
+        run.project_id == reference.project_id
+        and run.task_id == reference.task_id
+        and run.plan_sequence == reference.plan_sequence
+        and run.plan_attempt == reference.attempt
+        and run.role_id == "main"
+        and (run.stage_snapshot or {}).get("kind") == "train"
+        and task_id in (run.platform_task_ids or (run.platform_task_id,))
+        for run in snapshot.experiment_executions or ()
+    ):
+        raise TrainRuntimeError(
+            "The Train credential source does not match its Project execution."
+        )
+
+
+def _studio_wandb_key(
+    client: PyroMindAPIClient, task_id: str, node_id: str
+) -> str | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", node_id):
+        raise TrainRuntimeError("Invalid W&B builder node ID.")
+    try:
+        with _without_sensitive_sdk_logs(True):
+            output = client.studio.get_node_output(task_id, node_id)
+    except PyroMindAPIError as exc:
+        if exc.status_code in {401, 403}:
+            raise RuntimeCredentialUnavailableError(
+                "Open this run while signed in to refresh Studio access."
+            ) from None
+        raise TrainRuntimeError(
+            "Studio could not read the source W&B node output."
+        ) from None
+    except Exception:
+        raise TrainRuntimeError(
+            "Studio could not read the source W&B node output."
+        ) from None
+    parameters = (output or {}).get("parameters")
+    if not isinstance(parameters, list):
+        return None
+    values = [
+        row.get("value")
+        for row in parameters
+        if isinstance(row, dict) and row.get("name") == "wandb_config"
+    ]
+    if len(values) != 1:
+        return None
+    value = values[0]
+    if isinstance(value, str) and value.lstrip().startswith("{"):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return wandb_environment({"wandb_config": value}).get("WANDB_API_KEY")
 
 
 def _wandb_builder_configs(workflow: Mapping[str, Any]) -> dict[str, dict[str, Any]]:

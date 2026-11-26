@@ -7,12 +7,26 @@ from collections.abc import Mapping
 from hashlib import sha256
 from typing import Literal
 
+from pyromind_runtime.application.model_evaluation_plan import (
+    model_evaluation_tasks,
+    validate_evaluation_inputs,
+)
+from pyromind_runtime.application.plan_execution import recover_plan_delivery_rows
+from pyromind_runtime.application.sdk_execution_metadata import (
+    verified_sdk_inference_paths,
+)
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.pipeline import PipelineRun
-from pyromind_runtime.domain.snapshot import ExternalTaskState
+from pyromind_runtime.domain.preparation import ProjectView
+from pyromind_runtime.domain.snapshot import ConversationSnapshot, ExternalTaskState
 from pyromind_runtime.domain.storage_paths import StoragePathError, to_storage_api_path
-from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
+from pyromind_runtime.domain.workflow_execution import (
+    WorkflowExecutionRequest,
+    workflow_contains_training_node,
+)
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.product_store import ProductStore
 
 
@@ -42,8 +56,9 @@ class ConsolidationEvidence(ContractModel):
 
 
 def select_consolidation_evidence(
-    store: ProductStore,
+    store: FileProductStore,
     *,
+    approved_project: ProjectView | None = None,
     task_ids: Mapping[str, str] | None = None,
 ) -> ConsolidationEvidence:
     selected = dict(task_ids or {})
@@ -61,17 +76,25 @@ def select_consolidation_evidence(
     candidates: dict[Stage, list[ConsolidationStageEvidence]] = {
         stage: [] for stage in _STAGES
     }
+    scoped, eval_ids = _approved_sdk_tasks(store, snapshot, tasks, approved_project)
     pipelines = store.load_pipeline_runs().values()
-    pipeline_ids = {pipeline.task_id for pipeline in pipelines if pipeline.task_id}
+    pipeline_ids: set[str] = set()
     for pipeline in pipelines:
         task = tasks.get(pipeline.task_id or "")
         if (
             task is not None
             and task.kind == "data_preparation"
+            and (
+                approved_project is None
+                or not task.correlation
+                or not task.correlation.execution
+                or scoped.get(task.task_id) == "eval"
+            )
             and pipeline.conversation_id == snapshot.conversation_id
             and pipeline.submission_status == "submitted"
             and _matches_evaluation_pipeline(pipeline, task)
         ):
+            pipeline_ids.add(task.task_id)
             candidates["eval"].append(
                 _evidence(
                     task=task,
@@ -97,14 +120,36 @@ def select_consolidation_evidence(
         ):
             continue
         stage: Stage
-        if (
-            task.kind == "workflow_run"
-            and receipt.summary.get("has_training_node") is True
+        if receipt.request_id.startswith("sdk:"):
+            if receipt.request_id != "sdk:" + task_id or task_id not in scoped:
+                continue
+            if task_id in eval_ids:
+                stage = "eval"
+            elif (
+                scoped[task_id] == "train"
+                and task.kind == "workflow_run"
+                and workflow_contains_training_node(receipt.workflow)
+            ):
+                stage = "train"
+            elif scoped[task_id] == "dataset" and task.kind == "data_preparation":
+                stage = "dataset"
+            else:
+                continue
+        elif task.kind == "workflow_run" and (
+            receipt.summary.get("has_training_node") is True
+            or workflow_contains_training_node(receipt.workflow)
         ):
             stage = "train"
         elif task.kind == "data_preparation":
             stage = "dataset"
         else:
+            continue
+        if (
+            task.correlation
+            and task.correlation.execution
+            and approved_project
+            and scoped.get(task_id) != stage
+        ):
             continue
         candidates[stage].append(
             _evidence(
@@ -123,6 +168,85 @@ def select_consolidation_evidence(
         train=_select_stage("train", candidates["train"], selected.get("train")),
         eval=_select_stage("eval", candidates["eval"], selected.get("eval")),
     )
+
+
+def _approved_sdk_tasks(
+    store: FileProductStore,
+    snapshot: ConversationSnapshot,
+    tasks: dict[str, ExternalTaskState],
+    approved_project: ProjectView | None,
+) -> tuple[dict[str, str], set[str]]:
+    scoped: dict[str, str] = {}
+    eval_ids: set[str] = set()
+    if approved_project is None:
+        return scoped, eval_ids
+    if approved_project.conversation_id != snapshot.conversation_id:
+        raise ConsolidationEvidenceError(
+            "Approved plan belongs to another conversation"
+        )
+    stages = {
+        stage.id: stage.kind
+        for stage in approved_project.plan.stages
+        if stage.enabled and not stage.placeholder
+    }
+    planned = {task.id: task for task in approved_project.plan.tasks}
+    latest: dict[str, ExperimentExecutionView] = {}
+    for run in snapshot.experiment_executions or ():
+        task = planned.get(run.task_id)
+        if (
+            run.role_id == "main"
+            and run.project_id == approved_project.project_id
+            and run.plan_sequence == approved_project.plan_sequence
+            and task
+            and run.plan_attempt is not None
+            and run.stage_id == task.stage_id
+            and run.stage_id in stages
+        ):
+            previous = latest.get(task.id)
+            if previous is None or run.plan_attempt > (previous.plan_attempt or 0):
+                latest[task.id] = run
+    for run in latest.values():
+        task = tasks.get(run.platform_task_id or "")
+        correlation = task.correlation if task else None
+        reference = correlation.execution if correlation else None
+        if (
+            task
+            and correlation
+            and correlation.type == "main"
+            and (
+                not approved_project.cluster
+                or not correlation.cluster
+                or correlation.cluster == approved_project.cluster
+            )
+            and reference
+            and reference.project_id == run.project_id
+            and reference.plan_sequence == run.plan_sequence
+            and reference.task_id == run.task_id
+            and reference.attempt == run.plan_attempt
+            and store.verify_task_correlation(correlation)
+        ):
+            scoped[task.task_id] = stages[planned[run.task_id].stage_id] or ""
+    required = model_evaluation_tasks(approved_project, store.preparation_policy())
+    if required:
+        rows = recover_plan_delivery_rows(snapshot, approved_project)
+        for identifier, paths in verified_sdk_inference_paths(
+            store, approved_project, required
+        ).items():
+            if scoped.get(identifier) != "eval":
+                continue
+            correlation = tasks[identifier].correlation
+            assert correlation is not None and correlation.execution is not None
+            task = planned[correlation.execution.task_id]
+            if task.id not in required:
+                continue
+            try:
+                validate_evaluation_inputs(
+                    approved_project, task, rows, *paths, require_bindings=True
+                )
+            except ValueError:
+                continue
+            eval_ids.add(identifier)
+    return scoped, eval_ids
 
 
 def successful_dataset_recipe_runs(

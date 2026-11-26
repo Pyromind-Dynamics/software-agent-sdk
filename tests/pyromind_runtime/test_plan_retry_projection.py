@@ -1,6 +1,8 @@
 import json
 from typing import Literal
 
+import pytest
+
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.plan_execution import (
     PLAN_PATH,
@@ -275,3 +277,59 @@ def test_sdk_plan_completion_is_projected_against_the_registered_attempt():
     assert completed.run_id == receipt.run_id and completed.state == "succeeded"
     assert not project_rows({**saved, "id": "ds_prelabel", "plan_task_id": "other"})
     assert not project_rows({**saved, "platform_task_id": "unregistered"})
+
+
+def test_runtime_task_map_uses_approved_tasks_and_bound_receipts():
+    task = {"id": "prelabel", "stage_id": "data", "name": "Prepare data"}
+    project = ProjectView.model_validate(
+        {
+            "project_id": "p",
+            "conversation_id": "c",
+            "plan_sequence": 3,
+            "creation_command_id": "create",
+            "plan": {
+                "goal": "Train on labeled samples",
+                "stages": [{"id": "data", "name": "Data", "kind": "dataset"}],
+                "tasks": [{**task, "outputs": [{"name": "messages"}]}],
+            },
+        }
+    )
+    (queued,) = plan_executions(project, [{**task, "business_status": "pending"}])
+    bound = queued.model_copy(update={"platform_task_id": "1379"})
+    record = {
+        "stage_id": "data",
+        "attempt": 1,
+        "platform_task_id": "1379",
+        "business_status": "completed",
+        "verified_outputs": {"messages": "/workspace/train.jsonl"},
+    }
+
+    def project_record(**updates):
+        records = {"unplanned": record, "prelabel": {**record, **updates}}
+        rows = read_plan_tasks(
+            json.dumps(
+                {
+                    "project_plan": {"goal": project.plan.goal},
+                    "runtime": {"tasks": records},
+                }
+            ),
+            project,
+        )
+        return rows, list(plan_executions(project, rows, registered=[bound]))
+
+    (row,), (completed,) = project_record()
+    assert row["verified_outputs"] == record["verified_outputs"]
+    assert completed.run_id == bound.run_id and completed.state == "succeeded"
+    for conflict in [{"id": "other"}, {"stage_id": "train"}, {"plan_task_id": "other"}]:
+        assert project_record(**conflict) == ([], [])
+    for mismatch in [{"attempt": 2}, {"platform_task_id": "different"}]:
+        assert not project_record(**mismatch)[1]
+
+    records_only = {
+        "project_id": project.project_id,
+        "runtime": {"tasks": {"prelabel": record}},
+    }
+    assert read_plan_tasks(json.dumps(records_only), project) == [row]
+    records_only["project_id"] = "another-project"
+    with pytest.raises(ValueError, match="approved project ID"):
+        read_plan_tasks(json.dumps(records_only), project)

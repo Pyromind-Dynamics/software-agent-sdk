@@ -144,6 +144,16 @@ def context(
     return consolidation_context(project, tmp_path)
 
 
+def test_eval_accepts_approved_dataset_input(
+    project: ProjectInfo, context: ConsolidationContext, tmp_path: Path
+):
+    evaluation = next(node for node in project.graph.nodes if node.type == "evaluator")
+    evaluation.config["tasks"][0]["inputs"][0]["name"] = "dataset"
+    assert consolidation_context(project, tmp_path).validation_dataset == (
+        context.validation_dataset
+    )
+
+
 def _workflow(**params: str) -> dict:
     return {
         "nodes": [
