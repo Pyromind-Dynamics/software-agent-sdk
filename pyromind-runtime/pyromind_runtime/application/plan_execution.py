@@ -271,7 +271,9 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
     plan = json.loads(text)
     if not isinstance(plan, dict):
         raise ValueError("workflow plan requires a tasks array")
-    definition = plan if "tasks" in plan else plan.get("plan")
+    definition = (
+        plan if "tasks" in plan else plan.get("plan", plan.get("project_plan", {}))
+    )
     if "task_records" in plan:
         records = plan["task_records"]
         if not isinstance(records, dict):
@@ -290,13 +292,27 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
                 for task in project.plan.tasks
                 if isinstance(record := records.get(task.id), dict)
             ]
-    if not isinstance(definition, dict) or not isinstance(
-        definition.get("tasks"), list
-    ):
-        raise ValueError("workflow plan requires a tasks array")
-    tasks = definition["tasks"]
     runtime = plan.get("runtime")
     records = runtime.get("tasks") if isinstance(runtime, dict) else None
+    if not isinstance(definition, dict):
+        raise ValueError("workflow plan requires a tasks array")
+    if isinstance(definition.get("tasks"), list):
+        tasks = definition["tasks"]
+    elif (
+        project is not None and "tasks" not in definition and isinstance(records, dict)
+    ):
+        if definition.get("goal", project.plan.goal) != project.plan.goal:
+            raise ValueError("workflow plan does not match the approved project goal")
+        tasks = [
+            task.model_dump(include={"id", "stage_id", "outputs"}, mode="json")
+            for task in project.plan.tasks
+            if isinstance(record := records.get(task.id), dict)
+            and record.get("id", task.id) == task.id
+            and record.get("plan_task_id", task.id) == task.id
+            and record.get("stage_id", task.stage_id) == task.stage_id
+        ]
+    else:
+        raise ValueError("workflow plan requires a tasks array")
     if not isinstance(records, dict):
         records = plan.get("task_states", plan.get("task_records", {}))
     merged = []
