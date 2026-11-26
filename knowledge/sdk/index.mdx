@@ -1,6 +1,6 @@
 ---
 title: SDK 任务索引
-description: 按任务查找 PyroMind SDK 方法、使用示例和 Agent 执行边界。
+description: 按任务查找 PyroMind SDK 方法与使用示例。
 ---
 
 轻量级 Python SDK，用于调用 [PyroMind AI](https://pyromind.ai/) 平台 API — 管理训练工作流、Jupyter 实例、推理任务、EchoMind 等。
@@ -10,20 +10,11 @@ description: 按任务查找 PyroMind SDK 方法、使用示例和 Agent 执行�
 
 ## Agent 平台操作
 
-- [Agent 操作索引](agent-operations.mdx) — SDK 原语、普通准备函数、回调关联与待补能力
+- [Agent 操作索引](agent-operations.mdx) — 按操作查 SDK 方法、准备函数和使用示例
 - [CUSTOM 沙箱](sandboxes.mdx) — 创建、等待就绪、文件读写、命令退出码与释放资源
 
-系统消息明确启用 SDK 的已登录 Workbench 或 EchoMind 单 Main，可用 terminal 和
-`$PYROMIND_SDK_PYTHON` 调用当前账户的平台能力。身份、集群、默认镜像和关联上下文自动注入。
-未登录、受限自定义角色和历史子 Agent 不自动获得此身份。Tool 清单仍按原授权范围派生。
-OS Main 保留 `sandbox_terminal`，因为当前 SDK 命令流缺少所需代理配置；远端路径单独验收。
-
-按需读取 `workflow-execution` Skill 的 `references/sdk-execution.md`。
-普通函数准备和冻结脚本、构图、解析产物；Agent 直接调用 SDK 创建平台任务。
-异步任务使用当前会话或 Project task/attempt 的服务端关联，不要求经统一提交代理。
-Project 管理业务执行与验收，Runtime 负责回调事件、去重和会话恢复。
-准备能力或依赖尚未迁移时，保留当前清单仍列出的旧提交 Tool。
-部署 `OH_PLATFORM_SDK_ENABLED=false` 并重启服务，恢复原授权范围的旧入口并关闭 SDK 环境。
+会话中使用 terminal 和 `"$PYROMIND_SDK_PYTHON"` 运行 SDK 脚本，身份和集群由会话提供。
+工作流的校验、提交与结果处理见[执行参考](../../.agents/skills/workflow-execution/references/sdk-execution.md)。
 
 ## 入门
 

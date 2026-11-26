@@ -55,7 +55,7 @@ original pages before answering.
 
 | Page | Summary | Tags |
 |---|---|---|
-| [Agent 操作索引](sdk/agent-operations.mdx) | 任务到 SDK 方法的映射；区分 SDK 0.1.17 已覆盖能力、Runtime 提交职责、Storage 客户端与迁移缺口 | sdk, agent, tool, studio, storage, migration |
+| [Agent 操作索引](sdk/agent-operations.mdx) | 按操作查找 SDK 方法、准备函数和使用示例 | sdk, agent, studio, storage, sandbox |
 | [Custom Nodes](sdk/custom-nodes.mdx) | Pyromind SDK Custom Nodes 接口与使用说明 | sdk, custom-nodes |
 | [Echo Mind](sdk/echo-mind.mdx) | Pyromind SDK Echo Mind 接口与使用说明 | sdk, echo-mind |
 | [SDK 任务索引](sdk/index.mdx) | SDK 按任务渐进查阅入口；先选择能力，再读取精确文档 | sdk, index, progressive-disclosure |
