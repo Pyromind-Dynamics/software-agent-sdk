@@ -33,7 +33,7 @@ from pyromind_runtime.domain.storage_paths import (
     normalize_workspace_path,
     to_storage_api_path,
 )
-from pyromind_runtime.domain.versions import ArtifactVersion, fingerprint
+from pyromind_runtime.domain.versions import ArtifactVersion, canonical, fingerprint
 
 
 _TRAINING_METRICS = tuple(
@@ -42,10 +42,20 @@ _TRAINING_METRICS = tuple(
 )
 
 
+def _baseline_task_ids(snapshot: ConversationSnapshot, stage_id: str) -> set[str]:
+    if snapshot.project is None:
+        return set()
+    tasks = [task for task in snapshot.project.plan.tasks if task.stage_id == stage_id]
+    return {task.id for task in tasks if task.kind == "bench"} or {
+        task.id for task in tasks if task.kind != "analysis"
+    }
+
+
 def stage_report_runs(
     snapshot: ConversationSnapshot, project_id: str, node_id: str, kind: str
 ) -> dict[str, list[ExperimentExecutionView]]:
     result: dict[str, list[ExperimentExecutionView]] = {}
+    baseline_tasks = _baseline_task_ids(snapshot, node_id) if kind == "init" else None
     for run in reversed(snapshot.experiment_executions or ()):
         if (
             run.project_id != project_id
@@ -53,6 +63,7 @@ def stage_report_runs(
             or run.role_id != "main"
             or run.report_state != "ready"
             or run.plan_sequence is None
+            or (baseline_tasks is not None and run.task_id not in baseline_tasks)
             or (run.stage_snapshot or {}).get("kind") != kind
         ):
             continue
@@ -148,14 +159,35 @@ def project_observations(
             status = "running"
         else:
             status = "queued"
+        baseline_tasks = (
+            _baseline_task_ids(snapshot, stage.id) if stage.kind == "init" else None
+        )
         report_ids = tuple(
             dict.fromkeys(
                 artifact_id
                 for _, run in stage_runs
-                if run and run.report_state == "ready"
+                if run
+                and run.report_state == "ready"
+                and (baseline_tasks is None or run.task_id in baseline_tasks)
                 for artifact in run.artifacts
                 if isinstance(artifact_id := artifact.get("artifact_id"), str)
             )
+        )
+        analysis_report_ids: tuple[str, ...] = (
+            tuple(
+                dict.fromkeys(
+                    analysis_id
+                    for kind, run in stage_runs
+                    if kind == "analysis"
+                    and run
+                    and run.state == "succeeded"
+                    and run.report_state == "ready"
+                    for artifact in run.artifacts
+                    if isinstance(analysis_id := artifact.get("artifact_id"), str)
+                )
+            )
+            if stage.kind == "init"
+            else ()
         )
         history = (
             stage_report_runs(snapshot, project_id, stage.id, stage.kind)
@@ -177,6 +209,15 @@ def project_observations(
             if failed_delivery
             else "registering"
             if any(run and run.report_state == "registering" for _, run in stage_runs)
+            else "pending"
+            if any(
+                task.stage_id == stage.id
+                and task.report_output is not None
+                and (run := current_runs.get(task.id))
+                and run.state in {"succeeded", "waiting_analysis"}
+                and run.report_state != "ready"
+                for task in project.plan.tasks
+            )
             else None
         )
         nodes.append(
@@ -194,6 +235,7 @@ def project_observations(
                 else None,
                 current_run_ids=tuple(run.run_id for _, run in stage_runs if run),
                 report_version_ids=report_ids,
+                analysis_report_version_ids=analysis_report_ids,
                 historical_report_version_ids=tuple(
                     identity for identity in history if identity not in report_ids
                 ),
@@ -293,6 +335,69 @@ def _legacy_entry_report(
     return False
 
 
+def observation_analysis_report(
+    snapshot: ConversationSnapshot,
+    project_id: str,
+    node_id: str,
+    report_version_id: str,
+    versions: Versions,
+    context: RequestContext,
+) -> dict[str, str]:
+    overview = project_observations(snapshot, project_id)
+    node = next((node for node in overview.nodes if node.id == node_id), None)
+    if not node or report_version_id not in node.analysis_report_version_ids:
+        raise FileNotFoundError("Baseline analysis report is unavailable")
+    assert snapshot.project is not None
+    project = versions.project(snapshot.conversation_id, context, create=False)
+    if project is None:
+        raise FileNotFoundError("Baseline analysis report is unavailable")
+    artifact = versions.store.get_version(project.id, report_version_id)
+    if artifact.kind != "report" or artifact.state != "ready":
+        raise FileNotFoundError("Baseline analysis report is unavailable")
+    producers = {
+        run.id: run.source.task_id for run in versions.store.list_runs(project.id)
+    }
+    tasks = {
+        task.id: task
+        for task in snapshot.project.plan.tasks
+        if task.stage_id == node_id and task.kind == "analysis"
+    }
+    run = next(
+        (
+            run
+            for run in snapshot.experiment_executions or ()
+            if run.run_id in node.current_run_ids
+            and run.project_id == project_id
+            and run.stage_id == node.id
+            and run.role_id == "main"
+            and run.plan_sequence == overview.plan_sequence
+            and run.task_id in tasks
+            and run.state == "succeeded"
+            and run.report_state == "ready"
+            and any(item.get("artifact_id") == artifact.id for item in run.artifacts)
+            and artifact_belongs_to_execution(artifact, run, producers)
+        ),
+        None,
+    )
+    if run is None:
+        raise FileNotFoundError("Baseline analysis report is unavailable")
+    text = versions.snapshots.read_text(snapshot_result(artifact), context)
+    filename = artifact.manifest.source.filename
+    if filename.endswith(".json"):
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            document = None
+        if isinstance(document, dict) and isinstance(
+            original := document.get("attribution_report"), dict
+        ):
+            text = canonical(original)
+            original_filename = document.get("attribution_report_filename")
+            if isinstance(original_filename, str) and original_filename:
+                filename = original_filename
+    return {"filename": filename, "text": text}
+
+
 def observation_report_details(
     snapshot: ConversationSnapshot,
     project_id: str,
@@ -316,7 +421,7 @@ def observation_report_details(
     job = None
     historical_runs = (
         stage_report_runs(snapshot, project_id, node.id, node.type)
-        if report_version_id is not None
+        if report_version_id is not None or (node.type == "init" and analysis_job_id)
         else {}
     )
     if analysis_job_id is not None:
@@ -333,7 +438,13 @@ def observation_report_details(
         )
         if job is None:
             raise FileNotFoundError("Observation stage report is unavailable")
-        report_ids = job.report_ids
+        report_ids = (
+            tuple(
+                identity for identity in job.report_ids if identity in historical_runs
+            )
+            if node.type == "init"
+            else job.report_ids
+        )
     else:
         current_runs = {
             artifact_id: run
@@ -401,7 +512,7 @@ def observation_report_details(
             ),
             None,
         )
-        if analysis_job_id is None and run is None:
+        if (analysis_job_id is None or node.type == "init") and run is None:
             continue
         readable.append(artifact)
         if node.type == "init" and run is not None and run.platform_task_id:

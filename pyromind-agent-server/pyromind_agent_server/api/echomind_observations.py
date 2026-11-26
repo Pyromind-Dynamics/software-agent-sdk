@@ -104,6 +104,32 @@ async def report_details(
         raise HTTPException(409, "Observation report could not be read") from exc
 
 
+@router.get("/analysis-report")
+async def analysis_report(
+    project_id: str,
+    request: Request,
+    project_node_id: Annotated[str, Query(min_length=1, max_length=128)],
+    report_version_id: Annotated[str, Query(min_length=1, max_length=128)],
+) -> dict[str, str]:
+    context, info, _ = _load_project(request, project_id, require_cluster=True)
+    try:
+        return await get_product_runtime(
+            request
+        ).get_project_observation_analysis_report(
+            info.project.conversation_id,
+            info.project.project_id,
+            project_node_id,
+            report_version_id,
+            context,
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, "Observation report authorization required") from exc
+    except (FileNotFoundError, EvaluationStorageMissingError) as exc:
+        raise HTTPException(404, "Baseline analysis report is unavailable") from exc
+    except (OSError, ValueError, EvaluationStorageUnavailableError) as exc:
+        raise HTTPException(409, "Baseline analysis report could not be read") from exc
+
+
 @router.get("/series")
 async def series(
     project_id: str,

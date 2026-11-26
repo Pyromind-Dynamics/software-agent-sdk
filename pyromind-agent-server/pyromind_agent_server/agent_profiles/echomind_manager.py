@@ -80,7 +80,20 @@ include a files array with name, path
 (absolute /workspace path), size_bytes, sample_count and distributions
 (dimension to label counts) for each verified split. Omit unknown size_bytes.
 Dataset metrics are optional; record boolean verification outcomes under checks.
-Save reports with product_versions and record the returned report_version_id.
+For a declared primary report include schema_version: 1. For reports derived
+from a platform attempt, include the verified task ID in source.platform_task_id
+or the full ID list in source.platform_task_ids. Include a summary or findings
+in Init attribution reports. Submit the current
+plan_task_id, plan_attempt and verified_outputs using product_versions with
+action deliver_plan_outputs. Use validate_only=true to check the exact paths and
+report with the same validator before submitting. Reuse the command_id and the
+same inputs to read its result. While registration is pending, say the files
+have been generated and registration is in progress.
+Report delivery only after the tool returns report_state=ready with a
+report_version_id. On validation failure fix the indicated field and submit
+corrected inputs with a new command_id, without resubmitting platform work.
+For approved older tasks without a declared primary report, record verified
+outputs in workflowPLAN.json for the existing Runtime registration path.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence
 needed for the next decision. After an asynchronous platform submission succeeds,

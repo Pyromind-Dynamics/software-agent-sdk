@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -14,27 +15,35 @@ from pyromind_runtime.application.plan_artifact_delivery import (
     _read_report,
     delivery_key,
     delivery_report,
+    delivery_version_key,
     rebuild_legacy_report,
     register_plan_delivery,
 )
 from pyromind_runtime.application.plan_execution import (
+    PLAN_PATH,
     plan_executions,
     recover_plan_delivery_rows,
     with_plan_report,
 )
 from pyromind_runtime.application.project_observations import (
+    observation_analysis_report,
     observation_report_details,
     project_observations,
 )
 from pyromind_runtime.application.stage_analysis import ready_stage_analyses
-from pyromind_runtime.application.versions import Versions
+from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import ExperimentTask, PlanOutput
-from pyromind_runtime.domain.preparation import ProjectView
+from pyromind_runtime.domain.preparation import PreparationPolicy, ProjectView
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
-from pyromind_runtime.domain.versions import SaveVersion, SnapshotSource, VersionParent
+from pyromind_runtime.domain.versions import (
+    SaveVersion,
+    SnapshotSource,
+    VersionParent,
+    VersionToolRequest,
+)
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
@@ -47,6 +56,7 @@ from pyromind_runtime.ports.storage import (
 )
 
 from .fake_adapter import FakeAdapter
+from .test_preparation import preparation_setup as preparation_setup
 
 
 def test_primary_report_is_selected_by_type_and_validates_metrics():
@@ -64,6 +74,355 @@ def test_primary_report_is_selected_by_type_and_validates_metrics():
     read.return_value = b'{"metrics":[]}'
     with pytest.raises(InvalidPlanDelivery, match="invalid_report_metrics"):
         _read_report(storage, "init", outputs, report_name="baseline_results")
+
+
+def test_legacy_init_is_converted_only_with_its_verified_platform_receipt():
+    body = {
+        "report_kind": "init_baseline",
+        "source": {"platform_task_id": 1372},
+        "metrics": {
+            "result_accuracy": 0.55830258,
+            "result_total": 542,
+            "per_class": {"pass": {"f1": 0.57}},
+        },
+    }
+    storage = cast(
+        EvaluationStorage, SimpleNamespace(read=lambda _: json.dumps(body).encode())
+    )
+    outputs = {"report": "/run/baseline_report.json"}
+    report = _read_report(
+        storage, "init", outputs, report_name="report", platform_task_id="1372"
+    )
+    assert report["metrics"] == [
+        {"label": "result_accuracy", "value": 0.55830258, "unit": "ratio"},
+        {"label": "evaluated_samples", "value": 542.0, "unit": "count"},
+        {"label": "pass_f1", "value": 0.57, "unit": "ratio"},
+    ]
+    with pytest.raises(InvalidPlanDelivery, match="invalid_report_metrics"):
+        _read_report(
+            storage, "init", outputs, report_name="report", platform_task_id="1373"
+        )
+    with pytest.raises(InvalidPlanDelivery) as failure:
+        _read_report(
+            storage,
+            "init",
+            outputs,
+            report_name="report",
+            platform_task_id="1372",
+            require_schema_version=True,
+        )
+    assert failure.value.field == "schema_version"
+
+
+async def test_delivery_receipt_survives_replay_and_stale_workspace_status(
+    preparation_setup, tmp_path, monkeypatch
+):
+    preparation, owner, _ = preparation_setup
+    scope = owner.conversation_id
+    context = RequestContext(
+        user_id=owner.user_id,
+        profile_id=owner.profile_id,
+        authorization="Bearer test-only",
+    )
+    snapshots = FileArtifactSnapshots(tmp_path / "storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    data_dir = snapshots.path("/run", context)
+    data_dir.mkdir(parents=True)
+    (data_dir / "train.jsonl").write_text('{"label":"pass"}\n')
+    policy = PreparationPolicy.model_validate(
+        {"workflow_nodes": [{"id": "dataset", "name": "Dataset"}]}
+    )
+    source = {
+        "schema_version": 1,
+        "files": [{"path": "/workspace/run/train.jsonl", "sample_count": 42}],
+    }
+    storage = cast(
+        EvaluationStorage,
+        SimpleNamespace(
+            read=lambda _: json.dumps(source).encode(),
+            list=lambda _: {"report.json", "train.jsonl"},
+        ),
+    )
+    project = ProjectView.model_validate(
+        {
+            "project_id": "project",
+            "conversation_id": scope,
+            "plan_sequence": 1,
+            "creation_command_id": "accept",
+            "plan": {
+                "stages": [{"id": "dataset", "kind": "dataset", "name": "Dataset"}],
+                "tasks": [
+                    {
+                        "id": "prepare",
+                        "stage_id": "dataset",
+                        "name": "Prepare",
+                        "outputs": [
+                            {"name": "report", "kind": "report"},
+                            {"name": "train", "kind": "dataset"},
+                        ],
+                    }
+                ],
+            },
+        }
+    )
+    row = {
+        "id": "prepare",
+        "stage_id": "dataset",
+        "business_status": "in_progress",
+        "attempt": 1,
+    }
+    (data_dir / "report.json").write_text(json.dumps(source))
+    root = tmp_path / "sessions"
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(
+        root,
+        adapter,
+        preparation_store=preparation,
+        versions=versions,
+        observation_storage_factory=lambda _: storage,
+    )
+    monkeypatch.setattr(runtime, "get_project", AsyncMock(return_value=project))
+    workspace_plan = root / scope / PLAN_PATH
+
+    def request(attempt=1, report_path="/workspace/run/report.json"):
+        return VersionToolRequest(
+            action="deliver_plan_outputs",
+            arguments={
+                "plan_task_id": "prepare",
+                "plan_attempt": attempt,
+                "verified_outputs": {
+                    "report": report_path,
+                    "train": "/workspace/run/train.jsonl",
+                },
+            },
+        )
+
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=scope,
+                user_id=context.user_id,
+                profile_id=context.profile_id,
+                workspace_root=str(root / scope),
+                preparation_policy=policy,
+                tool_allowlist=("product_versions",),
+            ),
+            context,
+        )
+        workspace_plan.parent.mkdir(parents=True, exist_ok=True)
+        workspace_plan.write_text(json.dumps({"tasks": [row]}))
+        store = runtime._store(scope)
+        active = runtime._active[scope]
+        runtime._queue_task(
+            store,
+            scope,
+            "project-continue:project:prepare",
+            "project_continue",
+            "prepare",
+        )
+        await runtime._dispatch_queued_tasks(active, store)
+        execution = runtime._plan_attempt(store.load_snapshot(), project, "prepare")
+        assert execution and execution.plan_attempt == 1 and execution.state == "queued"
+        notification = adapter.external_task_notifications[-1][1]
+        assert notification.correlation and notification.correlation.execution
+        assert notification.correlation.execution.task_id == "prepare"
+        preflight = request()
+        preflight.arguments["validate_only"] = True
+        result = await runtime.version_call(scope, preflight, "check", context)
+        assert result["valid"] is True
+        assert not runtime._artifact_versions(scope, context)
+        with pytest.raises(ValueError, match="current approved task attempt"):
+            await runtime.version_call(scope, request(attempt=2), "future", context)
+        source["schema_version"] = 2
+        invalid = await runtime.version_call(
+            scope, request(), "superseded-command", context
+        )
+        assert invalid["report_state"] == "registering"
+        await asyncio.gather(*runtime._stage_analysis_workers.values())
+        source["schema_version"] = 1
+        first, second = await asyncio.gather(
+            runtime.version_call(scope, request(), "publish", context),
+            runtime.version_call(scope, request(), "publish", context),
+        )
+        assert first["report_state"] in {"registering", "ready"}
+        assert second["report_state"] in {"registering", "ready"}
+        await asyncio.gather(*runtime._stage_analysis_workers.values())
+        replay = await runtime.version_call(scope, request(), "publish", context)
+        assert replay["report_state"] == "ready", replay
+        report_id = replay["report_version_id"]
+        assert isinstance(report_id, str)
+        prior = await runtime.version_call(
+            scope, request(), "superseded-command", context
+        )
+        assert (
+            prior["report_state"] == "superseded" and prior["report_version_id"] is None
+        )
+        with pytest.raises(ValueError, match="different outputs"):
+            await runtime.version_call(
+                scope,
+                request(report_path="/workspace/run/other.json"),
+                "publish",
+                context,
+            )
+        await runtime._capture_plan_progress(active, store)
+        executions = store.load_snapshot().experiment_executions
+        assert executions and len(executions) == 1
+        run = executions[0]
+        assert (run.state, run.report_state) == ("succeeded", "ready")
+        assert run.artifacts[0]["artifact_id"] == report_id
+        reports = [
+            item
+            for item in runtime._artifact_versions(scope, context)
+            if item.registration_key == delivery_version_key(run, "report")
+        ]
+        assert [item.id for item in reports] == [report_id]
+        assert json.loads(workspace_plan.read_text()) == {"tasks": [row]}
+    finally:
+        await runtime.close()
+
+
+def test_v1_platform_report_must_match_its_trusted_task():
+    body = {
+        "schema_version": 1,
+        "source": {"platform_task_id": "other"},
+        "metrics": [{"label": "accuracy", "value": 0.72}],
+    }
+    storage = cast(
+        EvaluationStorage, SimpleNamespace(read=lambda _: json.dumps(body).encode())
+    )
+    outputs = {"report": "/bench/report.json"}
+    with pytest.raises(InvalidPlanDelivery) as failure:
+        _read_report(
+            storage,
+            "init",
+            outputs,
+            report_name="report",
+            platform_task_id="bound",
+            require_platform_source=True,
+            require_schema_version=True,
+        )
+    assert failure.value.field == "source.platform_task_id"
+    body.pop("source")
+    with pytest.raises(InvalidPlanDelivery):
+        _read_report(
+            storage,
+            "init",
+            outputs,
+            report_name="report",
+            platform_task_id="bound",
+            require_platform_source=True,
+            require_schema_version=True,
+        )
+    body["source"] = {"platform_task_id": "bound"}
+    assert _read_report(
+        storage,
+        "init",
+        outputs,
+        report_name="report",
+        platform_task_id="bound",
+        require_platform_source=True,
+        require_schema_version=True,
+    )["metrics"]
+    with pytest.raises(InvalidPlanDelivery) as narrative:
+        _read_report(
+            storage,
+            "init",
+            outputs,
+            report_name="report",
+            allow_narrative=True,
+            require_schema_version=True,
+        )
+    assert narrative.value.field == "summary"
+
+
+def test_failed_snapshot_is_never_reused_for_a_corrected_submission(
+    tmp_path, monkeypatch
+):
+    context = RequestContext(user_id="42")
+    snapshots = FileArtifactSnapshots(tmp_path / "Storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    directory = snapshots.path("/run", context)
+    directory.mkdir(parents=True)
+    for name, score in (("first.json", 0.51), ("corrected.json", 0.92)):
+        (directory / name).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "metrics": [{"label": "accuracy", "value": score}],
+                }
+            )
+        )
+    read = Mock(side_effect=lambda path: snapshots.path(path, context).read_bytes())
+    storage = cast(
+        EvaluationStorage,
+        SimpleNamespace(read=read, list=lambda _: {"first.json", "corrected.json"}),
+    )
+    task = ExperimentTask(
+        id="bench",
+        stage_id="init",
+        name="Bench",
+        kind="bench",
+        outputs=(PlanOutput(name="result", kind="report"),),
+    )
+    run = ExperimentExecutionView(
+        run_id="project:bench:1",
+        project_id="project",
+        task_id=task.id,
+        task_name=task.name,
+        role_id="main",
+        plan_sequence=1,
+        stage_id="init",
+        stage_snapshot={"kind": "init"},
+        state="succeeded",
+        report_state="not_started",
+        delivery_command_id="first",
+    )
+    original_save = snapshots.save
+
+    def fail_snapshot(source, target, request_context):
+        if source.text is not None:
+            raise OSError("simulated report write failure")
+        return original_save(source, target, request_context)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(snapshots, "save", fail_snapshot)
+        with pytest.raises(ValueError, match="snapshot not completed"):
+            register_plan_delivery(
+                versions,
+                storage,
+                task,
+                run,
+                {"verified_outputs": {"result": "/workspace/run/first.json"}},
+                "session",
+                context,
+            )
+    version_project = versions.project("session", context)
+    assert version_project
+    failed = [
+        item
+        for item in versions.store.list_versions(version_project.id)
+        if item.state == "failed"
+    ]
+    assert len(failed) == 1
+    corrected = run.model_copy(update={"delivery_command_id": "corrected"})
+    row = {"verified_outputs": {"result": "/workspace/run/corrected.json"}}
+    ready = register_plan_delivery(
+        versions, storage, task, corrected, row, "session", context
+    )
+    assert ready.id != failed[0].id
+    read.assert_called_with("/run/corrected.json")
+    assert (
+        json.loads(snapshots.read_text(snapshot_result(ready), context))["metrics"][0][
+            "value"
+        ]
+        == 0.92
+    )
+    assert (
+        register_plan_delivery(
+            versions, storage, task, corrected, row, "session", context
+        )
+        == ready
+    )
 
 
 def test_primary_dataset_report_registers_files_despite_bad_auxiliary_values():
@@ -135,6 +494,143 @@ def test_legacy_detection_preserves_summary_reports_and_skips_oversized_non_repo
     )["metrics"] == [{"label": "accuracy", "value": 0.55, "unit": "number"}]
     with pytest.raises(InvalidPlanDelivery, match="invalid_report"):
         _read_report(storage, "init", outputs, report_name="model_config")
+
+
+def test_baseline_and_attribution_complete_together_but_have_separate_reports(tmp_path):
+    context = RequestContext(user_id="42")
+    snapshots = FileArtifactSnapshots(tmp_path / "storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    project = ProjectView.model_validate(
+        {
+            "project_id": "p",
+            "conversation_id": "session",
+            "plan_sequence": 2,
+            "creation_command_id": "accept",
+            "plan": {
+                "stages": [{"id": "init", "kind": "init", "name": "Init"}],
+                "tasks": [
+                    {
+                        "id": "bench",
+                        "kind": "bench",
+                        "stage_id": "init",
+                        "name": "Measure",
+                        "outputs": [{"name": "result", "kind": "report"}],
+                    },
+                    {
+                        "id": "explain",
+                        "kind": "analysis",
+                        "stage_id": "init",
+                        "name": "Explain",
+                        "outputs": [{"name": "analysis", "kind": "report"}],
+                    },
+                ],
+            },
+        }
+    )
+    baseline_body = {
+        "schema_version": 1,
+        "metrics": [{"label": "result_accuracy", "value": 0.72, "unit": "ratio"}],
+    }
+    analysis_body = {
+        "schema_version": 1,
+        "findings": ["Low-confidence samples cause most errors."],
+        "badcases": [{"category": "glare", "count": 9}],
+    }
+    directory = snapshots.path("/run", context)
+    directory.mkdir(parents=True)
+    (directory / "bench.json").write_text(json.dumps(baseline_body))
+    (directory / "explain.json").write_text(json.dumps(analysis_body))
+    storage = cast(
+        EvaluationStorage,
+        SimpleNamespace(
+            read=lambda path: snapshots.path(path, context).read_bytes(),
+            list=lambda path: {
+                file.name for file in snapshots.path(path, context).iterdir()
+            },
+        ),
+    )
+    runs = {}
+    reports = {}
+    for task in project.plan.tasks:
+        ready = ExperimentExecutionView(
+            project_id="p",
+            plan_sequence=2,
+            stage_id="init",
+            stage_snapshot={"kind": "init"},
+            run_id=f"p:{task.id}:1",
+            task_id=task.id,
+            task_name=task.name,
+            role_id="main",
+            state="succeeded",
+            report_state="not_started",
+            delivery_command_id=task.id,
+        )
+        report = register_plan_delivery(
+            versions,
+            storage,
+            task,
+            ready,
+            {
+                "verified_outputs": {
+                    task.outputs[0].name: f"/workspace/run/{task.id}.json"
+                }
+            },
+            "session",
+            context,
+        )
+        reports[task.id] = report.id
+        runs[task.id] = with_plan_report(ready, report)
+
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": "session",
+            "capabilities": {},
+            "project": project,
+            "experiment_executions": [runs["bench"]],
+        }
+    )
+    waiting = project_observations(snapshot, "p").nodes[0]
+    assert waiting.business_status == "waiting_analysis"
+    assert waiting.report_version_ids == (reports["bench"],)
+    assert waiting.analysis_report_version_ids == ()
+
+    complete = snapshot.model_copy(
+        update={"experiment_executions": tuple(runs.values())}
+    )
+    node = project_observations(complete, "p").nodes[0]
+    assert node.business_status == "succeeded"
+    assert node.report_version_ids == (reports["bench"],)
+    assert node.analysis_report_version_ids == (reports["explain"],)
+    metrics = observation_report_details(complete, "p", "init", None, versions, context)
+    assert [metric.value for metric in metrics.metrics] == [0.72]
+    with pytest.raises(FileNotFoundError):
+        observation_report_details(
+            complete,
+            "p",
+            "init",
+            None,
+            versions,
+            context,
+            report_version_id=reports["explain"],
+        )
+    # A later export at the same path cannot change a published report.
+    (directory / "explain.json").write_text('{"summary":"later export"}')
+    original = observation_analysis_report(
+        complete,
+        "p",
+        "init",
+        reports["explain"],
+        versions,
+        context,
+    )
+    assert original["filename"] == "explain.json"
+    assert json.loads(original["text"]) == analysis_body
+    for state, identity in (
+        (complete, reports["bench"]),
+        (snapshot, reports["explain"]),
+    ):
+        with pytest.raises(FileNotFoundError):
+            observation_analysis_report(state, "p", "init", identity, versions, context)
 
 
 def test_legacy_report_rebuild_reuses_owned_source_and_keeps_the_previous_version(

@@ -45,3 +45,23 @@ On the terminal callback, use the submitted taskId:
 - Succeeded without training, stopped, or terminated: report the task status.
 
 For workflows with several training stages, the current taskId-based analysis may select only the first available W&B run. State which run was analyzed; do not claim that all stages were covered.
+
+## Project report delivery
+
+Use [export_plan_report.py](scripts/export_plan_report.py) for a versioned primary
+report from an existing JSON or JSONL result. Create the mapping from the actual
+fields of the evaluated artifact. For example, a mapping can contain
+`{"metrics":[{"label":"result_accuracy","unit":"ratio","path":["metrics","accuracy"]}]}`.
+A path is a list of object keys and zero-based array indexes. For JSONL, the
+first index selects a row. Optional `summary`, `findings`, `badcases`, `files`,
+`checks` and `source` mappings point to matching source fields. For derived
+platform reports, the source must identify the bound task ID or all task IDs.
+An Init attribution report needs a summary or findings. Retain existing Markdown, HTML and per-sample
+outputs for detailed inspection.
+
+Run `python3 scripts/export_plan_report.py result.json report_mapping.json > report.json`
+from the skill directory, with paths adjusted to the actual result and target.
+Check the verified Storage paths with `product_versions`, action
+`deliver_plan_outputs`, and `validate_only=true` before submitting the same
+outputs for registration. Wait for `report_state=ready` and `report_version_id`
+before reporting a formal delivery.

@@ -17,7 +17,11 @@ from pyromind_runtime.domain.experiment_plans import ExperimentTask
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import ProjectView
-from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
+from pyromind_runtime.domain.snapshot import (
+    ConversationSnapshot,
+    ExternalTaskState,
+    TimelineOperation,
+)
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
     from_storage_api_path,
@@ -83,6 +87,7 @@ def plan_executions(
     versions: Iterable[ArtifactVersion] = (),
     *,
     registered: Iterable[ExperimentExecutionView] = (),
+    require_canonical_delivery: bool = False,
 ) -> Iterator[ExperimentExecutionView]:
     tasks = {task.id: task for task in project.plan.tasks}
     stages = {stage.id: stage for stage in project.plan.stages}
@@ -129,11 +134,12 @@ def plan_executions(
             intent="execute",
             state=_BUSINESS_STATES[status],
             report_state="not_started",
+            report_required=task.report_output is not None,
             waiting_reason=row.get("next_action")
             if status == "blocked" and isinstance(row.get("next_action"), str)
             else None,
         )
-        if report:
+        if report and (task.report_output is None or not require_canonical_delivery):
             run = with_plan_report(run, report)
         validate_persisted_payload(run.model_dump(mode="json"))
         yield run
@@ -157,6 +163,92 @@ def with_plan_report(
                 },
             ),
         }
+    )
+
+
+def delivery_rows(
+    project: ProjectView, rows: list, runs: tuple[ExperimentExecutionView, ...]
+) -> list:
+    """Apply accepted delivery inputs for the current attempts to workspace rows."""
+    current = {}
+    for run in (*runs, *plan_executions(project, rows, registered=runs)):
+        if (
+            run.project_id != project.project_id
+            or run.plan_sequence != project.plan_sequence
+            or run.role_id != "main"
+        ):
+            continue
+        previous = current.get(run.task_id)
+        if previous is None or (run.plan_attempt or 1) > (previous.plan_attempt or 1):
+            current[run.task_id] = run
+    indexes: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        if isinstance(row, dict) and isinstance(row.get("id"), str):
+            indexes.setdefault(row["id"], []).append(index)
+    result = list(rows)
+    for task_id, run in current.items():
+        positions = indexes.get(task_id, [])
+        if len(positions) > 1:
+            continue
+        row = rows[positions[0]] if positions else {}
+        history = [
+            item
+            for item in runs
+            if item.task_id == task_id
+            and item.project_id == project.project_id
+            and item.plan_sequence == project.plan_sequence
+            and item.role_id == "main"
+        ]
+        if (
+            row
+            and _plan_run_id(f"{project.project_id}:{task_id}", row, history)
+            != run.run_id
+        ):
+            continue
+        if (
+            run.delivery_outputs
+            and (run.delivery_command_id or run.report_state == "ready")
+            and run.state not in {"failed", "cancelled", "needs_input"}
+            and row.get("business_status") not in {"blocked", "failed"}
+        ):
+            updated = {
+                **row,
+                "id": task_id,
+                "stage_id": run.stage_id,
+                "attempt": run.plan_attempt or 1,
+                "business_status": "completed",
+                "verified_outputs": run.delivery_outputs,
+            }
+            if positions:
+                result[positions[0]] = updated
+            else:
+                result.append(updated)
+    return result
+
+
+def _platform_task_ids(run: ExperimentExecutionView) -> set[str]:
+    ids = set(run.platform_task_ids)
+    if run.platform_task_id:
+        ids.add(run.platform_task_id)
+    return ids
+
+
+def platform_results_ready(
+    run: ExperimentExecutionView, statuses: dict[str, str]
+) -> bool:
+    return all(
+        statuses.get(task_id) == "succeeded" for task_id in _platform_task_ids(run)
+    )
+
+
+def platform_output_directories(
+    run: ExperimentExecutionView, tasks: tuple[ExternalTaskState, ...]
+) -> tuple[str, ...]:
+    ids = _platform_task_ids(run)
+    return tuple(
+        task.output_dir
+        for task in tasks
+        if task.task_id in ids and task.status == "succeeded" and task.output_dir
     )
 
 
@@ -290,15 +382,29 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
                 for task in project.plan.tasks
                 if isinstance(record := records.get(task.id), dict)
             ]
-    if not isinstance(definition, dict) or not isinstance(
-        definition.get("tasks"), list
-    ):
-        raise ValueError("workflow plan requires a tasks array")
-    tasks = definition["tasks"]
     runtime = plan.get("runtime")
-    records = runtime.get("tasks") if isinstance(runtime, dict) else None
-    if not isinstance(records, dict):
-        records = plan.get("task_states", plan.get("task_records", {}))
+    runtime_records = runtime.get("tasks") if isinstance(runtime, dict) else None
+    if isinstance(definition, dict) and isinstance(definition.get("tasks"), list):
+        tasks = definition["tasks"]
+    elif (
+        definition is None
+        and project is not None
+        and plan.get("project_id") == project.project_id
+        and isinstance(runtime_records, dict)
+    ):
+        # Use the approved task definitions when the workspace has only records.
+        tasks = [
+            task.model_dump(mode="json")
+            for task in project.plan.tasks
+            if task.id in runtime_records
+        ]
+    else:
+        raise ValueError("workflow plan requires a tasks array")
+    records = (
+        runtime_records
+        if isinstance(runtime_records, dict)
+        else plan.get("task_states", plan.get("task_records", {}))
+    )
     merged = []
     for task in tasks:
         if not isinstance(task, dict):
@@ -445,6 +551,7 @@ def next_approved_task(
     completed_task_id: str,
     *,
     completed_platform_id: str | None = None,
+    ready_deliveries: set[str] | None = None,
 ) -> tuple[ExperimentTask, dict[str, str]] | None:
     records = {
         row["id"]: row
@@ -452,8 +559,16 @@ def next_approved_task(
         if isinstance(row, dict) and isinstance(row.get("id"), str)
     }
     completed = records.get(completed_task_id, {})
+    primary_reports = {
+        task.id for task in project.plan.tasks if task.report_output is not None
+    }
     if (
         completed.get("business_status") != "completed"
+        or (
+            ready_deliveries is not None
+            and completed_task_id in primary_reports
+            and completed_task_id not in ready_deliveries
+        )
         or not isinstance(completed.get("verified_outputs"), dict)
         or not completed["verified_outputs"]
         or any(
@@ -477,6 +592,12 @@ def next_approved_task(
         row = records.get(task.id, {})
         status = row.get("business_status", "pending")
         if status == "completed":
+            if (
+                ready_deliveries is not None
+                and task.id in primary_reports
+                and task.id not in ready_deliveries
+            ):
+                return None
             continue
         if (
             status != "pending"
@@ -492,6 +613,12 @@ def next_approved_task(
                 outputs = upstream.get("verified_outputs")
                 if upstream.get("business_status") != "completed" or not isinstance(
                     outputs, dict
+                ):
+                    return None
+                if (
+                    ready_deliveries is not None
+                    and item.task_id in primary_reports
+                    and item.task_id not in ready_deliveries
                 ):
                     return None
                 path = verified_input_path(item, outputs)

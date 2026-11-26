@@ -30,8 +30,8 @@ type VersionCall = Callable[
 VERSION_DESCRIPTION = """Manage this conversation's artifact versions.
 Actions: list (no arguments); read (artifact_id of a frozen text file); save (kind,
 logical_key, source with storage_ref OR text and filename, optional parents and
-summary; for Project task outputs include plan_task_id and plan_attempt inside
-arguments alongside logical_key); compare (left_version_id, right_version_id);
+summary (JSON object); for Project task outputs include plan_task_id and
+plan_attempt alongside logical_key); compare (left_version_id, right_version_id);
 select (slot, version_id, expected_revision, optional reason);
 new_iteration (goal, expected_revision); recover (retry unfinished snapshots).
 bind_execution_metadata (task_id, workflow, optional code, output_dir and
@@ -42,6 +42,10 @@ Use the revision returned by list for selections and new iterations. Reuse the
 same command_id when retrying the same operation. A reference_only record is not
 a restorable snapshot. Selection affects future executions, not running tasks.
 Use version://<slot> in workflow path fields to consume a selected version.
+deliver_plan_outputs: submit plan_task_id, plan_attempt and verified_outputs for
+the approved task's named /workspace paths. Set validate_only to check inputs.
+The primary JSON report must include schema_version: 1. Repeat the same request
+and command_id to read progress. A ready receipt includes report_version_id.
 """
 
 
@@ -55,6 +59,7 @@ class ProductVersionsAction(Action):
         "new_iteration",
         "recover",
         "bind_execution_metadata",
+        "deliver_plan_outputs",
     ]
     command_id: str = Field(
         min_length=1, description="Stable unique operation ID; reuse on retries."

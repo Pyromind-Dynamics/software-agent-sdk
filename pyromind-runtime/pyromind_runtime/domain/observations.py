@@ -138,7 +138,7 @@ class ObservationNode(ContractModel):
     title: str
     type: str
     business_status: str
-    delivery_status: Literal["registering", "failed"] | None = Field(
+    delivery_status: Literal["pending", "registering", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     delivery_error: str | None = Field(
@@ -149,6 +149,9 @@ class ObservationNode(ContractModel):
     )
     current_run_ids: tuple[str, ...] = ()
     report_version_ids: tuple[str, ...] = ()
+    analysis_report_version_ids: tuple[str, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     historical_report_version_ids: tuple[str, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )

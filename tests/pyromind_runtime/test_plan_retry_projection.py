@@ -56,6 +56,54 @@ def test_verified_baseline_report_uses_the_single_canonical_platform_report():
     assert rows[0]["verified_outputs"] == {"baseline_report": "/workspace/report.json"}
 
 
+def test_runtime_task_map_projects_the_completed_baseline_on_its_bound_attempt():
+    task = {
+        "id": "bench_base",
+        "stage_id": "init",
+        "name": "Baseline",
+        "outputs": [{"name": "baseline_report", "kind": "report"}],
+    }
+    project = ProjectView.model_validate(
+        {
+            "project_id": "p",
+            "conversation_id": "c",
+            "plan_sequence": 6,
+            "creation_command_id": "create",
+            "plan": {
+                "stages": [{"id": "init", "name": "Init", "kind": "init"}],
+                "tasks": [task],
+            },
+        }
+    )
+    (queued,) = plan_executions(
+        project, [{**task, "attempt": 1, "business_status": "pending"}]
+    )
+    bound = queued.model_copy(update={"platform_task_id": "1372"})
+    outputs = {"baseline_report": "/workspace/results/baseline_report.json"}
+    record = {
+        "attempt": 1,
+        "platform_task_id": "1372",
+        "business_status": "completed",
+        "verified_outputs": outputs,
+    }
+    rows = read_plan_tasks(
+        json.dumps(
+            {
+                "project_id": "p",
+                "runtime": {"tasks": {"bench_base": record, "unknown-task": record}},
+            }
+        ),
+        project,
+    )
+    (row,) = rows
+    assert row["verified_outputs"] == outputs
+    assert row["stage_id"] == "init"
+    (completed,) = plan_executions(project, rows, registered=[bound])
+    assert completed.run_id == bound.run_id
+    assert completed.state == "succeeded"
+    assert not list(plan_executions(project, rows, registered=[queued]))
+
+
 def test_nested_plan_restores_saved_local_data_completion():
     task = {"id": "data_task", "stage_id": "data", "name": "Prepare data"}
     project = ProjectView.model_validate(

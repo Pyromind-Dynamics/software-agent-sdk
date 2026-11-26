@@ -363,7 +363,14 @@ class SnapshotProjector:
                 code="unsupported_status",
                 message=f"Unsupported conversation status: {status}",
             )
-        if snapshot.task_origins and event.run_id and event.task_id:
+        if (
+            event.run_id
+            and event.task_id
+            and (
+                snapshot.task_origins
+                or event.task_id.startswith(("project-start:", "project-continue:"))
+            )
+        ):
             snapshot = snapshot.model_copy(
                 update={
                     "task_runs": {
