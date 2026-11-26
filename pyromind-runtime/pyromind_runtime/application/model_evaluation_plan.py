@@ -81,8 +81,18 @@ def verified_input_path(item: PlanInput, outputs: dict) -> str | None:
 
 
 def validate_evaluation_inputs(
-    project: ProjectView, task: ExperimentTask, rows: list, model: str, dataset: str
+    project: ProjectView,
+    task: ExperimentTask,
+    rows: list,
+    model: str,
+    dataset: str,
+    *,
+    require_bindings: bool = False,
 ) -> None:
+    if require_bindings:
+        names = {item.name for item in task.inputs}
+        if not names & _MODEL_INPUTS or not names & _DATA_INPUTS:
+            raise ValueError("Model evaluation requires both model and dataset inputs")
     resources = {item.id: item.storage_path for item in project.plan.resources}
     outputs = {
         row.get("id"): row.get("verified_outputs")
@@ -119,6 +129,8 @@ def validate_evaluation_inputs(
                     f"Verify {item.task_id}.{item.output_name} in workflowPLAN before "
                     f"submitting {task.id}"
                 )
+        if require_bindings and not expected:
+            raise ValueError(f"{task.id} has no verified binding for {item.name}")
         if expected and (
             not actual.startswith("/")
             or to_storage_api_path(actual) != to_storage_api_path(expected)
@@ -155,10 +167,7 @@ def check_inference_receipt(
     *,
     sdk_receipts: dict[str, tuple[str, str]] | None = None,
 ) -> ExperimentExecutionView:
-    identities = run.platform_task_ids or (
-        (run.platform_task_id,) if run.platform_task_id else ()
-    )
-    if sdk_receipts and any(identity in sdk_receipts for identity in identities):
+    if run.platform_task_id and sdk_receipts and run.platform_task_id in sdk_receipts:
         return run
     receipt = receipts.get(run.platform_task_id) if run.platform_task_id else None
     if not inference_paths(receipt) and (

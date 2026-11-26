@@ -13,6 +13,7 @@ from pyromind_runtime.application.model_evaluation_plan import (
 from pyromind_runtime.application.plan_execution import (
     completed_callback_task,
     plan_executions,
+    with_platform_states,
 )
 from pyromind_runtime.application.sdk_execution_metadata import (
     verified_sdk_inference_paths,
@@ -261,6 +262,7 @@ async def test_late_sdk_callback_keeps_the_signed_originating_chat_turn(tmp_path
         await runtime.close()
 
 
+@pytest.mark.parametrize("receipt_kind", ["evaluation", "workflow_run"])
 @pytest.mark.parametrize("change", [None, "model", "dataset"])
 @pytest.mark.parametrize(
     "dataset_input_name", ["dataset", "eval_data", "evaluation_dataset"]
@@ -271,6 +273,7 @@ async def test_sdk_evaluation_plan_capture_checks_frozen_paths(
     inference_graph,
     monkeypatch,
     change,
+    receipt_kind,
     dataset_input_name,
 ):
     runtime, context, project = sdk_project_runtime
@@ -287,7 +290,7 @@ async def test_sdk_evaluation_plan_capture_checks_frozen_paths(
     )
     environment = await runtime.platform_sdk_context(scope, context)
     entry = json.loads(environment["PYROMIND_PROJECT_EXECUTIONS"])[0]
-    address = TaskCorrelation.model_validate_json(entry["out_ids"]["evaluation"])
+    address = TaskCorrelation.model_validate_json(entry["out_ids"][receipt_kind])
     await runtime.deliver_external_task_status(
         scope,
         task_id="sdk-evaluation",
@@ -325,9 +328,13 @@ async def test_sdk_evaluation_plan_capture_checks_frozen_paths(
     assert snapshot.experiment_executions
     run = snapshot.experiment_executions[0]
     assert run.platform_task_id == "sdk-evaluation"
+    if receipt_kind == "workflow_run":
+        assert not verified_sdk_inference_paths(runtime._store(scope), project, set())
     if change:
         assert run.state == "needs_input"
-        assert run.waiting_reason and "requires" in run.waiting_reason
+        assert run.waiting_reason
+        if receipt_kind == "evaluation":
+            assert "requires" in run.waiting_reason
         assert not run.artifacts and run.report_uri is None
     else:
         assert run.state == "succeeded"
@@ -383,4 +390,99 @@ async def test_sdk_second_shard_matches_its_registered_plan_attempt(
             allow_pending_analysis=True,
         )
         == task.id
+    )
+
+
+async def test_selected_eval_submission_requires_its_own_inference_receipt(
+    sdk_project_runtime, version_runtime, inference_graph, monkeypatch
+):
+    runtime, context, project = sdk_project_runtime
+    runtime.versions = version_runtime[0].versions
+    scope = project.conversation_id
+    environment = await runtime.platform_sdk_context(scope, context)
+    (entry,) = json.loads(environment["PYROMIND_PROJECT_EXECUTIONS"])
+    address = TaskCorrelation.model_validate_json(entry["out_ids"]["workflow_run"])
+    task = project.plan.tasks[0]
+    store = runtime._store(scope)
+    active = runtime._active[scope]
+    graph = inference_graph
+    graph["nodes"][1]["data"]["config"]["command"] = (
+        "python3 evaluate_inference.py --endpoint '$param' "
+        "--model-reference /models/merged --dataset-path /workspace/eval.jsonl"
+    )
+    for identity in ("first-inference", "score-only", "final-inference"):
+        await runtime.deliver_external_task_status(
+            scope,
+            task_id=identity,
+            status="Succeeded",
+            correlation=address,
+            trusted_platform=True,
+            auto_run=False,
+        )
+        await runtime.version_call(
+            scope,
+            VersionToolRequest(
+                action="bind_execution_metadata",
+                arguments={
+                    "task_id": identity,
+                    "workflow": graph
+                    if identity != "score-only"
+                    else {
+                        "name": "score only",
+                        "nodes": graph["nodes"][1:],
+                        "edges": [],
+                    },
+                },
+            ),
+            "metadata-" + identity,
+            context,
+        )
+        rows = [
+            {
+                "id": task.id,
+                "stage_id": task.stage_id,
+                "attempt": 1,
+                "platform_task_id": identity,
+                "business_status": "completed",
+            }
+        ]
+        monkeypatch.setattr(
+            active.adapter,
+            "read_workspace_text",
+            AsyncMock(return_value=json.dumps({"tasks": rows})),
+        )
+        await runtime._capture_plan_progress(active, store)
+        snapshot = await runtime.get_snapshot(scope, context)
+        assert snapshot.experiment_executions
+        (run,) = snapshot.experiment_executions
+        assert run.platform_task_id == identity
+        assert run.state == ("needs_input" if identity == "score-only" else "succeeded")
+
+    saved = store.load_snapshot()
+    assert saved.experiment_executions
+    (selected,) = saved.experiment_executions
+    delivered = saved.model_copy(
+        update={
+            "experiment_executions": (
+                selected.model_copy(update={"report_state": "ready"}),
+            ),
+            "external_tasks": tuple(
+                external.model_copy(update={"status": "failed"})
+                if external.task_id == "first-inference"
+                else external
+                for external in saved.external_tasks
+            ),
+        }
+    )
+    required = {task.id}
+    paths = verified_sdk_inference_paths(store, project, required)
+    evaluated = with_platform_states(delivered, required, sdk_receipts=paths)
+    assert (
+        evaluated.experiment_executions
+        and evaluated.experiment_executions[0].state == "succeeded"
+    )
+    ordinary = with_platform_states(delivered, set(), sdk_receipts=paths)
+    assert (
+        ordinary.experiment_executions
+        and ordinary.experiment_executions[0].state == "failed"
     )

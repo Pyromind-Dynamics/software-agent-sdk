@@ -8,11 +8,16 @@ from pathlib import PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from pyromind_runtime.application.model_evaluation_plan import sdk_inference_paths
+from pyromind_runtime.application.model_evaluation_plan import (
+    sdk_inference_paths,
+    validate_evaluation_inputs,
+)
+from pyromind_runtime.application.plan_execution import recover_plan_delivery_rows
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
+from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
     to_storage_api_path,
@@ -212,11 +217,23 @@ def bind_sdk_execution_metadata(
 
 def verified_sdk_inference_paths(
     store: FileProductStore,
+    project: ProjectView | None = None,
+    model_evals: set[str] | None = None,
 ) -> dict[str, tuple[str, str]]:
     """Read frozen inference graphs owned by their signed Project task/attempt."""
     snapshot = store.load_snapshot()
     tasks = {task.task_id: task for task in snapshot.external_tasks}
     paths = {}
+    approved = (
+        {
+            item.id: item
+            for item in project.plan.tasks
+            if model_evals and item.id in model_evals
+        }
+        if project
+        else {}
+    )
+    rows = None
     for receipt in store.load_workflow_execution_requests().values():
         correlation = receipt.correlation
         if correlation is None:
@@ -228,22 +245,50 @@ def verified_sdk_inference_paths(
             or receipt.conversation_id != snapshot.conversation_id
             or correlation.conversation_id != snapshot.conversation_id
             or correlation.type != "main"
-            or correlation.task_kind != "evaluation"
+            or correlation.task_kind not in {"evaluation", "workflow_run"}
             or reference is None
             or task is None
             or task.correlation != correlation
             or not store.verify_task_correlation(correlation)
         ):
             continue
-        if not any(
-            run.project_id == reference.project_id
-            and run.task_id == reference.task_id
-            and run.plan_sequence == reference.plan_sequence
-            and run.plan_attempt == reference.attempt
-            and task.task_id in (run.platform_task_ids or (run.platform_task_id,))
+        owners = [
+            run
             for run in snapshot.experiment_executions or ()
+            if task.task_id in (run.platform_task_ids or (run.platform_task_id,))
+        ]
+        if len(owners) != 1:
+            continue
+        owner = owners[0]
+        if (
+            owner.role_id != "main"
+            or owner.project_id != reference.project_id
+            or owner.task_id != reference.task_id
+            or owner.plan_sequence != reference.plan_sequence
+            or owner.plan_attempt != reference.attempt
         ):
             continue
-        if inference := sdk_inference_paths(receipt.workflow):
-            paths[task.task_id] = inference
+        inference = sdk_inference_paths(receipt.workflow)
+        if not inference:
+            continue
+        if correlation.task_kind == "workflow_run":
+            planned = approved.get(reference.task_id)
+            if (
+                project is None
+                or planned is None
+                or reference.project_id != project.project_id
+                or reference.plan_sequence != project.plan_sequence
+                or receipt.request_id != "sdk:" + task.task_id
+                or task.status != "succeeded"
+            ):
+                continue
+            if rows is None:
+                rows = recover_plan_delivery_rows(snapshot, project)
+            try:
+                validate_evaluation_inputs(
+                    project, planned, rows, *inference, require_bindings=True
+                )
+            except ValueError:
+                continue
+        paths[task.task_id] = inference
     return paths

@@ -1904,11 +1904,12 @@ class ConversationRuntime:
                 )
                 receipts = {p.task_id: p for p in pipelines.values() if p.task_id}
                 sdk_receipts = (
-                    await asyncio.to_thread(verified_sdk_inference_paths, store)
+                    await asyncio.to_thread(
+                        verified_sdk_inference_paths, store, project, required
+                    )
                     if required
                     else {}
                 )
-                previous_ids = {r.run_id: r.platform_task_id for r in registered}
                 for run in plan_executions(
                     project, rows, artifacts, registered=registered
                 ):
@@ -1918,19 +1919,26 @@ class ConversationRuntime:
                             update={"platform_task_id": previous.platform_task_id}
                         )
                     if run.task_id in required:
-                        run = run.model_copy(
-                            update={"platform_task_id": previous_ids.get(run.run_id)}
+                        row = rows_by_task[run.task_id]
+                        selected = row.get("platform_task_id") or row.get(
+                            "actual_platform_task_id"
                         )
+                        if selected is not None:
+                            if previous is None or selected not in (
+                                previous.platform_task_id,
+                                *previous.platform_task_ids,
+                            ):
+                                continue
+                            run = run.model_copy(update={"platform_task_id": selected})
                         run = check_inference_receipt(
                             run, receipts, sdk_receipts=sdk_receipts
                         )
-                        identities = run.platform_task_ids or (
-                            (run.platform_task_id,) if run.platform_task_id else ()
+                        paths = (
+                            sdk_receipts.get(run.platform_task_id)
+                            if run.platform_task_id
+                            else None
                         )
-                        for identity in identities:
-                            paths = sdk_receipts.get(identity)
-                            if paths is None:
-                                continue
+                        if paths is not None:
                             try:
                                 validate_evaluation_inputs(
                                     project, plan_tasks[run.task_id], rows, *paths
@@ -1945,7 +1953,6 @@ class ConversationRuntime:
                                         "waiting_reason": str(exc),
                                     }
                                 )
-                                break
                     attempt = run.run_id.rsplit(":", 1)[-1]
                     if (
                         self.versions
@@ -4443,7 +4450,9 @@ class ConversationRuntime:
             await asyncio.to_thread(store.load_pipeline_runs) if required else {}
         )
         sdk_receipts = (
-            await asyncio.to_thread(verified_sdk_inference_paths, store)
+            await asyncio.to_thread(
+                verified_sdk_inference_paths, store, project, required
+            )
             if required
             else {}
         )
