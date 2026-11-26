@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -500,7 +501,15 @@ def _validate_persisted_execution(
             if (value := os.environ.get(name))
         }
     )
-    registry.get_all_secrets_as_env_vars()
+    # The tool environment also registers routing metadata for LLM environment
+    # injection. Keep URLs with userinfo, opaque paths or query strings masked.
+    public_config = {"LLM_MODEL"}
+    base_url = context.model_configuration.get("base_url") or os.getenv("LLM_BASE_URL")
+    if isinstance(base_url, str) and re.fullmatch(
+        r"https?://(?:[\w.-]+|\[[a-fA-F\d:]+\])(?::\d+)?(?:/v1)?/?", base_url
+    ):
+        public_config.add("LLM_BASE_URL")
+    registry.get_all_secrets_as_env_vars(exclude=public_config)
     document = json.dumps({"workflow": workflow, **metadata}, ensure_ascii=False)
     if registry.mask_secrets_in_output(document) != document or (
         context.sdk_secrets is not None

@@ -15,6 +15,8 @@ from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
 from pyromind_common.sdk.secret import StaticSecret
 from pyromind_runtime.domain.context import RequestContext
 
+from .test_sdk_execution_metadata import sdk_recipe_factory as sdk_recipe_factory
+
 
 @pytest.fixture
 def validation_context(tmp_path: Path) -> ToolExecutionContext:
@@ -66,6 +68,63 @@ async def test_validation_publishes_the_same_graph_idempotently(validation_conte
     assert json.loads(path.read_text()) == graph
     assert hashlib.sha256(path.read_bytes()).hexdigest() == first["sha256"]
     assert list(path.parent.glob("*.json")) == [path]
+
+
+async def test_dataset_replay_persists_shared_model_routing(
+    validation_context, sdk_recipe_factory
+):
+    context = replace(
+        validation_context,
+        model_configuration={
+            "base_url": "https://model.test/v1",
+            "model": "model",
+            "api_key": "sdk-test-model-secret",
+        },
+    )
+    host = PiAdapter(
+        context.workspace_root, terminal_backend="os-sandbox"
+    )._business_tools
+    graph = sdk_recipe_factory("124", parent="123")["workflow"]
+    details = {"raw_response": {"data": {"workflow": graph}}}
+
+    result = await host._publish_validated_workflow(details, context)
+
+    path = context.workspace_root / result["validated_workflow_path"]
+    assert json.loads(path.read_text()) == graph
+    assert "sdk-test-model-secret" not in path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("model_config", "protected_value"),
+    [
+        (
+            {"base_url": "https://gateway.test/v1?token=private"},
+            "https://gateway.test/v1?token=private",
+        ),
+        (
+            {"base_url": "https://user:secret@gateway.test"},
+            "https://user:secret@gateway.test",
+        ),
+        (
+            {"base_url": "https://gateway.test/private-token"},
+            "https://gateway.test/private-token",
+        ),
+        ({"model": "shared-value", "api_key": "shared-value"}, "shared-value"),
+    ],
+)
+async def test_routing_metadata_cannot_exempt_credentials(
+    validation_context, model_config, protected_value
+):
+    context = replace(validation_context, model_configuration=model_config)
+    host = PiAdapter(
+        context.workspace_root, terminal_backend="os-sandbox"
+    )._business_tools
+    graph = validated_graph({"command": f"printenv; echo {protected_value}"})
+    result = await host._publish_validated_workflow(
+        {"raw_response": {"data": {"workflow": graph}}}, context
+    )
+    assert "artifact_unavailable" in result
+    assert not list(context.workspace_root.rglob("*.json"))
 
 
 @pytest.mark.parametrize(
