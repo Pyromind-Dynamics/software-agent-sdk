@@ -8,6 +8,15 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from pyromind_common.platform.dataset_replay import DatasetReplayPaths
+
+
+@runtime_checkable
+class DatasetReplayReader(Protocol):
+    def read(self, path: str) -> bytes: ...
+
+    def verify_splits(self, paths: DatasetReplayPaths) -> tuple[int, str, str]: ...
+
 
 class EvaluationStorageMissingError(LookupError):
     """A Storage object is confirmed absent (the backend answered "not found").

@@ -184,11 +184,11 @@ from pyromind_runtime.domain.content import JsonObject, JsonValue, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
-from pyromind_runtime.domain.project_storage import StorageProxyConfig
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.domain.workflow_execution import DatasetRecipeReceipt
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.storage import (
+    DatasetReplayReader,
     EvaluationStorage,
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
@@ -685,14 +685,12 @@ async def compile_echomind_script_plan(
             if source is None:
                 raise ValueError("工作区中找不到配方，请确认已保存并具有读取权限。")
             recipe = ConsolidationRecipe.model_validate_json(source)
-        read, check = _replay_checks(
+        read, check = await _replay_checks(
             request,
             store.root,
             project_id,
             context,
-            await runtime.development_storage_proxy(
-                consolidation.evidence.conversation_id, context
-            ),
+            consolidation.evidence.conversation_id,
             consolidation.source_batch,
         )
         compiled = await asyncio.to_thread(
@@ -733,25 +731,33 @@ class GeneratedConsolidation(BaseModel):
     repair: ConsolidationRepair | None = None
 
 
-def _replay_checks(
+async def _replay_checks(
     request: Request,
     root: Path,
     project_id: str,
     ctx: RequestContext,
-    development_proxy: StorageProxyConfig | None,
+    conversation_id: str,
     approved_source: str,
 ):
+    runtime = get_product_runtime(request)
+    development_proxy = await runtime.development_storage_proxy(conversation_id, ctx)
+    replay_reader = await runtime.dataset_replay_reader(conversation_id, ctx)
+
     @cache
-    def storage() -> EvaluationStorage:
-        return build_bound_evaluation_storage(
-            projects_root=root,
-            project_id=project_id,
-            context=ctx,
-            credential_store=build_runtime_credential_store(
-                root, request.app.state.config
-            ),
-            development_proxy=development_proxy,
-        ) or build_evaluation_storage(ctx)
+    def storage() -> EvaluationStorage | DatasetReplayReader:
+        return (
+            build_bound_evaluation_storage(
+                projects_root=root,
+                project_id=project_id,
+                context=ctx,
+                credential_store=build_runtime_credential_store(
+                    root, request.app.state.config
+                ),
+                development_proxy=development_proxy,
+            )
+            or replay_reader
+            or build_evaluation_storage(ctx)
+        )
 
     def read(path: str) -> bytes:
         return storage().read(to_storage_api_path(path))
@@ -844,12 +850,12 @@ async def generate_echomind_consolidation(
             recipe, invalid, revisions = await _read_repair_recipes(
                 runtime, context, ctx, receipts
             )
-            read, check = _replay_checks(
+            read, check = await _replay_checks(
                 request,
                 store.root,
                 project_id,
                 ctx,
-                await runtime.development_storage_proxy(conversation, ctx),
+                conversation,
                 context.source_batch,
             )
             compiled = await asyncio.to_thread(

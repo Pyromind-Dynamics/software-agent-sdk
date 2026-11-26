@@ -8,7 +8,7 @@ import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from PIL import Image
@@ -25,6 +25,13 @@ from pyromind_agent_server.echomind_sandbox_storage import (
     _require_sandbox,
 )
 from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_common.platform.dataset_replay import (
+    MAX_DECODE_BYTES as _MAX_DECODE_BYTES,
+    MAX_DECODE_IMAGES as _MAX_DECODE_IMAGES,
+    MAX_IMAGE_BYTES as _MAX_IMAGE_BYTES,
+    VERIFIER as _VERIFIER,
+    DatasetReplayPaths,
+)
 from pyromind_common.platform.scene_core import DATAFLOW_RUNTIME_FILENAMES
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.storage_paths import (
@@ -36,16 +43,13 @@ from pyromind_runtime.domain.workflow_execution import (
     WorkflowExecutionRequest,
 )
 from pyromind_runtime.ports.storage import (
+    DatasetReplayReader,
     EvaluationStorage,
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
 )
 
 
-_VERIFIER = (
-    Path(__file__).resolve().parents[2]
-    / ".agents/skills/data-processing/scripts/preparation/verify_training_splits.py"
-)
 Digest = Annotated[str, Field(pattern="^[0-9a-f]{64}$")]
 
 
@@ -130,11 +134,6 @@ def _candidate(
     return _validated_runtime(runtime, context.source_batch)
 
 
-_MAX_DECODE_IMAGES = 64
-_MAX_IMAGE_BYTES = 4 * 1024 * 1024
-_MAX_DECODE_BYTES = 12 * 1024 * 1024
-
-
 def _finish_live_verification(output: str) -> bytes:
     # Account for base64 padding per file plus bounded path/receipt metadata.
     if len(output) > 4 * _MAX_DECODE_BYTES // 3 + _MAX_DECODE_IMAGES * 8192:
@@ -175,55 +174,40 @@ def _finish_live_verification(output: str) -> bytes:
 
 
 def recheck_dataset_replay(
-    storage: EvaluationStorage, recipe: DatasetRecipeReceipt, *, approved_source: str
+    storage: EvaluationStorage | DatasetReplayReader,
+    recipe: DatasetRecipeReceipt,
+    *,
+    approved_source: str,
 ) -> bytes:
-    if not isinstance(storage, SandboxEvaluationStorage):
-        raise EvaluationStorageUnavailableError(
-            "换批复核需要已绑定的 Storage Sandbox。"
-        )
-    config = storage.binding.config
-
-    def path(uri: str) -> str:
-        return config.mount_root + to_storage_api_path(uri)
-
-    command = [
-        "sh",
-        "-c",
-        "for py in /opt/pyromind/dataflow-venv/bin/python "
-        "/home/openhands/dataflow-venv/bin/python "
-        "/tmp/pyromind-dataflow-venv-1.0.13-cpu/bin/python "
-        'python3; do if "$py" -I -c "from PIL import Image" >/dev/null 2>&1; '
-        'then exec "$py" "$@"; fi; done; exec python3 "$@"',
-        "verify-dataset",
-        "-I",
-        "-c",
-        _VERIFIER.read_text(),
-        "--read-only",
-        "--defer-image-decode",
-        str(_MAX_DECODE_IMAGES),
-        str(_MAX_IMAGE_BYTES),
-        str(_MAX_DECODE_BYTES),
-        "--mount-root",
-        config.mount_root,
-        "--approved-source",
-        path(approved_source),
-        "--source-batch",
-        path(recipe.source_path),
-        "--output-dir",
-        path(recipe.output_directory),
-    ]
-    if recipe.fixed_validation_path:
-        command.extend(["--fixed-validation", path(recipe.fixed_validation_path)])
-    try:
-        _require_sandbox(storage.client, config, require_writable=False)
-        response = storage.client.exec_command(config.sandbox_id, command, timeout=180)
-    except Exception:
-        raise EvaluationStorageUnavailableError(
-            "暂时无法从绑定的 Sandbox 复核 Dataset 输入和导出文件。"
-        ) from None
-    if response.returncode != 0:
+    paths = DatasetReplayPaths(
+        approved_source=to_storage_api_path(approved_source),
+        source_batch=to_storage_api_path(recipe.source_path),
+        output_dir=to_storage_api_path(recipe.output_directory),
+        fixed_validation=to_storage_api_path(recipe.fixed_validation_path)
+        if recipe.fixed_validation_path
+        else None,
+    )
+    if isinstance(storage, DatasetReplayReader):
+        code, output, error = storage.verify_splits(paths)
+    elif isinstance(storage, SandboxEvaluationStorage):
+        config = storage.binding.config
+        try:
+            _require_sandbox(storage.client, config, require_writable=False)
+            response = storage.client.exec_command(
+                config.sandbox_id,
+                paths.verification_command(config.mount_root),
+                timeout=180,
+            )
+        except Exception:
+            raise EvaluationStorageUnavailableError(
+                "暂时无法从绑定的 Sandbox 复核 Dataset 输入和导出文件。"
+            ) from None
+        code, output, error = response.returncode, response.output, response.stderr
+    else:
+        raise EvaluationStorageUnavailableError("换批复核需要已绑定的 Storage 工作区。")
+    if code != 0:
         if any(
-            marker in (response.stderr or response.output)
+            marker in (error or output)
             for marker in (
                 "Replay image exceeds the file limit",
                 "Replay images exceed the batch limit",
@@ -231,7 +215,7 @@ def recheck_dataset_replay(
         ):
             raise ValueError("换批图片小样超过回放上限，请选更小的样本批次")
         raise ValueError("复核失败，请检查小样、训练文件及验证集")
-    return _finish_live_verification(response.output)
+    return _finish_live_verification(output)
 
 
 def _summary(

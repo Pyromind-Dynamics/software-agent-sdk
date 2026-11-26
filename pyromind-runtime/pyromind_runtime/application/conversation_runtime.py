@@ -245,6 +245,7 @@ from pyromind_runtime.ports.experiment_plans import (
 from pyromind_runtime.ports.external_tasks import ExternalTaskRegistry
 from pyromind_runtime.ports.harness import (
     BackgroundExecutionContext,
+    DatasetReplayProvider,
     DevelopmentStorageReader,
     ExternalTaskNotification,
     ForkSpec,
@@ -262,6 +263,7 @@ from pyromind_runtime.ports.observability import ExecutionObserver
 from pyromind_runtime.ports.preparation import PreparationStore, ResourceMediaReader
 from pyromind_runtime.ports.project_flywheel import ProjectFlywheel
 from pyromind_runtime.ports.storage import (
+    DatasetReplayReader,
     EvaluationStorage,
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
@@ -4807,6 +4809,19 @@ class ConversationRuntime:
             context,
             max_bytes=max_bytes,
         )
+
+    async def dataset_replay_reader(
+        self, conversation_id: str, context: RequestContext
+    ) -> DatasetReplayReader | None:
+        store = await self._authorized_store(conversation_id, context)
+        if not context.x_cluster or context.x_cluster != await asyncio.to_thread(
+            store.load_x_cluster
+        ):
+            return None
+        adapter = self._adapter(await asyncio.to_thread(store.harness_id))
+        if isinstance(adapter, DatasetReplayProvider):
+            return await adapter.dataset_replay_reader(conversation_id)
+        return None
 
     async def development_storage_proxy(
         self, conversation_id: str, context: RequestContext

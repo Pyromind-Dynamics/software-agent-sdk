@@ -22,6 +22,7 @@ from uuid import uuid4
 import httpx
 from pydantic import SecretStr
 
+from harness_adapter.pi_adapter.actor_replay import RecordedActorReplayReader
 from harness_adapter.pi_adapter.business_tool_host import (
     PLATFORM_SDK_TOOL_NAMES,
     PyromindBusinessToolHost,
@@ -922,6 +923,19 @@ class PiAdapter:
             path,
             max_bytes=max_bytes,
         )
+
+    async def dataset_replay_reader(
+        self, conversation_id: str
+    ) -> RecordedActorReplayReader | None:
+        if self._terminal_backend != "sandbox" or not isinstance(
+            self._sandbox, FixedActorExecutionManager
+        ):
+            return None
+        root = self._safe_conversation_dir(conversation_id)
+        workspace = await asyncio.to_thread(
+            self._sandbox.recorded_workspace, conversation_id, PiSessionFiles(root)
+        )
+        return RecordedActorReplayReader(workspace) if workspace else None
 
     async def development_storage_proxy(
         self, conversation_id: str
