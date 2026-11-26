@@ -149,6 +149,7 @@ class EchoMindChat:
         chat_id = CHAT_PREFIX + manager_id
         context = replace(context, profile_id=CHAT_PROFILE)
         async with manager.lock_chat_creation():
+            manager.authorize(context.user_id, MANAGER_PROFILE)
             if self._runtime._store(chat_id).metadata_path.is_file():
                 return await self._runtime.get_snapshot(chat_id, context)
             snapshot = await self._runtime.create_conversation(

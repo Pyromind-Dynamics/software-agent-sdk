@@ -1172,6 +1172,9 @@ class ConversationRuntime:
         async with self._project_creation_locks.setdefault(
             conversation_id, asyncio.Lock()
         ):
+            await asyncio.to_thread(
+                store.authorize, context.user_id, context.profile_id
+            )
             project = await self._plan_io(self._preparations.store.project, owner)
             snapshot = store.load_snapshot()
             if project is None and (
@@ -1605,30 +1608,37 @@ class ConversationRuntime:
         command: UserMessageCommand,
         context: RequestContext,
     ) -> CommandReceipt:
-        receipt, _ = store.claim_command(command)
-        if receipt.status == "accepted":
-            task_id = f"chat-message:{command.command_id}"
-            event, _ = store.append(
-                ProductEvent(
-                    conversation_id=conversation_id,
-                    event_id=f"queued:{task_id}",
-                    type="task.queued",
-                    payload={
-                        "task_id": task_id,
-                        "kind": "chat_message",
-                        "command": command.model_dump(mode="json"),
-                    },
+        manager = self._store(conversation_id.removeprefix(CHAT_PREFIX))
+        linked = manager.metadata_path.is_file() and conversation_id.startswith(
+            CHAT_PREFIX
+        )
+        async with manager.lock_chat_creation() if linked else contextlib.nullcontext():
+            if linked:
+                manager.authorize(context.user_id, MANAGER_PROFILE)
+            receipt, _ = store.claim_command(command)
+            if receipt.status == "accepted":
+                task_id = f"chat-message:{command.command_id}"
+                event, _ = store.append(
+                    ProductEvent(
+                        conversation_id=conversation_id,
+                        event_id=f"queued:{task_id}",
+                        type="task.queued",
+                        payload={
+                            "task_id": task_id,
+                            "kind": "chat_message",
+                            "command": command.model_dump(mode="json"),
+                        },
+                    )
                 )
-            )
-            self._publish(event)
-            receipt = store.complete_command(
-                receipt.model_copy(
-                    update={
-                        "status": "completed",
-                        "response": {"accepted": True, "queued": True},
-                    }
+                self._publish(event)
+                receipt = store.complete_command(
+                    receipt.model_copy(
+                        update={
+                            "status": "completed",
+                            "response": {"accepted": True, "queued": True},
+                        }
+                    )
                 )
-            )
         try:
             await self._ensure_active(conversation_id, context)
         except Exception as exc:
@@ -6819,6 +6829,73 @@ class ConversationRuntime:
                 await asyncio.to_thread(self._observer.close)
             except Exception:
                 logger.exception("Execution observation close failed")
+
+    async def delete_echomind_conversation(
+        self,
+        conversation_id: str,
+        context: RequestContext,
+        *,
+        project_guard: Callable[[], contextlib.AbstractContextManager[None]]
+        | None = None,
+    ) -> None:
+        if context.profile_id != MANAGER_PROFILE:
+            raise PermissionError("deletion requires the EchoMind conversation owner")
+        store = self._store(conversation_id)
+        await asyncio.to_thread(
+            store.authorize, context.user_id, MANAGER_PROFILE, include_archived=True
+        )
+        async with (
+            self._project_creation_locks.setdefault(conversation_id, asyncio.Lock()),
+            store.lock_chat_creation(),
+        ):
+            if await asyncio.to_thread(store.is_workspace_archived):
+                return
+            expected_command_bytes = (
+                await asyncio.to_thread(store.commands_path.stat)
+            ).st_size
+            chat = self._store(CHAT_PREFIX + conversation_id)
+            expected_sequence = 0
+            sessions = (store, chat) if chat.metadata_path.is_file() else (store,)
+            for session in sessions:
+                snapshot = await asyncio.to_thread(session.load_snapshot)
+                if session is store:
+                    expected_sequence = snapshot.through_seq
+                active = self._active.get(snapshot.conversation_id)
+                if (
+                    snapshot.active_run_id
+                    or snapshot.status in {"running", "waiting_for_external_task"}
+                    or snapshot.experiment_queue
+                    or any(
+                        task.status in {"pending", "running", "waiting"}
+                        for task in snapshot.external_tasks
+                    )
+                    or any(job.status == "queued" for job in snapshot.stage_analyses)
+                    or (active and not self._is_releasable(active))
+                ):
+                    raise ProductRuntimeError(
+                        "conversation_busy",
+                        "会话仍有正在执行或排队的任务，请结束任务后再删除。",
+                    )
+
+            def archive() -> bool:
+                with project_guard() if project_guard else contextlib.nullcontext():
+                    return store.archive_workspace(
+                        context.user_id,
+                        MANAGER_PROFILE,
+                        expected_sequence=expected_sequence,
+                        expected_command_bytes=expected_command_bytes,
+                    )
+
+            archive_task = asyncio.create_task(asyncio.to_thread(archive))
+            try:
+                archived = await asyncio.shield(archive_task)
+            except asyncio.CancelledError:
+                await asyncio.gather(archive_task, return_exceptions=True)
+                raise
+            if not archived:
+                raise ProductRuntimeError(
+                    "conversation_busy", "会话状态刚刚发生变化，请重试删除。"
+                )
 
     async def list_snapshots(
         self,
