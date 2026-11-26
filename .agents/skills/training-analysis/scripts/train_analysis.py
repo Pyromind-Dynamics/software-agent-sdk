@@ -40,6 +40,13 @@ from typing import Any
 
 from analysis_helpers import diagnose_run, metric_series
 from data_sources import create_data_source, detect_data_source
+from data_sources.worb import WorbDataSource
+
+from pyromind_common.tools.utils.training_source import (
+    PYROMIND_WANDB_BASE_URL,
+    WANDB_BUILDER_NODE_TYPE,
+    wandb_builder_for_training,
+)
 
 
 PRE_API_BASE = "https://pre-api-portal.pyromind.ai/std2/studio_api/"
@@ -280,11 +287,10 @@ def _load_creds(path: Path | None = None) -> dict[str, str]:
     return {}
 
 
-def _source_from_args(args: argparse.Namespace) -> tuple[Any, dict[str, str]]:
-    """从 creds 文件创建数据源;creds 缺 data_source 时默认 wandb(向后兼容)。"""
-    creds = _load_creds(getattr(args, "creds_file", None))
-    name = getattr(args, "data_source", "") or creds.get("data_source") or "wandb"
-    return create_data_source(name), creds
+def _training_source(name: str, builder_type: str) -> Any:
+    if name == "wandb" and builder_type == WANDB_BUILDER_NODE_TYPE:
+        return WorbDataSource()
+    return create_data_source(name)
 
 
 def _history_float_values(history: list[dict[str, Any]], metric: str) -> list[float]:
@@ -446,7 +452,7 @@ class TrainingAnalysisService:
     ) -> tuple[Any, dict[str, str]]:
         creds = _load_creds(Path(creds_file) if creds_file else None)
         name = data_source or creds.get("data_source") or "wandb"
-        return create_data_source(name), creds
+        return _training_source(name, creds.get("wandb_builder_type", "")), creds
 
     def resolve_target(
         self,
@@ -503,19 +509,38 @@ class TrainingAnalysisService:
                 "Multiple training nodes; provide training_node_id: "
                 + ", ".join(str(_node_identifier(node)) for node in train_nodes)
             )
-        source_name = data_source or detect_data_source(nodes)
+        credential_nodes = nodes
+        builder_type = ""
+        if any(_node_type(node) == WANDB_BUILDER_NODE_TYPE for node in nodes):
+            selected_id = (
+                _node_identifier(train_nodes[0]) if len(train_nodes) == 1 else None
+            )
+            builder = wandb_builder_for_training(nodes, payload, selected_id)
+            if builder is None or len(train_nodes) > 1:
+                raise WandbAnalysisError(
+                    "Cannot identify the W&B builder bound to the training node"
+                )
+            credential_nodes = [builder, *train_nodes]
+            builder_type = _node_type(builder)
+        source_name = data_source or (
+            "wandb" if builder_type else detect_data_source(nodes)
+        )
         if not source_name:
             raise WandbAnalysisError(
                 "未能从平台节点自动识别数据源类型,请用 --data-source 指定"
                 "(如 --data-source wandb)"
             )
-        source = create_data_source(source_name)
-        creds = source.extract_creds(nodes, client=client, task_id=task_id) or {}
-        effective_api_key = (
-            api_key
-            or creds.get("WANDB_API_KEY", "")
-            or os.environ.get("WANDB_API_KEY", "")
+        source = _training_source(source_name, builder_type)
+        creds = (
+            source.extract_creds(credential_nodes, client=client, task_id=task_id) or {}
         )
+        effective_api_key = api_key or creds.get("WANDB_API_KEY", "")
+        if builder_type == WANDB_BUILDER_NODE_TYPE:
+            creds.update(
+                wandb_builder_type=builder_type, WANDB_BASE_URL=PYROMIND_WANDB_BASE_URL
+            )
+        else:
+            effective_api_key = effective_api_key or os.environ.get("WANDB_API_KEY", "")
         if effective_api_key:
             creds["WANDB_API_KEY"] = effective_api_key
 

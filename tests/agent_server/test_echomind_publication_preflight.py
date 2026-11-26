@@ -118,7 +118,7 @@ def test_production_preflight_requires_train_workflow_wandb(tmp_path, node_type)
     _, project = _publishable_project(tmp_path)
     workflow = {
         "nodes": [
-            {"id": "11", "data": {"nodeType": "WandbConfigBuilderNode"}},
+            {"id": "11", "data": {"nodeType": "PyroMindWandbConfigBuilderNode"}},
             {"id": "12", "data": {"nodeType": node_type, "config": {}}},
         ],
         "edges": [],
@@ -144,7 +144,7 @@ def test_production_preflight_requires_train_workflow_wandb(tmp_path, node_type)
         issue.node_id == "train"
         and issue.code == "executor_configuration_invalid"
         and "12" in issue.message
-        and "wandb_config" in issue.message
+        and "PyroMindWandbConfigBuilderNode.wandb_config" in issue.message
         for issue in issues
     )
 

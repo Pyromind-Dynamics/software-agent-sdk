@@ -48,7 +48,7 @@ description: 了解 Training Studio 内置系统节点的功能、连接方式�
 | Merge LoRA | `ModelMergeLoraNode` | 将 LoRA 适配器合并到基座权重，输出独立模型目录 |
 | Training Config Builder | `TrainingConfigBuilderNode` | 学习率、batch size、epoch、保存/评估步数等 |
 | Accelerate Config Builder | `AccelerateConfigBuilderNode` | 分布式训练与 ZeRO stage 配置 |
-| Wandb Config Builder | `WandbConfigBuilderNode` | WandB 实验追踪配置 |
+| Wandb Config Builder | `PyroMindWandbConfigBuilderNode` | WandB 实验追踪配置 |
 | Reward Item Builder | `RewardItemBuilderNode` | 单个 reward 函数入口、名称与权重 |
 | Reward Config Builder | `RewardConfigBuilderNode` | 组合多个 reward 项 |
 | GRPO Training Extra Config Builder | `GRPOTrainingExtraConfigBuilderNode` | 组采样数、温度、生成长度等 |

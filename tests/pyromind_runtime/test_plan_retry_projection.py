@@ -192,3 +192,38 @@ def test_two_failed_attempts_then_accepted_training_result(tmp_path):
         assert not list(
             plan_executions(project, [{**completed, **ambiguous}], registered=runs)
         )
+
+
+def test_sdk_plan_completion_is_projected_against_the_registered_attempt():
+    task = {"id": "ds_prelabel", "stage_id": "ds", "name": "Prelabel"}
+    project = ProjectView.model_validate(
+        {
+            "project_id": "p",
+            "conversation_id": "c",
+            "plan_sequence": 3,
+            "creation_command_id": "create",
+            "plan": {
+                "stages": [{"id": "ds", "name": "Dataset", "kind": "dataset"}],
+                "tasks": [task],
+            },
+        }
+    )
+    (queued,) = plan_executions(project, [{**task, "business_status": "pending"}])
+    receipt = queued.model_copy(update={"platform_task_id": "1366"})
+    saved = {
+        "plan_task_id": "ds_prelabel",
+        "stage_id": "ds",
+        "attempt": 1,
+        "platform_task_id": "1366",
+        "business_status": "completed",
+        "verified_outputs": {"sft_train_messages": "/workspace/dataset/train.jsonl"},
+    }
+
+    def project_rows(row):
+        rows = read_plan_tasks(json.dumps({"tasks": [row]}), project)
+        return list(plan_executions(project, rows, registered=[receipt]))
+
+    (completed,) = project_rows(saved)
+    assert completed.run_id == receipt.run_id and completed.state == "succeeded"
+    assert not project_rows({**saved, "id": "ds_prelabel", "plan_task_id": "other"})
+    assert not project_rows({**saved, "platform_task_id": "unregistered"})

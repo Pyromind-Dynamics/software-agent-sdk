@@ -112,7 +112,7 @@ Model Config 的 model_path 仍必填，平台声明的默认值为空字符串�
 | LoraConfigBuilderNode | lora_rank, lora_dropout, target_modules, exclude_modules, lora_adapter | `lora_config` |
 | TrainingConfigBuilderNode | num_epochs, batch_size, grad_accum, learning_rate, lr_scheduler_type, logging/save/eval steps, save_total_limit, seed, max_grad_norm | `training_config` |
 | AccelerateConfigBuilderNode | zero_stage | `accelerate_config` |
-| WandbConfigBuilderNode | wandb_api_key, wandb_project, wandb_name | `wandb_config` |
+| PyroMindWandbConfigBuilderNode | wandb_api_key, wandb_project, wandb_name | `wandb_config` |
 | GRPOTrainingExtraConfigBuilderNode | max_steps, num_generations, max_prompt_length, max_completion_length, temperature, enable_chord, enable_hint | `grpo_extra_config` |
 
 `TrainingConfigBuilderNode.save_total_limit` 显式填写：未指定保留策略时使用 `300`，避免平台默认 `3`
@@ -121,9 +121,9 @@ Model Config 的 model_path 仍必填，平台声明的默认值为空字符串�
 需要逐次评估选模时，保存间隔与 `eval_steps` 对齐（通常 `save_steps=eval_steps`），确保候选 step
 有对应 checkpoint；用户明确指定的保留策略优先。
 
-SFT 的 `wandb_config` 必填，连接 `WandbConfigBuilderNode.wandb_config`；DPO/GRPO 的该输入可选，
+SFT 的 `wandb_config` 必填，连接 `PyroMindWandbConfigBuilderNode.wandb_config`；DPO/GRPO 的该输入可选，
 保留用户已有有效设置，需记录训练曲线时连接。
-`WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填明文 Key；`wandb_project` 必填，
+`PyroMindWandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填明文 Key；`wandb_project` 必填，
 `wandb_name` 可选。`accelerate_config` 同样按必填连接，缺省会被校验拦截。
 
 `GRPOTrainingExtraConfigBuilderNode` 平台默认：`max_steps=200`、`num_generations=8`、
@@ -190,7 +190,7 @@ Inference 与 VLLMInference 的 startup_probe_max_duration 默认 1200 秒，可
 - 当前基准的训练、合并、推理及 GPU 命令节点 gpu_product 均为 `NVIDIA-H100-NVL`、
   `NVIDIA-L40S`，默认前者。其他集群应读取各自定义，不能把本集群枚举推广到全部部署。
 - 训练和推理 `gpu_count` 为 1～8（推理节点端口标 `gpu_count`、`gpu_product` 均必填）。
-- `WandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填 Secret 值。
+- `PyroMindWandbConfigBuilderNode.wandb_api_key` 只填 Secret 名，不填 Secret 值。
 - DatasetValidator、DatasetToJsonl、DataPreprocess 不是训练生成默认阶段；格式不合规时停止，
   不自动插入清洗节点。
 - GPU 枚举随平台迭代漂移；生成后按 `validate_workflow_dsl` 的 `ENUM_VALUE_INVALID` 修正当前 DSL。

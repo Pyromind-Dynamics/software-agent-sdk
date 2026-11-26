@@ -325,13 +325,21 @@ def test_evaluation_references_include_only_ready_assets_of_selected_receipt(
     ]
 
 
-@pytest.mark.parametrize("extra_output", [None, "logs_dir", "nested"])
+@pytest.mark.parametrize(
+    ("wandb_node_type", "extra_output"),
+    [
+        ("WandbConfigBuilderNode", None),
+        ("PyroMindWandbConfigBuilderNode", None),
+        ("PyroMindWandbConfigBuilderNode", "logs_dir"),
+        ("PyroMindWandbConfigBuilderNode", "nested"),
+    ],
+)
 def test_archived_train_recipe_rebinds_only_qualified_topology(
-    evidence_store: Mock, extra_output: str | None
+    evidence_store: Mock, wandb_node_type: str, extra_output: str | None
 ):
     node_specs: dict[str, tuple[str, JsonObject]] = {
         "t": ("ModelTrainSFTNode", {"output_path": "/workspace/old-train"}),
-        "w": ("WandbConfigBuilderNode", {"wandb_api_key": "a" * 40}),
+        "w": (wandb_node_type, {"wandb_api_key": "a" * 40}),
         "m": (
             "ModelMergeLoraNode",
             {
@@ -398,6 +406,18 @@ def test_archived_train_recipe_rebinds_only_qualified_topology(
     recipe = reference["runtime_candidate"]
     assert isinstance(recipe, dict)
     assert recipe["artifact_selection"] == "merged_model"
+    runtime_workflow = recipe["workflow"]
+    assert isinstance(runtime_workflow, dict)
+    runtime_nodes = runtime_workflow["nodes"]
+    assert isinstance(runtime_nodes, list)
+    assert {
+        "id": "w",
+        "data": {
+            "nodeType": "PyroMindWandbConfigBuilderNode",
+            "config": {"wandb_api_key": "WANDB_API_KEY"},
+        },
+    } in runtime_nodes
+    assert workflow["nodes"][1]["data"]["nodeType"] == wandb_node_type
     assert recipe["output_node_id"] == "m"
     output_uri = recipe["output_uri"]
     assert isinstance(output_uri, str)

@@ -28,6 +28,10 @@ from pyromind_agent_server.echomind_publication import (
     ProjectPublicationService,
     build_runtime_contract_draft,
 )
+from pyromind_common.tools.utils.training_source import (
+    WANDB_BUILDER_NODE_TYPE,
+    WANDB_BUILDER_NODE_TYPES,
+)
 from pyromind_common.tools.workflow.dsl_to_xyflow import convert_dsl_to_xyflow
 from pyromind_runtime.domain.storage_paths import normalize_workspace_path
 
@@ -518,18 +522,20 @@ def _prepare_training_record(record, base_dir):
 
 def _replace_wandb_credentials_with_references(workflow: dict[str, Any]) -> None:
     builders = [
-        node["data"]["config"]
+        node["data"]
         for node in workflow["nodes"]
-        if node["data"].get("nodeType") == "WandbConfigBuilderNode"
+        if node["data"].get("nodeType") in WANDB_BUILDER_NODE_TYPES
     ]
     if not builders:
-        raise ValueError("The recorded Train workflow has no WandbConfigBuilderNode.")
-    for config in builders:
+        raise ValueError("The recorded Train workflow has no W&B config builder.")
+    for builder in builders:
+        config = builder["config"]
         key = config.get("wandb_api_key")
         if not isinstance(key, str) or not key.strip() or key == "WANDB_API_KEY":
             raise ValueError(
                 "The recorded Train workflow has no reusable W&B credential."
             )
+        builder["nodeType"] = WANDB_BUILDER_NODE_TYPE
         config["wandb_api_key"] = "WANDB_API_KEY"
 
 

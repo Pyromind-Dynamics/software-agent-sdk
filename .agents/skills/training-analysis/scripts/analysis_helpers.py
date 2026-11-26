@@ -25,7 +25,7 @@ def metric_series(history: list[dict[str, Any]], metric: str) -> list[dict[str, 
         step_key = next(
             (
                 key
-                for key in TRAINING_STEP_KEYS
+                for key in (*TRAINING_STEP_KEYS, "step")
                 if isinstance(row.get(key), (int, float))
                 and not isinstance(row[key], bool)
                 and math.isfinite(row[key])

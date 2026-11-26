@@ -1,26 +1,30 @@
 # Pyromind 平台 wandb 数据契约
 
-平台训练工作流通过 `WandbConfigBuilderNode` 配置 wandb,训练节点注入环境变量后由
-训练框架 `wandb.init()` 记录。本文件描述数据形状与定位规则(已按 task 7710
+平台训练工作流通过 `PyroMindWandbConfigBuilderNode` 配置 wandb,训练节点注入环境变量后由
+训练框架 `wandb.init()` 记录。历史工作流也可能使用 `WandbConfigBuilderNode`。本文件描述数据形状与定位规则(已按 task 7710
 真实校准)。
 
 ## 定位策略(优先级从高到低)
 
 1. **节点 config 直接取凭证**: `task_workflow_result` 响应自带全部节点 config——
    训练节点的 `data.config.wandb_config` 文本块(含 `WANDB_API_KEY`/`WANDB_PROJECT`),
-   或 `WandbConfigBuilderNode` 的 `data.config` 结构化字段
+   或 `PyroMindWandbConfigBuilderNode` 的 `data.config` 结构化字段
    (`wandb_api_key`/`wandb_project`/`wandb_name`)。无需额外接口。
 2. **训练节点日志提取 run id**: 训练节点(节点类型含 `Train`,如
    `ModelTrainSFTNode`)→ `internal/logs/node/raw?nodeId={node_id}&taskId={task_id}`
    → stdout 中 `wandb: setting up run <run_id>`(或 `View run at` 行中的 url)。
-3. **WandbConfigBuilderNode 输出接口(回退)**: config 未含凭证时查
+3. **PyroMindWandbConfigBuilderNode 输出接口(回退)**: config 未含凭证时查
    `internal/output/node/raw?node_code={node_id}&task_id={task_id}`,输出文本含
    `wandb_config:` 块。
-4. **用户 run URL**: `https://wandb.ai/{entity}/{project}/runs/{run_id}`。
+4. **用户 run URL**：从 `/{entity}/{project}/runs/{run_id}` 提取 run 标识。新节点对应 [上海 WORB](https://worb-cn-east-1.pyromind-asia.cn/)，历史公有云链接使用 `wandb.ai`。
 5. **DSL 匹配**: `wandb_project`(project 名)+ `wandb_name`(display_name)过滤。
 6. **时间窗口**: 按任务执行时间匹配最近 finished runs。
 
 entity 由 wandb API `viewer()` 推断(如 `pengtao-shi-pyromind`),或 `--entity` 指定。
+
+## 上海 WORB 曲线
+
+`PyroMindWandbConfigBuilderNode` 的训练分析和 Project 面板使用 `https://worb-cn-east-1.pyromind-asia.cn`。按已知 run 链接定位已有记录，再从 `/api/runs/{uuid}/history` 分步读取指标。查询所用实例由工作流节点类型确定。
 
 ## 平台 API 端点
 

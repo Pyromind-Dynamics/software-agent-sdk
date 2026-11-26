@@ -2268,7 +2268,7 @@ def _validate_workflow_wandb_config(workflow: dict[str, Any]) -> None:
             continue
         raise ValueError(
             f"Workflow node {node_id} ({node_type}) requires wandb_config. "
-            "Connect WandbConfigBuilderNode.wandb_config."
+            "Connect PyroMindWandbConfigBuilderNode.wandb_config."
         )
 
 

@@ -304,6 +304,10 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
         if not isinstance(task, dict):
             merged.append(task)
             continue
+        if "plan_task_id" in task:
+            if "id" in task and task["id"] != task["plan_task_id"]:
+                continue
+            task = {**task, "id": task["plan_task_id"]}
         task_id = task.get("id")
         record = (
             records.get(task_id)

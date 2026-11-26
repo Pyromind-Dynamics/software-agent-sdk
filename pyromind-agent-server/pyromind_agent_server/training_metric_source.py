@@ -3,10 +3,11 @@
 import ast
 import hashlib
 import json
-import math
 import os
 import re
 from collections import OrderedDict
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,8 +16,17 @@ import httpx
 
 from pyromind_common.tools.utils.platform_env import platform_portal_url
 from pyromind_common.tools.utils.training_source import (
+    PYROMIND_WANDB_BASE_URL,
+    WANDB_BUILDER_NODE_TYPE,
+    finite_number,
+    node_id,
+    node_type,
+    wandb_builder_for_training,
     wandb_environment,
     wandb_run_reference,
+    worb_history_point,
+    worb_run_api_url,
+    worb_run_lookup_url,
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.observations import (
@@ -94,29 +104,40 @@ def find_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def node_id(node: dict[str, Any]) -> str:
-    return next(
-        (
-            str(node[k])
-            for k in ("node_code", "node_id", "id", "nodeId", "code")
-            if node.get(k) is not None
-        ),
-        "",
-    )
+async def bounded_lines(
+    response: httpx.Response, budget: ReadBudget
+) -> AsyncIterator[bytes]:
+    pending = b""
+    async for chunk in response.aiter_bytes(chunk_size=4096):
+        budget.remaining -= len(chunk)
+        if budget.remaining < 0:
+            raise ObservationPageTooLarge("W&B history exceeded its byte budget")
+        lines = (pending + chunk).split(b"\n")
+        pending = lines.pop()
+        for line in lines:
+            if line.strip():
+                yield line
+    if pending.strip():
+        yield pending
 
 
-def node_type(node: dict[str, Any]) -> str:
-    data = node.get("data")
-    if isinstance(data, dict) and isinstance(data.get("nodeType"), str):
-        return data["nodeType"]
-    return next(
-        (
-            node[k]
-            for k in ("node_type", "type", "nodeType", "node_class")
-            if isinstance(node.get(k), str)
-        ),
-        "",
-    )
+async def worb_scalars(
+    client: httpx.AsyncClient,
+    url: str,
+    auth: tuple[str, str],
+    params: dict[str, str],
+    keys: set[str],
+    budget: ReadBudget,
+) -> AsyncGenerator[tuple[str, int, float, float]]:
+    async with client.stream(
+        "GET", url, auth=auth, params=params, follow_redirects=False
+    ) as response:
+        response.raise_for_status()
+        async for line in bounded_lines(response, budget):
+            point = worb_history_point(json.loads(line))
+            if point[0] not in keys:
+                raise ValueError("Unexpected W&B metric")
+            yield point
 
 
 def log_text(value: object) -> str:
@@ -139,16 +160,6 @@ def log_text(value: object) -> str:
             if key in value:
                 return log_text(value[key])
     return ""
-
-
-def finite_number(value: object) -> float | None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except OverflowError:
-        return None
-    return number if math.isfinite(number) else None
 
 
 # Studio returns raw trainer output, which may use Python dicts or JSON.
@@ -203,6 +214,37 @@ class TaskLogRows:
                 self.gap = True
                 for step in sorted(rows)[:-2048]:
                     del rows[step]
+
+
+def history_points(
+    rows: dict[int, dict[str, Any]],
+    metrics: tuple[MetricConfig, ...],
+    source_run: str,
+    *,
+    require_axis: bool = False,
+) -> tuple[MetricPoint, ...]:
+    points = []
+    for step, row in sorted(rows.items()):
+        for metric in metrics:
+            if require_axis and not metric_value_available(metric, row, False):
+                continue
+            value = finite_number(row.get(metric.key))
+            if value is not None:
+                points.append(
+                    MetricPoint(
+                        key=metric.key,
+                        value=value,
+                        unit=metric.unit,
+                        source_point_id=f"{source_run}:{step}:{metric.key}",
+                        source_run_id=source_run,
+                        log_step=step,
+                        training_step=finite_number(row.get(metric.axis_key))
+                        if metric.axis_key
+                        else None,
+                        time=finite_number(row.get("_timestamp")),
+                    )
+                )
+    return tuple(points)
 
 
 def metric_value_available(
@@ -285,6 +327,8 @@ class TrainingLogState:
     timestamp: str = ""
     wandb: tuple[str, str, str] | None = None
     scroll_supported: bool = True
+    worb_run: tuple[str, str] | None = None
+    worb_viewer: str = ""
 
 
 def scroll_timestamp(payload: dict[str, Any]) -> str:
@@ -352,10 +396,11 @@ class PlatformTrainingMetricSource:
         state = self._logs.get(identity)
         try:
             async with httpx.AsyncClient(timeout=4, follow_redirects=False) as client:
+                payload: dict[str, Any] = {}
                 nodes: list[dict[str, Any]] | None = None
 
                 async def workflow_nodes() -> list[dict[str, Any]]:
-                    nonlocal nodes
+                    nonlocal nodes, payload
                     if nodes is None:
                         payload = await bounded_json(
                             client,
@@ -402,6 +447,8 @@ class PlatformTrainingMetricSource:
                         headers,
                         binding,
                         run_nodes,
+                        payload,
+                        state,
                         ref,
                         metrics,
                         start_step,
@@ -418,14 +465,18 @@ class PlatformTrainingMetricSource:
                 if state.wandb and tried_wandb:
                     page = await wandb_page(state.wandb)
                     if page is not None and (
-                        page.points or page.source_run_id == previous_source
+                        page.points
+                        or page.has_more
+                        or page.source_run_id == previous_source
                     ):
                         return page
 
                 log_page = await self._log_page(client, base, headers, binding, state)
                 logs = log_text(log_page)
                 state.timestamp = max(state.timestamp, scroll_timestamp(log_page))
-                state.wandb = wandb_run_reference(logs) or state.wandb
+                ref = wandb_run_reference(logs)
+                if ref and (ref[0] or not state.wandb or state.wandb[2] != ref[2]):
+                    state.wandb = ref
                 studio = task_log_history(
                     logs,
                     binding,
@@ -448,9 +499,15 @@ class PlatformTrainingMetricSource:
                 ):
                     page = await wandb_page(state.wandb)
                     if page is not None and (
-                        page.points or page.source_run_id == previous_source
+                        page.points
+                        or page.has_more
+                        or page.source_run_id == previous_source
                     ):
                         return page
+                if continuing_wandb:
+                    raise ObservationUnavailableError(
+                        "W&B history temporarily unavailable"
+                    )
                 if studio is not None:
                     return studio
                 return SourcePage(
@@ -517,43 +574,67 @@ class PlatformTrainingMetricSource:
         headers: dict[str, str],
         binding: RunBinding,
         nodes: list[dict[str, Any]],
+        workflow: dict[str, Any],
+        state: TrainingLogState,
         ref: tuple[str, str, str],
         metrics: tuple[MetricConfig, ...],
         start: int,
         count: int,
         previous_source: str,
     ) -> SourcePage | None:
+        builder = wandb_builder_for_training(nodes, workflow, state.node)
+        if not builder and any("WandbConfigBuilderNode" in node_type(n) for n in nodes):
+            return None
         credentials: dict[str, str] = {}
         for node in nodes:
+            if node is not builder and node_id(node) != state.node:
+                continue
             data = node.get("data", {})
             if isinstance(data, dict) and isinstance(data.get("config"), dict):
-                credentials.update(wandb_environment(data["config"]))
+                config = data["config"]
+                if node is builder and node_type(node) == WANDB_BUILDER_NODE_TYPE:
+                    config = {k: v for k, v in config.items() if k != "wandb_api_key"}
+                credentials.update(wandb_environment(config))
         try:
-            if not credentials.get("WANDB_API_KEY"):
-                builder = next(
-                    (n for n in nodes if "WandbConfigBuilderNode" in node_type(n)), None
+            if not credentials.get("WANDB_API_KEY") and builder:
+                output = await bounded_json(
+                    client,
+                    "GET",
+                    base + "internal/output/node/raw",
+                    params={"node_code": node_id(builder), "task_id": binding.task_id},
+                    headers=headers,
                 )
-                if builder:
-                    output = await bounded_json(
-                        client,
-                        "GET",
-                        base + "internal/output/node/raw",
-                        params={
-                            "node_code": node_id(builder),
-                            "task_id": binding.task_id,
-                        },
-                        headers=headers,
-                    )
-                    data = output.get("data", output)
-                    if isinstance(data, dict):
-                        credentials.update(wandb_environment(data))
+                data = output.get("data", output)
+                if isinstance(data, dict):
+                    credentials.update(wandb_environment(data))
             key = credentials.get("WANDB_API_KEY")
             entity = ref[0] or credentials.get("WANDB_ENTITY", "")
             project = ref[1] or credentials.get("WANDB_PROJECT", "")
-            if not key or not entity or not project:
+            if not key or not project:
+                return None
+            managed = (
+                builder is not None and node_type(builder) == WANDB_BUILDER_NODE_TYPE
+            )
+            if managed and not entity:
+                if not state.worb_viewer:
+                    viewer = await bounded_json(
+                        client,
+                        "GET",
+                        PYROMIND_WANDB_BASE_URL + "/api/v1/viewer",
+                        auth=("api", key),
+                        follow_redirects=False,
+                    )
+                    if isinstance(viewer.get("entity"), str):
+                        state.worb_viewer = viewer["entity"]
+                entity = state.worb_viewer
+            if not entity:
                 return None
             if previous_source and previous_source != f"{entity}/{project}/{ref[2]}":
                 start = 0
+            if managed:
+                return await self._worb_history(
+                    client, state, entity, project, ref[2], key, metrics, start, count
+                )
             return await self._history(
                 client,
                 entity,
@@ -574,6 +655,71 @@ class PlatformTrainingMetricSource:
             TypeError,
         ):
             return None
+
+    @staticmethod
+    async def _worb_history(
+        client: httpx.AsyncClient,
+        state: TrainingLogState,
+        entity: str,
+        project: str,
+        run: str,
+        api_key: str,
+        metrics: tuple[MetricConfig, ...],
+        start: int,
+        count: int,
+    ) -> SourcePage:
+        source_run = f"{entity}/{project}/{run}"
+        auth = ("api", api_key)
+        if not state.worb_run or state.worb_run[0] != source_run:
+            async with client.stream(
+                "GET",
+                worb_run_lookup_url(entity, project, run),
+                auth=auth,
+                follow_redirects=False,
+            ) as response:
+                if response.status_code != 302:
+                    raise ObservationUnavailableError("W&B run lookup unavailable")
+                url = worb_run_api_url(response.headers.get("location", ""))
+            state.worb_run = source_run, url
+        url = state.worb_run[1] + "/history"
+        keys = {m.key for m in metrics}
+        keys.update(m.axis_key for m in metrics if m.axis_key)
+        keys.discard("step")
+        if any("," in key for key in keys) or not keys:
+            raise ObservationUnavailableError("Unsupported W&B metric selection")
+        params = {"keys": ",".join(sorted(keys))}
+        budget = ReadBudget()
+        end = start + count
+        rows: dict[int, dict[str, Any]] = {}
+        async for key, index, step, value in worb_scalars(
+            client,
+            url,
+            auth,
+            {**params, "xMin": str(start), "xMax": str(end - 1)},
+            keys,
+            budget,
+        ):
+            if not start <= index < end:
+                raise ValueError("W&B metric outside the requested window")
+            row = rows.setdefault(index, {})
+            row[key] = value
+            # WORB coalesces an absent training step to the log index.
+            if index != step:
+                row["step"] = step
+
+        # Line count is not a high-water mark: uploads can omit scalar rows.
+        async with aclosing(
+            worb_scalars(client, url, auth, {**params, "xMin": str(end)}, keys, budget)
+        ) as future:
+            later = await anext(future, None)
+        if later is not None and later[1] < end:
+            raise ValueError("W&B metric outside the requested window")
+        return SourcePage(
+            points=history_points(rows, metrics, source_run, require_axis=True),
+            source_run_id=source_run,
+            next_step=end if later else max(rows, default=start),
+            has_more=later is not None,
+        )
 
     async def _history(
         self,
@@ -646,25 +792,7 @@ class PlatformTrainingMetricSource:
                     raise ObservationUnavailableError("Invalid source step window")
                 rows.setdefault(step, {}).update(item)
         source_run = f"{entity}/{project}/{run}"
-        points = []
-        for step, row in sorted(rows.items()):
-            for metric in metrics:
-                value = finite_number(row.get(metric.key))
-                if value is not None:
-                    points.append(
-                        MetricPoint(
-                            key=metric.key,
-                            value=value,
-                            unit=metric.unit,
-                            source_point_id=f"{source_run}:{step}:{metric.key}",
-                            source_run_id=source_run,
-                            log_step=step,
-                            training_step=finite_number(row.get(metric.axis_key))
-                            if metric.axis_key
-                            else None,
-                            time=finite_number(row.get("_timestamp")),
-                        )
-                    )
+        points = history_points(rows, metrics, source_run)
         last_step = data.get("historyKeys", {}).get("lastStep", -1)
         if type(last_step) is not int or last_step < -1:
             raise ObservationUnavailableError("Invalid W&B history step")

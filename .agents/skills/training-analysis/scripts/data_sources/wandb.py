@@ -15,20 +15,21 @@
 from __future__ import annotations
 
 import os
-import re
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-from platform_output import parse_node_output, strip_terminal_codes
+from platform_output import parse_node_output
+
+from pyromind_common.tools.utils.training_source import (
+    node_id,
+    node_type,
+    wandb_environment,
+    wandb_run_reference,
+)
 
 from .base import RunData
 
-
-RUN_SETUP_RE = re.compile(r"wandb:\s+setting up run\s+(\w+)")
-RUN_URL_RE = re.compile(r"https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/([A-Za-z0-9_-]+)")
-RUN_PATH_RE = re.compile(r"run-\d{8}_\d{6}-(\w+)")
-CONFIG_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
 
 WANDB_NODE_TYPE = "WandbConfigBuilderNode"
 
@@ -98,10 +99,12 @@ class WandbDataSource:
 
         if not creds.get("WANDB_API_KEY") and client is not None and task_id:
             for node in nodes:
-                node_id = self._node_identifier(node)
-                if WANDB_NODE_TYPE in self._node_type(node) and node_id:
+                identifier = node_id(node)
+                if WANDB_NODE_TYPE in node_type(node) and identifier:
                     creds.update(
-                        self._collect_output_env(client.node_output(node_id, task_id))
+                        wandb_environment(
+                            parse_node_output(client.node_output(identifier, task_id))
+                        )
                     )
                     break
 
@@ -113,103 +116,11 @@ class WandbDataSource:
         resolved = {
             key: value for key, value in config.items() if key != "wandb_api_key"
         }
-        return self._collect_wandb_env(resolved)
-
-    def _collect_wandb_env(self, output: dict[str, Any]) -> dict[str, str]:
-        """从节点输出/config 提取 WANDB_* 环境变量,覆盖多种真实形态。"""
-        result: dict[str, str] = {}
-
-        def merge_text(text: str) -> None:
-            for key, value in self._parse_config_text(text).items():
-                if value:
-                    result.setdefault(key.upper(), value)
-
-        config_value = output.get("wandb_config")
-        if isinstance(config_value, dict):
-            for key, value in config_value.items():
-                result[str(key).upper()] = str(value)
-        elif isinstance(config_value, str):
-            merge_text(config_value)
-
-        for key, value in output.items():
-            name = key.upper()
-            if (
-                name.startswith("WANDB_")
-                and name != "WANDB_CONFIG"
-                and value is not None
-            ):
-                result[name] = str(value)
-
-        entries = output.get("entries")
-        if isinstance(entries, list):
-            merge_text(
-                "".join(
-                    e.get("m", "")
-                    for e in entries
-                    if isinstance(e, dict) and isinstance(e.get("m"), str)
-                )
-            )
-
-        if not result:
-            for value in output.values():
-                if isinstance(value, str) and value.strip():
-                    merge_text(value)
-                    break
-
-        # 只保留 wandb 相关键,避免混入其他节点配置
-        return {k: v for k, v in result.items() if k.startswith("WANDB_")}
-
-    @staticmethod
-    def _parse_config_text(text: str) -> dict[str, str]:
-        """解析 wandb_config YAML 文本(仅 key: value 行,嵌套不做展开)。"""
-        result: dict[str, str] = {}
-        for line in text.splitlines():
-            match = CONFIG_LINE_RE.match(line)
-            if match:
-                result[match.group(1)] = match.group(2)
-        return result
-
-    @staticmethod
-    def _node_identifier(node: dict[str, Any]) -> str | None:
-        for key in ("node_code", "node_id", "id", "nodeId", "code"):
-            value = node.get(key)
-            if value is not None and str(value) != "":
-                return str(value)
-        return None
-
-    @staticmethod
-    def _node_type(node: dict[str, Any]) -> str:
-        data = node.get("data")
-        if isinstance(data, dict):
-            node_type = data.get("nodeType")
-            if isinstance(node_type, str) and node_type:
-                return node_type
-        for key in ("node_type", "type", "nodeType", "node_class"):
-            value = node.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return ""
-
-    def _collect_output_env(self, output: dict[str, Any]) -> dict[str, str]:
-        """从 node_output 接口响应提取凭证。"""
-        return self._collect_wandb_env(parse_node_output(output))
-
-    # ------------------------------------------------------------------
-    # run 定位
-    # ------------------------------------------------------------------
+        return wandb_environment(resolved)
 
     def extract_run_ref(self, log_text: str) -> tuple[str, str, str] | None:
         """从日志中提取 (entity, project, run_id);URL 行优先,其次 setting up run。"""
-        log_text = strip_terminal_codes(log_text)
-        for match in RUN_URL_RE.finditer(log_text):
-            return match.group(1), match.group(2), match.group(3)
-        match = RUN_SETUP_RE.search(log_text)
-        if match:
-            return "", "", match.group(1)
-        match = RUN_PATH_RE.search(log_text)
-        if match:
-            return "", "", match.group(1)
-        return None
+        return wandb_run_reference(log_text)
 
     # ------------------------------------------------------------------
     # SDK 连接

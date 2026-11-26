@@ -90,8 +90,10 @@ def test_train_resolves_archived_wandb_key_only_in_submission(
     backend = PlatformTrainWorkflowBackend(conversations_dir=conversations_dir)
     assert backend.submit_workflow(spec=spec, request_context=None) == "42"
     submitted = client.studio.create.call_args.args[0].workflow
+    assert submitted["nodes"][0]["data"]["nodeType"] == "PyroMindWandbConfigBuilderNode"
     assert submitted["nodes"][0]["data"]["config"]["wandb_api_key"] == key
     assert spec.workflow is not None
+    assert spec.workflow["nodes"][0]["data"]["nodeType"] == "WandbConfigBuilderNode"
     assert (
         spec.workflow["nodes"][0]["data"]["config"]["wandb_api_key"] == "WANDB_API_KEY"
     )

@@ -22,6 +22,10 @@ from pyromind_agent_server.echomind_runtime_contracts import (
     StageSubmissionResult,
 )
 from pyromind_agent_server.echomind_stage_executors import StageArtifactPayload
+from pyromind_common.tools.utils.training_source import (
+    WANDB_BUILDER_NODE_TYPE,
+    WANDB_BUILDER_NODE_TYPES,
+)
 from pyromind_runtime.domain.context import RequestContext
 
 
@@ -450,6 +454,16 @@ def render_workflow_template(
         raise TrainRuntimeError(f"Workflow template is invalid: {exc}") from exc
 
 
+def normalize_wandb_builder_nodes(workflow: dict[str, Any]) -> None:
+    nodes = workflow.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        data = node.get("data") if isinstance(node, dict) else None
+        if isinstance(data, dict) and data.get("nodeType") in WANDB_BUILDER_NODE_TYPES:
+            data["nodeType"] = WANDB_BUILDER_NODE_TYPE
+
+
 def prepare_workflow_for_submission(
     workflow: Mapping[str, Any],
     *,
@@ -485,6 +499,7 @@ def prepare_workflow_for_submission(
             parameter=spec.output_parameter,
             value=spec.output_uri,
         )
+    normalize_wandb_builder_nodes(effective)
     return effective
 
 

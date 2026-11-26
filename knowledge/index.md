@@ -129,6 +129,7 @@ original pages before answering.
 | [PathJoinNode](nodes/PathJoinNode/PathJoinNode.md) | PathJoinNode 节点的功能、输入输出、参数与运行说明 | nodes, pathjoinnode |
 | [PreviewFile](nodes/PreviewFile/PreviewFile.md) | PreviewFile 节点的功能、输入输出、参数与运行说明 | nodes, previewfile |
 | [PreviewImageEx](nodes/PreviewImageEx/PreviewImageEx.md) | PreviewImageEx 节点的功能、输入输出、参数与运行说明 | nodes, previewimageex |
+| [PyroMindWandbConfigBuilderNode](nodes/PyroMindWandbConfigBuilderNode/PyroMindWandbConfigBuilderNode.md) | PyroMindWandbConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, pyromindwandbconfigbuildernode |
 | [PythonFileProcessorNode](nodes/PythonFileProcessorNode/PythonFileProcessorNode.md) | PythonFileProcessorNode 节点的功能、输入输出、参数与运行说明 | nodes, pythonfileprocessornode |
 | [RewardConfigBuilderNode](nodes/RewardConfigBuilderNode/RewardConfigBuilderNode.md) | RewardConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, rewardconfigbuildernode |
 | [RewardItemBuilderCustomNode](nodes/RewardItemBuilderCustomNode/RewardItemBuilderCustomNode.md) | RewardItemBuilderCustomNode 节点的功能、输入输出、参数与运行说明 | nodes, rewarditembuildercustomnode |
@@ -140,7 +141,6 @@ original pages before answering.
 | [TestLLMNode](nodes/TestLLMNode/TestLLMNode.md) | TestLLMNode 节点的功能、输入输出、参数与运行说明 | nodes, testllmnode |
 | [TrainingConfigBuilderNode](nodes/TrainingConfigBuilderNode/TrainingConfigBuilderNode.md) | TrainingConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, trainingconfigbuildernode |
 | [VLLMInference](nodes/VLLMInference/VLLMInference.md) | VLLMInference 节点的功能、输入输出、参数与运行说明 | nodes, vllminference |
-| [WandbConfigBuilderNode](nodes/WandbConfigBuilderNode/WandbConfigBuilderNode.md) | WandbConfigBuilderNode 节点的功能、输入输出、参数与运行说明 | nodes, wandbconfigbuildernode |
 | [YoloTrainingExtraConfigBuilderNode](nodes/YoloTrainingExtraConfigBuilderNode/YoloTrainingExtraConfigBuilderNode.md) | 生成 YOLO 训练及推理使用的专用配置 | nodes, yolotrainingextraconfigbuildernode, yolo, training |
 
 ## Examples

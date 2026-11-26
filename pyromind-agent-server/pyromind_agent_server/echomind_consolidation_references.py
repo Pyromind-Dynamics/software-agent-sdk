@@ -15,9 +15,14 @@ from pyromind_agent_server.echomind_train_backend import (
 from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeError,
     TrainWorkflowSpec,
+    normalize_wandb_builder_nodes,
     prepare_workflow_for_submission,
 )
 from pyromind_common.tools.data_preparation.runner import runtime_bundle_fingerprint
+from pyromind_common.tools.utils.training_source import (
+    WANDB_BUILDER_NODE_TYPE,
+    WANDB_BUILDER_NODE_TYPES,
+)
 from pyromind_runtime.application.consolidation_evidence import (
     ConsolidationEvidence,
     ConsolidationEvidenceError,
@@ -92,7 +97,6 @@ _DATA = "DatasetConfigBuilderNode"
 _BASE = "ModelConfigBuilderNode"
 _TRAIN = "ModelTrainSFTNode"
 _MERGE = "ModelMergeLoraNode"
-_WANDB = "WandbConfigBuilderNode"
 _TRAIN_EDGES = {
     (_PATH_JOIN, "joined_path", _DATA, "train_data_path"),
     (_PATH_JOIN, "joined_path", _DATA, "val_data_path"),
@@ -113,7 +117,7 @@ _TRAIN_EDGES = {
     ("LoraConfigBuilderNode", "lora_config", _TRAIN, "lora_config"),
     ("TrainingConfigBuilderNode", "training_config", _TRAIN, "training_config"),
     ("AccelerateConfigBuilderNode", "accelerate_config", _TRAIN, "accelerate_config"),
-    (_WANDB, "wandb_config", _TRAIN, "wandb_config"),
+    (WANDB_BUILDER_NODE_TYPE, "wandb_config", _TRAIN, "wandb_config"),
     (_TRAIN, "model_output_path", _MERGE, "lora_path"),
 }
 _TRAIN_NODES = Counter({name: 1 for edge in _TRAIN_EDGES for name in edge[::2]})
@@ -551,7 +555,7 @@ def _xyflow_reference(workflow: JsonObject) -> tuple[JsonObject, bool]:
         config = (
             _safe_object(archived_config) if isinstance(archived_config, dict) else {}
         )
-        if data.get("nodeType") == "WandbConfigBuilderNode" and isinstance(
+        if data.get("nodeType") in WANDB_BUILDER_NODE_TYPES and isinstance(
             archived_config, dict
         ):
             key = archived_config.get("wandb_api_key")
@@ -588,6 +592,7 @@ def _train_runtime_candidate(
     if not re.fullmatch(r"[a-f0-9]{32}", conversation_id):
         return None
     candidate = deepcopy(workflow)
+    normalize_wandb_builder_nodes(candidate)
     nodes = _objects(candidate.get("nodes"))
     edges = _objects(candidate.get("edges"))
     types: dict[str, str] = {}

@@ -43,6 +43,7 @@ from pyromind_common.tools.utils.platform_env import (
     platform_cluster_target,
 )
 from pyromind_common.tools.utils.pyromind_api_client import get_pyromind_api_client
+from pyromind_common.tools.utils.training_source import WANDB_BUILDER_NODE_TYPES
 from pyromind_common.tools.workflow.task_submission import (
     create_workflow_api_client,
     submit_workflow_task,
@@ -474,7 +475,7 @@ def _wandb_builder_configs(workflow: Mapping[str, Any]) -> dict[str, dict[str, A
         data = node.get("data")
         if (
             not isinstance(data, dict)
-            or data.get("nodeType") != "WandbConfigBuilderNode"
+            or data.get("nodeType") not in WANDB_BUILDER_NODE_TYPES
         ):
             continue
         config = data.get("config")
