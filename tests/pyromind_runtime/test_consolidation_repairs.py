@@ -1,9 +1,11 @@
+import json
 from datetime import timedelta
 
 from pyromind_runtime.application.consolidation_repairs import plan_repair
 from pyromind_runtime.domain.base import utc_now
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import CommandReceipt
+from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     TimelineOperation,
@@ -57,3 +59,24 @@ def test_repair_waits_for_author_then_reports_persistent_gap():
     assert retry and retry.command_id != old.command_id
     fixed, patch = next_repair(receipts=(old,), revision="new-patch")
     assert patch and fixed.command_id not in {old.command_id, retry.command_id}
+
+
+def test_dataset_repair_checks_export_against_accepted_train_fields():
+    fields: JsonObject = {"image_field": "images", "assistant_response_field": "gt"}
+    _, command = plan_repair(
+        stage="dataset",
+        evidence="sha256:" + "4" * 64,
+        facts={"train_input_fields": fields},
+        issues=["dataset_train_fields_missing"],
+        revision="",
+        receipts=(),
+        snapshot=ConversationSnapshot(
+            conversation_id="test", capabilities=HarnessCapabilities()
+        ),
+        retry_command_id=None,
+    )
+    assert command and isinstance(command.content[0], TextContent)
+    guidance, facts = command.content[0].text.rsplit("\n", 1)
+    assert json.loads(facts)["train_input_fields"] == fields
+    assert "提交小样前在本地导出一行，对照 train_input_fields" in guidance
+    assert "修正 Dataset 导出" in guidance
