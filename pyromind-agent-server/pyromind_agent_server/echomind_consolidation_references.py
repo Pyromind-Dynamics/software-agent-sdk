@@ -541,7 +541,7 @@ def _workflow_receipt(
 
 
 def _source_path(value: str) -> str | None:
-    if re.fullmatch(r"version://r[0-9]+", value):
+    if re.fullmatch(r"version://[rv][0-9]+", value):
         return value
     if not re.fullmatch(r"[\w./-]+", value) or ".." in PurePosixPath(value).parts:
         return None

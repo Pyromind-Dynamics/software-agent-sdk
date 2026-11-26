@@ -249,6 +249,7 @@ def approved_evidence(evidence_store, request, inference_graph):
         receipt = _workflow(task).model_copy(
             update={
                 "request_id": "sdk:" + identifier,
+                "workflow_path": "version://v42",
                 "summary": {"name": stage},
                 "workflow": workflow,
             }
@@ -297,6 +298,7 @@ def test_sdk_consolidation_uses_frozen_graph_and_scoped_primary_receipt(
     evaluation = refs["eval"]
     assert isinstance(train, dict) and train["wandb_credential_task_id"] == "20"
     assert isinstance(evaluation, dict) and "workflow" in evaluation
+    assert evaluation["workflow_path"] == "version://v42"
     assert "runtime_candidate" not in evaluation
     assert "runtime_blocker" in consolidation_evaluation_reference(
         Mock(spec_set=Versions), evidence, RequestContext(user_id="42")
