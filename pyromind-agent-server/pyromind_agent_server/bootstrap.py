@@ -15,6 +15,7 @@ from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.task_status_query import PlatformTaskStatusQuery
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
+from pyromind_agent_server.accepted_workflow import read_accepted_workflow
 from pyromind_agent_server.config import (
     Config,
 )
@@ -209,6 +210,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         else None,
         resource_media_reader=StorageResourceInspector(),
         external_task_query=PlatformWorkflowSubmission(),
+        accepted_workflow_reader=read_accepted_workflow,
         observer=build_execution_observer(service.conversations_dir),
         external_tasks=external_tasks,
         idle_eviction_seconds=idle_eviction_seconds,

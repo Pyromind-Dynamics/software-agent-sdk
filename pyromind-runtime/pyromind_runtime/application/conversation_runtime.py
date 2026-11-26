@@ -98,6 +98,10 @@ from pyromind_runtime.application.sdk_execution_metadata import (
     bind_sdk_execution_metadata,
     verified_sdk_inference_paths,
 )
+from pyromind_runtime.application.sdk_workflow_archive import (
+    AcceptedWorkflowReader,
+    SdkWorkflowArchive,
+)
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
 from pyromind_runtime.application.stage_analysis import (
     existing_stage_analysis,
@@ -355,6 +359,7 @@ class ConversationRuntime:
         default_harness_id: str = "pi",
         project_flywheel: ProjectFlywheel | None = None,
         external_task_query: ExternalTaskQueryPort | None = None,
+        accepted_workflow_reader: AcceptedWorkflowReader | None = None,
         preparation_store: PreparationStore | None = None,
         resource_media_reader: ResourceMediaReader | None = None,
         experiment_plan_project_binder: ExperimentPlanProjectBinder | None = None,
@@ -390,6 +395,11 @@ class ConversationRuntime:
         )
         self._resource_media_reader = resource_media_reader
         self._external_task_query = external_task_query
+        self._sdk_workflow_archive = (
+            SdkWorkflowArchive(accepted_workflow_reader, versions)
+            if accepted_workflow_reader and versions
+            else None
+        )
         self._execution_event_task: asyncio.Task[None] | None = None
         self._experiment_plan_project_binder = experiment_plan_project_binder
         self._observer = observer
@@ -4420,6 +4430,14 @@ class ConversationRuntime:
             snapshot = await self._load_saved_snapshot(conversation_id, store, context)
             if snapshot.project and snapshot.project.cluster:
                 context = replace(context, x_cluster=snapshot.project.cluster)
+            if (
+                self._sdk_workflow_archive
+                and not self._closing
+                and not snapshot.capabilities.read_only
+            ):
+                self._sdk_workflow_archive.schedule(
+                    store, context, snapshot.external_tasks
+                )
             snapshot = await self._project_execution_status(snapshot, store)
             if not snapshot.capabilities.read_only:
                 await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
@@ -5712,6 +5730,9 @@ class ConversationRuntime:
                     "SDK task status requires a trusted platform source"
                 )
             await self._bind_sdk_project_task(store, task_id, task.correlation)
+            context = self._task_contexts.get(conversation_id)
+            if self._sdk_workflow_archive and context and not self._closing:
+                self._sdk_workflow_archive.schedule(store, context, (task,))
         normalized = _normalize_external_status(status)
         if task.kind == "workflow_run":
             auto_run = auto_run and task.resume_auto_run
@@ -6212,6 +6233,8 @@ class ConversationRuntime:
         # Release admission waiters first so shutdown can fail them immediately
         # instead of blocking on a suspended graph.
         self._closing = True
+        if self._sdk_workflow_archive:
+            await self._sdk_workflow_archive.close()
         analysis_tasks = (
             *self._stage_analysis_rechecks.values(),
             *self._stage_analysis_workers.values(),

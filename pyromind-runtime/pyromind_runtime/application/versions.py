@@ -364,18 +364,7 @@ class Versions:
             else self.resolve_inputs(project, definition, inputs, context, key)
         )
         inputs.update(fixed_inputs or {})
-        config = self.save(
-            project,
-            key + ":config",
-            SaveVersion(
-                kind="config",
-                logical_key=kind + "-config",
-                source=SnapshotSource(
-                    text=canonical(effective), filename="config.json"
-                ),
-            ),
-            context,
-        )
+        config = self.save_run_config(project, key, kind, effective, context)
         inputs["config"] = config.id
         if code is not None:
             script = self.save(
@@ -402,6 +391,27 @@ class Versions:
                 },
             ),
             source,
+        )
+
+    def save_run_config(
+        self,
+        project: VersionProject,
+        key: str,
+        kind: str,
+        definition: JsonObject,
+        context: RequestContext,
+    ) -> ArtifactVersion:
+        return self.save(
+            project,
+            key + ":config",
+            SaveVersion(
+                kind="config",
+                logical_key=kind + "-config",
+                source=SnapshotSource(
+                    text=canonical(definition), filename="config.json"
+                ),
+            ),
+            context,
         )
 
     def resolve_inputs(
