@@ -78,7 +78,10 @@ export function createTerminalTool(
           outputDetails = partial.details;
           onUpdate?.({ ...partial, details: { ...partial.details, cwd: commandCwd } });
         });
-        return { ...result, details: { ...details(), ...result.details, resultCategory: "success" } };
+        return {
+          ...result,
+          details: { ...details(), ...result.details, resultCategory: result.isError ? "failure" : "success" },
+        };
       } catch (error) {
         return {
           content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],

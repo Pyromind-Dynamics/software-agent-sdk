@@ -7,10 +7,6 @@ import pytest
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.echomind_chat import completed_chat_turns
 from pyromind_runtime.application.echomind_notices import (
-    candidate_for,
-    manager_messages,
-    public_blocks,
-    resolved_submission_notices,
     visible_chat_event,
 )
 from pyromind_runtime.application.plan_execution import PLAN_PATH, next_approved_task
@@ -23,10 +19,8 @@ from pyromind_runtime.domain.events import HarnessEvent, ProductEvent, ProductEv
 from pyromind_runtime.domain.preparation import ProjectView, SetPreparationPlan
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
-    ExecutionNoticeLink,
     ExternalTaskState,
     TimelineMessage,
-    TimelineOperation,
 )
 from pyromind_runtime.ports.harness import DelegatedRole, SessionSpec
 
@@ -91,57 +85,6 @@ def local_completion():
     }
 
 
-def test_rejected_submission_can_retry_without_requesting_a_user_decision():
-    event = ProductEvent(
-        conversation_id="session",
-        type="experiment_execution.changed",
-        payload={"execution": {"state": "failed", "run_id": "baseline"}},
-    )
-    snapshot = ConversationSnapshot.model_validate(
-        {
-            "conversation_id": "session",
-            "capabilities": {},
-            "status": "running",
-        }
-    )
-    assert candidate_for(event, snapshot, set()) is None
-    settled = snapshot.model_copy(update={"status": "idle"})
-    assert candidate_for(event, settled, set()) is not None
-
-
-def test_stage_and_final_messages_use_public_boundaries():
-    report = "[评测报告](https://example.org/r?x=1&y=2)\n\n格式示例 `<think>`。"
-
-    def blocks(text: str):
-        return (TextContent(text=text),)
-
-    for final in (False, True):
-        assert not public_blocks(
-            blocks('private prefix with "<think>example" and private notes</think>\n'),
-            publish=final,
-        )
-        assert not public_blocks(blocks("private prefix</think>"), publish=final)
-        assert not public_blocks(blocks("<think>unfinished"), publish=final)
-    assert not public_blocks(
-        blocks("arbitrary unmarked tool commentary"), publish=False
-    )
-    assert public_blocks(blocks("private</think>" + report), publish=True) == blocks(
-        report
-    )
-    assert public_blocks(blocks(report), publish=True) == blocks(report)
-    sample = report + '\n~~~json\n{"format":"<think>example</think>"}\n~~~\n'
-    assert public_blocks(blocks(sample), publish=True) == blocks(sample)
-    event = ProductEvent(
-        conversation_id="chat",
-        type="message.completed",
-        payload={
-            "content": [{"type": "text", "text": "old leaked copy"}],
-            "execution_notice": {"source_message_id": "legacy"},
-        },
-    )
-    assert visible_chat_event(event).payload["content"] == []
-
-
 def test_approved_continuation_requires_proven_local_outputs():
     project = ProjectView(
         project_id="project",
@@ -174,7 +117,7 @@ def test_approved_continuation_requires_proven_local_outputs():
     )
 
 
-async def test_sandbox_read_recovery_requires_login_and_notifies_original_turn_once(
+async def test_sandbox_read_recovery_requires_login_and_keeps_failure_out_of_chat(
     preparation_setup, tmp_path
 ):
     preparations, owner, policy = preparation_setup
@@ -237,19 +180,12 @@ async def test_sandbox_read_recovery_requires_login_and_notifies_original_turn_o
                 )
             )
             runtime._publish(event)
-        await wait_for(lambda: not runtime.echomind_notices.workers)
         notices = [
             m
             for m in runtime._store(chat.conversation_id).load_snapshot().timeline
             if isinstance(m, TimelineMessage) and m.execution_notice
         ]
-        assert len(notices) == 1
-        notice = notices[0]
-        assert (
-            notice.execution_notice and notice.execution_notice.origin_turn_id == "turn"
-        )
-        block = notice.content[0]
-        assert isinstance(block, TextContent) and "沙箱需要登录" in block.text
+        assert not notices
     finally:
         await runtime.close()
 
@@ -417,107 +353,6 @@ async def test_authenticated_read_recovers_a_missed_wrapped_plan_continuation(
     assert len(continuations) == 1
     assert continuations[0].task_id == f"project-continue:{project_id}:baseline"
     assert "/workspace/samples.jsonl" in continuations[0].hidden_text
-
-
-async def test_historical_pre_submission_blocker_is_corrected_on_the_same_bubble(
-    started_echomind_project,
-):
-    _, _, store, _, _, _ = started_echomind_project
-    snapshot = store.load_snapshot()
-    step = snapshot.experiment_executions[0]
-    mid = "execution-notice:" + sha256(f"run:{step.run_id}:failed".encode()).hexdigest()
-    message = TimelineMessage(
-        item_id=mid,
-        started_seq=1,
-        role="assistant",
-        content=(TextContent(text="请决定是否重试。"),),
-        execution_notice=ExecutionNoticeLink(origin_turn_id="original"),
-    )
-    chat = snapshot.model_copy(update={"timeline": (message,)})
-    assert not resolved_submission_notices(snapshot, chat)
-    manager = snapshot.model_copy(
-        update={
-            "experiment_executions": (
-                step.model_copy(update={"platform_task_id": "123"}),
-            )
-        }
-    )
-    [update] = resolved_submission_notices(manager, chat)
-    assert update.payload["message_id"] == mid
-    assert update.payload["execution_notice"] == {"origin_turn_id": "original"}
-    corrected = message.model_copy(
-        update={
-            "content": (TextContent(text="此前提交遇到问题，之后已成功提交到平台。"),)
-        }
-    )
-    assert not resolved_submission_notices(
-        manager, chat.model_copy(update={"timeline": (corrected,)})
-    )
-
-
-async def test_direct_project_resume_requires_a_receipt_bound_to_the_original_project(
-    started_echomind_project,
-):
-    _, _, store, _, _, _ = started_echomind_project
-    snapshot = store.load_snapshot()
-    step = snapshot.experiment_executions[0].model_copy(
-        update={"platform_task_id": "1294"}
-    )
-    direct = "confirmed-resume"
-    op = TimelineOperation(
-        run_id=direct,
-        item_id="submit",
-        started_seq=4,
-        completed_seq=5,
-        status="completed",
-        name="df_submit_evaluation",
-        category="tool",
-        details={"task_id": "1294"},
-    )
-    message = TimelineMessage(
-        run_id=direct,
-        item_id="result",
-        started_seq=6,
-        completed_seq=7,
-        role="assistant",
-        status="completed",
-        content=(TextContent(text="已提交评测任务 1294。"),),
-    )
-    event = ProductEvent(
-        conversation_id=snapshot.conversation_id,
-        seq=8,
-        type="status.changed",
-        run_id=direct,
-        payload={"status": "idle"},
-    )
-
-    def notice(operation):
-        return candidate_for(
-            event,
-            snapshot.model_copy(
-                update={
-                    "timeline": (operation, message),
-                    "experiment_executions": (step,),
-                }
-            ),
-            set(),
-        )
-
-    result = notice(op)
-    assert result and result.link.origin_turn_id == "original"
-    chat = snapshot.model_copy(
-        update={"conversation_id": "echomind-chat-test", "timeline": ()}
-    )
-    original, _ = manager_messages(
-        snapshot.model_copy(update={"timeline": (op, message)}),
-        chat,
-        7,
-        0,
-        frozenset({direct}),
-    )
-    assert original[7].payload["content"] == [message.content[0].model_dump()]
-    assert notice(op.model_copy(update={"details": {"task_id": "another"}})) is None
-    assert notice(op.model_copy(update={"status": "failed"})) is None
 
 
 async def test_saved_successful_callback_projects_its_output_before_dispatch(
@@ -901,29 +736,13 @@ async def test_unacknowledged_platform_callback_is_retried_before_new_requiremen
         await runtime.close()
 
 
-@pytest.mark.parametrize(
-    "placeholder",
-    (
-        "本轮执行已结束。可查看原任务中的执行详情。",
-        "本轮执行已结束，执行记录中没有可展示的结果正文。",
-        "This round ended without a recorded user-facing result.",
-        "此前经过裁剪的报告正文",
-    ),
-)
-async def test_ordinary_execution_completion_delivers_one_readable_result(
-    preparation_setup, tmp_path, placeholder, monkeypatch
+async def test_manager_execution_never_writes_chat_or_replays_old_notices(
+    preparation_setup, tmp_path
 ):
     preparations, owner, policy = preparation_setup
     cid = owner.conversation_id
     context = RequestContext(user_id=owner.user_id, profile_id="echomind")
-    outcomes = []
-
-    class Adapter(FakeAdapter):
-        async def compose_execution_notice(self, handle, facts):
-            outcomes.append(facts)
-            return '{"message":null}'
-
-    adapter = Adapter()
+    adapter = FakeAdapter()
     runtime = ConversationRuntime(tmp_path, adapter, preparation_store=preparations)
     try:
         await runtime.create_conversation(
@@ -972,183 +791,50 @@ async def test_ordinary_execution_completion_delivers_one_readable_result(
                 "message.delta",
                 {"message_id": source, "text": fragment, "public_delta": fragment},
             )
-            await wait_for(lambda: not runtime.echomind_notices.workers)
-        [preview] = [
-            i
-            for i in chat_store.load_snapshot().timeline
-            if isinstance(i, TimelineMessage)
-        ]
-        assert preview.status == "streaming" and preview.content == (
-            TextContent(text="  ## 交付物"),
-        )
-        assert (
-            preview.execution_notice
-            and preview.execution_notice.origin_turn_id == "user-turn"
-        )
-        # Reconnect after writing a preview but before saving the worker cursor.
-        chat_store.save_execution_notice_cursor(1)
-        runtime.echomind_notices.schedule(cid)
-        await wait_for(lambda: not runtime.echomind_notices.workers)
-        assert [
-            e.payload["text"] for e in chat_store.replay() if e.type == "message.delta"
-        ] == ["  ## ", "交付物"]
         publish(
             "message.completed",
-            {"role": "assistant", "message_id": "empty", "content": []},
-        )
-        publish(
-            "message.completed",
-            {
-                "role": "assistant",
-                "message_id": "echomind-update:analysis:milestone",
-                "content": blocks,
-            },
-        )
-        await wait_for(lambda: not runtime.echomind_notices.workers)
-        [first] = [
-            i
-            for i in chat_store.load_snapshot().timeline
-            if isinstance(i, TimelineMessage)
-        ]
-        assert manager.load_snapshot().status == "running"
-        assert [block.model_dump() for block in first.content] == blocks
-        assert (
-            first.execution_notice
-            and first.execution_notice.source_message_id
-            == "echomind-update:analysis:milestone"
-        )
-        publish(
-            "message.delta",
-            {
-                "message_id": "final",
-                "text": "[[echomind:reply]]最终",
-                "public_delta": "最终",
-            },
-        )
-        publish(
-            "message.delta",
-            {
-                "message_id": "echomind-update:analysis:aborted",
-                "text": "incomplete",
-                "public_delta": "incomplete",
-            },
-        )
-        await wait_for(lambda: not runtime.echomind_notices.workers)
-        publish(
-            "message.completed",
-            {
-                "role": "assistant",
-                "message_id": "final",
-                "content": [{"type": "text", "text": "[[echomind:reply]]最终结论"}],
-            },
+            {"message_id": source, "role": "assistant", "content": blocks},
         )
         publish("status.changed", {"status": "idle"})
-        await wait_for(lambda: not runtime.echomind_notices.workers)
-        messages = {
-            i.execution_notice.source_message_id: i
-            for i in chat_store.load_snapshot().timeline
-            if isinstance(i, TimelineMessage) and i.execution_notice
-        }
-        assert messages[source].item_id == preview.item_id
-        assert messages["final"].content == (TextContent(text="最终结论"),)
-        assert messages["echomind-update:analysis:aborted"].status == "completed"
-        assert not messages["echomind-update:analysis:aborted"].content
-        run = "historical-run"
-        origin = "historical-turn"
-        task = "requirement:chat:historical"
-        runtime._queue_task(
-            manager, cid, task, "requirement", "Inspect", origin_turn_id=origin
-        )
-        manager.append(
-            ProductEvent(
-                conversation_id=cid,
-                task_id=task,
-                run_id=run,
-                type="message.completed",
-                payload={
-                    "role": "assistant",
-                    "message_id": run,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "## 目录概览\n样本使用 `<think>` 标签。\n"
-                                "图片共有 15 张。"
-                            ),
-                        }
-                    ],
-                },
-            )
-        )
-        ended, _ = manager.append(
-            ProductEvent(
-                conversation_id=cid,
-                task_id=task,
-                run_id=run,
-                type="status.changed",
-                payload={"status": "idle"},
-            )
-        )
-        identity = "execution-notice:" + sha256(f"round:{run}".encode()).hexdigest()
         chat_store.append(
             ProductEvent(
                 conversation_id=chat.conversation_id,
-                event_id=identity,
-                run_id=run,
                 type="message.completed",
                 payload={
+                    "message_id": "legacy",
                     "role": "assistant",
-                    "message_id": identity,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": placeholder,
-                        }
-                    ],
-                    "execution_notice": {"origin_turn_id": origin},
+                    "content": blocks,
+                    "execution_notice": {
+                        "origin_turn_id": "user-turn",
+                        "public_copy": True,
+                    },
                 },
             )
         )
-        chat_store.save_execution_notice_cursor(ended.seq)
-
-        def unexpected_plan_lookup(snapshot):
-            raise AssertionError("An old round must not consult the current plan")
-
-        monkeypatch.setattr(
-            "pyromind_runtime.application.echomind_notices.plan_ready",
-            unexpected_plan_lookup,
-        )
-        for _ in range(2):
-            await runtime.echomind_chat.snapshot(cid, context)
-            await wait_for(lambda: not runtime.echomind_notices.workers)
-        visible = await runtime.echomind_chat.snapshot(cid, context)
-        assert visible
-        messages = [
-            item for item in visible.timeline if isinstance(item, TimelineMessage)
-        ]
-        assert len(messages) == 3
-        assert messages[-1].item_id == identity
-        assert messages[-1].content == (
-            TextContent(
-                text="## 目录概览\n样本使用 `<think>` 标签。\n图片共有 15 张。"
-            ),
-        )
-        assert (
-            messages[-1].execution_notice
-            and messages[-1].execution_notice.origin_turn_id == origin
-        )
-        assert all(
-            item.execution_notice
-            and item.execution_notice.origin_turn_id == "user-turn"
-            for item in messages[:-1]
-        )
-        assert messages[1].content == (TextContent(text="最终结论"),)
-        assert not outcomes
+        chat_events = chat_store.replay()
+        for snapshot in (
+            await runtime.echomind_chat.snapshot(cid, context),
+            await runtime.echomind_chat.open(cid, {}, context),
+        ):
+            assert snapshot
+            assert [
+                m.item_id for m in snapshot.timeline if isinstance(m, TimelineMessage)
+            ] == ["legacy"]
+        assert chat_store.replay() == chat_events
+        assert [
+            event.payload.get("message_id")
+            for event in chat_events
+            if event.type.startswith("message.")
+        ] == ["legacy"]
+        legacy = chat_events[-1]
+        replay = visible_chat_event(legacy)
+        assert replay.seq == legacy.seq and replay.type == "chat.notification.skipped"
+        assert not replay.payload
     finally:
         await runtime.close()
 
 
-def test_chat_model_pairs_late_results_with_original_questions():
+def test_chat_model_keeps_own_receipts_and_excludes_historical_main_results():
     rows = []
 
     def message(role, turn, text, *, run=None, notice=None, identity=None):
@@ -1211,6 +897,40 @@ def test_chat_model_pairs_late_results_with_original_questions():
         {"conversation_id": "chat", "capabilities": {}, "timeline": rows}
     )
     assert completed_chat_turns(snapshot, "c") == [
-        {"question": "Inspect A", "answer": "Old A\n\nA result"},
+        {"question": "Inspect A", "answer": "Queue receipt"},
         {"question": "Explain B", "answer": "Answer B"},
     ]
+
+
+def test_chat_handoff_uses_only_completed_public_preparation_answers():
+    rows = [
+        ("user", "u1", "a", "Remember Cedar", None, None),
+        ("assistant", "a1", "a", "private draft", "Cedar", None),
+        ("user", "u2", "b", "Another question", None, None),
+        ("assistant", "a2", "b", "internal execution output", None, None),
+        ("assistant", "a3", "a", "task details", "background result", "task"),
+    ]
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": "manager",
+            "capabilities": {},
+            "timeline": [
+                dict(
+                    kind="message",
+                    role=role,
+                    item_id=item,
+                    turn_id=turn,
+                    started_seq=seq,
+                    status="completed",
+                    content=[dict(type="text", text=text)],
+                    preparation_reply=reply,
+                    task_id=task,
+                )
+                for seq, (role, item, turn, text, reply, task) in enumerate(rows, 1)
+            ],
+        }
+    )
+    assert completed_chat_turns(snapshot, "new", preparation=True) == [
+        {"question": "Remember Cedar", "answer": "Cedar"}
+    ]
+    assert completed_chat_turns(snapshot, "new", preparation=True, budget=1) == []

@@ -4,14 +4,16 @@ import asyncio
 import logging
 import os
 import re
+import secrets
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 
-from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
+from harness_adapter.task_status_query import PlatformTaskStatusQuery
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
 from pyromind_agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
 from pyromind_agent_server.echomind_acquisition_tasks import (
@@ -35,7 +37,10 @@ from pyromind_agent_server.echomind_runtime_factory import (
 from pyromind_agent_server.echomind_runtime_scheduler import (
     RuntimeGraphPoller,
 )
-from pyromind_agent_server.evaluation_storage import build_evaluation_storage
+from pyromind_agent_server.evaluation_storage import (
+    build_evaluation_storage,
+    build_observation_evaluation_storage,
+)
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
 )
@@ -45,10 +50,14 @@ from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.storage_quota import ensure_conversation_quota
+from pyromind_agent_server.task_monitor_worker import TOKEN_ENV
+from pyromind_agent_server.training_metric_source import PlatformTrainingMetricSource
 from pyromind_agent_server.workflow_status import set_workflow_status_dispatcher
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
+from pyromind_runtime.application.task_monitor import TaskMonitor
+from pyromind_runtime.application.train_observer import ObservationCursor, TrainObserver
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import ResourceLimits
 from pyromind_runtime.domain.content import JsonObject
@@ -58,9 +67,11 @@ from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIndex
+from pyromind_runtime.infrastructure.sqlite_task_monitor_store import (
+    SQLiteTaskMonitorStore,
+)
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
 from pyromind_runtime.ports.harness import HarnessAdapter
-from pyromind_runtime.ports.workflows import WorkflowEventSink
 
 
 logger = logging.getLogger(__name__)
@@ -151,6 +162,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         context: RequestContext,
         graph_run_id: str | None,
         correlation: TaskCorrelation | None = None,
+        continue_after_completion: bool = False,
     ):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.submit_versioned_workflow(
@@ -161,9 +173,9 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             context,
             graph_run_id=graph_run_id,
             correlation=correlation,
+            continue_after_completion=continue_after_completion,
         )
 
-    terminal_backend: str | None = None
     external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
 
     def pipeline_runs(conversation_id: str) -> PipelineRuns:
@@ -174,29 +186,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             versions=versions,
         )
 
-    workflows = None
-    workflow_enabled = os.getenv("PYROMIND_AGENTGENOME_ENABLED", "0") == "1"
-
-    async def workflow_call(
-        scope: str,
-        action: str,
-        arguments: JsonObject,
-        request_id: str,
-        context: RequestContext,
-        origin_run_id: str | None,
-    ) -> JsonObject:
-        assert isinstance(runtime, ConversationRuntime)
-        return await runtime.workflow_call(
-            scope, action, arguments, request_id, context, origin_run_id
-        )
-
     terminal_backend = resolve_pi_terminal_backend()
     pi_adapter = PiAdapter(
         service.conversations_dir,
         terminal_backend=terminal_backend,
         apply_workspace_quota=ensure_conversation_quota,
         pipeline_runs=pipeline_runs,
-        workflow_call=workflow_call if workflow_enabled else None,
     )
     pi_adapter.set_version_handler(version_call, execution_call)
 
@@ -206,22 +201,6 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
 
     pi_adapter.set_training_artifact_hook(record_training_artifacts)
     adapters: dict[str, HarnessAdapter] = {"pi": pi_adapter}
-    if workflow_enabled:
-
-        def execution_host(scope: str) -> ExecutionHost:
-            def subscribe(execution_id: str, sink: WorkflowEventSink | None) -> None:
-                pi_adapter.execution_subscribe(scope, execution_id, sink)
-
-            return ExecutionHost(
-                pi_adapter.execution_request(scope),
-                subscribe,
-                service.conversations_dir / scope,
-            )
-
-        workflows = AgentGenomeBackend(
-            agentgenome_home(service.conversations_dir),
-            execution_host,
-        )
     idle_eviction_seconds = int(
         os.getenv("PYROMIND_IDLE_CONVERSATION_EVICTION_SECONDS", "300")
     )
@@ -272,11 +251,23 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         resource_retention_seconds=resource_retention_seconds,
         max_active_conversations=max_active_conversations,
         resource_limits=resource_limits_from_environment(),
-        workflows=workflows,
         workflow_submission=PlatformWorkflowSubmission(),
         versions=versions,
         evaluation_storage_factory=build_evaluation_storage,
+        observation_storage_factory=build_observation_evaluation_storage,
+        train_observer=TrainObserver(
+            PlatformTrainingMetricSource(), ObservationCursor(secrets.token_bytes(32))
+        ),
     )
+    if os.getenv("PYROMIND_TASK_MONITOR_ENABLED", "1") == "1":
+        runtime.task_monitor = TaskMonitor(
+            SQLiteTaskMonitorStore(service.conversations_dir / ".task-monitor.sqlite3"),
+            PlatformTaskStatusQuery(),
+            runtime,
+            first_delay=float(os.getenv("PYROMIND_TASK_MONITOR_FIRST_DELAY", "60")),
+            interval=float(os.getenv("PYROMIND_TASK_MONITOR_INTERVAL", "180")),
+        )
+        runtime.task_monitor.recover(service.conversations_dir)
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     pi_adapter.set_plan_submission_handler(runtime.bind_plan_submission)
     pi_adapter.set_echo_chat_handler(
@@ -339,7 +330,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         backend,
         raw_backend if raw_backend is not None else "<unset, defaulting to pi>",
         sorted(adapters),
-        terminal_backend or "-",
+        terminal_backend,
         idle_eviction_seconds,
         release_grace_seconds,
         resource_retention_seconds,
@@ -393,6 +384,9 @@ def resource_limits_from_environment() -> ResourceLimits:
 def install_product_api(app: FastAPI) -> FastAPI:
     """Install the product API and own its runtime lifecycle."""
     from pyromind_agent_server.api.echomind_chat import router as echomind_chat_router
+    from pyromind_agent_server.api.echomind_observations import (
+        router as observations_router,
+    )
     from pyromind_agent_server.api.echomind_projects import (
         router as echomind_projects_router,
     )
@@ -402,7 +396,19 @@ def install_product_api(app: FastAPI) -> FastAPI:
     from pyromind_agent_server.api.router import create_product_router
 
     app.state.product_runtime = None
+    app.state.task_monitor_token = os.getenv(TOKEN_ENV) or secrets.token_urlsafe(32)
     original_lifespan = app.router.lifespan_context
+
+    @app.post("/internal/task-monitor/check", include_in_schema=False)
+    async def check_background_tasks(request: Request) -> dict[str, int]:
+        supplied = request.headers.get("x-task-monitor-token", "")
+        if not secrets.compare_digest(supplied, app.state.task_monitor_token):
+            raise HTTPException(403, "Invalid task monitor credential")
+        runtime = ensure_product_runtime(app)
+        if runtime is None or runtime.task_monitor is None:
+            raise HTTPException(503, "Task monitoring is unavailable")
+        checked = await runtime.task_monitor.check_due(limit=1)
+        return {"checked": checked}
 
     @asynccontextmanager
     async def product_lifespan(current_app: FastAPI):
@@ -418,6 +424,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     app.include_router(echomind_projects_router)
     app.include_router(echomind_chat_router)
+    app.include_router(observations_router)
     app.include_router(create_evaluation_runs_router())
     return app
 
@@ -429,6 +436,30 @@ def _echomind_runtime_poll_seconds() -> float:
     except ValueError:
         return 15
     return value if value > 0 else 15
+
+
+async def _supervise_monitor(app: FastAPI) -> None:
+    while True:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "pyromind_agent_server.task_monitor_worker",
+            "--url",
+            os.getenv("OH_INTERNAL_SERVER_URL", "http://127.0.0.1:8000"),
+            env={**os.environ, TOKEN_ENV: app.state.task_monitor_token},
+        )
+        try:
+            await process.wait()
+            logger.warning("Task monitor worker exited; restarting")
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=10)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+        await asyncio.sleep(5)
 
 
 async def start_product_runtime(app: FastAPI) -> None:
@@ -459,8 +490,20 @@ async def start_product_runtime(app: FastAPI) -> None:
             app.state.echomind_graph_poller = graph_poller
             await graph_poller.start()
 
+        if (
+            runtime.task_monitor is not None
+            and os.getenv("PYROMIND_TASK_MONITOR_AUTOSTART", "1") == "1"
+            and getattr(app.state, "task_monitor_worker", None) is None
+        ):
+            app.state.task_monitor_worker = asyncio.create_task(_supervise_monitor(app))
+
 
 async def stop_product_runtime(app: FastAPI) -> None:
+    worker = getattr(app.state, "task_monitor_worker", None)
+    if worker is not None:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        app.state.task_monitor_worker = None
     graph_poller = getattr(app.state, "echomind_graph_poller", None)
     if graph_poller is not None:
         await graph_poller.stop()

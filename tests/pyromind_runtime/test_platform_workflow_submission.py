@@ -3,8 +3,25 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
 from harness_adapter import workflow_submission as module
 from pyromind_runtime.domain.context import RequestContext
+
+
+async def test_query_preserves_platform_failure_details(monkeypatch):
+    task = SimpleNamespace(status="Failed", error_message="Model preparation failed")
+    client = SimpleNamespace(studio=SimpleNamespace(get_task=lambda _: task))
+    monkeypatch.setattr(module, "create_workflow_api_client", lambda **kwargs: client)
+
+    result = await module.PlatformWorkflowSubmission().query(
+        "42", RequestContext(user_id="42", cookie="auth_token=ephemeral")
+    )
+
+    assert result == {
+        "task_id": "42",
+        "status": "Failed",
+        "error_summary": "Model preparation failed",
+    }
 
 
 def test_prepare_uses_storage_dsl_validation_and_marks_training(monkeypatch):

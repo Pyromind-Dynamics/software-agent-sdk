@@ -286,7 +286,7 @@ def model_reference(value: str, source: ModelSource) -> str:
 
 
 def build_inference_dsl(
-    definition: dict[str, Any], output_dir: str, run_id: str
+    definition: dict[str, Any], output_dir: str, run_id: str, files: SubmissionFiles
 ) -> str:
     options = definition["inference"]
     source = EvaluationConfig.model_validate(
@@ -345,11 +345,12 @@ def build_inference_dsl(
         )
         lora = to_agent_storage_path(reference, field="inference.model_path")
         merged = output + "/merged-model"
+        model_type = lora_merge_model_type(files, base)
         preparation = (
             f"model = ModelMergeLoraNode(id=3, lora_path={lora!r}, "
             f"model_path={base!r}, output_path={merged!r}, "
-            f"gpu_count={options['gpu_count']!r}, "
-            f"gpu_product={options['gpu_product']!r})\n\n"
+            f"gpu_count=1, gpu_product={options['gpu_product']!r}, "
+            f"model_type={model_type!r})\n\n"
         )
         model_input = "model.merged_model_path"
     elif source.type in {"storage", "checkpoint"}:
@@ -379,6 +380,20 @@ def build_inference_dsl(
         f"cpu={definition['cpu']}, memory={definition['memory']}, "
         "param=inference.endpoint)\n"
     )
+
+
+def lora_merge_model_type(files: SubmissionFiles, base_model: str) -> str:
+    """Pick the platform loader from the base model's config, including aliases."""
+    try:
+        config = json.loads(files.read_text(f"{base_model}/config.json"))
+    except (OSError, ValueError):
+        return "auto"
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    if model_type == "qwen3_vl":
+        return "qwen3vl"
+    if model_type == "qwen3_5":
+        return "qwen3.5"
+    return "auto"
 
 
 class EvaluationConfigurationError(ValueError):
@@ -688,7 +703,7 @@ class InferencePipelineHandler:
                     definition, output_dir, run_id
                 )
             else:
-                dsl = build_inference_dsl(definition, output_dir, run_id)
+                dsl = build_inference_dsl(definition, output_dir, run_id, files)
             workflow = convert_dsl_to_xyflow(dsl, name=f"agent-evaluation-{run_id[:8]}")
             validate_pipeline_topology(workflow, require_inference=not cpu_only)
             self._publish_canvas(conversation, dsl)

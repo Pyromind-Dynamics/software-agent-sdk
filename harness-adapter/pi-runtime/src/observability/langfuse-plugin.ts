@@ -647,16 +647,17 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
     if (state) finalizeRoot({ cancelled: true });
 
     const sessionId = ctx.sessionManager.getSessionId();
-    const turnNumber = resolveTurnNumber(ctx, event.prompt);
-    const promptImages = extractImages(event.images);
-    const { text: promptText, meta: userMeta } = truncateText(event.prompt);
+    const prompt = event.messageType === "user" ? event.prompt : event.message.customType;
+    const turnNumber = resolveTurnNumber(ctx, prompt);
+    const promptImages = event.messageType === "user" ? extractImages(event.images) : [];
+    const { text: promptText, meta: userMeta } = truncateText(prompt);
     const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     const isSubagent = Boolean(inheritedParent);
     traceAttributes = {
       ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
       ...(isSubagent ? {} : {
-        [LangfuseOtelSpanAttributes.TRACE_INPUT]: JSON.stringify({ role: "user", content: userText }),
+        [LangfuseOtelSpanAttributes.TRACE_INPUT]: JSON.stringify({ role: event.messageType, content: userText }),
       }),
       [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
         ? (inheritedParent!.sessionId ?? sessionId)
@@ -668,7 +669,7 @@ export default function (pi: ExtensionAPI, recorder?: ObservationRecorder) {
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
-        input: { role: "user", content: userText },
+        input: { role: event.messageType, content: userText },
         metadata: {
           source: "pi",
           extension: EXTENSION_NAME,

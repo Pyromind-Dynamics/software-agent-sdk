@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from dataclasses import replace
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from aiohttp.test_utils import TestServer
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.train_observer import ObservationCursor, TrainObserver
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.commands import (
     CreateProjectCommand,
@@ -20,6 +22,7 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.observations import MetricPoint, SourcePage
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy, SetPreparationPlan
 from pyromind_runtime.domain.session_policy import SessionPolicy
@@ -39,8 +42,10 @@ from .test_preparation import (
 from .test_workflow_execution import FakeSubmission
 
 
-async def test_main_runs_baseline_training_and_evaluation_without_child_sessions(
-    preparation_setup, tmp_path, monkeypatch
+@pytest.mark.parametrize("queued_preparation", [False, True], ids=["user", "queue"])
+@pytest.mark.parametrize("state_format", ["task_records", "tasks"])
+async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
+    preparation_setup, tmp_path, monkeypatch, queued_preparation, state_format
 ):
     preparation, owner, _ = preparation_setup
     scope = owner.conversation_id
@@ -48,6 +53,8 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         user_id=owner.user_id, profile_id=owner.profile_id, x_cluster="test"
     )
     profile = ECHOMIND_PRODUCT_PROFILE
+    assert profile.skill_allowlist and profile.development_skill_allowlist
+    assert profile.development_product_instructions
     root = tmp_path / "conversations"
     monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
     adapter = PiAdapter(root, terminal_backend="os-sandbox")
@@ -56,13 +63,38 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         FileArtifactSnapshots(tmp_path / "storage"),
     )
     studio = FakeSubmission()
+
+    class Metrics:
+        async def read(
+            self, binding, _metrics, start, _count, _context, *, previous_source=""
+        ):
+            assert binding.task_id == "task-123"
+            return SourcePage(
+                points=(
+                    MetricPoint(
+                        key="loss",
+                        value=0.25,
+                        unit="number",
+                        source_point_id=f"point:{start}",
+                        source_run_id="source",
+                        log_step=start,
+                        training_step=start,
+                    ),
+                ),
+                source_run_id="source",
+                next_step=start + 1,
+            )
+
     runtime = ConversationRuntime(
         root,
         adapter,
         preparation_store=preparation,
         versions=versions,
         workflow_submission=studio,
+        train_observer=TrainObserver(Metrics(), ObservationCursor(b"test-only")),
     )
+    for _ in range(4):
+        await runtime._stage_analysis_capacity.acquire()
     adapter.set_version_handler(runtime.version_call)
     adapter.set_preparation_handler(
         runtime.preparation_call, runtime.preparation_revision
@@ -135,6 +167,7 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 "kind": kind,
                 "stage_id": key,
                 "name": key,
+                "outputs": [{"name": "primary_results", "kind": "report"}],
                 "inputs": [
                     {"name": "model", "resource_id": "merged"},
                     {"name": "dataset", "resource_id": "data"},
@@ -153,13 +186,21 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         "model_path": "/workspace/model",
         "operation": "inference",
     }
+    evidence = json.dumps(
+        {
+            "summary": "Final evidence",
+            "metrics": [{"label": "通过率", "value": 0.75, "unit": "ratio"}],
+        }
+    )
     report = {
         "action": "save",
         "command_id": "report",
         "arguments": {
             "kind": "report",
-            "logical_key": "summary",
-            "source": {"text": "Final evidence", "filename": "report.md"},
+            "logical_key": "candidate/evidence",
+            "plan_task_id": "candidate",
+            "plan_attempt": 1,
+            "source": {"text": evidence, "filename": "report.json"},
         },
     }
     actions = [
@@ -199,13 +240,44 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
         None,
     ]
     requests = []
+    analysis_requests = []
+    reviewed = asyncio.Event()
     review_started = asyncio.Event()
     finish_review = asyncio.Event()
     finish_plan_turn = asyncio.Event()
 
     async def respond(http_request):
         body = await http_request.json()
+        system = body["messages"][0]["content"]
+        if "Summarize the candidate evaluation" in system:
+            assert reviewed.is_set()
+            assert not body.get("tools")
+            analysis_requests.append(body)
+            content = json.dumps({"summary": "评估已完成", "findings": []})
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]
+            return web.Response(
+                text="".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+                + "data: [DONE]\n\n",
+                content_type="text/event-stream",
+            )
         requests.append(body)
+        if len(requests) == 1:
+            return stream(
+                "set_preparation_plan", request.model_dump(mode="json"), "plan"
+            )
+        if len(requests) == 2:
+            return stream()
         if not actions and not review_started.is_set():
             review_started.set()
             await asyncio.wait_for(finish_review.wait(), timeout=10)
@@ -222,12 +294,29 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             ]
             rows[1]["plan_attempt"] = 3
             rows[-1]["report_version_id"] = artifact.id
+            rows[-1]["verified_outputs"] = {"primary_results": artifact.id}
             rows[-1]["business_status"] = "in_progress"
+            plan_file: dict[str, object] = {"tasks": rows}
+            if state_format == "task_records":
+                plan_file = {
+                    "plan": plan,
+                    "task_records": {
+                        row["id"]: {
+                            "plan_attempt": 1,
+                            **{
+                                name: value
+                                for name, value in row.items()
+                                if name not in {"id", "stage_id"}
+                            },
+                        }
+                        for row in rows
+                    },
+                }
             action = (
                 "write",
                 {
                     "path": "public_data/workflowPLAN.json",
-                    "content": json.dumps({"tasks": rows}),
+                    "content": json.dumps(plan_file),
                 },
             )
         elif action and action[0] == "edit":
@@ -237,6 +326,8 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                     for r in s.experiment_executions or ()
                 )
             )
+            assert not analysis_requests
+            reviewed.set()
             action = (
                 "edit",
                 {
@@ -277,6 +368,7 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                     skill_allowlist=profile.skill_allowlist,
                     development_tool_allowlist=profile.development_tool_allowlist,
                     development_skill_allowlist=profile.development_skill_allowlist,
+                    development_product_instructions=profile.development_product_instructions,
                     delegated_roles=(),
                     command_allowlist=profile.command_allowlist,
                     product_instructions=profile.instructions,
@@ -288,17 +380,71 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 ),
                 context,
             )
-            await runtime.preparation_call(
-                scope,
-                "set_preparation_plan",
-                request.model_dump(mode="json"),
-                replace(context, preparation_revision=0),
+            if queued_preparation:
+                await runtime.enqueue_chat_requirement(
+                    scope,
+                    EnqueueTaskCommand(
+                        command_id="prepare", instruction="Review the dataset."
+                    ),
+                    context,
+                )
+            else:
+                await runtime.submit_command(
+                    scope,
+                    UserMessageCommand.model_validate(
+                        {
+                            "command_id": "prepare",
+                            "content": [
+                                {"type": "text", "text": "Review the dataset."}
+                            ],
+                        }
+                    ),
+                    context,
+                )
+            prepared = await wait_for(
+                lambda s: (
+                    s.preparation
+                    and s.preparation.plan
+                    and not s.experiment_queue
+                    and s.status != "running"
+                )
             )
+            assert prepared.preparation
+            preparation_prompt = requests[0]["messages"][0]["content"]
+            assert profile.instructions in preparation_prompt
+            assert profile.development_product_instructions not in preparation_prompt
+            assert set(re.findall(r"<name>([^<]+)</name>", preparation_prompt)) == set(
+                profile.skill_allowlist
+            )
+            assert "frozen-reward-evaluation" not in preparation_prompt
             create = CreateProjectCommand(
-                command_id="approve", expected_preparation_revision=1
+                command_id="approve",
+                expected_preparation_revision=prepared.preparation.revision,
             )
             receipt = await runtime.submit_command(scope, create, context)
             assert receipt == await runtime.submit_command(scope, create, context)
+            missing_binding = {
+                "kind": "report",
+                "logical_key": "candidate/evidence",
+                "source": {"text": evidence, "filename": "report.json"},
+            }
+            with pytest.raises(ValueError, match="arguments.plan_task_id"):
+                await runtime.version_call(
+                    scope,
+                    VersionToolRequest(action="save", arguments=missing_binding),
+                    "missing-binding",
+                    context,
+                )
+            with pytest.raises(ValueError, match="conflicts"):
+                await runtime.version_call(
+                    scope,
+                    VersionToolRequest(
+                        action="save",
+                        arguments={**missing_binding, "plan_task_id": "baseline"},
+                    ),
+                    "wrong-binding",
+                    context,
+                )
             for i, platform_id in enumerate(
                 ["evaluation-1", "task-123", "evaluation-2"]
             ):
@@ -317,6 +463,51 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                     )
                     == stages[i][0]
                 )
+                if i == 1:
+                    assert snapshot.project is not None
+                    project_id = snapshot.project.project_id
+                    overview = await runtime.get_project_observations(
+                        scope, project_id, context
+                    )
+                    (binding,) = overview.bindings
+                    assert binding.project_node_id == "training"
+                    for wrong_node in ("baseline", "candidate"):
+                        with pytest.raises(ValueError, match="not bound"):
+                            await runtime.get_project_training_series(
+                                scope,
+                                project_id,
+                                wrong_node,
+                                binding.run_id,
+                                (),
+                                None,
+                                100,
+                                context,
+                            )
+                    first = await runtime.get_project_training_series(
+                        scope,
+                        project_id,
+                        "training",
+                        binding.run_id,
+                        ("loss", "unconfigured_metric"),
+                        None,
+                        100,
+                        context,
+                    )
+                    second = await runtime.get_project_training_series(
+                        scope,
+                        project_id,
+                        "training",
+                        binding.run_id,
+                        ("loss",),
+                        first.next_cursor,
+                        100,
+                        context,
+                    )
+                    assert [
+                        point.log_step for point in first.points + second.points
+                    ] == [0, 1]
+                    assert first.ignored_keys == ("unconfigured_metric",)
+                    assert not second.ignored_keys
                 for _ in range(2):
                     await runtime.deliver_external_task_status(
                         scope, task_id=platform_id, status="succeeded"
@@ -333,7 +524,32 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 )
             )
             finish_plan_turn.set()
-            await wait_for(lambda s: s.status != "running")
+            await wait_for(
+                lambda s: (
+                    s.status != "running"
+                    and any(job.status == "queued" for job in s.stage_analyses)
+                )
+            )
+            assert runtime._active[scope].inflight > 0
+            assert not await runtime._release(scope, reason="test-capacity")
+            for _ in range(4):
+                runtime._stage_analysis_capacity.release()
+            snapshot = await wait_for(
+                lambda s: (
+                    s.status != "running"
+                    and any(job.status == "ready" for job in s.stage_analyses)
+                )
+            )
+            (job,) = snapshot.stage_analyses
+            assert job.stage_id == "candidate" and job.role == "evaluation_analysis"
+            assert job.result is not None
+            assert job.result.metrics[0].value == 0.75
+            assert len(analysis_requests) == 1
+            assert snapshot.project is not None
+            overview = await runtime.get_project_observations(
+                scope, snapshot.project.project_id, context
+            )
+            assert overview.stage_analyses == (job,)
             await runtime.submit_command(
                 scope,
                 create.model_copy(update={"command_id": "approve-again"}),
@@ -342,6 +558,12 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             snapshot = await runtime.get_snapshot(scope, context)
             assert all(
                 r.state == "succeeded" for r in snapshot.experiment_executions or ()
+            )
+            execution_prompt = requests[2]["messages"][0]["content"]
+            assert profile.development_product_instructions in execution_prompt
+            assert profile.instructions not in execution_prompt
+            assert set(re.findall(r"<name>([^<]+)</name>", execution_prompt)) == set(
+                profile.development_skill_allowlist
             )
             (training,) = (
                 r
@@ -354,22 +576,32 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
             (artifact_id,) = [
                 e.payload["artifact_id"]
                 for e in events
-                if e.type == "artifact.registered" and e.payload["kind"] == "report"
+                if e.type == "artifact.registered"
+                and e.payload["kind"] == "report"
+                and e.payload["artifact_id"] != job.report_version_id
             ]
             read = VersionToolRequest(
                 action="read", arguments={"artifact_id": artifact_id}
             )
             assert (await runtime.version_call(scope, read, "lookup", context))[
                 "text"
-            ] == "Final evidence"
+            ] == evidence
             with pytest.raises(PermissionError):
                 await runtime.version_call(
                     scope, read, "foreign", replace(context, profile_id="other")
                 )
+            old_request = VersionToolRequest(action="save", arguments=missing_binding)
+            legacy = versions.call(scope, old_request, "legacy-save", context)
+            replay = await runtime.version_call(
+                scope, old_request, "legacy-save", context
+            )
+            assert replay["id"] == legacy["id"]
             assert len(studio.submissions) == 1 and len(jobs) == 2
             assert not (root / scope / "pi" / "subagents").exists()
             assert all(
-                "subagent" not in {t["function"]["name"] for t in r["tools"]}
+                {"subagent", "ls", "find", "grep"}.isdisjoint(
+                    t["function"]["name"] for t in r["tools"]
+                )
                 for r in requests
             )
             assert all(e.payload.get("category") != "subagent" for e in events)
@@ -382,17 +614,15 @@ async def test_main_runs_baseline_training_and_evaluation_without_child_sessions
                 )
             await runtime.submit_command(scope, queued, context)
             await runtime.submit_command(scope, queued, context)
-            assert (
-                len(
-                    [
-                        e
-                        for e in runtime._store(scope).replay()
-                        if e.type == "task.queued"
-                        and e.payload["kind"] == "requirement"
-                    ]
-                )
-                == 1
-            )
+            queued_requirements = [
+                e.payload["task_id"]
+                for e in runtime._store(scope).replay()
+                if e.type == "task.queued" and e.payload["kind"] == "requirement"
+            ]
+            expected = ["requirement:additional"]
+            if queued_preparation:
+                expected.insert(0, "requirement:prepare")
+            assert queued_requirements == expected
             await asyncio.wait_for(review_started.wait(), timeout=10)
             follow_up = UserMessageCommand.model_validate(
                 {
@@ -432,7 +662,8 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
     runtime = ConversationRuntime(root, adapter, preparation_store=preparation)
     policy = SessionPolicy(
         configuration_version=2,
-        product_instructions="Execute the approved plan directly.",
+        product_instructions="Review the plan.",
+        development_product_instructions="Execute the approved plan directly.",
         preparation_policy=PreparationPolicy(
             workflow_nodes=tuple(
                 node.model_copy(update={"roles": ()})
@@ -491,6 +722,9 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
             )
         )
         assert await runtime.apply_session_configuration(scope, policy, context)
+        assert adapter.session_policies[-1][1].product_instructions == (
+            policy.development_product_instructions
+        )
         assert store.access_policy()["delegated_roles"] == ()
         snapshot = await runtime.get_snapshot(scope, context)
         assert snapshot.project is not None

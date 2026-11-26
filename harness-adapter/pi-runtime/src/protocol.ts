@@ -106,6 +106,18 @@ export function decodeFrame(line: string): Frame {
   throw new Error("unknown JSONL frame type");
 }
 
+/** Normalize a JSON object emitted as text before Pi validates the tool schema. */
+export function decodeObjectArgument(args: unknown, field: string): unknown {
+  if (!isRecord(args)) return args;
+  const value = args[field];
+  if (typeof value !== "string" || value.length > 262144) return args;
+  try {
+    const decoded: unknown = JSON.parse(value);
+    if (isRecord(decoded)) return { ...args, [field]: decoded };
+  } catch { /* Leave malformed values to native schema validation. */ }
+  return args;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }

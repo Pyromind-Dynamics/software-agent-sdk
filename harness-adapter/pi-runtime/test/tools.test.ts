@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { restrictSkillReads } from "../src/session-policy.js";
 import {
@@ -25,7 +24,14 @@ test("business tools carry trusted context separately from model arguments", asy
   const config = { name: "set_preparation_plan", description: "", inputSchema: {} };
   const tool = businessTool(peer, config, undefined, () => ({preparation_revision: 5}));
   const args = {entry_task_id: "first", plan: {}};
-  await tool.execute("call", args, undefined);
+  assert.ok(tool.prepareArguments);
+  assert.equal(tool.prepareArguments(args), args);
+  for (const plan of ["[]", "null", "incomplete {"]) {
+    const invalid = { ...args, plan };
+    assert.equal(tool.prepareArguments(invalid), invalid);
+  }
+  const prepared = tool.prepareArguments({ ...args, plan: JSON.stringify(args.plan) });
+  await tool.execute("call", prepared, undefined);
   assert.deepEqual(request, {
     preparation_revision: 5, tool_call_id: "call",
     tool_name: "set_preparation_plan", arguments: args,
@@ -89,7 +95,6 @@ test("sandbox read resolves the remote endpoint for Storage paths", async (conte
   let ensures = 0;
   const tools = await createTools(
     {} as JsonlRpcPeer,
-    new NodeExecutionEnv({ cwd: root }),
     root,
     "sandbox",
     [],
@@ -138,7 +143,6 @@ test("sandbox lanes resolve logical task paths without changing Storage paths", 
   let sandbox!: SandboxTools;
   await createTools(
     {} as JsonlRpcPeer,
-    new NodeExecutionEnv({ cwd: root }),
     root,
     "sandbox",
     [],

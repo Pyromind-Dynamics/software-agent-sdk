@@ -47,6 +47,7 @@ _SSE_HEARTBEAT_SECONDS = 15.0
 
 class PrepareWorkflowExecutionBody(BaseModel):
     workflow_path: str = Field(min_length=1)
+    continue_after_completion: bool = False
     request_id: str | None = None
 
 
@@ -96,6 +97,7 @@ async def configure_session(
                 skill_allowlist=profile.skill_allowlist,
                 development_tool_allowlist=profile.development_tool_allowlist,
                 development_skill_allowlist=profile.development_skill_allowlist,
+                development_product_instructions=profile.development_product_instructions,
                 product_instructions=profile.instructions,
                 delegated_roles=tuple(
                     role.model_dump(mode="json")
@@ -190,6 +192,7 @@ def create_product_router(
                 body.workflow_path,
                 context_for(request),
                 request_id=body.request_id,
+                continue_after_completion=body.continue_after_completion,
             )
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
@@ -231,6 +234,7 @@ def create_product_router(
             skill_allowlist=profile.skill_allowlist,
             development_tool_allowlist=profile.development_tool_allowlist,
             development_skill_allowlist=profile.development_skill_allowlist,
+            development_product_instructions=profile.development_product_instructions,
             command_allowlist=profile.command_allowlist,
             delegated_roles=profile.delegated_roles,
             preparation_policy=profile.preparation_policy,
@@ -280,9 +284,12 @@ def create_product_router(
         request: Request,
     ) -> ConversationSnapshot:
         await asyncio.to_thread(_require_profile, request, conversation_id, profile)
+        context = context_for(request)
         try:
+            if context.cookie or context.authorization:
+                await configure_session(request, conversation_id, profile)
             snapshot = await get_product_runtime(request).get_snapshot(
-                conversation_id, context_for(request)
+                conversation_id, context
             )
             return public_snapshot(snapshot)
         except ProductRuntimeError as exc:
@@ -362,6 +369,8 @@ def create_product_router(
         runtime = get_product_runtime(request)
         await asyncio.to_thread(_require_profile, request, conversation_id, profile)
         try:
+            if context.cookie or context.authorization:
+                await configure_session(request, conversation_id, profile)
             await runtime.authorize_event_stream(conversation_id, context)
         except ProductRuntimeError as exc:
             raise _product_error(exc) from exc
@@ -419,6 +428,18 @@ def create_product_router(
             raise _product_error(exc) from exc
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
+
+    @router.get("/{conversation_id}/pending-inputs/{request_id}/html")
+    async def read_input_html(conversation_id: str, request_id: str, request: Request):
+        try:
+            html = await get_product_runtime(request).read_input_html(
+                conversation_id, request_id, context_for(request)
+            )
+            return JSONResponse({"html": html}, headers={"Cache-Control": "private, no-store"})
+        except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
+            raise _not_found(conversation_id) from exc
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
 
     @router.get(
         "/{conversation_id}/pending-inputs/{request_id}/media/{content_index}/{image_index}"

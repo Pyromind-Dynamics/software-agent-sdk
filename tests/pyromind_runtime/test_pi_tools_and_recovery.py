@@ -46,9 +46,11 @@ from harness_adapter.pi_adapter.tool_output import (
 )
 from pyromind_agent_server.api.schemas import AgentLLMConfig
 from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import WorkflowState
 from pyromind_runtime.ports.harness import (
     ExternalTaskNotification,
@@ -640,6 +642,72 @@ async def test_stale_runner_exit_does_not_clear_replacement_or_emit_error(
     assert session.runner is replacement
     assert session.queue.empty()
     await adapter.close(handle)
+
+
+@pytest.mark.parametrize("reader", ["snapshot", "stream"])
+async def test_read_recovers_running_turn_with_empty_queue_after_restart(
+    tmp_path, monkeypatch, reader
+):
+    monkeypatch.setattr(pi_adapter_module, "PiRunnerProcess", _LifecycleFakeRunner)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "conversations"
+    root.mkdir()
+    cid = "interrupted-preparation"
+    ctx = RequestContext(user_id="42")
+    adapter = PiAdapter(root, terminal_backend="os-sandbox")
+    runtime = ConversationRuntime(root, adapter)
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=cid,
+                user_id=ctx.user_id,
+                workspace_root=str(root / cid),
+                model_configuration={"model": "gpt-5", "api_key": "test-key"},
+            ),
+            ctx,
+        )
+        task = "requirement:prepare"
+        run = "callback:prepare:1"
+        runtime._store(cid).append(
+            ProductEvent(
+                conversation_id=cid,
+                run_id=run,
+                task_id=task,
+                type="status.changed",
+                payload={"status": "running"},
+            )
+        )
+        adapter._session(cid).files.save_inflight(
+            {"run_id": run, "task_id": task, "operations": {}}
+        )
+    finally:
+        await runtime.close()
+
+    restored = PiAdapter(root, terminal_backend="os-sandbox")
+    runtime = ConversationRuntime(root, restored)
+    try:
+        if reader == "snapshot":
+            await runtime.get_snapshot(cid, ctx)
+        else:
+            events = runtime.stream_events(cid, 0, ctx)
+            try:
+                await anext(events)
+            finally:
+                await events.aclose()
+        async with asyncio.timeout(5):
+            while runtime._store(cid).load_snapshot().status != "paused":
+                await asyncio.sleep(0.01)
+        snapshot = await runtime.get_snapshot(cid, ctx)
+        assert snapshot.active_run_id is None
+        assert not snapshot.external_tasks and not snapshot.experiment_queue
+        assert [
+            event.run_id
+            for event in runtime._store(cid).replay()
+            if event.type == "status.changed"
+            and event.payload.get("status") == "paused"
+        ] == [run]
+    finally:
+        await runtime.close()
 
 
 @pytest.mark.parametrize("legacy", [True, False], ids=["legacy", "parallel-owned"])
@@ -1947,6 +2015,45 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
 
     assert session.queue.qsize() == 1
     assert (await session.queue.get()).payload["status"] == "idle"
+
+
+async def test_run_failure_is_delivered_when_sandbox_snapshot_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
+    files = PiSessionFiles(tmp_path / "conversation-1")
+    files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
+    session = SimpleNamespace(
+        session_id="conversation-1",
+        finished_runs=set(),
+        running=True,
+        files=files,
+        queue=asyncio.Queue(),
+    )
+
+    async def unavailable(_session):
+        raise RuntimeError("PI_SANDBOX_NOT_RUNNING")
+
+    monkeypatch.setattr(adapter, "_read_workflow", unavailable)
+    await adapter._runner_event(
+        cast(Any, session),
+        {
+            "eventId": "completion-1",
+            "sessionId": "conversation-1",
+            "runId": "run-1",
+            "kind": "run.finished",
+            "payload": {
+                "outcome": {"status": "failed", "error_code": "model_error"},
+            },
+        },
+    )
+
+    completion = session.queue.get_nowait()
+    assert completion.payload["status"] == "error"
+    error = completion.payload["error"]
+    assert isinstance(error, dict) and error["code"] == "model_error"
+    assert completion.payload["snapshot_error"] is True
+    assert "run-1" in files.load_pending_completions()
 
 
 async def test_adapter_projects_generic_write_completion_to_workflow(tmp_path) -> None:

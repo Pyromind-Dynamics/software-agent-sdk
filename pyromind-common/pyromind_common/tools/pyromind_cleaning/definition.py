@@ -102,6 +102,10 @@ class RunDatasetCleaningAction(Action):
     )
     cpu: int = Field(default=4, ge=1, le=64)
     memory: int = Field(default=32, ge=1, le=256)
+    continue_after_completion: bool = Field(
+        default=False,
+        description="Enable only when the user asks for work after cleaning completes.",
+    )
 
     @property
     def visualize(self) -> Text:
@@ -157,6 +161,9 @@ does not execute the script or read dataset content. Use `limit=3` for a sample
 run. To continue an interrupted run, call this tool again with `resume_run_id`;
 the platform reuses all frozen runtime files and passes `--resume`.
 
+Set continue_after_completion=true only when the user explicitly asks to check
+the results or do further work after cleaning. Otherwise the backend reports
+completion. End the current turn after submission, without sleeping or polling.
 When the terminal workflow callback resumes the conversation, use the
 `output_dir` returned by this tool: read report.json for validation,
 counters, errors, and checkpoint state, then output.jsonl for cleaned rows.

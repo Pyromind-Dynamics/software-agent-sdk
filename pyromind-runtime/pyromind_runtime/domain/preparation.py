@@ -25,6 +25,7 @@ class WorkflowTaskDefinition(ContractModel):
     evaluation_target: Literal["model", "model_or_predictions"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    requires_report: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class WorkflowNodeDefinition(ContractModel):

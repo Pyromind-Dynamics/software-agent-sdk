@@ -10,6 +10,7 @@ from pyromind_runtime.application.model_evaluation_plan import (
     check_inference_receipt,
     verified_input_path,
 )
+from pyromind_runtime.application.stage_analysis import artifact_belongs_to_execution
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import ExperimentTask
@@ -19,6 +20,7 @@ from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
+    from_storage_api_path,
     normalize_workspace_path,
 )
 from pyromind_runtime.domain.versions import ArtifactVersion
@@ -80,7 +82,11 @@ def plan_executions(
 ) -> Iterator[ExperimentExecutionView]:
     tasks = {task.id: task for task in project.plan.tasks}
     stages = {stage.id: stage for stage in project.plan.stages}
-    reports = {v.id: v for v in versions if v.kind == "report" and v.state == "ready"}
+    reports = {
+        v.id: v
+        for v in versions
+        if v.kind in {"report", "evaluation"} and v.state == "ready"
+    }
     history: dict[str, list[ExperimentExecutionView]] = {}
     for run in registered:
         if run.project_id == project.project_id and run.role_id == "main":
@@ -117,24 +123,36 @@ def plan_executions(
             role_id="main",
             intent="execute",
             state=_BUSINESS_STATES[status],
-            report_state="ready" if report else "not_started",
-            report_uri=report.manifest.storage_ref if report else None,
-            artifacts=(
+            report_state="not_started",
+            waiting_reason=row.get("next_action")
+            if status == "blocked" and isinstance(row.get("next_action"), str)
+            else None,
+        )
+        if report:
+            run = with_plan_report(run, report)
+        validate_persisted_payload(run.model_dump(mode="json"))
+        yield run
+
+
+def with_plan_report(
+    run: ExperimentExecutionView, report: ArtifactVersion
+) -> ExperimentExecutionView:
+    return run.model_copy(
+        update={
+            "report_state": "ready",
+            "delivery_error": None,
+            "delivery_error_field": None,
+            "report_uri": report.manifest.storage_ref,
+            "artifacts": (
                 {
                     "artifact_id": report.id,
                     "name": report.logical_key,
                     "uri": report.manifest.storage_ref,
                     "sha256": report.manifest.digest,
                 },
-            )
-            if report
-            else (),
-            waiting_reason=row.get("next_action")
-            if status == "blocked" and isinstance(row.get("next_action"), str)
-            else None,
-        )
-        validate_persisted_payload(run.model_dump(mode="json"))
-        yield run
+            ),
+        }
+    )
 
 
 def completed_plan_write(event: ProductEvent, snapshot: ConversationSnapshot) -> bool:
@@ -160,11 +178,113 @@ def _is_plan_write(item: TimelineOperation) -> bool:
     )
 
 
-def read_plan_tasks(text: str) -> list:
+def recover_plan_delivery_rows(
+    snapshot: ConversationSnapshot, project: ProjectView
+) -> list:
+    """Recover paths only for already recorded successful attempts."""
+    completed = {
+        run.run_id: run
+        for run in snapshot.experiment_executions or ()
+        if run.project_id == project.project_id
+        and run.plan_sequence == project.plan_sequence
+        and run.role_id == "main"
+        and run.state == "succeeded"
+    }
+    if not completed:
+        return []
+    text: str | None = None
+    for item in snapshot.timeline:
+        if not isinstance(item, TimelineOperation) or not _is_plan_write(item):
+            continue
+        arguments = item.arguments
+        if not isinstance(arguments, dict):
+            continue
+        if item.name == "write":
+            content = arguments.get("content")
+            text = content if isinstance(content, str) else None
+            continue
+        edits = arguments.get("edits")
+        if text is None or not isinstance(edits, list) or not edits:
+            text = None
+            continue
+        for edit in edits:
+            old = edit.get("oldText") if isinstance(edit, dict) else None
+            new = edit.get("newText") if isinstance(edit, dict) else None
+            if not isinstance(old, str) or not old or not isinstance(new, str):
+                text = None
+                break
+            if text.count(old) != 1:
+                text = None
+                break
+            text = text.replace(old, new, 1)
+    if text is None:
+        return []
+    try:
+        document = json.loads(text)
+        if not isinstance(document, dict):
+            return []
+        plan = document.get("plan", document)
+        if not isinstance(plan, dict) or plan.get("goal") != project.plan.goal:
+            return []
+        declarations = {
+            entry["id"]: entry
+            for entry in plan.get("tasks", [])
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        }
+        rows = read_plan_tasks(text, project)
+    except (TypeError, ValueError):
+        return []
+    tasks = {task.id: task for task in project.plan.tasks}
+    recovered = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("business_status") != "completed":
+            continue
+        task_id = row.get("id")
+        task = tasks.get(task_id) if isinstance(task_id, str) else None
+        if task is None:
+            continue
+        declaration = declarations.get(task.id, {})
+        outputs = declaration.get("outputs")
+        if (
+            declaration.get("stage_id") != task.stage_id
+            or not isinstance(outputs, list)
+            or [out.get("name") for out in outputs if isinstance(out, dict)]
+            != [out.name for out in task.outputs]
+        ):
+            continue
+        run_id = _plan_run_id(
+            f"{project.project_id}:{task.id}",
+            row,
+            [run for run in completed.values() if run.task_id == task.id],
+        )
+        if run_id in completed:
+            recovered.append(row)
+    return recovered
+
+
+def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
     plan = json.loads(text)
     if not isinstance(plan, dict):
         raise ValueError("workflow plan requires a tasks array")
     definition = plan if "tasks" in plan else plan.get("plan")
+    if "task_records" in plan:
+        records = plan["task_records"]
+        if not isinstance(records, dict):
+            raise ValueError("workflow plan task_records must be an object")
+        if project is not None:
+            return [
+                {
+                    "id": task.id,
+                    "stage_id": task.stage_id,
+                    "attempt": record.get("plan_attempt", 1),
+                    "business_status": record.get("business_status"),
+                    "verified_outputs": record.get("verified_outputs", {}),
+                    "report_version_id": record.get("report_version_id"),
+                    "next_action": record.get("next_action"),
+                }
+                for task in project.plan.tasks
+                if isinstance(record := records.get(task.id), dict)
+            ]
     if not isinstance(definition, dict) or not isinstance(
         definition.get("tasks"), list
     ):
@@ -173,7 +293,7 @@ def read_plan_tasks(text: str) -> list:
     runtime = plan.get("runtime")
     records = runtime.get("tasks") if isinstance(runtime, dict) else None
     if not isinstance(records, dict):
-        records = plan.get("task_states", {})
+        records = plan.get("task_states", plan.get("task_records", {}))
     merged = []
     for task in tasks:
         if not isinstance(task, dict):
@@ -219,6 +339,56 @@ def read_plan_tasks(text: str) -> list:
             }
         merged.append(task)
     return merged
+
+
+def resolve_plan_output_paths(
+    project: ProjectView,
+    rows: list,
+    registered: tuple[ExperimentExecutionView, ...],
+    artifacts: tuple[ArtifactVersion, ...],
+    producers: dict[str, str | None],
+) -> list:
+    """Resolve legacy version IDs only when they belong to the selected attempt."""
+    versions = {
+        version.id: version
+        for version in artifacts
+        if version.state in {"ready", "reference_only"}
+    }
+    by_run = {
+        run.run_id: run
+        for run in registered
+        if run.project_id == project.project_id
+        and run.plan_sequence == project.plan_sequence
+        and run.role_id == "main"
+    }
+    resolved = {}
+    for projected in plan_executions(project, rows, registered=registered):
+        registered_run = by_run.get(projected.run_id)
+        run = registered_run or projected
+        resolved[run.task_id] = run
+    result = []
+    for row in rows:
+        outputs = row.get("verified_outputs") if isinstance(row, dict) else None
+        task_id = row.get("id") if isinstance(row, dict) else None
+        run = resolved.get(task_id) if isinstance(task_id, str) else None
+        if run is None or not isinstance(outputs, dict):
+            result.append(row)
+            continue
+        paths = dict(outputs)
+        for key, value in outputs.items():
+            artifact = versions.get(value) if isinstance(value, str) else None
+            if artifact is None or not artifact_belongs_to_execution(
+                artifact, run, producers
+            ):
+                continue
+            path = artifact.manifest.source.storage_ref or artifact.manifest.storage_ref
+            if path and path.startswith("/"):
+                try:
+                    paths[key] = from_storage_api_path(path)
+                except StoragePathError:
+                    continue
+        result.append({**row, "verified_outputs": paths})
+    return result
 
 
 def completed_callback_task(
@@ -365,7 +535,7 @@ def restore_saved_data_status(snapshot: ConversationSnapshot) -> ConversationSna
     try:
         rows = [
             row
-            for row in read_plan_tasks(text)
+            for row in read_plan_tasks(text, project)
             if isinstance(row, dict)
             and row.get("stage_id") in data_stages
             and row.get("business_status") == "completed"

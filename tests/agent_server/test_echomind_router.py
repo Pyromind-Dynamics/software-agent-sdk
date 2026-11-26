@@ -1,4 +1,6 @@
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -8,6 +10,7 @@ from pyromind_agent_server.agent_profiles.echomind_manager import (
     ECHOMIND_MANAGER_DEVELOPMENT_TOOLS,
     ECHOMIND_MANAGER_PROFILE,
 )
+from pyromind_agent_server.api import echomind_observations
 from pyromind_agent_server.echomind_projects import (
     ProjectClusterMismatchError,
     ProjectNotFoundError,
@@ -17,6 +20,7 @@ from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
 )
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.experiment_plans import (
     ExperimentContext,
     ExperimentStage,
@@ -55,6 +59,55 @@ def _experiment_plan(*, name: str = "AVI experiment") -> WorkflowPlan:
     )
 
 
+@pytest.mark.parametrize(
+    ("handler", "method", "arguments"),
+    [
+        ("overview", "get_project_observations", ()),
+        (
+            "retry_artifact_delivery",
+            "retry_project_artifact_delivery",
+            (echomind_observations.ArtifactDeliveryRetry(project_node_id="dataset"),),
+        ),
+        ("report_details", "get_project_observation_report", ("dataset", None, None)),
+        ("series", "get_project_training_series", ("train", "run", None, None, 1000)),
+    ],
+)
+async def test_observations_use_the_stored_project_id(
+    tmp_path, monkeypatch, handler, method, arguments
+):
+    project_id = uuid4()
+    store = ProjectStore(tmp_path)
+    store.bind_plan(
+        PlanRevision(
+            project_id=project_id.hex,
+            revision=1,
+            plan=_experiment_plan(),
+            confirmed_by="42",
+        ),
+        conversation_id="conversation-1",
+        cluster="cn-east-1",
+        owner_user_id="42",
+    )
+    context = RequestContext(user_id="42", x_cluster="cn-east-1")
+
+    def load_project(request, requested_id, *, require_cluster):
+        assert require_cluster
+        info = store.load(requested_id, owner_user_id=context.user_id)
+        store.require_cluster(info, context.x_cluster)
+        return context, info, store
+
+    call = AsyncMock()
+    monkeypatch.setattr(echomind_observations, "_load_project", load_project)
+    monkeypatch.setattr(
+        echomind_observations,
+        "get_product_runtime",
+        lambda _: SimpleNamespace(**{method: call}),
+    )
+    await getattr(echomind_observations, handler)(str(project_id), None, *arguments)
+    assert call.await_args is not None
+    assert call.await_args.args[:2] == ("conversation-1", project_id.hex)
+
+
 def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert ECHOMIND_PRODUCT_PROFILE.profile_id == "echomind"
     assert set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ()) == {
@@ -64,7 +117,6 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
         "terminal",
         "ask_user",
         "set_preparation_plan",
-        "publish_echomind_update",
         "request_reward_bundle_review",
     }
     assert ECHOMIND_PRODUCT_PROFILE.skill_allowlist == (

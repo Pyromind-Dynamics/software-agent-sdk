@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { TSchema } from "@earendil-works/pi-ai";
-import { isRecord, type JsonObject } from "./protocol.js";
+import { decodeObjectArgument, isRecord, type JsonObject } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
 
 export interface AskUserToolSpec {
@@ -91,12 +91,7 @@ export function createAskUserTool(
     description: spec.description,
     parameters: spec.inputSchema as TSchema,
     prepareArguments(args: unknown) {
-      if (preparationTool || !isRecord(args) || typeof args.presentation !== "string" || args.presentation.length > 262144) return args;
-      try {
-        const presentation: unknown = JSON.parse(args.presentation);
-        if (isRecord(presentation)) return { ...args, presentation };
-      } catch { /* Native validation reports invalid presentation. */ }
-      return args;
+      return preparationTool ? args : decodeObjectArgument(args, "presentation");
     },
     // The human wait must serialize with the rest of the tool batch: no other
     // tool call may run while the question is open.

@@ -46,6 +46,7 @@ class SessionSpec(ContractModel):
     skill_allowlist: tuple[str, ...] | None = None
     development_tool_allowlist: tuple[str, ...] | None = None
     development_skill_allowlist: tuple[str, ...] | None = None
+    development_product_instructions: str | None = None
     command_allowlist: tuple[str, ...] | None = None
     delegated_roles: tuple[DelegatedRole, ...] | None = None
     preparation_policy: PreparationPolicy | None = None
@@ -258,3 +259,14 @@ class SubmissionReceiptReader(Protocol):
         operation_id: str,
         context: RequestContext,
     ) -> JsonObject | None: ...
+
+
+@runtime_checkable
+class ProjectStageAnalyzer(Protocol):
+    async def analyze_project_stage(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject: ...

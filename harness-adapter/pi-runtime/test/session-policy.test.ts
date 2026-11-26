@@ -38,7 +38,7 @@ test("skill capability ceiling enforces reads through aliases, absolute paths an
   const restricted = restrictSkillReads(tool, root, [skills], [allowed], skills);
   await restricted.execute("allowed", { path: ".agents/skills/selected/SKILL.md" });
   for (const path of [".agents/skills/other/SKILL.md", join(denied, "SKILL.md"), ".agents/skills/selected/escape/SKILL.md", ".agents/skills"]) {
-    await assert.rejects(() => restricted.execute("denied", { path }), /not enabled/);
+    await assert.rejects(() => restricted.execute("denied", { path }), /not enabled.*Available skills: selected/);
   }
   assert.equal(calls, 1);
 
@@ -54,7 +54,7 @@ test("skill capability ceiling enforces reads through aliases, absolute paths an
     () => sandboxRestricted.execute("remote-denied", {
       path: "/target-workspace/.pyromind-agent/conv-1/.agents/skills/other/SKILL.md",
     }),
-    /not enabled/,
+    /not enabled.*Available skills: selected/,
   );
   await sandboxRestricted.execute("remote-allowed", {
     path: "/target-workspace/.pyromind-agent/conv-1/.agents/skills/selected/SKILL.md",

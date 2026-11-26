@@ -9,13 +9,11 @@ import { subagentLiveness } from "./subagent-liveness.js";
 import { usesAgentTerminal } from "./subagent-terminals.js";
 import { ToolCoordinator } from "./tool-coordinator.js";
 import { createRetrievalTools, verifyReadScope } from "./retrieval-tools.js";
-import { genomeHostAccess } from "./genome-host.js";
 import { WorkflowExecution, type ExecutionAccess } from "./workflow-execution.js";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import {
   type AgentEndEvent,
   type AgentSession,
@@ -166,9 +164,9 @@ function discoverableSkills(
       }
     }
   }
-  return [...found.values()].sort((left, right) =>
-    left.name.localeCompare(right.name),
-  );
+  return [...found.values()]
+    .filter(skill => !config.skillAllowlist || config.skillAllowlist.includes(skill.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 type ModelRuntime = Awaited<
@@ -241,8 +239,7 @@ export async function createPiSession(
       skill_roots: config.skillRoots,
       discoverable_skills: discoverableSkills(config),
       instrumented_hooks: ["no-progress-guard", "tool-result-status"],
-      other_registered_behaviors: [...(enableDelegation ? ["subagent-host", "pi-subagents"] : []), ...(config.terminalBackend === "sandbox" ? ["sandbox-path-rewrite", "skill-context-rewrite"] : []),
-        ...(params.workflows_enabled === true ? ["agentgenome"] : [])],
+      other_registered_behaviors: [...(enableDelegation ? ["subagent-host", "pi-subagents"] : []), ...(config.terminalBackend === "sandbox" ? ["sandbox-path-rewrite", "skill-context-rewrite"] : [])],
       hook_inventory: "project registrations; third-party handlers not enumerated",
       terminal_backend: config.terminalBackend,
       retry: modelRetrySettings(),
@@ -251,7 +248,6 @@ export async function createPiSession(
   });
   const { modelRuntime, model } = await createPiModelRuntime(config);
   recordFinalProviderPayload(modelRuntime, recorder);
-  const env = new NodeExecutionEnv({ cwd: config.workspaceRoot, shellEnv: safeShellEnvironment() });
   const terminalEnvironment = params.terminal_environment ?? {};
   if (!isRecord(terminalEnvironment) || Object.values(terminalEnvironment).some((v) => typeof v !== "string")) throw new Error("invalid terminal environment");
   const skillPaths = [
@@ -301,7 +297,6 @@ export async function createPiSession(
   };
   const rawTools = await createTools(
     peer,
-    env,
     config.workspaceRoot,
     config.terminalBackend,
     config.skillRoots,
@@ -353,18 +348,19 @@ export async function createPiSession(
     if (!skillPaths.some(parent => inside(canonical, parent))) throw new Error("Allowed skill escapes resource roots");
     return canonical;
   });
-  const guard = (tool: AgentTool, roots: string[] | undefined, terminal: ToolCoordinator, role?: string) => {
+  const guard = (tool: AgentTool, roots: string[] | undefined, terminal: ToolCoordinator, role?: SubagentRoleDefinition) => {
     const guarded = restrictSkillReads(
       tool,
       config.workspaceRoot,
       skillPaths,
       roots,
       config.skillsDirectory,
-      { canonicalizeWorkspacePaths: config.terminalBackend !== "sandbox" },
+      { canonicalizeWorkspacePaths: config.terminalBackend !== "sandbox",
+        allowedSkillNames: role ? role.skills ?? [] : config.skillAllowlist },
     );
     return sandboxTools && tool.name === "terminal"
-      ? terminal.wrap(guarded, peer, role, true)
-      : coordinator.wrap(guarded, peer, role);
+      ? terminal.wrap(guarded, peer, role?.name, true)
+      : coordinator.wrap(guarded, peer, role?.name);
   };
   const tools = observedTools.map((tool) =>
     guard(tool, allowedSkillRoots, mainTerminal),
@@ -387,7 +383,7 @@ export async function createPiSession(
     const scoped = childTools.filter(tool => role.tools.includes(tool.name)).map(tool => {
       const raw =
         observedTools.find(candidate => candidate.name === tool.name) ?? tool;
-      return guard(raw, roots, mainTerminal, role.name);
+      return guard(raw, roots, mainTerminal, role);
     });
     const askUser = sessionOptions.askUserTool && role.tools.includes("ask_user")
       ? [createDelegatedAskUserTool(peer, sessionOptions.askUserTool, role.name)] : [];
@@ -404,7 +400,7 @@ export async function createPiSession(
           observe(tool),
           role ? role.skillPaths : allowedSkillRoots,
           terminal,
-          role?.name,
+          role,
         );
         if (tool.name !== "read") return guarded;
         return { ...guarded, async execute(id, args, signal, update) {
@@ -425,18 +421,12 @@ export async function createPiSession(
     defaultThinkingLevel: config.thinkingLevel,
   });
   const agentDir = join(config.workspaceRoot, "pi", "agent");
-  const experienceHost = genomeHostAccess(peer, params.workflows_enabled === true);
   const resourceLoader = new DefaultResourceLoader({
     cwd: config.workspaceRoot,
     agentDir,
     settingsManager,
     systemPrompt: config.systemPrompt,
-    appendSystemPrompt: params.workflows_enabled === true
-      ? ["历史经验复用时，Storage 文件统一写成 /workspace/<path>，会话文件写成 public_data/...。"]
-      : [],
-    eventBus: experienceHost.eventBus,
     noExtensions: !enableDelegation,
-    additionalExtensionPaths: experienceHost.additionalExtensionPaths,
     extensionFactories: [
       (pi) => langfusePlugin(pi, recorder),
       ...(subagents && subagentExtension ? [subagents.extension,
@@ -546,7 +536,6 @@ export async function createPiSession(
     noContextFiles: true,
   });
   await resourceLoader.reload();
-  experienceHost.assertLoaded(resourceLoader);
   const extensions = resourceLoader.getExtensions();
   if (!extensions.extensions.some((extension) => extension.path === "<inline:no-spin>")) {
     throw new Error(`Repetition protection failed to load: ${JSON.stringify(extensions.errors)}`);
@@ -563,6 +552,7 @@ export async function createPiSession(
     model,
     thinkingLevel: config.thinkingLevel,
     noTools: "builtin",
+    tools: config.toolAllowlist,
     customTools: tools.map(toolDefinition),
     resourceLoader,
     sessionManager,
@@ -778,11 +768,6 @@ function toolDefinition(tool: AgentTool): ToolDefinition {
       return tool.execute(callId, params, signal, onUpdate);
     },
   } as ToolDefinition;
-}
-
-function safeShellEnvironment(): Record<string, string> {
-  const names = ["PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"];
-  return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
 }
 
 export function nativeSubagentApi(

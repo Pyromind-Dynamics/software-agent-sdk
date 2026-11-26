@@ -13,12 +13,11 @@
     "test": "node --test --import tsx test/*.test.ts"
   },
   "dependencies": {
-    "@agentgenome/pi-extension": "file:vendor/agentgenome-pi-extension-0.6.60.tgz",
     "@anthropic-ai/sandbox-runtime": "0.0.26",
-    "@earendil-works/pi-agent-core": "0.87.0",
-    "@earendil-works/pi-ai": "0.87.0",
-    "@earendil-works/pi-coding-agent": "0.87.0",
-    "@earendil-works/pi-tui": "0.87.0",
+    "@earendil-works/pi-agent-core": "1.2.0",
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@earendil-works/pi-tui": "1.2.0",
     "@langfuse/otel": "5.14.0",
     "@langfuse/pi-observability-plugin": "0.1.2",
     "@langfuse/tracing": "5.14.0",

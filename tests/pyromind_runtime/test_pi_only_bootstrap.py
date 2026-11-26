@@ -25,7 +25,7 @@ async def test_product_runtime_registers_only_pi(tmp_path, monkeypatch, configur
     else:
         monkeypatch.setenv("PYROMIND_HARNESS_BACKEND", configured)
     monkeypatch.setenv("PYROMIND_VERSION_DB_PATH", str(tmp_path / "versions.sqlite3"))
-    monkeypatch.setenv("PYROMIND_AGENTGENOME_ENABLED", "0")
+    monkeypatch.setenv("PYROMIND_AGENTGENOME_ENABLED", "1")
     monkeypatch.setattr(bootstrap, "build_experiment_plan_store", lambda: None)
     monkeypatch.setattr(bootstrap, "set_workflow_status_dispatcher", lambda _: None)
     app = FastAPI()
@@ -37,6 +37,7 @@ async def test_product_runtime_registers_only_pi(tmp_path, monkeypatch, configur
     try:
         assert runtime.default_harness_id == "pi"
         assert set(runtime.adapters) == {"pi"}
+        assert runtime._workflows is None
         adapter = runtime.adapters["pi"]
         assert isinstance(adapter, PiAdapter)
         hook = adapter._business_tools.training_artifact_hook

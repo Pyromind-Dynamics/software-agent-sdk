@@ -41,10 +41,20 @@ class UserInputQuestion(ContractModel):
         return self
 
 
+class InputHtmlArtifact(ContractModel):
+    path: str = Field(
+        pattern=r"^public_data/[a-zA-Z0-9_/-]+[.]html$",
+        max_length=512,
+        description="Self-contained HTML in this conversation workspace; embed images as data URIs.",
+    )
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class UserInputPresentation(ContractModel):
     """Agent-authored display only; choices and authorization live outside it."""
 
     title: str | None = Field(default=None, max_length=200)
+    html_artifact: InputHtmlArtifact | None = Field(default=None, exclude_if=lambda value: value is None)
     content: tuple[ContentBlock, ...] = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")

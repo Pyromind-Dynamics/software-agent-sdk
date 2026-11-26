@@ -1,6 +1,7 @@
 """Display content round-trips independently of decisions and task documents."""
 
 import base64
+import hashlib
 import json
 
 import httpx
@@ -12,7 +13,11 @@ from pyromind_runtime.application.conversation_runtime import ConversationRuntim
 from pyromind_runtime.application.input_presentation import input_media_path
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import ProductEvent
-from pyromind_runtime.domain.user_input import PendingUserInput, UserInputRequest
+from pyromind_runtime.domain.user_input import (
+    InputHtmlArtifact,
+    PendingUserInput,
+    UserInputRequest,
+)
 from pyromind_runtime.ports.harness import SessionSpec
 
 from .fake_adapter import FakeAdapter
@@ -115,6 +120,12 @@ async def test_pending_media_and_snapshot_use_owner_scoped_runtime_without_execu
         ),
         context,
     )
+    html = "<figure>边界复核</figure>"
+    relative = "public_data/reviews/comparison.html"
+    file = tmp_path / "workspace" / "c" / relative
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(html, encoding="utf-8")
+    artifact = {"path": relative, "sha256": hashlib.sha256(html.encode()).hexdigest()}
     store = runtime._store("c")
     store.append(
         ProductEvent(
@@ -126,7 +137,7 @@ async def test_pending_media_and_snapshot_use_owner_scoped_runtime_without_execu
                     {
                         "request_id": "r",
                         "questions": QUESTIONS,
-                        "presentation": PRESENTATION,
+                        "presentation": {**PRESENTATION, "html_artifact": artifact},
                     }
                 )
             ),
@@ -149,6 +160,23 @@ async def test_pending_media_and_snapshot_use_owner_scoped_runtime_without_execu
                 snapshot.json()["pending_inputs"][0]["presentation"]["content"]
                 == PRESENTATION["content"]
             )
+            html_url = profile.route_prefix + "/c/pending-inputs/r/html"
+            document = await client.get(html_url)
+            assert document.status_code == 200
+            assert document.json() == {"html": html}
+            assert document.headers["cache-control"] == "private, no-store"
+            assert (
+                await client.get(html_url.replace("/r/html", "/other/html"))
+            ).status_code == 404
+            assert (
+                await client.get(html_url, headers={"x-pyromind-debug-user-id": "43"})
+            ).status_code == 404
+            other_profile = html_url.replace(
+                profile.route_prefix, "/api/v2/pyromind/conversations"
+            )
+            assert (await client.get(other_profile)).status_code == 404
+            file.write_text("changed", encoding="utf-8")
+            assert (await client.get(html_url)).status_code == 409
             response = await client.get(path)
             assert response.status_code == 200
             assert response.headers["cache-control"] == "private, no-store"
@@ -179,7 +207,16 @@ async def test_pending_media_and_snapshot_use_owner_scoped_runtime_without_execu
                 )
             )
             assert (await client.get(path)).status_code == 404
+            assert (await client.get(html_url)).status_code == 404
             assert len(reads) == 1
             assert store.load_snapshot().project is None
     finally:
         await runtime.close()
+
+
+@pytest.mark.parametrize(
+    "path", ["public_data/../secret.html", "/tmp/example.html", "public_data/file.js"]
+)
+def test_html_reference_stays_in_public_workspace(path):
+    with pytest.raises(ValidationError):
+        InputHtmlArtifact(path=path, sha256="0" * 64)

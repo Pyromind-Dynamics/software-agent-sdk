@@ -1,6 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -21,10 +22,12 @@ from pyromind_runtime.domain.commands import (
 from pyromind_runtime.domain.content import TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
+    CHAT_PREFIX,
     CHAT_PROFILE,
     CHAT_TOOLS,
     ENQUEUE,
     GET_STATUS,
+    MANAGER_PROFILE,
     READ_REPORT,
 )
 from pyromind_runtime.domain.errors import ProductRuntimeError
@@ -47,7 +50,57 @@ from .test_preparation import (
 from .test_product_api import _app
 
 
-async def test_standalone_saved_report_delivers_readable_link_once(
+async def test_manager_summaries_rank_newer_saved_chat_activity(tmp_path):
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    context = RequestContext(user_id="42", profile_id=MANAGER_PROFILE)
+    try:
+        for manager_id in ("chat-first", "main-first"):
+            await runtime.create_conversation(
+                SessionSpec(
+                    conversation_id=manager_id,
+                    user_id=context.user_id,
+                    workspace_root=str(tmp_path / manager_id),
+                    profile_id=MANAGER_PROFILE,
+                ),
+                context,
+            )
+        chat_id = f"{CHAT_PREFIX}chat-first"
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=chat_id,
+                user_id=context.user_id,
+                workspace_root=str(tmp_path / chat_id),
+                profile_id=CHAT_PROFILE,
+            ),
+            replace(context, profile_id=CHAT_PROFILE),
+        )
+        main_time = datetime(2090, 1, 1, tzinfo=UTC)
+        chat_time = datetime(2090, 1, 2, tzinfo=UTC)
+        for conversation_id, at in (
+            ("main-first", main_time),
+            (chat_id, chat_time),
+        ):
+            runtime._store(conversation_id).append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    occurred_at=at,
+                    type="status.changed",
+                    payload={"status": "idle"},
+                )
+            )
+        summaries = await runtime.list_summaries(context)
+        assert [(item.conversation_id, item.updated_at) for item in summaries] == [
+            ("chat-first", chat_time),
+            ("main-first", main_time),
+        ]
+        assert (
+            await runtime.echomind_chat.saved_updated_at("chat-first", "other") is None
+        )
+    finally:
+        await runtime.close()
+
+
+async def test_saved_report_remains_readable_without_chat_delivery(
     preparation_setup, tmp_path
 ):
     preparation, owner, policy = preparation_setup
@@ -109,15 +162,7 @@ async def test_standalone_saved_report_delivers_readable_link_once(
         )
         saved = await runtime.version_call(manager_id, request, "save-report", context)
         artifact_id = saved["id"]
-        async with asyncio.timeout(5):
-            while runtime.echomind_notices.workers:
-                await asyncio.sleep(0.02)
         chat_store = runtime._store(chat.conversation_id)
-        first = chat_store.load_snapshot().timeline[-1]
-        assert isinstance(first, TimelineMessage) and first.execution_notice
-        assert first.execution_notice.origin_turn_id == "request-turn"
-        assert first.execution_notice.action == "report"
-        assert first.execution_notice.target_id == artifact_id
         runtime._record_execution(
             manager,
             ExperimentExecutionView(
@@ -131,19 +176,7 @@ async def test_standalone_saved_report_delivers_readable_link_once(
                 artifacts=({"artifact_id": artifact_id},),
             ),
         )
-        async with asyncio.timeout(5):
-            while runtime.echomind_notices.workers:
-                await asyncio.sleep(0.02)
-        assert chat_store.load_snapshot().timeline[-1] == first
-        assert (
-            sum(
-                isinstance(item, TimelineMessage)
-                for item in chat_store.load_snapshot().timeline
-            )
-            == 1
-        )
-
-        revised = await runtime.version_call(
+        await runtime.version_call(
             manager_id,
             VersionToolRequest(
                 action="save",
@@ -155,20 +188,10 @@ async def test_standalone_saved_report_delivers_readable_link_once(
             "save-report-revision",
             context,
         )
-        async with asyncio.timeout(5):
-            while runtime.echomind_notices.workers:
-                await asyncio.sleep(0.02)
-        [updated] = [
-            m
-            for m in chat_store.load_snapshot().timeline
-            if isinstance(m, TimelineMessage)
-        ]
-        assert updated.item_id == first.item_id
-        assert (
-            updated.execution_notice
-            and updated.execution_notice.target_id == revised["id"]
+        assert not any(
+            isinstance(item, TimelineMessage)
+            for item in chat_store.load_snapshot().timeline
         )
-        assert updated.content == (TextContent(text="报告已更新，最新为第 2 版。"),)
 
         url = f"/api/v2/echomind/conversations/{manager_id}/chat/reports/{artifact_id}"
         async with httpx.AsyncClient(
@@ -183,134 +206,6 @@ async def test_standalone_saved_report_delivers_readable_link_once(
             denied = await client.get(url, headers={"x-pyromind-debug-user-id": "99"})
             assert denied.status_code == 404
     finally:
-        await runtime.close()
-
-
-async def test_execution_notice_writes_after_chat_replies_once_and_links_original_turn(
-    preparation_setup, tmp_path
-):
-    preparation, owner, policy = preparation_setup
-    manager_id = owner.conversation_id
-    context = RequestContext(user_id=owner.user_id, profile_id="echomind")
-    composing = asyncio.Event()
-    reply = asyncio.Event()
-
-    class Adapter(FakeAdapter):
-        async def compose_execution_notice(self, handle, facts):
-            if facts["milestone"] == "report_ready":
-                composing.set()
-                await reply.wait()
-                return '{"message":"报告已就绪，可以查看。"}'
-            return '{"message":null}'
-
-    runtime = ConversationRuntime(tmp_path, Adapter(), preparation_store=preparation)
-    try:
-        await runtime.create_conversation(
-            SessionSpec(
-                conversation_id=manager_id,
-                user_id=context.user_id,
-                workspace_root=str(tmp_path / manager_id),
-                profile_id="echomind",
-                preparation_policy=policy,
-                delegated_roles=(DelegatedRole(name="eval"),),
-            ),
-            context,
-        )
-        chat = await runtime.echomind_chat.open(manager_id, {}, context)
-        manager = runtime._store(manager_id)
-        chat_store = runtime._store(chat.conversation_id)
-
-        def write_chat(message_id, role, turn_id):
-            event, _ = chat_store.append(
-                ProductEvent(
-                    conversation_id=chat.conversation_id,
-                    type="message.completed",
-                    turn_id=turn_id,
-                    payload={
-                        "message_id": message_id,
-                        "role": role,
-                        "content": [{"type": "text", "text": "用户正在对话。"}],
-                    },
-                )
-            )
-            runtime._publish(event)
-
-        write_chat("first", "user", "origin")
-        runtime._queue_task(
-            manager,
-            manager_id,
-            "linked-task",
-            "requirement",
-            "review",
-            origin_turn_id="origin",
-        )
-        execution = ExperimentExecutionView(
-            run_id="run",
-            project_id="project",
-            task_id="task",
-            task_name="evaluation",
-            role_id="main",
-            state="waiting_analysis",
-            report_state="not_started",
-            platform_task_id="linked-task",
-        )
-        runtime._record_execution(manager, execution)
-        result = execution.model_copy(
-            update={"state": "reported", "report_state": "ready"}
-        )
-        runtime._record_execution(manager, result)
-        async with asyncio.timeout(5):
-            await composing.wait()
-        write_chat("second", "user", "later")
-        write_chat("reply", "assistant", "later")
-        reply.set()
-        # Related projections can repeat the same verified milestone.
-        runtime._record_execution(
-            manager, result.model_copy(update={"summary": "updated"})
-        )
-        async with asyncio.timeout(5):
-            while runtime.echomind_notices.workers:
-                await asyncio.sleep(0.02)
-        messages = [
-            item
-            for item in chat_store.load_snapshot().timeline
-            if isinstance(item, TimelineMessage)
-        ]
-        assert [item.item_id for item in messages[:-1]] == ["first", "second", "reply"]
-        notice = messages[-1]
-        assert notice.execution_notice is not None
-        assert notice.execution_notice.origin_turn_id == "origin"
-        assert notice.content == (TextContent(text="报告已就绪，可以查看。"),)
-        assert (
-            sum(
-                event.type == "chat.notification.skipped"
-                for event in chat_store.replay()
-            )
-            == 1
-        )
-        pending, _ = manager.append(
-            ProductEvent(
-                conversation_id=manager_id,
-                type="input.requested",
-                task_id="linked-task",
-                payload={
-                    "request_id": "question",
-                    "questions": [{"id": "review", "prompt": "是否扩大测试范围？"}],
-                },
-            )
-        )
-        runtime._publish(pending)
-        async with asyncio.timeout(5):
-            while runtime.echomind_notices.workers:
-                await asyncio.sleep(0.02)
-        last = chat_store.load_snapshot().timeline[-1]
-        assert isinstance(last, TimelineMessage) and last.execution_notice is not None
-        assert last.execution_notice.action == "confirmation"
-        assert last.execution_notice.target_id == "question"
-        assert last.execution_notice.origin_turn_id == "origin"
-        assert last.content == (TextContent(text="执行需要你回复，请查看待确认事项。"),)
-    finally:
-        reply.set()
         await runtime.close()
 
 

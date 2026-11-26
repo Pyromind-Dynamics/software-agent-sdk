@@ -814,6 +814,51 @@ async def test_product_profiles_isolate_conversations_with_the_same_profile_id(
     await runtime.close()
 
 
+async def test_authenticated_snapshot_updates_old_profile_after_active_turn(tmp_path):
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(conversations, adapter)
+    app = _app(tmp_path, runtime)
+    prefix = "/api/profile/conversations"
+    app.include_router(
+        create_product_router(
+            ConversationProfile(route_prefix=prefix, configuration_version=37)
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {"x-pyromind-debug-user-id": "42"}
+    authenticated = {"Authorization": "Bearer test-credential"}
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=headers
+        ) as client:
+            created = await client.post(prefix, json={"llm": {"model": "test-model"}})
+            cid = created.raise_for_status().json()["conversation_id"]
+            store = FileProductStore(conversations / cid)
+            path = f"{prefix}/{cid}/snapshot"
+            initial_version = store.configuration_version()
+            assert initial_version < 37
+            (await client.get(path)).raise_for_status()
+            assert store.configuration_version() == initial_version
+
+            for status in ("running", "idle"):
+                store.append(
+                    ProductEvent(
+                        conversation_id=cid,
+                        type="status.changed",
+                        payload={"status": status},
+                    )
+                )
+                (await client.get(path, headers=authenticated)).raise_for_status()
+                expected_version = 37 if status == "idle" else initial_version
+                assert store.configuration_version() == expected_version
+            (await client.get(path, headers=authenticated)).raise_for_status()
+            assert len(adapter.session_policies) == 1
+    finally:
+        await runtime.close()
+
+
 async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
     tmp_path,
 ) -> None:
@@ -864,6 +909,53 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     payload={**assistant, "content": blocks},
                 )
             )
+            public_answer = "visible preparation answer"
+            for task_id in (None, "execution-task"):
+                store.append(
+                    ProductEvent(
+                        conversation_id=conversation_id,
+                        task_id=task_id,
+                        type="message.completed",
+                        payload={
+                            "role": "assistant",
+                            "message_id": task_id or "preparation",
+                            "content": blocks,
+                            "preparation_reply": private if task_id else public_answer,
+                        },
+                    )
+                )
+            project_answer = "Project evaluation is complete"
+            first_chunk = "Project evaluation"
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    task_id="execution-task",
+                    type="message.delta",
+                    payload={
+                        "message_id": "project-answer",
+                        "text": private,
+                        "project_reply_delta": first_chunk,
+                    },
+                )
+            )
+            path = f"{profile.route_prefix}/{conversation_id}/snapshot"
+            partial = await client.get(path)
+            assert partial.status_code == 200
+            assert private not in partial.text
+            assert first_chunk in partial.text
+            store.append(
+                ProductEvent(
+                    conversation_id=conversation_id,
+                    task_id="execution-task",
+                    type="message.completed",
+                    payload={
+                        "role": "assistant",
+                        "message_id": "project-answer",
+                        "content": blocks,
+                        "project_reply": project_answer,
+                    },
+                )
+            )
             store.append(
                 ProductEvent(
                     conversation_id=conversation_id,
@@ -882,12 +974,15 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     payload={"code": "test", "message": safe},
                 )
             )
-            path = f"{profile.route_prefix}/{conversation_id}/snapshot"
             view = await client.get(path)
             assert view.status_code == 200
             assert private not in view.text
             assert safe in view.text
-            assert all(item["kind"] != "message" for item in view.json()["timeline"])
+            messages = [i for i in view.json()["timeline"] if i["kind"] == "message"]
+            assert [m["content"] for m in messages] == [
+                [{"type": "text", "text": public_answer}],
+                [{"type": "text", "text": project_answer}],
+            ]
             assert store.load_snapshot().timeline[0].kind == "message"
             context = RequestContext(user_id="42", profile_id=profile.profile_id)
             events = _sse_stream(
@@ -901,6 +996,12 @@ async def test_execution_profile_hides_internal_text_from_snapshot_and_stream(
                     assert f"id: {seq}\n" in frame
                     assert private not in frame
                     frames.append(frame)
+                assert any(public_answer in frame for frame in frames)
+                assert any(
+                    "event: message.delta" in frame and first_chunk in frame
+                    for frame in frames
+                )
+                assert any(project_answer in frame for frame in frames)
                 assert safe in frames[-1]
             finally:
                 await events.aclose()

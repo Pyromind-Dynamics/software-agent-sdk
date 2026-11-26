@@ -26,6 +26,14 @@ class EvaluationStorageUnavailableError(RuntimeError):
     the failure must never be classified as "the object does not exist".
     """
 
+    def __init__(self, message: str, *, retryable: bool | None = None) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class EvaluationStorageTooLargeError(EvaluationStorageUnavailableError):
+    """An object could not be downloaded within the read limit."""
+
 
 class EvaluationStorage(Protocol):
     """Byte-level access to one run's Storage output directory.

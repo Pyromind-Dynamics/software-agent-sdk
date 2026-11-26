@@ -96,7 +96,10 @@ async def test_single_plan_tool_after_question_and_stale_model_request(
             await release.wait()
             return stream(
                 "set_preparation_plan",
-                ready_request.model_dump(mode="json"),
+                {
+                    **ready_request.model_dump(mode="json"),
+                    "plan": ready_request.plan.model_dump_json(),
+                },
                 "plan-first",
             )
         if concurrent_edit and len(captured) == 3:

@@ -97,6 +97,6 @@ def test_report_size_failure_is_not_retried(download):
             )
         return httpx.Response(200, content=b"too large")
 
-    with pytest.raises(ValueError, match="exceeds"):
+    with pytest.raises(storage.StorageFileTooLargeError, match="exceeds"):
         run(handler, max_bytes=2)
     assert len(calls) == 2 and waits == []

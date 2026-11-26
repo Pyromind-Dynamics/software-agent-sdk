@@ -177,6 +177,39 @@ def test_versioned_script_uses_separate_report_assets(
     assert resumed["metrics"]["current_request_count"] == 0
 
 
+def test_inference_directory_uses_the_validation_file(
+    evaluation_module, evaluation_inputs, inference_server, tmp_path
+):
+    directory = tmp_path / "eval" / "0828"
+    directory.mkdir(parents=True)
+    path = Path(evaluation_inputs["dataset_path"]).rename(directory / "val.jsonl")
+    (directory / "train.jsonl").write_text("unexpected training data")
+    endpoint, state = inference_server
+
+    result = evaluation_module.evaluate_inference(
+        **{**evaluation_inputs, "dataset_path": str(directory), "endpoint": endpoint}
+    )
+
+    assert result["metrics"]["dataset_path"] == str(path.resolve())
+    assert result["metrics"]["pass_rate"] == 1
+    assert len(state["requests"]) == 1
+
+
+def test_inference_directory_requires_validation_file_inside_the_directory(
+    evaluation_module, evaluation_inputs, tmp_path
+):
+    directory = tmp_path / "eval"
+    directory.mkdir()
+    path = directory / "val.jsonl"
+    for linked in (False, True):
+        if linked:
+            path.symlink_to(evaluation_inputs["dataset_path"])
+        with pytest.raises(ValueError, match="needs a val.jsonl file inside it"):
+            evaluation_module.evaluate_inference(
+                **{**evaluation_inputs, "dataset_path": str(directory)}
+            )
+
+
 def test_zero_business_score_is_successful_execution(
     evaluation_module, evaluation_inputs, inference_server
 ):

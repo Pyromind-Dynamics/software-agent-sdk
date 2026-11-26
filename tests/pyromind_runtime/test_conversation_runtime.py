@@ -550,6 +550,65 @@ async def test_runtime_resumes_callback_through_owning_adapter(tmp_path) -> None
     await runtime.close()
 
 
+@pytest.mark.parametrize("completed_before_running_result", [False, True])
+async def test_studio_poll_reports_running_without_overwriting_terminal_status(
+    tmp_path, completed_before_running_result
+):
+    class Query:
+        async def query(self, task_id: str, context: RequestContext) -> JsonObject:
+            if completed_before_running_result:
+                await runtime.deliver_external_task_status(
+                    "session", task_id=task_id, status="succeeded"
+                )
+            return {"status": "Running"}
+
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(tmp_path, adapter, external_task_query=Query())
+    context = RequestContext(user_id="42", cookie="test-cookie")
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id="session",
+                user_id="42",
+                workspace_root=str(tmp_path / "session"),
+            ),
+            context,
+        )
+        store = runtime._store("session")
+        now = datetime.now(UTC).isoformat()
+        store.append(
+            ProductEvent(
+                conversation_id="session",
+                type="external_task.submitted",
+                payload={
+                    "task_id": "training",
+                    "kind": "workflow_run",
+                    "status": "pending",
+                    "submitted_at": now,
+                    "updated_at": now,
+                },
+            )
+        )
+
+        await runtime._poll_external_tasks()
+        await runtime._poll_external_tasks()
+
+        expected = "succeeded" if completed_before_running_result else "running"
+        assert store.load_snapshot().external_tasks[0].status == expected
+        running_events = [
+            event
+            for event in store.replay()
+            if event.type == "external_task.updated"
+            and event.payload.get("status") == "running"
+        ]
+        assert len(running_events) == (0 if completed_before_running_result else 1)
+        assert len(adapter.external_task_notifications) == (
+            1 if completed_before_running_result else 0
+        )
+    finally:
+        await runtime.close()
+
+
 @pytest.mark.parametrize("callback_first", [False, True])
 async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
     tmp_path, monkeypatch, callback_first
@@ -599,7 +658,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
             queried.set()
             await release_query.wait()
             returned.set()
-            return {"status": "Failed"}
+            return {"status": "Failed", "error_summary": "Platform node failed"}
 
     class Adapter(FakeAdapter):
         async def notify_external_task(self, handle, notification, context):
@@ -615,6 +674,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
             conversation_id,
             task_id="task-1",
             status="Failed",
+            error_summary="Platform node failed",
             correlation=correlation,
         )
 
@@ -650,6 +710,7 @@ async def test_runtime_polls_restored_studio_task_and_deduplicates_callback(
         assert terminal == [repeated]
         task = store.load_snapshot().external_tasks[0]
         assert task.status == "failed" and not task.resume_pending
+        assert task.error_summary == "Platform node failed"
         assert len(adapter.external_task_notifications) == 1
         _, notice, _ = adapter.external_task_notifications[0]
         assert notice.correlation == correlation

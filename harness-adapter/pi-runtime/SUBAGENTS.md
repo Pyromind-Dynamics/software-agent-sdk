@@ -1,7 +1,7 @@
 # Pi subagents integration
 
 The adapter loads the unmodified, published `pi-subagents@0.78.0` package through
-Pi's resource loader. Pi packages are pinned to `0.87.0`. The plugin owns child
+Pi's resource loader. Pi packages are pinned to `1.2.0`. The plugin owns child
 sessions, concurrency, background processes, durable artifacts, completion
 notifications and resume. There is no adapter-owned agent database or scheduler.
 
@@ -90,15 +90,6 @@ API, HTTP route or snapshot schema is added. Dependency direction remains:
 server -> adapter -> runtime; only the adapter imports Pi and pi-subagents.
 Old product snapshots need no migration. Existing Pi sessions are covered by
 Pi's own session reader and the regression tests.
-
-## AgentGenome compatibility artifact
-
-The deployed `0.6.3` artifact is newer than this workspace's reference repository.
-`vendor/agentgenome-pi-extension-0.6.3-pi087.tgz` changes only its peer declaration
-to `0.84.2 || 0.87.0`; runtime code and embedded Python wheels are byte-for-byte
-unchanged. Reproduce it with `python3 scripts/repack-agentgenome.py`, then refresh
-the npm lockfile. Tests compare every archived runtime file and exercise the real
-AgentGenome stage/judge workflow against Pi 0.87.0. No forced peer resolution is used.
 
 References: [plugin](https://github.com/nicobailon/pi-subagents),
 [roles](https://github.com/nicobailon/pi-subagents/blob/main/docs/agents.md),

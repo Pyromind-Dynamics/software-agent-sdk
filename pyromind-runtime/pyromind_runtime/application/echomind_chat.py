@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from datetime import datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,7 @@ from pyromind_runtime.domain.snapshot import (
     TimelineOperation,
 )
 from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.infrastructure.file_product_store import ProductStoreError
 from pyromind_runtime.ports.harness import SessionSpec
 
 
@@ -39,12 +41,14 @@ if TYPE_CHECKING:
 
 
 def completed_chat_turns(
-    snapshot: ConversationSnapshot, current: str
-) -> list[JsonObject]:
+    snapshot: ConversationSnapshot,
+    current: str,
+    *,
+    preparation: bool = False,
+    budget: int = 32000,
+) -> list[dict[str, str]]:
     questions: dict[str, str] = {}
     replies: dict[str, str] = {}
-    enqueued: set[str] = set()
-    results: dict[str, list[str]] = {}
     latest: dict[str, int] = {}
     for item in snapshot.timeline:
         if not isinstance(item, (TimelineMessage, TimelineOperation)):
@@ -53,43 +57,19 @@ def completed_chat_turns(
         if isinstance(item, TimelineOperation):
             if turn:
                 replies.pop(turn, None)
-                if item.name == ENQUEUE and item.status == "completed":
-                    enqueued.add(turn)
             continue
-        if item.status != "completed":
+        if item.status != "completed" or (preparation and item.task_id):
             continue
         text = "\n".join(
             b.text for b in item.content if isinstance(b, TextContent)
         ).strip()
+        if preparation and item.role == "assistant":
+            text = item.preparation_reply or ""
         if not text:
             continue
-        if link := item.execution_notice:
-            if link.source_message_id and not link.public_copy:
-                continue
-            origin = link.origin_turn_id
-            if not origin or origin == current:
-                continue
-            if link.action == "report" and link.target_id:
-                text += f"\n[report: {link.target_id}]"
-            elif link.has_result is not True:
-                # Historical round notices predate the typed result flag.
-                if link.has_result is False or not item.run_id or link.action:
-                    continue
-                digest = sha256(f"round:{item.run_id}".encode()).hexdigest()
-                if item.item_id != f"execution-notice:{digest}" or text.startswith(
-                    (
-                        "本轮执行已结束",
-                        "This execution round has ended",
-                        "This round ended without",
-                        "This round has ended",
-                    )
-                ):
-                    continue
-            results.setdefault(origin, []).append(text)
-            latest[origin] = max(
-                latest.get(origin, 0), item.completed_seq or item.started_seq
-            )
-        elif item.role == "user":
+        if item.execution_notice:
+            continue
+        if item.role == "user":
             key = item.command_id or turn or item.item_id
             if key != current:
                 questions[key] = text
@@ -99,17 +79,15 @@ def completed_chat_turns(
                 latest.get(turn, 0), item.completed_seq or item.started_seq
             )
 
-    # Select recently answered turns (including late deliveries), then restore
+    # Select recently answered turns (including queued requirements), then restore
     # original question order for the model. Never split a pair across the budget.
-    selected: dict[str, JsonObject] = {}
-    remaining = 32000
+    selected: dict[str, dict[str, str]] = {}
+    remaining = budget
     for key in sorted(questions, key=lambda k: latest.get(k, 0), reverse=True):
-        parts = [] if key in enqueued or key not in replies else [replies[key]]
-        parts.extend(results.get(key, ()))
-        if not parts:
+        if key not in replies:
             continue
         question = questions[key][:4000]
-        answer = "\n\n".join(parts)
+        answer = replies[key]
         if len(answer) > 8000:
             answer = answer[:4000] + "\n…\n" + answer[-3997:]
         size = len(question) + len(answer)
@@ -144,8 +122,21 @@ class EchoMindChat:
         chat_id = CHAT_PREFIX + manager_id
         if not self._runtime._store(chat_id).metadata_path.is_file():
             return None
-        self._runtime.echomind_notices.schedule(manager_id)
         return await self._runtime.get_snapshot(chat_id, context)
+
+    async def saved_updated_at(self, manager_id: str, user_id: str) -> datetime | None:
+        store = self._runtime._store(CHAT_PREFIX + manager_id)
+        if not store.metadata_path.is_file():
+            return None
+
+        def load_updated_at() -> datetime | None:
+            try:
+                store.authorize(user_id, CHAT_PROFILE)
+                return store.load_snapshot().updated_at
+            except (OSError, ValueError, ProductStoreError):
+                return None
+
+        return await asyncio.to_thread(load_updated_at)
 
     async def open(
         self, manager_id: str, model: JsonObject, context: RequestContext
@@ -159,7 +150,6 @@ class EchoMindChat:
         context = replace(context, profile_id=CHAT_PROFILE)
         async with manager.lock_chat_creation():
             if self._runtime._store(chat_id).metadata_path.is_file():
-                self._runtime.echomind_notices.schedule(manager_id)
                 return await self._runtime.get_snapshot(chat_id, context)
             snapshot = await self._runtime.create_conversation(
                 SessionSpec(
@@ -175,7 +165,6 @@ class EchoMindChat:
                 ),
                 context,
             )
-            self._runtime.echomind_notices.schedule(manager_id)
             return snapshot
 
     async def model_history(
@@ -185,7 +174,19 @@ class EchoMindChat:
             raise PermissionError("EchoMind chat session required")
         store = await self._runtime._authorized_store(chat_id, context)
         snapshot = await asyncio.to_thread(store.load_snapshot)
-        return completed_chat_turns(snapshot, current)
+        turns = completed_chat_turns(snapshot, current)
+        manager = await self._runtime._authorized_store(
+            chat_id.removeprefix(CHAT_PREFIX),
+            replace(context, profile_id=MANAGER_PROFILE),
+        )
+        history = await asyncio.to_thread(manager.load_snapshot)
+        remaining = 32000 - sum(
+            len(row["question"]) + len(row["answer"]) for row in turns
+        )
+        preparation = completed_chat_turns(
+            history, current, preparation=True, budget=remaining
+        )
+        return [dict(row) for row in (*preparation, *turns)]
 
     async def call(
         self,

@@ -366,7 +366,7 @@ def test_reusable_workflow_runtime_has_no_engine_or_harness_imports() -> None:
         ), relative
 
 
-def test_sdk_agentgenome_uses_host_bridge_without_native_execution_fallback() -> None:
+def test_legacy_genome_bridge_stays_isolated_from_the_product_runner() -> None:
     adapter = ROOT / "harness-adapter"
     bridge = (adapter / "harness_adapter/agentgenome_bridge.py").read_text()
     imports = {
@@ -379,16 +379,14 @@ def test_sdk_agentgenome_uses_host_bridge_without_native_execution_fallback() ->
         {"agentgenome.local_host", "agentgenome.local_service"}
     )
     session = (adapter / "pi-runtime/src/pi-session.ts").read_text()
-    assert "additionalExtensionPaths" in session
-    assert "experienceHost.assertLoaded(resourceLoader)" in session
+    manifest = (adapter / "pi-runtime/package.json").read_text()
+    assert "@agentgenome/pi-extension" not in manifest
     for path in (adapter / "pi-runtime/src").rglob("*.ts"):
         source = path.read_text()
         assert "createGenomeExtension" not in source, path
         assert "createBridgeHost" not in source, path
-    host = (adapter / "pi-runtime/src/genome-host.ts").read_text()
-    assert "provideGenomeHost" in host
-    assert "prepareArguments" not in host
-    assert "validateToolArguments" not in host
+        assert "provideGenomeHost" not in source, path
+        assert "@agentgenome/pi-extension" not in source, path
     assert 'peer.request("workflow.invoke"' not in session
     assert "NativeClient" not in session
     assert "nativeHost" not in session
@@ -543,6 +541,12 @@ def test_preparation_policy_is_trusted_profile_configuration():
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
     review_tool = "request_reward_bundle_review"
     assert review_tool in tools
+    assert DEFAULT_PRODUCT_PROFILE.development_product_instructions is None
+    assert "set_preparation_plan" in ECHOMIND_PRODUCT_PROFILE.instructions
+    assert "frozen-reward-evaluation" not in ECHOMIND_PRODUCT_PROFILE.instructions
+    execution = ECHOMIND_PRODUCT_PROFILE.development_product_instructions
+    assert execution and "frozen-reward-evaluation" in execution
+    assert "set_preparation_plan" not in execution
     assert "rubric-elicitation" in (ECHOMIND_PRODUCT_PROFILE.skill_allowlist or ())
     assert review_tool not in (
         ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()
@@ -573,7 +577,6 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "ask_user",
         "get_storage_url",
         "propose_runtime_resources",
-        "publish_echomind_update",
         "get_project_reward",
         "df_submit_evaluation",
         "df_submit_pipeline",

@@ -9,6 +9,7 @@ from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
     normalize_workspace_path,
 )
+from pyromind_runtime.domain.versions import ArtifactKind
 
 
 class PlanResource(ContractModel):
@@ -103,6 +104,11 @@ class PlanInput(ContractModel):
 class PlanOutput(ContractModel):
     name: str = Field(min_length=1)
     description: str = ""
+    kind: ArtifactKind | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Use report for the task's primary report.",
+    )
 
 
 class CompletionCondition(ContractModel):
@@ -123,6 +129,18 @@ class ExperimentTask(ContractModel):
     inputs: tuple[PlanInput, ...] = ()
     outputs: tuple[PlanOutput, ...] = ()
     completion_conditions: tuple[CompletionCondition, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_primary_report(self) -> ExperimentTask:
+        if sum(output.kind == "report" for output in self.outputs) > 1:
+            raise ValueError("a task can declare only one primary report")
+        return self
+
+    @property
+    def report_output(self) -> PlanOutput | None:
+        return next(
+            (output for output in self.outputs if output.kind == "report"), None
+        )
 
 
 class PlanEdge(ContractModel):

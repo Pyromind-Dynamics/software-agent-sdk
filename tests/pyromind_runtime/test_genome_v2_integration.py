@@ -1,4 +1,4 @@
-"""Real packaged plugin + Pi session + host RPC; deterministic model responses."""
+"""Legacy Python bridge and Pi execution RPC with a test-provided receipt tool."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+
 from harness_adapter.agentgenome_bridge import AgentGenomeBackend, ExecutionHost
 from harness_adapter.pi_adapter.runner import PiRunnerProcess
 
@@ -149,7 +150,7 @@ with open(sys.argv[1]) as file:
                     )
                 elif stage_calls % 3 == 2:
                     tool = (
-                        "genome_step_result",
+                        "submit_stage_receipt",
                         {
                             "request_id": stage_request["request_id"],
                             "outcome": "completed",
@@ -193,14 +194,18 @@ with open(sys.argv[1]) as file:
     sinks = {}
 
     async def on_request(method: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if method == "workflow.invoke":
-            assert arguments["action"] == "step_result"
-            return await backend.invoke(
+        if method == "tool.execute":
+            assert arguments["tool_name"] == "submit_stage_receipt"
+            receipt = await backend.invoke(
                 "session",
                 "step_result",
                 {**arguments["arguments"], "execution_id": current_round},
-                arguments["request_id"],
+                arguments["tool_call_id"],
             )
+            return {
+                "content": [{"type": "text", "text": json.dumps(receipt)}],
+                "is_error": False,
+            }
         if method == "execution.output":
             if sink := sinks.get(arguments["id"]):
                 await sink(arguments)
@@ -247,8 +252,20 @@ with open(sys.argv[1]) as file:
                 "session_path": str(workspace / "pi/session.jsonl"),
                 "skills_directory": str(workspace / "skills"),
                 "skill_roots": [],
-                "tools": [],
-                "workflows_enabled": True,
+                "tools": [
+                    {
+                        "name": "submit_stage_receipt",
+                        "description": "Submit the stage receipt to the test host.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                k: {"type": "string"}
+                                for k in ("request_id", "outcome", "summary")
+                            },
+                            "required": ["request_id", "outcome", "summary"],
+                        },
+                    }
+                ],
                 "model": {
                     "provider": "openai",
                     "id": "test",

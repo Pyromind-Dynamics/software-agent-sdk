@@ -31,6 +31,7 @@ from pyromind_runtime.domain.snapshot import (
     UsageState,
     WorkflowState,
 )
+from pyromind_runtime.domain.stage_analysis import StageAnalysisJob
 from pyromind_runtime.domain.user_input import PendingUserInput
 
 
@@ -260,6 +261,9 @@ class SnapshotProjector:
         return updated.model_copy(
             update={
                 "through_seq": event.seq,
+                "created_at": event.occurred_at
+                if event.seq == 1
+                else snapshot.created_at,
                 "updated_at": _latest(snapshot.updated_at, event.occurred_at),
             }
         )
@@ -294,6 +298,18 @@ class SnapshotProjector:
             if item.get("task_id") != event.payload["task_id"]
         )
         return snapshot.model_copy(update={"experiment_queue": queue})
+
+    def _on_project_stage_analysis_changed(
+        self, snapshot: ConversationSnapshot, event: ProductEvent
+    ) -> ConversationSnapshot:
+        job = StageAnalysisJob.model_validate(event.payload["job"])
+        updated = tuple(
+            job if prior.job_id == job.job_id else prior
+            for prior in snapshot.stage_analyses
+        )
+        if not any(prior.job_id == job.job_id for prior in snapshot.stage_analyses):
+            updated += (job,)
+        return snapshot.model_copy(update={"stage_analyses": updated})
 
     def _on_experiment_execution_changed(
         self, snapshot: ConversationSnapshot, event: ProductEvent
@@ -415,6 +431,10 @@ class SnapshotProjector:
         else:
             content = (*content, TextContent(text=text))
         update: dict[str, object] = {"content": content}
+        if isinstance(delta := event.payload.get("preparation_reply_delta"), str):
+            update["preparation_reply"] = (item.preparation_reply or "") + delta
+        if isinstance(project_delta := event.payload.get("project_reply_delta"), str):
+            update["project_reply"] = (item.project_reply or "") + project_delta
         if (notice := event.payload.get("execution_notice")) is not None:
             update["execution_notice"] = ExecutionNoticeLink.model_validate(notice)
         return self._replace(snapshot, item.model_copy(update=update))
@@ -447,6 +467,12 @@ class SnapshotProjector:
         command_id = event.payload.get("command_id")
         if isinstance(command_id, str):
             update["command_id"] = command_id
+        if isinstance(reply := event.payload.get("preparation_reply"), str):
+            update["preparation_reply"] = reply
+        if "project_reply" in event.payload:
+            project_reply = event.payload["project_reply"]
+            if isinstance(project_reply, str) or project_reply is None:
+                update["project_reply"] = project_reply
         if "content" in event.payload:
             update["content"] = self._content(event.payload)
         if (notice := event.payload.get("execution_notice")) is not None:

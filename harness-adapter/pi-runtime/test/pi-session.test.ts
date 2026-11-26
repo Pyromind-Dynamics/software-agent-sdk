@@ -4,6 +4,41 @@ import { mkdtemp, mkdir, writeFile, rm, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { createPiSession, modelRetrySettings } from "../src/pi-session.js";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
+import { fixture, text } from "./fixtures/no-spin.js";
+
+test("the first notification of each phase uses its prompt and skills without touching the sandbox", async (t) => {
+  const { config, peer, requests, root } = await fixture(t, (_, response) => text(response, "Ready."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const name of ["planning", "execution"]) {
+    await mkdir(join(root, "skills", name));
+    await writeFile(join(root, "skills", name, "SKILL.md"), `---\nname: ${name}\ndescription: A test skill.\n---\n`);
+  }
+  const rpc = t.mock.method(peer, "request");
+  for (const [enabled, disabled] of [["planning", "execution"], ["execution", "planning"]]) {
+    const prompt = `Use the ${enabled} contract. Storage is mounted at /workspace.`;
+    const { session } = await createPiSession({
+      ...config, tool_allowlist: ["read", "terminal", "evidence"],
+      skill_allowlist: [enabled], system_prompt: prompt,
+    }, peer);
+    try {
+      await session.sendCustomMessage({
+        customType: "pyromind.external_task", content: "Requirement queued.", display: false,
+      }, { triggerTurn: true });
+      const request = requests.at(-1);
+      assert.deepEqual(request.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(),
+        ["evidence", "read", "terminal"]);
+      const system = request.messages[0].content;
+      assert.ok(system.includes(prompt));
+      assert.ok(system.includes(`<location>.agents/skills/${enabled}/SKILL.md</location>`));
+      assert.ok(!system.includes(disabled));
+      assert.doesNotMatch(system, /\/tmp\/pi-no-spin-/);
+    } finally {
+      session.dispose();
+    }
+  }
+  assert.equal(requests.length, 2);
+  assert.ok(!rpc.mock.calls.some(call => call.arguments[0].startsWith("sandbox.")));
+});
 
 test("model retries default to a small budget on both layers", () => {
   assert.deepEqual(modelRetrySettings({}), {
@@ -52,7 +87,6 @@ test("manager retrieval uses resource mirrors and the sandbox, never the host wo
   } as unknown as JsonlRpcPeer;
   const { session, subagents } = await createPiSession({
     session_id: "manager-retrieval", workspace_root: root, terminal_backend: "sandbox",
-    workflows_enabled: true,
     session_path: join(root, "pi", "session.jsonl"), system_prompt: "Inspect resources",
     skills_directory: skills, skill_roots: [], skill_allowlist: ["allowed"], tools: [],
     tool_allowlist: ["read", "write", "edit", "terminal", "grep", "find", "ls"],

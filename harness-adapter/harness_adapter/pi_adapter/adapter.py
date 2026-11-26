@@ -33,7 +33,10 @@ from harness_adapter.pi_adapter.event_translator import (
 )
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
-from harness_adapter.pi_adapter.protocol import PROTOCOL_VERSION
+from harness_adapter.pi_adapter.protocol import (
+    PROTOCOL_VERSION,
+    SandboxAuthorizationRequired,
+)
 from harness_adapter.pi_adapter.runner import (
     PiRunnerError,
     PiRunnerExit,
@@ -83,10 +86,6 @@ from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import (
     CHAT_TOOLS,
-    MANAGER_PROFILE,
-    PUBLIC_UPDATE_PREFIX,
-    PUBLISH_UPDATE,
-    PublishUpdate,
 )
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
@@ -446,6 +445,50 @@ class PiAdapter:
         self._preparation_revision = revision
         self._preparation_review = review
 
+    async def analyze_project_stage(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+    ) -> JsonObject:
+        session = self._session(handle.session_id)
+        if (session.context.user_id, session.context.profile_id) != (
+            context.user_id,
+            context.profile_id,
+        ):
+            raise PermissionError(
+                "Stage evidence belongs to another conversation owner"
+            )
+
+        async def deny(_method: str, _params: dict[str, Any]) -> Any:
+            raise PermissionError("Stage analysis has no tool access")
+
+        async def ignore(_value: Any) -> None:
+            pass
+
+        runner = PiRunnerProcess(
+            request_handler=deny, event_handler=ignore, exit_handler=ignore
+        )
+        try:
+            async with asyncio.timeout(55):
+                result = await runner.start(
+                    {
+                        "mode": "stage_analysis",
+                        "role": role,
+                        "model": {
+                            **session.config["model"],
+                            "api_key": _api_key(session.model_configuration),
+                        },
+                        "evidence": evidence,
+                    }
+                )
+            if not isinstance(result, dict):
+                raise ValueError("Invalid stage analysis response")
+            return result
+        finally:
+            await runner.close()
+
     async def read_submission_receipt(
         self,
         handle: SessionHandle,
@@ -509,21 +552,6 @@ class PiAdapter:
 
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
-        if session.config.get("profile_id") == MANAGER_PROFILE and PUBLISH_UPDATE in (
-            session.config.get("tool_allowlist") or ()
-        ):
-            specs.append(
-                {
-                    "name": PUBLISH_UPDATE,
-                    "description": (
-                        "Send a verified stage result to the user's chat now. "
-                        "Include deliverable links in the exact public Markdown. "
-                        "Use this tool before continuing to the next step. "
-                        "Text alongside a tool call is private."
-                    ),
-                    "input_schema": PublishUpdate.model_json_schema(),
-                }
-            )
         if self._echo_chat_call is not None:
             specs += [
                 {
@@ -1844,7 +1872,11 @@ class PiAdapter:
         await runner.start(
             {
                 "session_id": session.session_id,
-                "workflows_enabled": self._workflow_call is not None,
+                "preparation_dialogue": session.config.get("profile_id") == "echomind"
+                and "set_preparation_plan"
+                in (session.config.get("tool_allowlist") or ()),
+                "project_dialogue": session.config.get("profile_id") == "echomind"
+                and self._queues_messages(session),
                 "chat_turn_history": self._chat_history is not None
                 and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),
@@ -2070,49 +2102,10 @@ class PiAdapter:
                 not in (session.config.get("tool_allowlist") or ())
             ):
                 raise PermissionError("tool is not enabled for this conversation")
-            arguments = params.get("arguments")
-            if not isinstance(arguments, dict):
+            tool_arguments = params.get("arguments")
+            if not isinstance(tool_arguments, dict):
                 raise ValueError("tool arguments must be an object")
-            if tool_name == PUBLISH_UPDATE:
-                inflight = session.files.load_inflight() or {}
-                run_id = inflight.get("run_id")
-                call_id = params.get("tool_call_id")
-                if (
-                    session.config.get("profile_id") != MANAGER_PROFILE
-                    or PUBLISH_UPDATE
-                    not in (session.config.get("tool_allowlist") or ())
-                    or params.get("origin") is not None
-                    or not isinstance(run_id, str)
-                    or not run_id
-                    or not isinstance(call_id, str)
-                    or not call_id
-                ):
-                    raise PermissionError(
-                        "Publishing requires an active EchoMind manager run"
-                    )
-                message = PublishUpdate.model_validate(arguments).message
-                if not message.strip():
-                    raise ValueError("The public update must contain a message")
-                identity = f"{PUBLIC_UPDATE_PREFIX}{run_id}:{call_id}"
-                session.queue.put_nowait(
-                    HarnessEvent(
-                        session_id=session.session_id,
-                        event_id=identity,
-                        run_id=run_id,
-                        task_id=inflight.get("task_id"),
-                        turn_id=inflight.get("turn_id"),
-                        type="message.completed",
-                        payload={
-                            "role": "assistant",
-                            "message_id": identity,
-                            "content": [{"type": "text", "text": message}],
-                        },
-                    )
-                )
-                return {
-                    "content": [{"type": "text", "text": "Progress message recorded."}],
-                    "is_error": False,
-                }
+            arguments = dict(tool_arguments)
             if tool_name in CHAT_TOOLS:
                 tool_call_id = params.get("tool_call_id")
                 if self._echo_chat_call is None or not isinstance(tool_call_id, str):
@@ -2197,7 +2190,6 @@ class PiAdapter:
                 self._emit_tool_signals(session, tool_name, result)
                 return result
 
-            arguments = dict(arguments)
             binding = (arguments.pop("plan_task_id"), arguments.pop("plan_attempt", 1))
             assert self._plan_submission is not None
             async with session.submission_lock:
@@ -2623,7 +2615,7 @@ class PiAdapter:
         if dsl is None and not snapshot_error:
             try:
                 dsl = await self._read_workflow(session)
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, RuntimeError, SandboxAuthorizationRequired):
                 dsl = None
                 snapshot_error = True
         normalized: JsonObject = {

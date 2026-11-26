@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { inside } from "./workspace-policy.js";
@@ -19,7 +19,7 @@ export function capabilityCeiling(allowed: string[] | undefined) {
 
 export function restrictSkillReads(
   tool: AgentTool, workspace: string, resourceRoots: string[], allowedRoots: string[] | undefined,
-  skillsDirectory?: string, options: { canonicalizeWorkspacePaths?: boolean } = {},
+  skillsDirectory?: string, options: { canonicalizeWorkspacePaths?: boolean; allowedSkillNames?: string[] } = {},
 ): AgentTool {
   if (!allowedRoots || !["read", "grep", "find", "ls"].includes(tool.name)) return tool;
   return { ...tool, execute: async (id, args: any, signal, update) => {
@@ -55,7 +55,8 @@ export function restrictSkillReads(
         return tool.execute(id, args, signal, update);
       }
       if (resourceRoots.some(root => inside(canonical, root)) && !allowedRoots.some(root => inside(canonical, root))) {
-        throw new Error("Skill is not enabled for this conversation");
+        const available = options.allowedSkillNames ?? allowedRoots.map(root => basename(root));
+        throw new Error(`Skill is not enabled for this conversation. Available skills: ${available.join(", ") || "none"}.`);
       }
     }
     return tool.execute(id, args, signal, update);

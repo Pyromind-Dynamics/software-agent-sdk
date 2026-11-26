@@ -19,6 +19,7 @@ from pyromind_runtime.domain.experiment_plans import (
     ExperimentPlanView,
 )
 from pyromind_runtime.domain.preparation import PreparationView, ProjectView
+from pyromind_runtime.domain.stage_analysis import StageAnalysisJob
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.user_input import PendingUserInput
 
@@ -65,6 +66,12 @@ class ExecutionNoticeLink(ContractModel):
 
 
 class TimelineMessage(TimelineEntry):
+    preparation_reply: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    project_reply: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     kind: Literal["message"] = "message"
     item_id: str = Field(min_length=1)
     started_seq: int = Field(ge=1)
@@ -197,6 +204,7 @@ class ExternalTaskState(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     task_id: str = Field(min_length=1)
+    x_cluster: str | None = None
     kind: Literal[
         "historical_experience",
         "data_cleaning",
@@ -247,6 +255,9 @@ class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
     through_seq: int = Field(default=0, ge=0)
+    created_at: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     updated_at: AwareDatetime | None = None
     status: ConversationStatus = "idle"
     active_run_id: str | None = None
@@ -263,6 +274,9 @@ class ConversationSnapshot(ContractModel):
     experiment_plan: ExperimentPlanView | None = None
     experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None
+    stage_analyses: tuple[StageAnalysisJob, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     experiment_queue: tuple[JsonObject, ...] | None = None
     task_origins: dict[str, str] = Field(
         default_factory=dict, exclude_if=lambda value: not value
@@ -310,6 +324,9 @@ class ConversationSummary(ContractModel):
     status: ConversationStatus
     through_seq: int = Field(ge=0)
     title: str | None = None
+    created_at: AwareDatetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     updated_at: AwareDatetime | None = None
     project_id: str | None = None
     cluster: str | None = None
@@ -336,6 +353,7 @@ class ConversationSummary(ContractModel):
             conversation_id=snapshot.conversation_id,
             status=snapshot.status,
             through_seq=snapshot.through_seq,
+            created_at=snapshot.created_at,
             updated_at=snapshot.updated_at,
             title=title,
             project_id=project.project_id if project else None,

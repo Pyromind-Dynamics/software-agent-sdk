@@ -37,7 +37,8 @@ def validate_workflow_catalog(
         if stage.enabled and not (node.roles if policy.allowed_roles else node.tasks):
             raise ValueError("unimplemented catalog nodes must remain disabled")
     for index, task in enumerate(plan.tasks):
-        node = nodes[stages[task.stage_id].kind or ""]
+        stage = stages[task.stage_id]
+        node = nodes[stage.kind or ""]
         allowed = tuple(item.id for item in node.tasks)
         if task.kind not in allowed:
             raise ValueError(
@@ -46,6 +47,11 @@ def validate_workflow_catalog(
             )
 
         definition = next(item for item in node.tasks if item.id == task.kind)
+        if stage.enabled and definition.requires_report and task.report_output is None:
+            raise ValueError(
+                f"plan.tasks[{index}].outputs for {task.id!r}: "
+                "declare an output with kind='report'"
+            )
         if definition.evaluation_target == "model" and not {"model", "dataset"} <= {
             item.name for item in task.inputs
         }:

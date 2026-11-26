@@ -1,4 +1,6 @@
-# AgentGenome v1 接入
+# AgentGenome v1 接入（历史版本）
+
+本文记录 Pi 0.87 期间的接入方式。自 Pi 1.2.0 起，SDK 已停用 AgentGenome 扩展及其服务端后端，以下启动选项和测试步骤仅适用于旧版本。
 
 AgentGenome 管共享资产、版本和图内状态。SDK Runtime 管会话、权限、排队和产品事件；HarnessAdapter 将执行请求接到当前 Pi 会话的终端后端。固定脚本直接执行，不经过第二次 LLM 调用。
 
