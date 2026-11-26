@@ -348,6 +348,8 @@ def verify_dataset_replays(
     receipts: list[WorkflowExecutionRequest],
     read: Callable[[str], bytes] | None,
     check: Callable[[DatasetRecipeReceipt], bytes] | None,
+    *,
+    train_fields: Mapping[str, str] | None = None,
 ) -> DatasetReplayResult:
     if not receipts:
         return DatasetReplayResult()
@@ -374,6 +376,24 @@ def verify_dataset_replays(
             ):
                 continue
             proof = _summary(recipe, context, read, check)
+            if train_fields and "image_field" in train_fields:
+                splits = [("train", proof.train_sha256)]
+                if proof.val_rows:
+                    splits.append(("val", proof.val_sha256))
+                for split, sha in splits:
+                    issue = _vision_export_issue(
+                        read(f"{recipe.output_directory}/{split}_messages.jsonl"),
+                        sha,
+                        train_fields,
+                        split=split,
+                    )
+                    if issue:
+                        return _blocked(
+                            "dataset_train_fields_mismatch",
+                            f"小样任务 {receipt.task_id} 的 {issue}。"
+                            f"请按 Train {context.evidence.train.task_id} 的字段修正 "
+                            "Dataset 导出，并用修正后的配方复核两批小样。",
+                        )
         except EvaluationStorageUnavailableError:
             return _blocked(
                 "dataset_replay_storage_unavailable",
@@ -445,50 +465,103 @@ def verify_dataset_replays(
     return _blocked("dataset_replay_required", message)
 
 
-def compatible_train_reader(runtime: Mapping[str, object]) -> bool:
+def train_reader_fields(runtime: Mapping[str, object]) -> dict[str, str]:
     workflow = runtime.get("workflow")
     if not isinstance(workflow, dict):
-        return False
+        return {}
     nodes, edges = workflow.get("nodes"), workflow.get("edges")
     if not isinstance(nodes, list) or not isinstance(edges, list):
-        return False
-    ids: dict[str, list[str]] = {}
+        return {}
+    graph = {}
     for node in nodes:
-        data = node.get("data") if isinstance(node, dict) else None
-        if not isinstance(node, dict) or not isinstance(data, dict):
-            return False
-        identity = node.get("id")
-        kind = data.get("nodeType")
-        if not isinstance(kind, str) or not isinstance(identity, str):
-            return False
-        if kind == "DatasetConfigBuilderMessageNode":
-            config = data.get("config")
-            if (
-                not isinstance(config, dict)
-                or config.get("messages_field") != "messages"
-            ):
-                return False
-        ids.setdefault(kind, []).append(identity)
-    kinds = (
-        "DatasetConfigBuilderMessageNode",
-        "DatasetConfigBuilderNode",
-        "ModelTrainSFTNode",
-    )
-    if any(len(ids.get(kind, [])) != 1 for kind in kinds):
-        return False
-    for role, output_kind, input_kind in zip(
-        ("dataset_kind_config", "dataset_config"), kinds, kinds[1:]
-    ):
-        bindings = [
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            return {}
+        identity, data = node["id"], node.get("data")
+        if identity in graph or not isinstance(data, dict):
+            return {}
+        graph[identity] = data
+
+    def upstream(target: str, port: str) -> str | None:
+        incoming = [
             edge
             for edge in edges
             if isinstance(edge, dict)
-            and edge.get("target") == ids[input_kind][0]
-            and edge.get("targetHandle") == role
+            and edge.get("target") == target
+            and edge.get("targetHandle") == port
         ]
-        if len(bindings) != 1 or (
-            bindings[0].get("source"),
-            bindings[0].get("sourceHandle"),
-        ) != (ids[output_kind][0], role):
-            return False
-    return True
+        if len(incoming) != 1 or incoming[0].get("sourceHandle") != port:
+            return None
+        source = incoming[0].get("source")
+        return source if isinstance(source, str) and source in graph else None
+
+    trainers = [
+        i for i, data in graph.items() if data.get("nodeType") == "ModelTrainSFTNode"
+    ]
+    if len(trainers) != 1:
+        return {}
+    dataset = upstream(trainers[0], "dataset_config")
+    if not dataset or graph[dataset].get("nodeType") != "DatasetConfigBuilderNode":
+        return {}
+    reader = upstream(dataset, "dataset_kind_config")
+    if not reader:
+        return {}
+    config = graph[reader].get("config")
+    kind = graph[reader].get("nodeType")
+    if not isinstance(config, dict):
+        return {}
+    if (
+        kind == "DatasetConfigBuilderMessageNode"
+        and config.get("messages_field") == "messages"
+    ):
+        return {"messages_field": "messages"}
+    if kind != "DatasetConfigBuilderVisionNode":
+        return {}
+    roles = ["image_field", "user_prompt_field", "assistant_response_field"]
+    if config.get("system_prompt_field"):
+        roles.append("system_prompt_field")
+    fields = {
+        key: config[key]
+        for key in roles
+        if isinstance(config.get(key), str)
+        and re.fullmatch(r"[\w.-]{1,128}", config[key])
+    }
+    return fields if len(set(fields.values())) == len(roles) else {}
+
+
+def compatible_train_reader(runtime: Mapping[str, object]) -> bool:
+    """Whether a verified messages export alone meets the Train reader contract."""
+    return train_reader_fields(runtime) == {"messages_field": "messages"}
+
+
+def _vision_export_issue(
+    raw: bytes, expected_sha: str, fields: Mapping[str, str], *, split: str
+) -> str | None:
+    if hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise ValueError("Dataset export changed after verification")
+    for line_number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError("Expected a verified SFT record")
+        invalid: list[str] = []
+        for role, name in fields.items():
+            value = row.get(name)
+            if role == "image_field":
+                valid = (
+                    isinstance(value, list)
+                    and bool(value)
+                    and value == row.get("images")
+                )
+            else:
+                valid = isinstance(value, str) and (
+                    role == "system_prompt_field" or bool(value.strip())
+                )
+            if not valid:
+                invalid.append(name)
+        if invalid:
+            return (
+                f"{split}_messages.jsonl 第 {line_number} 行缺少或无法读取 "
+                + "、".join(invalid)
+            )
+    return None

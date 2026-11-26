@@ -924,6 +924,7 @@ async def generate_echomind_consolidation(
                 "training_validation": context.training_validation,
             },
             "assets": review.assets.get(stage),
+            "train_input_fields": review.assets.get("train_input_fields"),
         }
         repair, command = plan_repair(
             stage=stage,

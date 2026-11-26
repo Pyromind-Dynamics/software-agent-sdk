@@ -25,7 +25,7 @@ from pyromind_agent_server.echomind_consolidation_references import (
     consolidation_references,
 )
 from pyromind_agent_server.echomind_consolidation_replay import (
-    compatible_train_reader,
+    train_reader_fields,
     verify_dataset_replays,
 )
 from pyromind_agent_server.echomind_dataset_consolidation import extract_dataset_recipe
@@ -143,8 +143,20 @@ def build_script_compilation(
         evidence.dataset,
         evidence.conversation_id,
     )
+    train = references.get("train")
+    candidate = train.get("runtime_candidate") if isinstance(train, dict) else None
+    train_runtime = (
+        supplied.train_runtime
+        if supplied.train_runtime is not None
+        else candidate
+        if isinstance(candidate, dict)
+        else None
+    )
+    train_fields = train_reader_fields(train_runtime or {})
     receipts = successful_dataset_recipe_runs(store, evidence)
-    replay = verify_dataset_replays(context, receipts, read_replay_file, check_replay)
+    replay = verify_dataset_replays(
+        context, receipts, read_replay_file, check_replay, train_fields=train_fields
+    )
     source = extract_dataset_recipe(
         archive_workflow=dataset.workflow,
         source_batch=context.source_batch,
@@ -162,16 +174,10 @@ def build_script_compilation(
         if supplied.evaluator_runtime is None
         else {}
     )
-    train = references.get("train")
-    train_candidate = (
-        train.get("runtime_candidate") if isinstance(train, dict) else None
-    )
     eval_candidate = evaluator.get("runtime_candidate")
     candidates: dict[ConsolidationStageName, JsonObject | None] = {
         "dataset": source.runtime,
-        "train": supplied.train_runtime
-        if supplied.train_runtime is not None
-        else (train_candidate if isinstance(train_candidate, dict) else None),
+        "train": train_runtime,
         "eval": supplied.evaluator_runtime
         if supplied.evaluator_runtime is not None
         else (eval_candidate if isinstance(eval_candidate, dict) else None),
@@ -179,6 +185,7 @@ def build_script_compilation(
     assets: JsonObject = {
         "dataset": [asset.model_dump(mode="json") for asset in source.assets],
         "eval": evaluator.get("assets", {}),
+        "train_input_fields": dict(train_fields),
     }
     problems = {
         "dataset": "缺少已验证的 Dataset 运行配方。",
@@ -274,7 +281,10 @@ def build_script_compilation(
             stage == "train"
             and rendered is not None
             and replay.proof
-            and not compatible_train_reader({"workflow": rendered})
+            and (
+                not train_fields
+                or train_reader_fields({"workflow": rendered}) != train_fields
+            )
         ):
             blockers.append(
                 ConsolidationBlocker(

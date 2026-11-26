@@ -12,7 +12,9 @@ from pyromind_agent_server.echomind_consolidation import ConsolidationContext
 from pyromind_agent_server.echomind_consolidation_replay import (
     _VERIFIER,
     _finish_live_verification,
+    _vision_export_issue,
     compatible_train_reader,
+    train_reader_fields,
     verify_dataset_replays,
 )
 from pyromind_common.platform.recipe import (
@@ -346,6 +348,58 @@ def test_train_consumer_checks_the_actual_reader():
     nodes[0]["data"]["config"]["messages_field"] = "messages"
     edges.clear()
     assert not compatible_train_reader(runtime)
+
+
+def test_vision_train_requires_fields_from_the_connected_reader():
+    fields = {
+        "image_field": "pictures",
+        "system_prompt_field": "system_prompt",
+        "user_prompt_field": "user_prompt",
+        "assistant_response_field": "gt",
+    }
+    nodes = [
+        {
+            "id": "2",
+            "data": {"nodeType": "DatasetConfigBuilderVisionNode", "config": fields},
+        },
+        {"id": "4", "data": {"nodeType": "DatasetConfigBuilderNode"}},
+        {"id": "10", "data": {"nodeType": "ModelTrainSFTNode"}},
+    ]
+    edges = [
+        {"source": a, "target": b, "sourceHandle": port, "targetHandle": port}
+        for a, b, port in [
+            ("2", "4", "dataset_kind_config"),
+            ("4", "10", "dataset_config"),
+        ]
+    ]
+    runtime = {"workflow": {"nodes": nodes, "edges": edges}}
+    assert train_reader_fields(runtime) == fields
+    good = {
+        **_message("inspect"),
+        "images": ["pcb.png"],
+        "pictures": ["pcb.png"],
+        "system_prompt": "inspect PCB",
+        "user_prompt": "describe",
+        "gt": "OK",
+    }
+    raw = json.dumps(good).encode()
+    sha = hashlib.sha256(raw).hexdigest()
+    assert _vision_export_issue(raw, sha, fields, split="train") is None
+    with pytest.raises(ValueError, match="changed"):
+        _vision_export_issue(raw + b" ", sha, fields, split="train")
+    incomplete = {**good, "pictures": ["other.png"], "gt": None}
+    rows = raw + b"\n" + json.dumps(incomplete).encode()
+    issue = _vision_export_issue(
+        rows, hashlib.sha256(rows).hexdigest(), fields, split="val"
+    )
+    assert (
+        issue
+        and "val_messages.jsonl 第 2 行" in issue
+        and "pictures" in issue
+        and "gt" in issue
+    )
+    edges.append({**edges[0], "source": "other"})
+    assert not train_reader_fields(runtime)
 
 
 def test_tracer_directory_reads_media_and_pins_fixed_validation(tmp_path: Path):
