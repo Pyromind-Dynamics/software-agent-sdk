@@ -280,6 +280,7 @@ with PyroMindAPIClient(max_retries=0) as client:
 
 平台创建与 Project 元数据更新是两个动作。沿用现有 Project task/attempt、执行事件及
 元数据更新入口；绑定失败只重试绑定，保留真实任务 ID，不再次创建平台任务。
+对于计划内的 Train，Runtime 会根据签名回调的任务号，在项目所有者的登录态下从 Studio 读取实际执行图并归档。回调时缺少登录态，恢复原会话后可补登记同一任务。训练报告与工作流分别保存。
 SDK 查询、文件操作、停止任务不要求先创建 Project 或业务 execution。
 Dataset Recipe 的 task、实际工作流、代码、冻结配方及输出元数据在可信回调确认归属后，
 通过已有 `product_versions` 的 `bind_execution_metadata` 动作单独登记；不是提交前置
