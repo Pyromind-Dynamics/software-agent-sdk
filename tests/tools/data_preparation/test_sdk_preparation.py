@@ -26,6 +26,7 @@ from pyromind_common.platform.preparation import (
     prepare_edp_render,
     prepare_pipeline,
 )
+from pyromind_common.platform.recipe import read_prepared_dataset_recipe
 from pyromind_common.platform.scene_options import (
     AggregateOptions,
     CleaningOptions,
@@ -33,6 +34,7 @@ from pyromind_common.platform.scene_options import (
     RenderOptions,
     ReuseAssessment,
 )
+from pyromind_common.platform.workflows import prepare_workflow
 from pyromind_runtime.domain import storage_paths as product_paths
 
 
@@ -439,9 +441,19 @@ def test_pipeline_resume_cannot_switch_structured_output_contract(
         )
 
 
-@pytest.mark.parametrize("profile", ["none", "text"])
+@pytest.mark.parametrize(
+    ("profile", "parent"), [("none", None), ("text", None), ("vision", "1379")]
+)
 def test_pipeline_recipe_reuses_frozen_business_builders(
-    sdk_files, sdk_staging, sdk_run_id, processing_scripts, sdk_model_profiles, profile
+    sdk_files,
+    sdk_staging,
+    sdk_run_id,
+    processing_scripts,
+    sdk_model_profiles,
+    sdk_validator,
+    profile,
+    parent,
+    monkeypatch,
 ):
     for name in ("pipeline.py", "export.py"):
         (sdk_files.root / name).write_text("print('recipe')\n")
@@ -450,6 +462,7 @@ def test_pipeline_recipe_reuses_frozen_business_builders(
         sft_export_script_path="export.py",
         input_path="/workspace/input.jsonl",
         model_profile=profile,
+        replay_of_task_id=parent,
     )
     graph = prepare_pipeline(
         options,
@@ -467,13 +480,61 @@ def test_pipeline_recipe_reuses_frozen_business_builders(
         "export",
         "verifier",
     }
-    if profile == "text":
-        key = sdk_model_profiles["text"]["DF_API_KEY"]
+    dsl = DslConverter().to_python(graph)
+    validated = prepare_workflow(sdk_validator, dsl=dsl, name=graph["name"])
+    parsed = read_prepared_dataset_recipe(command)
+    assert parsed and parsed.model_dump(mode="json") == recipe
+    assert (
+        validated["nodes"][0]["data"]["config"] == graph["nodes"][0]["data"]["config"]
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        read_prepared_dataset_recipe(command + "\necho changed")
+    assert read_prepared_dataset_recipe("echo legacy") is None
+    header, _, body = command.partition("\n")
+    assert ("Replay requires 1-5" in body) == bool(parent)
+    unsafe = parsed.model_copy(
+        update={
+            "command_template": parsed.command_template
+            + "\nexport DF_API_KEY=plaintext"
+        }
+    )
+    with pytest.raises(ValueError, match="worker credential"):
+        read_prepared_dataset_recipe(
+            "# pyromind-dataset-recipe-v1 "
+            + unsafe.model_dump_json()
+            + "\n"
+            + body
+            + "\nexport DF_API_KEY=plaintext"
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        read_prepared_dataset_recipe(
+            header.replace('"assets":[{', '"assets":[{"unknown":"value",', 1)
+            + "\n"
+            + body
+        )
+    if parent:
+        guard = next(
+            line for line in body.splitlines() if "Replay requires 1-5" in line
+        )
+        with pytest.raises(ValueError, match="does not match"):
+            read_prepared_dataset_recipe(header + "\n" + body.replace(guard, "true", 1))
+    if profile != "none":
+        key = sdk_model_profiles[profile]["DF_API_KEY"]
         assert key not in json.dumps(recipe)
         assert key not in command
         assert 'export DF_API_KEY="$param"' in recipe["command_template"]
-        transported = materialize_runtime_environment(graph)
-        assert key in transported["nodes"][0]["data"]["config"]["command"]
+        transported = materialize_runtime_environment(validated)
+        config = transported["nodes"][0]["data"]["config"]
+        assert config["command"] == command
+        assert config["param"] == key
+        sdk_model_profiles[profile]["DF_API_KEY"] = "renewed-credential"
+        monkeypatch.setenv("PYROMIND_DATAFLOW_PROFILES", json.dumps(sdk_model_profiles))
+        renewed = materialize_runtime_environment(validated)
+        assert renewed["nodes"][0]["data"]["config"]["param"] == "renewed-credential"
+        sdk_model_profiles[profile]["DF_MODEL_NAME"] = "another-model"
+        monkeypatch.setenv("PYROMIND_DATAFLOW_PROFILES", json.dumps(sdk_model_profiles))
+        with pytest.raises(ValueError, match="changed"):
+            materialize_runtime_environment(validated)
 
 
 def test_saved_prediction_scoring_runs_examples_before_freezing(

@@ -1,13 +1,14 @@
+import json
 import logging
 import os
 import subprocess
 from traceback import format_exception
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
 
-from pyromind_agent_server import echomind_train_backend
+from pyromind_agent_server import echomind_dataset_backend, echomind_train_backend
 from pyromind_agent_server.echomind_consolidation import ConsolidationContext
 from pyromind_agent_server.echomind_consolidation_replay import _candidate
 from pyromind_agent_server.echomind_dataset_backend import (
@@ -18,9 +19,11 @@ from pyromind_agent_server.echomind_dataset_runtime import (
     DatasetWorkflowSpec,
 )
 from pyromind_agent_server.echomind_runtime_contracts import (
+    RuntimeCredentialUnavailableError,
     RuntimeSubmissionNotAttemptedError,
 )
 from pyromind_agent_server.echomind_train_runtime import TrainRuntimeError
+from pyromind_common.platform.credentials import materialize_runtime_environment
 from pyromind_common.tools.data_preparation.platform_submit import (
     _build_dataflow_command,
 )
@@ -37,9 +40,16 @@ from pyromind_runtime.application.consolidation_evidence import (
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
-from pyromind_runtime.domain.task_correlation import TaskCorrelation
-from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
+from pyromind_runtime.domain.task_correlation import (
+    ProjectTaskReference,
+    TaskCorrelation,
+)
+from pyromind_runtime.domain.workflow_execution import (
+    DatasetRecipeReceipt,
+    WorkflowExecutionRequest,
+)
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 
@@ -122,6 +132,172 @@ def label_backend(tmp_path, monkeypatch):
     client.studio.create.return_value.task_id = 102
     monkeypatch.setattr(echomind_train_backend, "_client", lambda **_: client)
     return PlatformDatasetWorkflowBackend(conversations_dir=tmp_path), spec, client
+
+
+@pytest.mark.parametrize(
+    "case", ["param", "declaration", "expired", "project", "foreign_parent", "endpoint"]
+)
+def test_sdk_dataset_key_comes_from_owners_signed_task(
+    label_backend, monkeypatch, case
+):
+    backend, initial, client = label_backend
+    store = FileProductStore(backend.conversations_dir / initial.conversation_id)
+    project = "project"
+    spec = initial.model_copy(
+        update={
+            "dataflow_credential_task_id": "102",
+            "template_values": {"project_id": project},
+        }
+    )
+    context = RequestContext(
+        user_id="owner", cookie="session=owner", x_cluster=spec.cluster
+    )
+    command = "unset DF_API_KEY DF_API_URL DF_API_BASE_URL DF_MODEL_NAME\n" + _command()
+    parent_ref = store.issue_task_correlation(
+        TaskCorrelation(
+            conversation_id=spec.conversation_id,
+            task_kind="data_preparation",
+            cluster=spec.cluster,
+            execution=ProjectTaskReference(
+                project_id=project,
+                task_id="data",
+                plan_sequence=4,
+                attempt=1,
+            ),
+        )
+    )
+    declaration = (
+        "{{pyromind.runtime:vision:DF_API_URL,DF_MODEL_NAME,DF_API_KEY}}\n"
+        "python pipeline.py"
+    )
+    archived = _workflow(
+        declaration if case == "declaration" else command, "DF_API_KEY"
+    )
+    if case == "declaration":
+        remote = materialize_runtime_environment(
+            archived,
+            {
+                "PYROMIND_DATAFLOW_PROFILES": json.dumps(
+                    {
+                        "vision": {
+                            "DF_API_KEY": _KEY,
+                            "DF_MODEL_NAME": _MODEL,
+                            "DF_API_URL": _ENDPOINT,
+                        },
+                    }
+                )
+            },
+        )
+    else:
+        remote = _workflow(command, _KEY)
+    read = AsyncMock(return_value=remote)
+    monkeypatch.setattr(echomind_dataset_backend, "read_accepted_workflow", read)
+    for task_id in ("101", "102"):
+        correlation = (
+            parent_ref
+            if task_id == "101"
+            else store.issue_task_correlation(
+                TaskCorrelation(
+                    conversation_id=spec.conversation_id,
+                    task_kind="data_preparation",
+                    cluster=spec.cluster,
+                )
+            )
+        )
+        recipe = (
+            DatasetRecipeReceipt(
+                source_path="/workspace/source",
+                output_directory="/workspace/output",
+                command_template="prepare {source_batch} {output_uri}",
+                assets=(),
+                uses_labeling_gateway=True,
+                replay_of_task_id="999" if case == "foreign_parent" else "101",
+            )
+            if task_id == "102"
+            else None
+        )
+        store.save_workflow_execution_request(
+            WorkflowExecutionRequest(
+                request_id="sdk:" + task_id,
+                conversation_id=spec.conversation_id,
+                task_id=task_id,
+                status="submitted",
+                workflow_path="workflow.py",
+                workflow=archived,
+                fingerprint="hash",
+                summary={},
+                correlation=correlation,
+                dataset_recipe=recipe,
+            ),
+            expected_revision=None,
+        )
+        store.append(
+            ProductEvent.model_validate(
+                {
+                    "type": "external_task.submitted",
+                    "conversation_id": spec.conversation_id,
+                    "payload": {
+                        "task_id": task_id,
+                        "status": "succeeded",
+                        "kind": "data_preparation",
+                        "x_cluster": spec.cluster,
+                        "submitted_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "correlation": correlation.model_dump(mode="json"),
+                    },
+                }
+            )
+        )
+    store.append(
+        ProductEvent.model_validate(
+            {
+                "type": "experiment_execution.changed",
+                "conversation_id": spec.conversation_id,
+                "payload": {
+                    "execution": {
+                        "run_id": "project:data:1",
+                        "project_id": project,
+                        "plan_sequence": 4,
+                        "plan_attempt": 1,
+                        "task_id": "data",
+                        "task_name": "data",
+                        "stage_snapshot": {"kind": "dataset"},
+                        "role_id": "main",
+                        "state": "succeeded",
+                        "report_state": "ready",
+                        "platform_task_id": "101",
+                    }
+                },
+            }
+        )
+    )
+    if case == "expired":
+        with pytest.raises(RuntimeCredentialUnavailableError):
+            backend.submit_workflow(spec=spec, request_context=None)
+        read.assert_not_awaited()
+    elif case in {"project", "foreign_parent", "endpoint"}:
+        if case == "project":
+            spec = spec.model_copy(update={"template_values": {"project_id": "other"}})
+        if case == "endpoint":
+            spec = spec.model_copy(
+                update={
+                    "workflow": _workflow(
+                        _command(endpoint="https://other.test"), "DF_API_KEY"
+                    )
+                }
+            )
+        with pytest.raises(RuntimeSubmissionNotAttemptedError) as err:
+            backend.submit_workflow(spec=spec, request_context=context)
+        client.studio.create.assert_not_called()
+        assert _KEY not in str(err.value)
+        if case != "endpoint":
+            read.assert_not_awaited()
+    else:
+        assert backend.submit_workflow(spec=spec, request_context=context) == "102"
+        graph = client.studio.create.call_args.args[0].workflow
+        assert graph["nodes"][0]["data"]["config"]["param"] == _KEY
+        assert _KEY not in spec.model_dump_json()
+        read.assert_awaited_once_with("102", context)
 
 
 def test_only_platform_submission_receives_archived_dataflow_key(label_backend, caplog):

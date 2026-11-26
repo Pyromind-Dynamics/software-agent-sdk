@@ -198,6 +198,35 @@ def proposal(context: ConsolidationContext) -> ConsolidationProposal:
     )
 
 
+def test_train_only_plan_compiles_without_training_validation(
+    project: ProjectInfo,
+    context: ConsolidationContext,
+    proposal: ConsolidationProposal,
+) -> None:
+    context = context.model_copy(update={"train_uses_validation": False})
+    train_runtime = dict(proposal.train_runtime)
+    train_runtime["command_template"] = (
+        "train {base_model} {train_dataset} {output_uri}"
+    )
+    draft = compile_consolidation(
+        project,
+        context,
+        proposal.model_copy(
+            update={
+                "train_runtime": train_runtime,
+                "batch_validation_source": "none",
+            }
+        ),
+    )
+    dataset, train, evaluation = draft.nodes
+    assert dataset.config["batch_validation_source"] == "none"
+    assert set(train.inputs) == {"base_model", "train_dataset"}
+    assert (
+        evaluation.inputs["validation_dataset"].binding.value
+        == context.validation_dataset
+    )
+
+
 def test_reviews_and_applies_original_project(
     tmp_path: Path,
     project: ProjectInfo,

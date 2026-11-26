@@ -60,6 +60,35 @@ def test_archived_annotations_never_become_a_training_recipe() -> None:
     assert "example-secret" not in repr(result)
 
 
+def test_sdk_preparation_command_exposes_source_references_for_repair() -> None:
+    result = extract_dataset_recipe(
+        archive_workflow={
+            "nodes": [
+                {
+                    "data": {
+                        "type": "DataPreparationNode",
+                        "config": {
+                            "command": (
+                                "run /target-workspace/exp/pipeline.py "
+                                "/target-workspace/incoming/source.jsonl"
+                            )
+                        },
+                    }
+                }
+            ],
+            "edges": [],
+        },
+        source_batch="/workspace/images",
+    )
+    assert [asset.role for asset in result.assets] == [
+        "pipeline_source",
+        "input_manifest",
+    ]
+    assert (
+        result.runtime is None and result.blockers[0].code == "dataset_recipe_required"
+    )
+
+
 def _reviewed_runtime() -> dict:
     return {
         "workflow": _workflow(""),

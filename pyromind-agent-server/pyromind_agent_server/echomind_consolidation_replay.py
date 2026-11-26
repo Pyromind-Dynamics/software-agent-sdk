@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from pyromind_agent_server.echomind_sandbox_storage import (
     _require_sandbox,
 )
 from pyromind_agent_server.echomind_storage import canonical_sha256
+from pyromind_common.platform.scene_core import DATAFLOW_RUNTIME_FILENAMES
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.storage_paths import (
     normalize_workspace_path,
@@ -239,10 +241,6 @@ def _summary(
     check: Callable[[DatasetRecipeReceipt], bytes],
 ) -> _LiveVerification:
     output = normalize_workspace_path(recipe.output_directory)
-    conversation = context.evidence.conversation_id
-    prefix = f"/workspace/.pyromind-agent/{conversation}/data_preparation/"
-    if not output.startswith(prefix) or output == prefix.rstrip("/"):
-        raise ValueError("Dataset replay output is outside the selected conversation")
     verifier = [asset for asset in recipe.assets if asset.role == "verifier"]
     if (
         len(verifier) != 1
@@ -253,36 +251,96 @@ def _summary(
     if len(raw) > 4096:
         raise ValueError("Unexpected validation artifact")
     result = _Verification.model_validate_json(raw)
-    if not result.val_rows:
-        raise ValueError("Train binds a validation dataset; validation split is empty")
+    if context.train_uses_validation != bool(result.val_rows) or (
+        not context.train_uses_validation and recipe.fixed_validation_path
+    ):
+        raise ValueError(
+            "Replay validation rows do not match the approved Train inputs"
+        )
     live = _LiveVerification.model_validate_json(check(recipe))
     if live.model_dump(exclude={"approved_source_member"}) != result.model_dump():
         raise ValueError("Original source or exported data changed since verification")
     return live
 
 
-def _check_assets(
+def _replay_key(
     recipe: DatasetRecipeReceipt,
     context: ConsolidationContext,
     read: Callable[[str], bytes],
-) -> None:
-    root = PurePosixPath(
-        "/workspace/.pyromind-agent",
-        context.evidence.conversation_id,
-        "data_preparation",
-        "recipe-assets",
-    )
+    runtime: JsonObject,
+) -> str:
+    root = PurePosixPath("/workspace/.pyromind-agent", context.evidence.conversation_id)
+    legacy = root / "data_preparation"
+    output = PurePosixPath(normalize_workspace_path(recipe.output_directory))
+    if not any(
+        base in output.parents
+        for base in (legacy, root / "public_data" / "data-preparation")
+    ):
+        raise ValueError("Dataset replay output is outside this conversation's staging")
     roles = {asset.role for asset in recipe.assets}
     if not {"pipeline", "export", "verifier"} <= roles or len(roles) != len(
         recipe.assets
     ):
         raise ValueError("Incomplete Dataset runtime assets")
+    command = recipe.command_template
+    normalized: dict[str, str] = {}
+
+    def register(path: PurePosixPath, identity: str) -> None:
+        normalized[str(path)] = identity
+        normalized["/target-workspace" + to_storage_api_path(str(path))] = identity
+
     for asset in recipe.assets:
         path = PurePosixPath(normalize_workspace_path(asset.path))
-        if path.parent != root / asset.sha256:
+        if path.parent not in (
+            legacy / "recipe-assets" / asset.sha256,
+            output / "recipe-assets" / asset.sha256,
+        ):
             raise ValueError("Recipe assets must be pinned in the source conversation")
         if hashlib.sha256(read(path.as_posix())).hexdigest() != asset.sha256:
             raise ValueError("Frozen Dataset asset has changed")
+        register(path, f"asset:{asset.role}:{asset.sha256}")
+    # SDK staging keeps a copy of the DataFlow support bundle per run.
+    for dirname in set(
+        re.findall(
+            re.escape(to_storage_api_path(str(output)))
+            + r"/(runtime(?:-r[0-9]+)?)(?=[/'\"\s;]|$)",
+            command,
+        )
+    ):
+        directory = output / dirname
+        digest = hashlib.sha256()
+        for name in sorted(DATAFLOW_RUNTIME_FILENAMES):
+            digest.update(name.encode() + b"\0" + read(str(directory / name)) + b"\0")
+        fingerprint = digest.hexdigest()
+        if f"DF_RUNTIME_FINGERPRINT={fingerprint}" not in command:
+            raise ValueError("Frozen DataFlow runtime fingerprint has changed")
+        register(directory, f"runtime:{fingerprint}")
+        for name in DATAFLOW_RUNTIME_FILENAMES:
+            register(directory / name, f"runtime:{fingerprint}/{name}")
+    # A directory prefix alone must never normalize an unverified file inside it.
+    pattern = "|".join(
+        re.escape(path) for path in sorted(normalized, key=len, reverse=True)
+    )
+    command = re.sub(
+        rf"(?<![\w/.-])(?:{pattern})(?![\w/.-])",
+        lambda match: "\0" + normalized[match[0]] + "\0",
+        command,
+    )
+    return canonical_sha256(
+        {
+            "runtime": {
+                **{
+                    k: v
+                    for k, v in runtime.items()
+                    if k != "dataflow_credential_task_id"
+                },
+                "command_template": command,
+            },
+            "assets": sorted((a.role, a.sha256) for a in recipe.assets),
+            "fixed_validation": recipe.fixed_validation_path,
+            "batch_label_source": recipe.batch_label_source,
+        }
+    )
 
 
 def verify_dataset_replays(
@@ -307,18 +365,7 @@ def verify_dataset_replays(
         assert recipe is not None and receipt.task_id
         try:
             runtime = _candidate(receipt, context)
-            key = canonical_sha256(
-                {
-                    "runtime": {
-                        k: v
-                        for k, v in runtime.items()
-                        if k != "dataflow_credential_task_id"
-                    },
-                    "assets": sorted((a.role, a.path, a.sha256) for a in recipe.assets),
-                    "fixed_validation": recipe.fixed_validation_path,
-                    "batch_label_source": recipe.batch_label_source,
-                }
-            )
+            key = _replay_key(recipe, context, read, runtime)
             if latest and (
                 key != latest_key
                 or normalize_workspace_path(latest.recipe.source_path)
@@ -326,8 +373,6 @@ def verify_dataset_replays(
                 or latest.recipe.output_directory == recipe.output_directory
             ):
                 continue
-            if latest is None:
-                _check_assets(recipe, context, read)
             proof = _summary(recipe, context, read, check)
         except EvaluationStorageUnavailableError:
             return _blocked(
@@ -371,9 +416,13 @@ def verify_dataset_replays(
             runtime=latest_runtime,
             proof=ConsolidationDatasetReplay(
                 batch_label_source=recipe.batch_label_source,
-                batch_validation_source="fixed"
-                if recipe.fixed_validation_path
-                else "batch",
+                batch_validation_source=(
+                    "none"
+                    if not context.train_uses_validation
+                    else "fixed"
+                    if recipe.fixed_validation_path
+                    else "batch"
+                ),
                 fixed_validation_path=recipe.fixed_validation_path,
                 dataset_runtime_sha256=canonical_sha256(latest_runtime),
                 task_ids=(receipt.task_id, latest.task_id),

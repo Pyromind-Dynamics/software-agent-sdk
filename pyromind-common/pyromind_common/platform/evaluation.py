@@ -39,6 +39,15 @@ from pyromind_common.platform.scene_core import validate_pipeline_topology
 from pyromind_common.platform.workflows import prepare_workflow
 
 
+def staged_evaluation_digest(assets: dict[str, Path]) -> str:
+    return hashlib.sha256(
+        "".join(
+            name + hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in sorted(assets.items())
+        ).encode()
+    ).hexdigest()
+
+
 def _scoring_preflight(definition: dict[str, Any], runtime_dir: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="evaluation-preflight-") as directory:
         archive = Path(directory) / "preflight.zip"
@@ -137,12 +146,7 @@ def stage_evaluation(
     if frozen_reward is not None:
         assets["frozen_reward.py"] = runtime_dir / "frozen_reward.py"
     _validate_report_ui_bundle(runtime_dir)
-    runtime_hash = hashlib.sha256(
-        "".join(
-            name + hashlib.sha256(path.read_bytes()).hexdigest()
-            for name, path in sorted(assets.items())
-        ).encode()
-    ).hexdigest()
+    runtime_hash = staged_evaluation_digest(assets)
     if prior is not None:
         definition = prior
         if definition["runtime_sha256"] != runtime_hash:

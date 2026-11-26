@@ -72,7 +72,7 @@ async def test_scoped_sdk_submission_archives_platform_graph_without_agent_bindi
             raise PermissionError("expired")
         return platform_graph
 
-    archive = SdkWorkflowArchive(read, runtime.versions)
+    archive = SdkWorkflowArchive(read, runtime.versions, runtime.register_external_task)
     runtime._sdk_workflow_archive = archive
     scope = project.conversation_id
     context = replace(context, cookie="session=first")
@@ -132,7 +132,9 @@ async def test_scoped_sdk_submission_archives_platform_graph_without_agent_bindi
     assert version_run.source.task_id == "21"
     assert "version://" + version_run.spec.inputs["config"] == receipt.workflow_path
     assert final.workflow_path == "version://" + version_run.id
-    restored_archive = SdkWorkflowArchive(read, runtime.versions)
+    restored_archive = SdkWorkflowArchive(
+        read, runtime.versions, runtime.register_external_task
+    )
     restored_archive.schedule(store, context, store.load_snapshot().external_tasks)
     await asyncio.gather(*restored_archive._workers.values())
     assert len(calls) == (2 if mode == "renew" else 1)

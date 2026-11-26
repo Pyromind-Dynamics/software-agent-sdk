@@ -62,6 +62,7 @@ class ConsolidationContext(BaseModel):
     )
     base_model: str
     validation_dataset: str
+    train_uses_validation: bool = Field(default=True, exclude_if=lambda value: value)
     training_validation: str | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
@@ -83,7 +84,7 @@ class ConsolidationProposal(BaseModel):
         default=None,
         exclude_if=lambda v: v is None,
     )
-    batch_validation_source: Literal["fixed", "batch"] | None = Field(
+    batch_validation_source: Literal["fixed", "batch", "none"] | None = Field(
         default=None,
         exclude_if=lambda v: v is None,
     )
@@ -111,7 +112,7 @@ class ConsolidationDatasetReplay(BaseModel):
         default=None,
         exclude_if=lambda v: v is None,
     )
-    batch_validation_source: Literal["fixed", "batch"] | None = Field(
+    batch_validation_source: Literal["fixed", "batch", "none"] | None = Field(
         default=None,
         exclude_if=lambda v: v is None,
     )
@@ -252,8 +253,9 @@ def consolidation_context(
     ):
         raise ValueError("The approved plan does not belong to this Project.")
     by_type = _stages(project)
+    store = FileProductStore(conversations_root / project.project.conversation_id)
     evidence = select_consolidation_evidence(
-        FileProductStore(conversations_root / project.project.conversation_id),
+        store,
         task_ids=task_ids,
         approved_project=approved_project,
     )
@@ -292,6 +294,8 @@ def consolidation_context(
         if not fixed_train.endswith(".jsonl"):
             raise ValueError("The fixed train-time validation input must be JSONL.")
         data["training_validation"] = fixed_train
+    elif approved_project and _confirmed_train_only(store, evidence, approved_project):
+        data["train_uses_validation"] = False
     if not str(data["validation_dataset"]).endswith(".jsonl"):
         raise ValueError("The approved fixed evaluation input must be JSONL.")
     return ConsolidationContext.model_validate(
@@ -300,6 +304,49 @@ def consolidation_context(
             "evidence_sha256": canonical_sha256(data),
             "approved_project": approved_project,
         }
+    )
+
+
+def _confirmed_train_only(
+    store: FileProductStore, evidence: ConsolidationEvidence, project: ProjectView
+) -> bool:
+    receipt = store.load_workflow_execution_requests().get(
+        "sdk:" + evidence.train.task_id
+    )
+    if not receipt or not receipt.correlation or not receipt.correlation.execution:
+        return False
+    task_id = receipt.correlation.execution.task_id
+    task = next((t for t in project.plan.tasks if t.id == task_id), None)
+    if not task:
+        return False
+    dataset_inputs = {"train_dataset", "train_data", "train_messages"}
+    names = {item.name for item in task.inputs}
+    if not (names & dataset_inputs) or names - dataset_inputs - {"base_model", "model"}:
+        return False
+    nodes, edges = receipt.workflow.get("nodes"), receipt.workflow.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return False
+    builders = [
+        (node.get("id"), data.get("config"))
+        for node in nodes
+        if isinstance(node, dict)
+        and isinstance(data := node.get("data"), dict)
+        and data.get("nodeType") == "DatasetConfigBuilderNode"
+    ]
+    if len(builders) != 1:
+        return False
+    node_id, config = builders[0]
+    if not isinstance(node_id, str) or not isinstance(config, dict):
+        return False
+    connected = [
+        edge.get("targetHandle")
+        for edge in edges
+        if isinstance(edge, dict) and edge.get("target") == node_id
+    ]
+    return (
+        bool(config.get("train_data_path") or "train_data_path" in connected)
+        and not config.get("val_data_path")
+        and "val_data_path" not in connected
     )
 
 
@@ -364,20 +411,22 @@ def _stage_inputs_outputs(
             ),
         }, {"train_messages": _TRAIN_ROWS, "val_messages": _VAL_ROWS}
     if kind == "train":
-        return {
+        inputs = {
             "train_dataset": _input(
                 _TRAIN_ROWS,
                 kind="node_output",
                 node_id=dataset.id,
                 port="train_messages",
             ),
-            "validation_dataset": _input(
-                _VAL_ROWS, kind="node_output", node_id=dataset.id, port="val_messages"
-            ),
             "base_model": _input(
                 _TRAINED_MODEL, kind="literal", value=context.base_model
             ),
-        }, {"trained_model": _TRAINED_MODEL}
+        }
+        if context.train_uses_validation:
+            inputs["validation_dataset"] = _input(
+                _VAL_ROWS, kind="node_output", node_id=dataset.id, port="val_messages"
+            )
+        return inputs, {"trained_model": _TRAINED_MODEL}
     return {
         "candidate_model": _input(
             _TRAINED_MODEL, kind="node_output", node_id=train.id, port="trained_model"
@@ -395,6 +444,12 @@ def compile_consolidation(
         raise ValueError(
             "The proposal is for different Project content or task evidence."
         )
+    if not context.train_uses_validation and proposal.batch_validation_source != "none":
+        raise ValueError(
+            "The approved training plan requires all batch samples for training."
+        )
+    if context.train_uses_validation and proposal.batch_validation_source == "none":
+        raise ValueError("The approved training plan requires a validation input.")
     stage_nodes = _stages(project)
     configs = {
         "dataset": (proposal.dataset_runtime, context.evidence.dataset),

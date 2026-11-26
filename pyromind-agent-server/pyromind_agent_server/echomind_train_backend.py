@@ -238,10 +238,10 @@ class PlatformTrainWorkflowBackend:
         task_id = spec.wandb_credential_task_id
         if task_id is None:
             return ()
-        archived = self._archived_credential_workflow(
+        archived = self._archived_credential_receipt(
             spec, request_context, task_id=task_id
         )
-        source_nodes = _wandb_builder_configs(archived)
+        source_nodes = _wandb_builder_configs(archived.workflow)
         targets = [
             (node_id, config)
             for node_id, config in _wandb_builder_configs(workflow).items()
@@ -279,14 +279,14 @@ class PlatformTrainWorkflowBackend:
             bound.append(key)
         return tuple(bound)
 
-    def _archived_credential_workflow(
+    def _archived_credential_receipt(
         self,
         spec: TrainWorkflowSpec,
         request_context: RequestContext | None,
         *,
         task_id: str,
         task_kind: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> WorkflowExecutionRequest:
         owner = spec.owner_user_id
         if self.conversations_dir is None or not owner:
             raise TrainRuntimeError("The credential source is unavailable.")
@@ -331,7 +331,9 @@ class PlatformTrainWorkflowBackend:
             )
         ):
             _verify_train_credential_receipt(store, receipt, task_id, spec)
-        return receipt.workflow
+        if task_kind == "data_preparation" and receipt.request_id.startswith("sdk:"):
+            _verify_dataset_credential_receipt(store, receipt, spec)
+        return receipt
 
     def query_task(
         self,
@@ -492,6 +494,73 @@ def _is_lora_adapter(files: set[str]) -> bool:
     return "adapter_config.json" in files and bool(
         files & {"adapter_model.safetensors", "adapter_model.bin"}
     )
+
+
+def _verify_dataset_credential_receipt(
+    store: FileProductStore, receipt: WorkflowExecutionRequest, spec: TrainWorkflowSpec
+) -> None:
+    snapshot = store.load_snapshot()
+
+    def signed_success(item: WorkflowExecutionRequest) -> bool:
+        c = item.correlation
+        return bool(
+            c
+            and c.type == "main"
+            and c.task_kind == "data_preparation"
+            and c.cluster == spec.cluster
+            and c.conversation_id == spec.conversation_id
+            and item.request_id == "sdk:" + str(item.task_id)
+            and item.status == "submitted"
+            and store.verify_task_correlation(c)
+            and any(
+                t.task_id == item.task_id
+                and t.kind == c.task_kind
+                and t.correlation == c
+                and t.status == "succeeded"
+                and not t.graph_run_id
+                and t.x_cluster == spec.cluster
+                for t in snapshot.external_tasks
+            )
+        )
+
+    if not signed_success(receipt):
+        raise TrainRuntimeError(
+            "The Dataset credential source has no signed success receipt."
+        )
+    source = receipt
+    if receipt.dataset_recipe and receipt.dataset_recipe.replay_of_task_id:
+        parent = receipt.dataset_recipe.replay_of_task_id
+        original = store.load_workflow_execution_requests().get("sdk:" + parent)
+        if (
+            not original
+            or not signed_success(original)
+            or (original.dataset_recipe and original.dataset_recipe.replay_of_task_id)
+            or original.correlation is None
+            or receipt.correlation is None
+            or receipt.correlation.execution
+            not in (None, original.correlation.execution)
+        ):
+            raise TrainRuntimeError("The Dataset source has no signed replay lineage.")
+        source = original
+    ref = source.correlation.execution if source.correlation else None
+    project = spec.template_values.get("project_id", "").replace("-", "")
+    if (
+        not ref
+        or project != ref.project_id.replace("-", "")
+        or not any(
+            run.role_id == "main"
+            and run.project_id == ref.project_id
+            and run.task_id == ref.task_id
+            and run.plan_sequence == ref.plan_sequence
+            and run.plan_attempt == ref.attempt
+            and (run.stage_snapshot or {}).get("kind") == "dataset"
+            and source.task_id in (run.platform_task_id, *run.platform_task_ids)
+            for run in snapshot.experiment_executions or ()
+        )
+    ):
+        raise TrainRuntimeError(
+            "The Dataset credential source is outside this Project execution."
+        )
 
 
 def _verify_train_credential_receipt(

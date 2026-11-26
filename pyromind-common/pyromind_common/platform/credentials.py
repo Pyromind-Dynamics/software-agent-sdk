@@ -11,6 +11,13 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any, Literal
 
+from pyromind_common.platform.recipe import (
+    RecipeReceipt,
+    dataset_gateway_exports,
+    dataset_public_profile,
+    read_prepared_dataset_recipe,
+)
+
 
 _ENVIRONMENT_NAMES = frozenset(
     {
@@ -28,6 +35,21 @@ _ENVIRONMENT_NAMES = frozenset(
 _BINDING = re.compile(
     r"\{\{pyromind\.runtime:(environment|text|vision):([A-Z_,]+)(?::([a-f0-9]{64}))?\}\}"
 )
+
+_DATASET_KEY = re.compile(r"\{\{pyromind\.dataset-key:(text|vision):([a-f0-9]{64})\}\}")
+
+
+def dataset_key_parameter(
+    profile: Literal["text", "vision"], values: Mapping[str, str]
+) -> str:
+    public = dataset_public_profile(values)
+    return (
+        "{{pyromind.dataset-key:"
+        + profile
+        + ":"
+        + _public_model_fingerprint(public)
+        + "}}"
+    )
 
 
 def _public_model_fingerprint(values: Mapping[str, str]) -> str:
@@ -78,6 +100,34 @@ def runtime_environment_prefix(
     )
 
 
+def _bind_dataset_key(
+    param: str, recipe: RecipeReceipt, environment: Mapping[str, str]
+) -> str:
+    match = _DATASET_KEY.fullmatch(param)
+    if not match or not recipe.uses_labeling_gateway:
+        raise ValueError("Invalid Dataset gateway credential binding")
+    profile: Literal["text", "vision"] = "text" if match[1] == "text" else "vision"
+    values = dataflow_environment(profile, environment)
+    if dataset_key_parameter(profile, values) != param:
+        raise ValueError("Model configuration changed after workflow preparation")
+    prefix = "\n".join(
+        [
+            *dataset_gateway_exports(dataset_public_profile(values)),
+            'export DF_API_KEY="$param"',
+            "unset param",
+            "set -eu",
+            "",
+        ]
+    )
+    if not recipe.command_template.startswith(
+        prefix.replace("{", "{{").replace("}", "}}")
+    ):
+        raise ValueError("Dataset recipe does not match the selected model profile")
+    if not values.get("DF_API_KEY"):
+        raise ValueError("Required Dataset gateway credential is unavailable")
+    return values["DF_API_KEY"]
+
+
 def materialize_runtime_environment(
     workflow: dict[str, Any], environ: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
@@ -123,6 +173,24 @@ def materialize_runtime_environment(
         command = config.get("command")
         if not isinstance(command, str):
             continue
+        param = config.get("param")
+        recipe = read_prepared_dataset_recipe(command)
+        if recipe is not None:
+            if (
+                len(prepared["nodes"]) != 1
+                or prepared.get("edges")
+                or node["data"].get("nodeType") != "CustomCommandCPUNode"
+            ):
+                raise ValueError("Dataset recipe requires a single CPU node")
+            if recipe.uses_labeling_gateway:
+                if not isinstance(param, str):
+                    raise ValueError("Missing Dataset gateway credential binding")
+                config["param"] = _bind_dataset_key(param, recipe, environment)
+            elif param not in ("", None):
+                raise ValueError("Unexpected Dataset gateway parameter")
+            continue
+        if isinstance(param, str) and param.startswith("{{pyromind.dataset-key:"):
+            raise ValueError("Dataset credential binding requires a prepared recipe")
         config["command"] = _BINDING.sub(bind, command)
         if "{{pyromind.runtime:" in config["command"]:
             raise ValueError("Invalid worker environment declaration")

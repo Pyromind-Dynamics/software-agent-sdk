@@ -15,6 +15,17 @@ from pyromind_agent_server.echomind_consolidation_replay import (
     compatible_train_reader,
     verify_dataset_replays,
 )
+from pyromind_common.platform.recipe import (
+    RECIPE_INPUT,
+    RECIPE_OUTPUT,
+    RecipeAsset,
+    compose_recipe,
+)
+from pyromind_common.platform.scene_core import (
+    DATAFLOW_RUNTIME_FILENAMES,
+    _build_dataflow_command,
+    runtime_bundle_fingerprint,
+)
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
 
@@ -136,7 +147,20 @@ def test_read_only_replay_decodes_bounded_media_without_remote_pillow(tmp_path: 
     assert limited.returncode != 0 and "file limit" in limited.stderr
 
 
-@pytest.mark.parametrize("change", ["original", "identical", "unrelated", "tampered"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "original",
+        "identical",
+        "unrelated",
+        "tampered",
+        "sdk_train_only",
+        "empty_required",
+        "sdk_asset_changed",
+        "sdk_bundle_changed",
+        "sdk_external_command_changed",
+    ],
+)
 def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
     conversation = "a" * 32
     project = "b" * 32
@@ -164,6 +188,9 @@ def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
             "validation_dataset": "/workspace/eval.jsonl",
         }
     )
+    sdk = change.startswith("sdk_")
+    if sdk:
+        context = context.model_copy(update={"train_uses_validation": False})
     receipts = []
     snapshots = {}
     live = {}
@@ -182,14 +209,61 @@ def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
         snapshots[asset_path] = raw
     for i, text in enumerate(("first", "first" if change == "identical" else "second")):
         source = tmp_path / f"batch{i}.jsonl"
-        _jsonl(source, [{"text": text}, {"text": "fixed val"}])
+        validation = (
+            [] if sdk or change == "empty_required" else [{"text": "fixed val"}]
+        )
+        _jsonl(source, [{"text": text}, *validation])
         output = tmp_path / f"run{i}"
         output.mkdir()
         _jsonl(output / "train_messages.jsonl", [_message(text)])
-        _jsonl(output / "val_messages.jsonl", [_message("fixed val")])
+        _jsonl(
+            output / "val_messages.jsonl", [_message(row["text"]) for row in validation]
+        )
         run = _run(source, output)
         assert run.returncode == 0, run.stderr
         uri = f"/workspace/.pyromind-agent/{conversation}/data_preparation/run{i}"
+        run_assets = assets
+        template = "prepare {source_batch} {output_uri}"
+        if sdk:
+            run_assets = []
+            for role, original, sha in assets:
+                path = f"{uri}/recipe-assets/{sha}/{role}.py"
+                snapshots[path] = snapshots[original]
+                if change == "sdk_asset_changed" and i == 0 and role == "export":
+                    snapshots[path] += b"changed"
+                run_assets.append((role, path, sha))
+            fingerprint = runtime_bundle_fingerprint(
+                _VERIFIER.parent, DATAFLOW_RUNTIME_FILENAMES
+            )
+            for name in DATAFLOW_RUNTIME_FILENAMES:
+                snapshots[f"{uri}/runtime/{name}"] = (
+                    _VERIFIER.parent / name
+                ).read_bytes()
+            if change == "sdk_bundle_changed" and i == 0:
+                snapshots[f"{uri}/runtime/image_utils.py"] += b"changed"
+            prepared, _ = compose_recipe(
+                input_path="/workspace/" + source.name,
+                output_dir=uri,
+                assets=tuple(
+                    RecipeAsset(role=role, path=path, sha256=sha)
+                    for role, path, sha in run_assets
+                ),
+                dataflow_command=_build_dataflow_command(
+                    input_path=RECIPE_INPUT,
+                    output_dir=RECIPE_OUTPUT,
+                    llm_env={},
+                    convert_format="messages",
+                    runtime_dir_name="runtime",
+                    runtime_storage_dir=uri.removeprefix("/workspace") + "/runtime",
+                    runtime_fingerprint=fingerprint,
+                ),
+                llm_env={},
+                fixed_validation_path=None,
+                replay_of_task_id="100",
+            )
+            template = prepared.command_template
+            if change == "sdk_external_command_changed":
+                template += f" --model /workspace/models/model{i}"
         snapshots[uri + "/verification.json"] = (
             output / "verification.json"
         ).read_bytes()
@@ -225,11 +299,11 @@ def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
                     "dataset_recipe": {
                         "source_path": "/workspace/" + source.name,
                         "output_directory": uri,
-                        "command_template": "prepare {source_batch} {output_uri}",
+                        "command_template": template,
                         "uses_labeling_gateway": False,
                         "assets": [
                             {"role": role, "path": asset_path, "sha256": sha}
-                            for role, asset_path, sha in assets
+                            for role, asset_path, sha in run_assets
                         ],
                     },
                 }
@@ -238,11 +312,16 @@ def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
     replay = verify_dataset_replays(
         context, receipts, snapshots.__getitem__, lambda r: live[r.output_directory]
     )
-    if change == "original":
+    if change in ("original", "sdk_train_only"):
         assert (
             replay.runtime and replay.proof and replay.proof.task_ids == ("100", "101")
         )
         assert "source_batch" in str(replay.runtime)
+        if sdk:
+            assert replay.proof.batch_validation_source == "none"
+            assert replay.proof.val_rows == (0, 0)
+            template = replay.runtime["command_template"]
+            assert isinstance(template, str) and "run1/recipe-assets" in template
     else:
         assert replay.proof is None and replay.blocker
 

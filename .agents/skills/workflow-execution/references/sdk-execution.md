@@ -101,17 +101,13 @@ Access Key 可以替代旧校验路由的 Cookie。
 ### Pipeline 准备示例
 
 `prepare_pipeline` 直接返回含 `name`、`nodes`、`edges` 的工作流字典。
-小样通过并获准全量后，先生成覆盖完整目标数据的 Manifest，核对记录总数与图片根目录。
-`mode="full"` 使用传入的全部记录，输入路径应指向刚核对的全量 Manifest。
-图片相对路径按 Manifest 所在目录解析，所引用的图片和冻结资产都要对平台任务可见。
+普通预标注可以直接传已核对的 Manifest。EchoMind 计划要求产出 SFT 训练数据时，传计划确认的原始目录或文件，使用 `--sft-export` 指定已通过小样的导出脚本。原始数据需要转成 Manifest 时用 `--prepare-script` 指定转换脚本。只有 Train 确实绑定固定验证集时才传 `--fixed-validation`。按计划确认的标签来源传 `--batch-label-source`。
 
-将下面脚本保存为 `public_data/data-preparation/prepare_pipeline.py`。
-三个参数依次为全量 Manifest、Storage 运行目录的父目录、已验证的小样 Pipeline 脚本。
-模型 profile 沿用小样的视觉网关配置，用户改过网关时按下一节在准备前重建。
+将下面脚本保存为 `public_data/data-preparation/prepare_pipeline.py`。三个位置参数依次为源输入、Storage 运行父目录和已验证的 Pipeline 脚本。固化小样使用 `/workspace/.pyromind-agent/<当前会话ID>/data_preparation` 作为父目录，每个小样独立运行。
 
 ```python
+import argparse
 import json
-import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -123,14 +119,29 @@ from pyromind_common.platform.preparation import (
 )
 from pyromind_common.platform.scene_options import PipelineOptions
 
+parser = argparse.ArgumentParser()
+parser.add_argument("source")
+parser.add_argument("staging_parent", type=Path)
+parser.add_argument("pipeline")
+parser.add_argument("--sft-export")
+parser.add_argument("--prepare-script")
+parser.add_argument("--fixed-validation")
+parser.add_argument("--batch-label-source", choices=["dataset", "collection"])
+parser.add_argument("--replay-of-task-id")
+args = parser.parse_args()
+
 workspace = Path.cwd()
-manifest = Path(sys.argv[1])
 run_id = uuid4()
-staging = StagingDirectory.mounted(Path(sys.argv[2]) / str(run_id))
+staging = StagingDirectory.mounted(args.staging_parent / str(run_id))
 graph = prepare_pipeline(
     PipelineOptions(
-        script_path=sys.argv[3],
-        input_path=str(manifest),
+        script_path=args.pipeline,
+        input_path=args.source,
+        prepare_script_path=args.prepare_script,
+        sft_export_script_path=args.sft_export,
+        fixed_validation_path=args.fixed_validation,
+        batch_label_source=args.batch_label_source,
+        replay_of_task_id=args.replay_of_task_id,
         model_profile="vision",
         output_schema="structured",
         mode="full",
@@ -156,7 +167,7 @@ print(json.dumps({
 调用 `validate_workflow_dsl`。取得 `validated_workflow_path` 后，按下面的 SDK
 创建示例读取该文件，Pipeline 的 `out_id` 选择
 `json.loads(os.environ["PYROMIND_TASK_CONTEXTS"])["data_preparation"]`。
-Project 场景使用对应 task/attempt 的 `out_ids["data_preparation"]`。
+研发主任务使用对应 Project task/attempt 的 `out_ids["data_preparation"]`。换批小样用 `--replay-of-task-id` 引用原研发任务，使用 `PYROMIND_TASK_CONTEXTS` 的会话签名，保留原研发任务的归属。
 
 冻结错误包含实际本地文件路径。新的运行目录需要同时改变本地目录和 Storage 映射，
 `StagingDirectory.mounted` 会完成这两个值的配对。只有 Storage 字符串变化时，
@@ -282,9 +293,7 @@ with PyroMindAPIClient(max_retries=0) as client:
 元数据更新入口；绑定失败只重试绑定，保留真实任务 ID，不再次创建平台任务。
 对于计划内的 Train，Runtime 会根据签名回调的任务号，在项目所有者的登录态下从 Studio 读取实际执行图并归档。回调时缺少登录态，恢复原会话后可补登记同一任务。训练报告与工作流分别保存。
 SDK 查询、文件操作、停止任务不要求先创建 Project 或业务 execution。
-Dataset Recipe 的 task、实际工作流、代码、冻结配方及输出元数据在可信回调确认归属后，
-通过已有 `product_versions` 的 `bind_execution_metadata` 动作单独登记；不是提交前置
-条件，登记失败也不重新 create。SDK `get_task` 成功不能代替可信回调的归属确认。
+对 SDK 准备的 SFT Dataset，平台接受的命令包含可校验的配方；Runtime 在可信回调或项目所有者下次打开会话时一并归档工作流、配方和输出目录。回放沿用原研发任务的签名归属并独立登记。旧任务仅有冻结配方文件时，可以补登记同一任务，保留已有执行结果。
 
 先读取无密钥的实际校验图与冻结的 `dataset-recipe.json`。以下是对话中 Tool 调用的参数
 示意，`safe_validated_graph` 和 `frozen_recipe` 是已读取的 JSON 对象，不在 terminal

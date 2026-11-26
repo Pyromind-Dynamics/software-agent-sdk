@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import re
+import shlex
 from copy import deepcopy
 from http.cookies import SimpleCookie
 from pathlib import PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from pyromind_common.platform.recipe import (
+    RecipeAsset,
+    compose_recipe,
+    read_prepared_dataset_recipe,
+)
 from pyromind_runtime.application.model_evaluation_plan import (
     sdk_inference_paths,
     validate_evaluation_inputs,
@@ -23,6 +29,7 @@ from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
     to_storage_api_path,
 )
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import (
     RunSource,
     fingerprint,
@@ -121,6 +128,8 @@ def _validate_metadata(request: _ExecutionMetadata, context: RequestContext) -> 
         if isinstance(config, dict):
             command = config.get("command")
             if isinstance(command, str):
+                if request.dataset_recipe and read_prepared_dataset_recipe(command):
+                    command = command.partition("\n")[2]
                 commands.append(command)
     validate_persisted_payload(workflow.get("execution_argos", []))
     if request.dataset_recipe is not None:
@@ -143,8 +152,105 @@ def _validate_metadata(request: _ExecutionMetadata, context: RequestContext) -> 
         raise ValueError("Request credentials cannot be saved in execution metadata")
 
 
+def submitted_sdk_dataset_recipe(workflow: JsonObject) -> DatasetRecipeReceipt | None:
+    nodes = workflow.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) != 1 or workflow.get("edges") != []:
+        return None
+    node = nodes[0]
+    data = node.get("data") if isinstance(node, dict) else None
+    if not isinstance(data, dict) or data.get("nodeType") != "CustomCommandCPUNode":
+        return None
+    config = data.get("config")
+    if not isinstance(config, dict) or not isinstance(
+        command := config.get("command"), str
+    ):
+        return None
+    prepared = read_prepared_dataset_recipe(command)
+    if prepared is None:
+        return None
+    if prepared.uses_labeling_gateway:
+        if not isinstance(config.get("param"), str) or not config["param"]:
+            raise ValueError("Missing Dataset labeling credential binding")
+        config["param"] = "DF_API_KEY"
+    elif config.get("param"):
+        raise ValueError("Unexpected Dataset command parameter")
+    return DatasetRecipeReceipt.model_validate(prepared.model_dump())
+
+
+class IndependentReplayNeedsStudio(ValueError):
+    def __init__(self, task_id: str, cluster: str):
+        self.task_id = task_id
+        self.cluster = cluster
+        super().__init__("独立换批小样需要项目所有者的登录态核对平台实际执行的工作流。")
+
+
+def _verify_replay_command(workflow: JsonObject, recipe: DatasetRecipeReceipt) -> None:
+    nodes = workflow.get("nodes")
+    node = nodes[0] if isinstance(nodes, list) and len(nodes) == 1 else None
+    data = node.get("data") if isinstance(node, dict) else None
+    config = data.get("config") if isinstance(data, dict) else None
+    command = config.get("command") if isinstance(config, dict) else None
+    invalid = ValueError(
+        "平台任务未执行这份完整配方的导出、校验和小样条数检查。"
+        "请用完整 Dataset 配方提交换批小样。"
+    )
+    if not (
+        isinstance(command, str)
+        and isinstance(data, dict)
+        and data.get("nodeType") == "CustomCommandCPUNode"
+        and workflow.get("edges") == []
+    ):
+        raise invalid
+    before, begin, rest = recipe.command_template.partition("\n(\n")
+    processing, end, _ = rest.rpartition("\n)\n")
+    if not begin or not end:
+        raise invalid
+    env = {}
+    try:
+        for line in before.splitlines():
+            if not line.startswith("export "):
+                continue
+            for item in shlex.split(line)[1:]:
+                key, _, value = item.partition("=")
+                if key in ("DF_API_URL", "DF_API_BASE_URL", "DF_MODEL_NAME"):
+                    env[key] = value
+        embedded = submitted_sdk_dataset_recipe(workflow)
+        if embedded is not None and embedded != recipe:
+            raise invalid
+        if recipe.uses_labeling_gateway:
+            env["DF_API_KEY"] = "$param"
+        expected, expected_command = compose_recipe(
+            input_path=recipe.source_path,
+            output_dir=recipe.output_directory,
+            assets=tuple(
+                RecipeAsset.model_validate(asset.model_dump())
+                for asset in recipe.assets
+            ),
+            dataflow_command=processing.format(),
+            llm_env=env,
+            fixed_validation_path=recipe.fixed_validation_path,
+            replay_of_task_id=recipe.replay_of_task_id,
+            batch_label_source=recipe.batch_label_source,
+            prepared_gateway=recipe.uses_labeling_gateway
+            if embedded is not None
+            else None,
+            development_environment='export DF_API_KEY="$param"',
+        )
+    except (ValueError, KeyError, IndexError):
+        raise invalid from None
+    if (
+        DatasetRecipeReceipt.model_validate(expected.model_dump()) != recipe
+        or expected_command != command
+    ):
+        raise invalid
+
+
 def _validate_recipe(
-    recipe: DatasetRecipeReceipt, output_dir: str, store: FileProductStore
+    recipe: DatasetRecipeReceipt,
+    output_dir: str,
+    store: FileProductStore,
+    correlation: TaskCorrelation,
+    task_id: str,
 ) -> None:
     if to_storage_api_path(recipe.output_directory) != to_storage_api_path(output_dir):
         raise ValueError("Recipe output does not match the SDK task output")
@@ -164,21 +270,62 @@ def _validate_recipe(
     if recipe.replay_of_task_id is not None:
         parent = recipe.replay_of_task_id
         snapshot = store.load_snapshot()
-        if not any(
-            task.task_id == parent
-            and task.kind == "data_preparation"
-            and task.status == "succeeded"
-            and task.graph_run_id is None
-            for task in snapshot.external_tasks
-        ) or not any(
-            receipt.task_id == parent
-            and receipt.status == "submitted"
-            and receipt.dataset_recipe is not None
-            for receipt in store.load_workflow_execution_requests().values()
+        source = next(
+            (item for item in snapshot.external_tasks if item.task_id == parent), None
+        )
+        parent_receipt = next(
+            (
+                item
+                for item in store.load_workflow_execution_requests().values()
+                if item.task_id == parent
+                and item.status == "submitted"
+                and source is not None
+                and item.correlation == source.correlation
+            ),
+            None,
+        )
+        if (
+            parent == task_id
+            or source is None
+            or source.kind != "data_preparation"
+            or source.status != "succeeded"
+            or source.graph_run_id is not None
+            or any(run.task_id == parent for run in store.load_pipeline_runs().values())
+            or parent_receipt is None
+            or not parent_receipt.workflow.get("nodes")
+            or (
+                parent_receipt.dataset_recipe
+                and parent_receipt.dataset_recipe.replay_of_task_id
+            )
         ):
             raise ValueError(
-                "Replay requires a successful Dataset Recipe in this conversation"
+                "Replay requires a successful Dataset task in this conversation"
             )
+        if store.preparation_policy() is not None:
+            original = parent_receipt.correlation
+            ref = original.execution if original else None
+            if not (
+                original
+                and original.type == "main"
+                and ref
+                and original.task_kind == "data_preparation"
+                and store.verify_task_correlation(original)
+                and original.cluster
+                and correlation.cluster == original.cluster
+                and (correlation.execution is None or correlation.execution == ref)
+                and any(
+                    run.role_id == "main"
+                    and run.project_id == ref.project_id
+                    and run.task_id == ref.task_id
+                    and run.plan_sequence == ref.plan_sequence
+                    and run.plan_attempt == ref.attempt
+                    and parent in (run.platform_task_id, *run.platform_task_ids)
+                    for run in snapshot.experiment_executions or ()
+                )
+            ):
+                raise PermissionError(
+                    "Replay requires its signed Project Dataset receipt"
+                )
 
 
 def bind_sdk_execution_metadata(
@@ -188,12 +335,15 @@ def bind_sdk_execution_metadata(
     context: RequestContext,
     *,
     platform_archive: bool = False,
+    accepted_workflow: JsonObject | None = None,
 ) -> tuple[WorkflowExecutionRequest, str | None]:
     """Record metadata only; a trusted callback must already establish ownership."""
     store.authorize(context.user_id, context.profile_id)
     request = _ExecutionMetadata.model_validate(arguments)
     with store.lock_sdk_submission(request.task_id):
-        return _bind_sdk_metadata(store, versions, request, context, platform_archive)
+        return _bind_sdk_metadata(
+            store, versions, request, context, platform_archive, accepted_workflow
+        )
 
 
 def _bind_sdk_metadata(
@@ -202,7 +352,14 @@ def _bind_sdk_metadata(
     request: _ExecutionMetadata,
     context: RequestContext,
     platform_archive: bool,
+    accepted_workflow: JsonObject | None,
 ) -> tuple[WorkflowExecutionRequest, str | None]:
+    request.workflow = deepcopy(request.workflow)
+    embedded = submitted_sdk_dataset_recipe(request.workflow)
+    if embedded is not None:
+        if request.dataset_recipe is not None and request.dataset_recipe != embedded:
+            raise ValueError("Dataset recipe differs from the submitted command")
+        request.dataset_recipe = embedded
     if platform_archive:
         request.workflow = portable_sdk_workflow(request.workflow)
         validate_persisted_payload(request.workflow)
@@ -226,7 +383,11 @@ def _bind_sdk_metadata(
             "retry metadata binding without resubmitting"
         )
     reference = correlation.execution
-    if reference is None and store.preparation_policy() is not None:
+    if (
+        reference is None
+        and store.preparation_policy() is not None
+        and not (request.dataset_recipe and request.dataset_recipe.replay_of_task_id)
+    ):
         raise PermissionError(
             "Project metadata needs its signed Project task association"
         )
@@ -246,7 +407,9 @@ def _bind_sdk_metadata(
                 "Dataset Recipe requires a development data-preparation task"
             )
         output_dir = output_dir or request.dataset_recipe.output_directory
-        _validate_recipe(request.dataset_recipe, output_dir, store)
+        _validate_recipe(
+            request.dataset_recipe, output_dir, store, correlation, task.task_id
+        )
     if output_dir is not None:
         output_dir = from_storage_api_path(output_dir)
         if task.output_dir is not None and to_storage_api_path(
@@ -254,15 +417,42 @@ def _bind_sdk_metadata(
         ) != to_storage_api_path(output_dir):
             raise ValueError("SDK task output directory cannot change")
     identity = "sdk:" + task.task_id
-    digest = fingerprint(request.model_dump(mode="json"))
     previous = store.load_workflow_execution_requests().get(identity)
+    independently_verified = False
+    if reference is None and store.preparation_policy() is not None:
+        assert (
+            request.dataset_recipe is not None
+            and request.dataset_recipe.replay_of_task_id
+        )
+        verified = request.workflow if platform_archive else accepted_workflow
+        if (
+            verified is None
+            and previous
+            and previous.summary.get("metadata_source") == "studio_task"
+        ):
+            verified = previous.workflow
+        if verified is None:
+            if not correlation.cluster:
+                raise ValueError("独立换批小样没有已验签的集群归属。")
+            raise IndependentReplayNeedsStudio(task.task_id, correlation.cluster)
+        verified = deepcopy(verified)
+        _verify_replay_command(verified, request.dataset_recipe)
+        if portable_sdk_workflow(verified) != portable_sdk_workflow(request.workflow):
+            raise ValueError("提交的配方工作流与平台实际执行的工作流不一致。")
+        independently_verified = True
+    digest = fingerprint(request.model_dump(mode="json"))
     if previous is not None:
         if previous.correlation != correlation:
             raise ValueError("SDK task association cannot change")
         if platform_archive or previous.fingerprint == digest:
             return previous, output_dir
         if (
-            previous.summary.get("metadata_source") != "studio_task"
+            (
+                previous.dataset_recipe is not None
+                and request.dataset_recipe is not None
+                and previous.dataset_recipe != request.dataset_recipe
+            )
+            or previous.summary.get("metadata_source") != "studio_task"
             or portable_sdk_workflow(request.workflow) != previous.workflow
         ):
             raise ValueError(
@@ -271,6 +461,7 @@ def _bind_sdk_metadata(
         if not (request.code or output_dir or request.dataset_recipe):
             return previous, output_dir
         request.workflow = previous.workflow
+        request.dataset_recipe = request.dataset_recipe or previous.dataset_recipe
     if platform_archive:
         project = versions.project(snapshot.conversation_id, context)
         assert project is not None
@@ -298,7 +489,11 @@ def _bind_sdk_metadata(
         dataset_recipe=request.dataset_recipe,
         summary={
             "name": str(request.workflow.get("name", "workflow")),
-            **({"metadata_source": "studio_task"} if platform_archive else {}),
+            **(
+                {"metadata_source": "studio_task"}
+                if platform_archive or independently_verified
+                else {}
+            ),
         },
         correlation=correlation,
         task_id=task.task_id,

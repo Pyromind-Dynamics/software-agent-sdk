@@ -54,15 +54,25 @@ def plan_repair(
     previous.sort(key=lambda item: item.recorded_at)
     latest = previous[-1] if previous else None
     latest_id = latest.command_id if latest else ""
-    if snapshot.pending_inputs or snapshot.status in {
-        "waiting_for_confirmation",
-        "waiting_for_input",
-    }:
+    if (
+        snapshot.pending_inputs
+        or snapshot.pending_permissions
+        or snapshot.status
+        in {
+            "waiting_for_confirmation",
+            "waiting_for_input",
+        }
+    ):
         return ConsolidationRepair(
             stage=stage,
             command_id=latest_id,
             status="needs_input",
-            message="请先在当前对话回答待确认的问题，工作台会继续校验。",
+            message=(
+                "请在当前会话查看待授权的操作，处理后将继续校验。"
+                if snapshot.status == "waiting_for_confirmation"
+                or snapshot.pending_permissions
+                else "请先在当前对话回答待确认的问题，工作台会继续校验。"
+            ),
         ), None
     if conversation_has_work(snapshot) or (
         latest is not None
@@ -73,7 +83,11 @@ def plan_repair(
             stage=stage,
             command_id=latest_id,
             status="working",
-            message="等待当前对话或平台小样完成，随后重新校验。",
+            message=(
+                "当前会话正在等待平台任务回调，随后重新校验。"
+                if snapshot.status == "waiting_for_external_task"
+                else "当前会话正在处理，结束后将重新校验。"
+            ),
         ), None
 
     payload = json.dumps(facts, ensure_ascii=False, sort_keys=True)
@@ -95,17 +109,27 @@ def plan_repair(
     path = repair_recipe_path(evidence, stage)
     field = "evaluator_runtime" if stage == "eval" else "train_runtime"
     stage_instruction = (
-        "用 df_submit_pipeline 复用原研发任务的 pipeline、"
+        "按 data-processing 的 SDK 路径使用 prepare_pipeline、"
+        "validate_workflow_dsl 和 submit_workflow，"
+        "复用原研发任务的 pipeline、"
         "model_profile 和 output_schema。"
         "用 prepare_script_path 接入实际执行的原始输入转换，用 sft_export_script_path "
         "接入训练数据导出。固定训练中验证集使用 plan 确认的 fixed_validation_path，"
-        "正式 Eval 集单独绑定。按已确认策略设置 batch_label_source，"
+        "若原 Train 未绑定验证集则全批训练，不切验证样本，正式 Eval 集单独绑定。"
+        "按已确认策略设置 batch_label_source，"
         "取值 dataset 或 collection。"
         "回放时 replay_of_task_id 填 development_task.task_id，"
-        "回放独立登记，省略原研发计划的 plan_task_id 和 plan_attempt。"
+        "从 PYROMIND_TASK_CONTEXTS 读取 data_preparation 的签名 out_id，独立登记回放。"
+        "每次回放在 /workspace/.pyromind-agent/<当前会话ID>/data_preparation/ "
+        "下创建独立运行目录。"
+        "已有平台任务先核对其终态与冻结的 dataset-recipe.json，旧版 SDK 回执缺失时，"
+        "用 product_versions 的 bind_execution_metadata 动作，"
+        "将实际校验图和冻结配方关联至原小样任务号。"
         "将同一确认来源内的 1–5 条样本放在独立的 input_path，保留来源身份和媒体。"
         "有已封存的 Tracer 样本时，在换批验收中覆盖其实际输入布局。"
         "先核对已有回放证据；仅补所缺的小样，使同一配方在两个不同输入上完成 CPU 回放。"
+        "每份平台执行图都应实际运行输入准备、处理、SFT 导出和 verifier。"
+        "旧任务只做过预标注时复用其脚本和样本，另用完整配方跑缺少的小样。"
         "对照研发任务和已确认的样本身份与标签策略，缺少业务决定时使用 ask_user。"
         "编译器直接读取工具生成的回执，手写验证结果不能作为证据。"
         if stage == "dataset"

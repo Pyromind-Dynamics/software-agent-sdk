@@ -2274,6 +2274,10 @@ def _validate_workflow_wandb_config(workflow: dict[str, Any]) -> None:
 
 def _validate_ports(project: ProjectInfo, issues: list[PublicationIssue]) -> None:
     nodes_by_id = {node.id: node for node in project.graph.nodes}
+    train_only = any(
+        node.type == "dataset" and node.config.get("batch_validation_source") == "none"
+        for node in project.graph.nodes
+    )
     for node in project.graph.nodes:
         for input_name, (
             required_port,
@@ -2282,6 +2286,23 @@ def _validate_ports(project: ProjectInfo, issues: list[PublicationIssue]) -> Non
             expected_source_port,
         ) in _REQUIRED_INPUTS.get(node.type, {}).items():
             node_input = node.inputs.get(input_name)
+            if (
+                train_only
+                and node.type == "train"
+                and input_name == "validation_dataset"
+            ):
+                if node_input is not None:
+                    issues.append(
+                        PublicationIssue(
+                            code="input_binding_invalid",
+                            message=(
+                                "Train cannot bind a validation split "
+                                "with a train-only Dataset."
+                            ),
+                            node_id=node.id,
+                        )
+                    )
+                continue
             if node_input is None:
                 issues.append(
                     PublicationIssue(

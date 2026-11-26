@@ -32,6 +32,12 @@ def test_repair_waits_for_author_then_reports_persistent_gap():
     assert "主会话直接补齐" in command.content[0].model_dump_json()
     assert next_repair()[1] == command
     assert "1086" in command.content[0].model_dump_json()
+    assert "prepare_pipeline" in command.content[0].model_dump_json()
+    assert "df_submit_pipeline" not in command.content[0].model_dump_json()
+    permission = snapshot.model_copy(update={"status": "waiting_for_confirmation"})
+    assert "待授权" in next_repair(state=permission)[0].message
+    active = snapshot.model_copy(update={"status": "running"})
+    assert "平台" not in next_repair(state=active)[0].message
     old = CommandReceipt(
         command_id=first.command_id,
         status="completed",

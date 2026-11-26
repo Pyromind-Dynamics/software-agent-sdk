@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
@@ -9,7 +7,10 @@ from uuid import UUID, uuid4
 from pyromind_runtime.application.versions import Versions, snapshot_result
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.pipeline import PipelineRun
+from pyromind_runtime.domain.pipeline import (
+    PipelineRun,
+    pipeline_definition_fingerprint,
+)
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
@@ -445,9 +446,7 @@ class PipelineRuns:
             CheckpointSelectionPolicy.model_validate(
                 definition.get("scoring_spec", {}).get("selection", {})
             )
-        fingerprint = hashlib.sha256(
-            json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        fingerprint = pipeline_definition_fingerprint(definition)
         previous = self.resolve(resume_run_id) if resume_run_id else None
         if resume_run_id and previous is None:
             raise ValueError("unknown inference run in this conversation")

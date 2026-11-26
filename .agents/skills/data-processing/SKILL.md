@@ -110,8 +110,9 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    脚本使用已通过小样的同一实现。指定 `fixed_validation_path` 时原样保留该固定集。
    验证可复用性时，传原成功 Dataset 的 `replay_of_task_id` 和另一份 1–5 条的小样。
    固化回放独立登记，省略原研发的 `plan_task_id` 与 `plan_attempt`。先核对已成功的回执，只补缺少的小样。
-   可信回调确认任务归属后，单独登记真实 task ID、Recipe、代码、工作流及输出元数据；
-   登记失败只补登记，不重新提交。EDP 保存每片 task ID、run ID、manifest 与输出目录，
+   计划要求 SFT 时，在同一个 prepare_pipeline 工作流中完成输入转换、预标注和 SFT 导出，
+   使用已确认的 Train 验证策略。Runtime 从可信回调自动登记该配方和任务号。研发交付时核对
+   配方、输出目录和实际样本数；旧 SDK 有冻结配方时只补登记原任务。EDP 保存每片 task ID、run ID、manifest 与输出目录，
    部分成功后不整批重投。
    DataFlow/EDP 平台任务（含具身
    case 的逐 episode 执行）等待终态回调。用户需要查看运行进度时，按

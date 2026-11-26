@@ -95,6 +95,7 @@ from pyromind_runtime.application.reward_workflows import (
     validate_reward_workflow,
 )
 from pyromind_runtime.application.sdk_execution_metadata import (
+    IndependentReplayNeedsStudio,
     bind_sdk_execution_metadata,
     verified_sdk_inference_paths,
 )
@@ -396,7 +397,9 @@ class ConversationRuntime:
         self._resource_media_reader = resource_media_reader
         self._external_task_query = external_task_query
         self._sdk_workflow_archive = (
-            SdkWorkflowArchive(accepted_workflow_reader, versions)
+            SdkWorkflowArchive(
+                accepted_workflow_reader, versions, self.register_external_task
+            )
             if accepted_workflow_reader and versions
             else None
         )
@@ -2635,13 +2638,30 @@ class ConversationRuntime:
         if self.versions is None:
             raise ValueError("version management is unavailable")
         if request.action == "bind_execution_metadata":
-            receipt, output_dir = await asyncio.to_thread(
-                bind_sdk_execution_metadata,
-                self._store(conversation_id),
-                self.versions,
-                request.arguments,
-                context,
-            )
+            try:
+                receipt, output_dir = await asyncio.to_thread(
+                    bind_sdk_execution_metadata,
+                    store,
+                    self.versions,
+                    request.arguments,
+                    context,
+                )
+            except IndependentReplayNeedsStudio as needed:
+                if not self._sdk_workflow_archive or not (
+                    context.authorization or context.cookie
+                ):
+                    raise
+                workflow = await self._sdk_workflow_archive.reader(
+                    needed.task_id, replace(context, x_cluster=needed.cluster)
+                )
+                receipt, output_dir = await asyncio.to_thread(
+                    bind_sdk_execution_metadata,
+                    store,
+                    self.versions,
+                    request.arguments,
+                    context,
+                    accepted_workflow=workflow,
+                )
             if output_dir is not None:
                 self.register_external_task(
                     conversation_id,

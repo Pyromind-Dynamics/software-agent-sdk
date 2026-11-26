@@ -590,9 +590,7 @@ class TracerBatchMaterializer:
             )
         if fixed_validation:
             if not rows["train"] or rows["val"]:
-                raise AcquisitionPaused(
-                    "Fixed-validation batch must supply training images only"
-                )
+                raise AcquisitionPaused("This batch must supply training images only")
         elif not all(rows.values()):
             raise AcquisitionPaused("A platform SFT batch requires both source splits")
         return rows
@@ -751,9 +749,7 @@ class AcquisitionSimulationRunner:
             < len(required_splits) * current.requested_rounds
         ):
             if fixed_validation:
-                raise AcquisitionPaused(
-                    "This release requires train-only input with fixed validation"
-                )
+                raise AcquisitionPaused("This release requires train-only batch input")
             raise AcquisitionPaused(
                 "Every platform SFT batch needs train and val samples"
             )
@@ -1482,8 +1478,9 @@ def dataset_labels_batch(published: PublishedGraph) -> bool:
 
 def fixed_batch_validation(published: PublishedGraph) -> bool:
     dataset = next((node for node in published.nodes if node.type == "dataset"), None)
-    return (
-        dataset is not None and dataset.config.get("batch_validation_source") == "fixed"
+    return dataset is not None and dataset.config.get("batch_validation_source") in (
+        "fixed",
+        "none",
     )
 
 

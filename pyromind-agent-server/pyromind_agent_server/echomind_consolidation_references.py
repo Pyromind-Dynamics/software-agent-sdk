@@ -3,11 +3,13 @@ from __future__ import annotations
 import re
 import shlex
 from collections import Counter
+from collections.abc import Callable
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
 from pyromind_agent_server.echomind_failure_evidence import redact_graph_failure_text
+from pyromind_agent_server.echomind_sdk_eval_consolidation import sdk_evaluation_assets
 from pyromind_agent_server.echomind_train_backend import (
     _WANDB_KEY_MARKER,
     _WANDB_KEY_PATTERN,
@@ -38,6 +40,7 @@ from pyromind_runtime.domain.preparation import ProjectView
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
     from_storage_api_path,
+    normalize_workspace_path,
 )
 from pyromind_runtime.domain.versions import VersionRun, canonical, fingerprint
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
@@ -98,15 +101,16 @@ _DATA = "DatasetConfigBuilderNode"
 _BASE = "ModelConfigBuilderNode"
 _TRAIN = "ModelTrainSFTNode"
 _MERGE = "ModelMergeLoraNode"
+_DATA_KIND_NODES = {
+    "DatasetConfigBuilderMessageNode",
+    "DatasetConfigBuilderTextNode",
+    "DatasetConfigBuilderVisionNode",
+}
+_DATA_INPUTS = {
+    "train_data_path": "train_dataset",
+    "val_data_path": "validation_dataset",
+}
 _TRAIN_EDGES = {
-    (_PATH_JOIN, "joined_path", _DATA, "train_data_path"),
-    (_PATH_JOIN, "joined_path", _DATA, "val_data_path"),
-    (
-        "DatasetConfigBuilderMessageNode",
-        "dataset_kind_config",
-        _DATA,
-        "dataset_kind_config",
-    ),
     (
         "DatasetExtraConfigBuilderNode",
         "dataset_extra_config",
@@ -121,8 +125,6 @@ _TRAIN_EDGES = {
     (WANDB_BUILDER_NODE_TYPE, "wandb_config", _TRAIN, "wandb_config"),
     (_TRAIN, "model_output_path", _MERGE, "lora_path"),
 }
-_TRAIN_NODES = Counter({name: 1 for edge in _TRAIN_EDGES for name in edge[::2]})
-_TRAIN_NODES[_PATH_JOIN] = 2
 _PATH_FIELDS = {
     _PATH_JOIN: {"base_path", "subpath"},
     _DATA: set(),
@@ -204,20 +206,44 @@ def consolidation_references(
 
 
 def consolidation_evaluation_reference(
-    versions: Versions,
+    versions: Versions | None,
     evidence: ConsolidationEvidence,
     context: RequestContext,
     *,
     runtime_dir: Path = _EVAL_RUNTIME_DIR,
+    store: FileProductStore | None = None,
+    read_asset: Callable[[str], bytes] | None = None,
 ) -> JsonObject:
     if evidence.eval.source == "workflow_execution_request":
-        return {
-            "runtime_blocker": (
-                "The SDK Eval workflow is verified. Replay still requires "
-                "hash-pinned scoring code, dataset/evaluation configuration, "
-                "and report assets."
+        if store is None:
+            return {"runtime_blocker": "缺少 SDK 评测工作流的回执归档。"}
+        try:
+            store.authorize(context.user_id, context.profile_id)
+            receipt = _workflow_receipt(
+                tuple(store.load_workflow_execution_requests().values()),
+                evidence.eval,
+                evidence.conversation_id,
             )
-        }
+            indexes, arguments = _evaluation_arguments(receipt.workflow)
+            definition, directory, assets = sdk_evaluation_assets(
+                store, receipt, arguments, runtime_dir, read_asset
+            )
+            safe, _ = _xyflow_reference(receipt.workflow)
+            candidate = _bind_evaluation_workflow(
+                safe,
+                indexes,
+                arguments,
+                definition,
+                evidence,
+                arguments["--run-id"],
+                directory,
+                assets,
+            )
+            return {"runtime_candidate": candidate, "assets": assets}
+        except (OSError, ValueError, TrainRuntimeError) as exc:
+            return {"runtime_blocker": _safe_text(str(exc))}
+    if versions is None:
+        return {"runtime_blocker": "Eval 版本归档不可用。"}
     project = versions.project(evidence.conversation_id, context, create=False)
     if project is None:
         return {"runtime_blocker": "No versioned Eval archive for this conversation."}
@@ -328,10 +354,60 @@ def _evaluation_runtime_candidate(
             "Eval report assets are unavailable for its recorded runtime digest."
         )
 
-    source_nodes = _objects(workflow.get("nodes"))
-    safe_workflow = deepcopy(candidate)
+    indexes, arguments = _evaluation_arguments(workflow)
+    run_path = (
+        f"/workspace/.pyromind-agent/{evidence.conversation_id}/"
+        f"data_preparation/{record.source.source_id}"
+    )
+    dataset_config = definition.get("dataset_config")
+    evaluation_config = definition.get("evaluation_config")
+    if not isinstance(dataset_config, dict) or not isinstance(evaluation_config, dict):
+        raise ValueError("Eval is missing its versioned dataset mapping or rubric.")
+    source_artifacts = (
+        ("runtime_script", arguments["script"], script),
+        ("dataset_config", arguments["--dataset-config"], canonical(dataset_config)),
+        (
+            "evaluation_config",
+            arguments["--evaluation-config"],
+            canonical(evaluation_config),
+        ),
+    )
+    pinned: JsonObject = {}
+    for role, raw_path, content in source_artifacts:
+        path = _safe_eval_path(raw_path)
+        digest = sha256(content.encode()).hexdigest()
+        asset = assets.get(role)
+        if (
+            not isinstance(asset, dict)
+            or asset.get("path") != path
+            or asset.get("sha256") != fingerprint({PurePosixPath(path).name: digest})
+        ):
+            raise ValueError(f"Eval versioned asset {role} is missing or changed.")
+        pinned[role] = {"path": path, "sha256": digest}
+    report_assets: JsonObject = {}
+    for name in _REPORT_ASSET_NAMES:
+        path = f"{run_path}/{name}"
+        digest = sha256((runtime_dir / name).read_bytes()).hexdigest()
+        report_assets[name] = {"path": path, "sha256": digest}
+
+    candidate = _bind_evaluation_workflow(
+        candidate,
+        indexes,
+        arguments,
+        definition,
+        evidence,
+        record.source.source_id,
+        run_path,
+        {**pinned, **report_assets},
+    )
+    return candidate, report_assets
+
+
+def _evaluation_arguments(
+    workflow: JsonObject,
+) -> tuple[dict[str, int], dict[str, str]]:
     indexes, command = _evaluation_topology(
-        source_nodes, _objects(workflow.get("edges"))
+        _objects(workflow.get("nodes")), _objects(workflow.get("edges"))
     )
     tokens = shlex.split(command)
     if (
@@ -344,15 +420,25 @@ def _evaluation_runtime_candidate(
             "Archived Eval command does not match the qualified scorer CLI."
         )
     arguments = dict(zip(tokens[2::2], tokens[3::2], strict=True))
+    arguments["script"] = tokens[1]
+    return indexes, arguments
+
+
+def _bind_evaluation_workflow(
+    workflow: JsonObject,
+    indexes: dict[str, int],
+    arguments: dict[str, str],
+    definition: JsonObject,
+    evidence: ConsolidationEvidence,
+    run_id: str,
+    expected_path: str,
+    assets: JsonObject,
+) -> JsonObject:
     model = arguments["--model"]
     run_path = _safe_eval_path(arguments["--report-assets-dir"])
-    expected_path = (
-        f"/workspace/.pyromind-agent/{evidence.conversation_id}/"
-        f"data_preparation/{record.source.source_id}"
-    )
     if (
         not re.fullmatch(r"[a-f0-9]{32}", evidence.conversation_id)
-        or arguments["--run-id"] != record.source.source_id
+        or arguments["--run-id"] != run_id
         or arguments["--endpoint"] != "$param"
         or not re.fullmatch(r"[a-zA-Z0-9._-]{1,64}", model)
         or _safe_eval_path(arguments["--output-dir"]) != run_path
@@ -362,40 +448,7 @@ def _evaluation_runtime_candidate(
     ):
         raise ValueError("Eval command does not match the recorded run and dataset.")
 
-    dataset_config = definition.get("dataset_config")
-    evaluation_config = definition.get("evaluation_config")
-    if not isinstance(dataset_config, dict) or not isinstance(evaluation_config, dict):
-        raise ValueError("Eval is missing its versioned dataset mapping or rubric.")
-    source_artifacts = (
-        ("runtime_script", tokens[1], script),
-        ("dataset_config", arguments["--dataset-config"], canonical(dataset_config)),
-        (
-            "evaluation_config",
-            arguments["--evaluation-config"],
-            canonical(evaluation_config),
-        ),
-    )
-    file_digests: dict[str, str] = {}
-    file_paths: dict[str, str] = {}
-    for role, raw_path, content in source_artifacts:
-        path = _safe_eval_path(raw_path)
-        digest = sha256(content.encode()).hexdigest()
-        asset = assets.get(role)
-        if (
-            not isinstance(asset, dict)
-            or asset.get("path") != path
-            or asset.get("sha256") != fingerprint({PurePosixPath(path).name: digest})
-        ):
-            raise ValueError(f"Eval versioned asset {role} is missing or changed.")
-        file_digests[path] = digest
-        file_paths[role] = path
-    report_assets: JsonObject = {}
-    for name in _REPORT_ASSET_NAMES:
-        path = f"{run_path}/{name}"
-        digest = sha256((runtime_dir / name).read_bytes()).hexdigest()
-        file_digests[path] = digest
-        report_assets[name] = {"path": path, "sha256": digest}
-
+    safe_workflow = deepcopy(workflow)
     nodes = _objects(safe_workflow.get("nodes"))
     for node_type, index in indexes.items():
         config = _node_config(nodes[index])
@@ -418,16 +471,21 @@ def _evaluation_runtime_candidate(
     )
     output_uri = f"{run_output}/report.json"
     checks = " ".join(
-        f"{shlex.quote(path)} {digest}" for path, digest in file_digests.items()
+        f"{shlex.quote(path)} {asset['sha256']}"
+        for asset in assets.values()
+        if isinstance(asset, dict) and isinstance(path := asset.get("path"), str)
     )
+    script_path = _safe_eval_path(arguments["script"])
+    dataset_path = _safe_eval_path(arguments["--dataset-config"])
+    evaluation_path = _safe_eval_path(arguments["--evaluation-config"])
     command_template = (
         f"python3 -c {shlex.quote(_CHECK_EVAL_ASSETS)} {checks} && "
-        f"python3 {shlex.quote(file_paths['runtime_script'])} "
+        f"python3 {shlex.quote(script_path)} "
         "--run-id '{graph_run_id}' "
         f'--endpoint "$param" --model {shlex.quote(model)} '
         "--model-reference '{candidate_model}' --dataset-path '{validation_dataset}' "
-        f"--dataset-config {shlex.quote(file_paths['dataset_config'])} "
-        f"--evaluation-config {shlex.quote(file_paths['evaluation_config'])} "
+        f"--dataset-config {shlex.quote(dataset_path)} "
+        f"--evaluation-config {shlex.quote(evaluation_path)} "
         f"--output-dir '{run_output}' --report-assets-dir {shlex.quote(run_path)} "
         "&& test -s '{output_uri}'"
     )
@@ -462,9 +520,9 @@ def _evaluation_runtime_candidate(
         "command_binding_path": command_path,
         "output_uri": output_uri,
         "artifact_selection": "evaluation_report",
-        "runtime_sha256": expected_bundle,
+        "runtime_sha256": definition["runtime_sha256"],
     }
-    return result, report_assets
+    return result
 
 
 def _safe_eval_path(value: JsonValue) -> str:
@@ -611,16 +669,13 @@ def _xyflow_reference(workflow: JsonObject) -> tuple[JsonObject, bool]:
     )
 
 
-def _train_runtime_candidate(
-    workflow: JsonObject, conversation_id: str, task_id: str
-) -> JsonObject | None:
-    if not re.fullmatch(r"[a-f0-9]{32}", conversation_id):
-        return None
-    candidate = deepcopy(workflow)
-    normalize_wandb_builder_nodes(candidate)
+def _train_graph_inputs(
+    candidate: JsonObject,
+) -> tuple[list[JsonObject], list[JsonObject], set[str]] | None:
     nodes = _objects(candidate.get("nodes"))
     edges = _objects(candidate.get("edges"))
     types: dict[str, str] = {}
+    data_ports: set[str] = set()
     for node in nodes:
         node_id = node.get("id")
         data = node.get("data")
@@ -635,10 +690,30 @@ def _train_runtime_candidate(
         if not isinstance(node_type, str) or not isinstance(config, dict):
             return None
         path_fields = {key for key in config if key.endswith(("path", "_dir", "_uri"))}
+        if node_type == _DATA:
+            for port in path_fields.intersection(_DATA_INPUTS):
+                path = config[port]
+                if path is None or path == "":
+                    continue
+                if not isinstance(path, str):
+                    return None
+                try:
+                    normalize_workspace_path(path)
+                except StoragePathError:
+                    return None
+                data_ports.add(port)
+            path_fields.difference_update(_DATA_INPUTS)
         if path_fields != _PATH_FIELDS.get(node_type, set()):
             return None
         types[node_id] = node_type
-    if Counter(types.values()) != _TRAIN_NODES or len(edges) != len(_TRAIN_EDGES):
+    kind_nodes = _DATA_KIND_NODES.intersection(types.values())
+    if len(kind_nodes) != 1:
+        return None
+    required_edges = _TRAIN_EDGES | {
+        (kind_nodes.pop(), "dataset_kind_config", _DATA, "dataset_kind_config")
+    }
+    required_types = {name for edge in required_edges for name in edge[::2]}
+    if Counter(t for t in types.values() if t != _PATH_JOIN) != Counter(required_types):
         return None
     topology = set()
     path_joins = set()
@@ -653,29 +728,60 @@ def _train_runtime_candidate(
             or not isinstance(target_port, str)
         ):
             return None
-        topology.add((types.get(source), source_port, types.get(target), target_port))
         if types.get(source) == _PATH_JOIN:
+            if (
+                source_port != "joined_path"
+                or types.get(target) != _DATA
+                or target_port not in _DATA_INPUTS
+                or target_port in data_ports
+                or source in path_joins
+            ):
+                return None
+            data_ports.add(target_port)
             path_joins.add(source)
         else:
+            topology.add(
+                (types.get(source), source_port, types.get(target), target_port)
+            )
             retained_edges.append(edge)
-    if topology != _TRAIN_EDGES or len(path_joins) != 2:
+    if (
+        "train_data_path" not in data_ports
+        or topology != required_edges
+        or len(retained_edges) != len(required_edges)
+        or path_joins != {node for node, kind in types.items() if kind == _PATH_JOIN}
+    ):
         return None
 
     retained_nodes = [node for node in nodes if node["id"] not in path_joins]
+    return retained_nodes, retained_edges, data_ports
+
+
+def _train_runtime_candidate(
+    workflow: JsonObject, conversation_id: str, task_id: str
+) -> JsonObject | None:
+    if not re.fullmatch(r"[a-f0-9]{32}", conversation_id):
+        return None
+    candidate = deepcopy(workflow)
+    normalize_wandb_builder_nodes(candidate)
+    graph_inputs = _train_graph_inputs(candidate)
+    if graph_inputs is None:
+        return None
+    retained_nodes, retained_edges, data_ports = graph_inputs
     candidate["nodes"] = list(retained_nodes)
     candidate["edges"] = list(retained_edges)
     positions: dict[str, int] = {}
     for index, node in enumerate(retained_nodes):
-        node_id, data = node["id"], node["data"]
-        assert isinstance(node_id, str) and isinstance(data, dict)
-        node_type = types[node_id]
+        data = node["data"]
+        assert isinstance(data, dict)
+        node_type = data["nodeType"]
+        assert isinstance(node_type, str)
         positions[node_type] = index
         config = data["config"]
         assert isinstance(config, dict)
         for key in _PATH_FIELDS.get(node_type, set()):
             config[key] = ""
         if node_type == _DATA:
-            config.update(train_data_path="", val_data_path="")
+            config.update(dict.fromkeys(data_ports, ""))
         if _has_unbound_config(config):
             return None
 
@@ -687,8 +793,11 @@ def _train_runtime_candidate(
     )
     output_uri = f"{output_root}/merged-model"
     bindings = {
-        f"nodes[{positions[_DATA]}].data.config.train_data_path": "train_dataset",
-        f"nodes[{positions[_DATA]}].data.config.val_data_path": "validation_dataset",
+        **{
+            f"nodes[{positions[_DATA]}].data.config.{port}": role
+            for port, role in _DATA_INPUTS.items()
+            if port in data_ports
+        },
         f"nodes[{positions[_BASE]}].data.config.model_path": "base_model",
         f"nodes[{positions[_MERGE]}].data.config.model_path": "base_model",
     }

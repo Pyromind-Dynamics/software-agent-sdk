@@ -8,11 +8,13 @@ from dataclasses import replace
 
 from pyromind_runtime.application.sdk_execution_metadata import (
     bind_sdk_execution_metadata,
+    submitted_sdk_dataset_recipe,
 )
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import ExternalTaskState
+from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
 
@@ -23,7 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 class SdkWorkflowArchive:
-    def __init__(self, reader: AcceptedWorkflowReader, versions: Versions):
+    def __init__(
+        self,
+        reader: AcceptedWorkflowReader,
+        versions: Versions,
+        register_task: Callable[[str, JsonObject], object],
+    ):
+        self.register_task = register_task
         self.reader = reader
         self.versions = versions
         self._workers: dict[TaskKey, asyncio.Task[None]] = {}
@@ -46,7 +54,10 @@ class SdkWorkflowArchive:
                 correlation is None
                 or correlation.type != "main"
                 or not correlation.signature
-                or not correlation.execution
+                or (
+                    not correlation.execution
+                    and correlation.task_kind != "data_preparation"
+                )
                 or not correlation.cluster
                 or correlation.task_kind
                 not in {"workflow_run", "evaluation", "data_preparation"}
@@ -79,15 +90,30 @@ class SdkWorkflowArchive:
     ) -> None:
         try:
             async with self._capacity:
-                if await asyncio.to_thread(self._missing, store, task, context):
+                receipt = await asyncio.to_thread(self._existing, store, task, context)
+                if receipt is None:
                     workflow = await self.reader(task.task_id, context)
-                    await asyncio.to_thread(
+                    if task.correlation and not task.correlation.execution:
+                        recipe = submitted_sdk_dataset_recipe(workflow)
+                        if recipe is None or not recipe.replay_of_task_id:
+                            self._complete.add(key)
+                            self._retry.pop(key, None)
+                            return
+                    receipt, _ = await asyncio.to_thread(
                         bind_sdk_execution_metadata,
                         store,
                         self.versions,
                         {"task_id": task.task_id, "workflow": workflow},
                         context,
                         platform_archive=True,
+                    )
+                if receipt.dataset_recipe is not None and task.output_dir is None:
+                    self.register_task(
+                        key[0],
+                        {
+                            "task_id": task.task_id,
+                            "output_dir": receipt.dataset_recipe.output_directory,
+                        },
                     )
                 self._complete.add(key)
                 self._retry.pop(key, None)
@@ -102,18 +128,16 @@ class SdkWorkflowArchive:
             self._workers.pop(key, None)
 
     @staticmethod
-    def _missing(
+    def _existing(
         store: FileProductStore, task: ExternalTaskState, context: RequestContext
-    ) -> bool:
+    ) -> WorkflowExecutionRequest | None:
         store.authorize(context.user_id, context.profile_id)
         correlation = task.correlation
         if not correlation or not store.verify_task_correlation(correlation):
             raise PermissionError("Unverified SDK task")
         reference = correlation.execution
-        if reference is None:
-            raise ValueError("Unscoped SDK task")
         snapshot = store.load_snapshot()
-        if not any(
+        if reference is not None and not any(
             run.role_id == "main"
             and run.project_id == reference.project_id
             and run.task_id == reference.task_id
@@ -123,11 +147,15 @@ class SdkWorkflowArchive:
             for run in snapshot.experiment_executions or ()
         ):
             raise ValueError("SDK task has no matching approved execution")
-        return not any(
-            receipt.task_id == task.task_id
-            and receipt.correlation == correlation
-            and receipt.status == "submitted"
-            for receipt in store.load_workflow_execution_requests().values()
+        return next(
+            (
+                receipt
+                for receipt in store.load_workflow_execution_requests().values()
+                if receipt.task_id == task.task_id
+                and receipt.correlation == correlation
+                and receipt.status == "submitted"
+            ),
+            None,
         )
 
     async def close(self) -> None:

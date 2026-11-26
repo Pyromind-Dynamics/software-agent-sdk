@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from pyromind_common.platform.credentials import (
     dataflow_environment,
+    dataset_key_parameter,
     runtime_environment_prefix,
 )
 from pyromind_common.platform.paths import to_agent_storage_path, to_storage_api_path
@@ -22,6 +23,7 @@ from pyromind_common.platform.recipe import (
     RECIPE_INPUT,
     RECIPE_OUTPUT,
     compose_recipe,
+    dataset_public_profile,
     recipe_asset,
 )
 from pyromind_common.platform.scene_core import (
@@ -260,14 +262,11 @@ def prepare_pipeline(
     model_profile = options.model_profile or (
         prior.model_profile if prior is not None else "text"
     )
+    has_recipe = options.sft_export_script_path is not None
     llm_env = dataflow_environment(model_profile) if model_profile != "none" else {}
-    environment = (
-        runtime_environment_prefix(
-            [name for name, value in llm_env.items() if value], profile=model_profile
-        )
-        if model_profile != "none"
-        else None
-    )
+    uses_gateway = bool(llm_env.get("DF_API_KEY"))
+    if has_recipe:
+        llm_env = dataset_public_profile(llm_env)
     output_schema = options.output_schema or (
         prior.output_schema if prior is not None else None
     )
@@ -377,7 +376,6 @@ def prepare_pipeline(
     staging.freeze(script, script_file)
     if support is not None and support_file is not None:
         staging.freeze(support, support_file)
-    has_recipe = options.sft_export_script_path is not None
     command = _build_dataflow_command(
         input_path=RECIPE_INPUT
         if has_recipe
@@ -427,7 +425,7 @@ def prepare_pipeline(
             fixed_validation_path=fixed_validation_path,
             replay_of_task_id=options.replay_of_task_id,
             batch_label_source=options.batch_label_source,
-            development_environment=environment,
+            prepared_gateway=uses_gateway,
         )
         staging.write(
             "dataset-recipe.json",
@@ -435,9 +433,16 @@ def prepare_pipeline(
                 recipe.model_dump(), ensure_ascii=False, sort_keys=True
             ).encode(),
         )
-    elif environment is not None:
+    elif model_profile != "none":
+        environment = runtime_environment_prefix(
+            [name for name, value in llm_env.items() if value], profile=model_profile
+        )
         command = environment + "\n" + command
     workflow = _build_dataflow_workflow(options, run_id, command)
+    if has_recipe and model_profile != "none" and uses_gateway:
+        workflow["nodes"][0]["data"]["config"]["param"] = dataset_key_parameter(
+            model_profile, llm_env
+        )
     validate_pipeline_topology(workflow)
     staging.write(
         f"pipeline-revisions/{revision:08d}.json"

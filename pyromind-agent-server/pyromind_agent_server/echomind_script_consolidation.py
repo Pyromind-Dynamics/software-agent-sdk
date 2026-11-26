@@ -152,8 +152,14 @@ def build_script_compilation(
         conversation_id=evidence.conversation_id,
     )
     evaluator = (
-        consolidation_evaluation_reference(versions, evidence, request_context)
-        if versions is not None and supplied.evaluator_runtime is None
+        consolidation_evaluation_reference(
+            versions,
+            evidence,
+            request_context,
+            store=store,
+            read_asset=read_replay_file,
+        )
+        if supplied.evaluator_runtime is None
         else {}
     )
     train = references.get("train")

@@ -47,22 +47,24 @@ class DatasetRecipeExtraction:
     blockers: tuple[ConsolidationBlocker, ...] = ()
 
 
-def _archive_dataflow_commands(workflow: JsonObject) -> tuple[str, ...]:
+def _archive_dataflow_commands(workflow: JsonObject) -> tuple[tuple[str, ...], bool]:
     nodes = workflow.get("nodes")
     if not isinstance(nodes, list):
-        return ()
+        return (), False
     commands: list[str] = []
+    structured_annotations = False
     for node in nodes:
         data = node.get("data") if isinstance(node, dict) else None
         config = data.get("config") if isinstance(data, dict) else None
         command = config.get("command") if isinstance(config, dict) else None
-        if (
-            isinstance(command, str)
-            and "DF_STATE_DIR=" in command
-            and _DATAFLOW_STRUCTURED.search(command)
-        ):
+        if not isinstance(command, str) or not isinstance(data, dict):
+            continue
+        if "DF_STATE_DIR=" in command and _DATAFLOW_STRUCTURED.search(command):
             commands.append(command)
-    return tuple(commands)
+            structured_annotations = True
+        elif data.get("type") == "DataPreparationNode":
+            commands.append(command)
+    return tuple(commands), structured_annotations
 
 
 def _archive_assets(
@@ -90,7 +92,9 @@ def _archive_assets(
             ]
             if filename == "processed.jsonl":
                 role = "annotations"
-            elif filename.endswith(".jsonl") and "manifest" in filename:
+            elif filename == "source.jsonl" or (
+                filename.endswith(".jsonl") and "manifest" in filename
+            ):
                 role = "input_manifest"
             elif filename.endswith(".py") and "runtime-cache" in parts:
                 role = "runtime_file"
@@ -147,7 +151,7 @@ def extract_dataset_recipe(
     Archive references attest to what an older command named. Storage existence,
     annotation review, and execution of the rendered contract need separate checks.
     """
-    commands = _archive_dataflow_commands(archive_workflow)
+    commands, structured_annotations = _archive_dataflow_commands(archive_workflow)
     assets = _archive_assets(commands, conversation_id=conversation_id)
     if reviewed_runtime is not None:
         try:
@@ -166,14 +170,15 @@ def extract_dataset_recipe(
             )
         return DatasetRecipeExtraction(runtime=runtime, assets=assets)
 
-    if not commands:
+    if not structured_annotations:
         return DatasetRecipeExtraction(
             runtime=None,
+            assets=assets,
             blockers=(
                 _dataset_blocker(
                     "dataset_recipe_required",
-                    "研发回执缺少从已确认输入到训练与验证 JSONL 的执行契约。"
-                    "请提供已审阅的 Dataset 配方。",
+                    "已找到数据处理工作流，尚缺从本轮输入到训练数据的可重放配方。"
+                    "Agent 需关联输入准备、处理和导出脚本，并用两批不同的小样验证。",
                 ),
             ),
         )

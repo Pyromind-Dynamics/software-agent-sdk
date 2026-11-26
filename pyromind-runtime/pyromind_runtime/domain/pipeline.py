@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Literal
 from uuid import UUID
 
@@ -8,6 +10,11 @@ from pydantic import Field
 from pyromind_runtime.domain.base import ContractModel
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.training_evaluation import StepEvaluation
+
+
+def pipeline_definition_fingerprint(definition: JsonObject) -> str:
+    payload = json.dumps(definition, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class PipelineRun(ContractModel):

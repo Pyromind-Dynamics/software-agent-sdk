@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from string import Formatter
 from typing import Literal
 
 from pydantic import BaseModel
@@ -37,6 +40,79 @@ RECIPE_INPUT = "/__pyromind_recipe_input__"
 RECIPE_OUTPUT = "/__pyromind_recipe_output__"
 
 
+_RECIPE_COMMENT = "# pyromind-dataset-recipe-v1 "
+_GATEWAY_EXPORT = 'export DF_API_KEY="$param"'
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"\b(?:DF_API_KEY|PYROMIND_API_KEY|PYROMIND_AUTH_TOKEN|LLM_AUTH_TOKEN|WANDB_API_KEY)\s*="
+)
+_REPLAY_LIMIT = (
+    "awk 'NF && ++n > 5 { exit 1 } END { if (!n) exit 1 }' "
+    '"$recipe_input"'
+    ' || { echo "Replay requires 1-5 manifest rows" >&2; exit 1; }'
+)
+
+
+def dataset_public_profile(values: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: values[name]
+        for name in ("DF_API_URL", "DF_API_BASE_URL", "DF_MODEL_NAME")
+        if values.get(name)
+    }
+
+
+def dataset_gateway_exports(public_profile: Mapping[str, str]) -> list[str]:
+    return [
+        "unset DF_API_KEY DF_API_URL DF_API_BASE_URL DF_MODEL_NAME",
+        *(
+            f"export {name}={shlex.quote(value)}"
+            for name, value in public_profile.items()
+        ),
+    ]
+
+
+def _development_command(receipt: RecipeReceipt) -> str:
+    fields = []
+    for _, field, spec, conversion in Formatter().parse(receipt.command_template):
+        if field is None:
+            continue
+        if field not in {"source_batch", "output_uri"} or spec or conversion:
+            raise ValueError("Invalid Dataset recipe template field")
+        fields.append(field)
+    if set(fields) != {"source_batch", "output_uri"}:
+        raise ValueError("Missing Dataset recipe inputs")
+    command = receipt.command_template.format(
+        source_batch=shlex.quote(receipt.source_path),
+        output_uri=shlex.quote(receipt.output_directory),
+    )
+    if receipt.replay_of_task_id:
+        # A development replay checks up to five rows before DataFlow calls the model.
+        before, pipeline_start, rest = command.partition("\n(\n")
+        if not pipeline_start:
+            raise ValueError("Replay recipe has no pipeline step")
+        return before + "\n" + _REPLAY_LIMIT + pipeline_start + rest
+    return command
+
+
+def read_prepared_dataset_recipe(command: str) -> RecipeReceipt | None:
+    if not command.startswith(_RECIPE_COMMENT):
+        return None
+    header, newline, body = command.partition("\n")
+    metadata = header.removeprefix(_RECIPE_COMMENT)
+    try:
+        receipt = RecipeReceipt.model_validate_json(metadata)
+        rendered = _development_command(receipt)
+    except (AttributeError, IndexError, KeyError, ValueError):
+        raise ValueError("Invalid SDK Dataset recipe declaration") from None
+    if not newline or metadata != receipt.model_dump_json() or body != rendered:
+        raise ValueError("Dataset command does not match its declared recipe")
+    allowed = _GATEWAY_EXPORT + "\n"
+    if rendered.count(allowed) != int(
+        receipt.uses_labeling_gateway
+    ) or _CREDENTIAL_ASSIGNMENT.search(rendered.replace(allowed, "")):
+        raise ValueError("Dataset recipes can only refer to the worker credential")
+    return receipt
+
+
 def recipe_asset(
     role: Literal["prepare", "pipeline", "export", "support_file", "verifier"],
     local: Path,
@@ -63,16 +139,16 @@ def compose_recipe(
     replay_of_task_id: str | None,
     batch_label_source: BatchLabelSource | None = None,
     development_environment: str | None = None,
+    prepared_gateway: bool | None = None,
 ) -> tuple[RecipeReceipt, str]:
     source_path = to_agent_storage_path(input_path)
     output_directory = to_agent_storage_path(output_dir)
     key = llm_env.get("DF_API_KEY")
-    public_profile = {
-        name: llm_env[name]
-        for name in ("DF_API_URL", "DF_API_BASE_URL", "DF_MODEL_NAME")
-        if llm_env.get(name)
-    }
-    if key and not all(public_profile.get(k) for k in ("DF_API_URL", "DF_MODEL_NAME")):
+    gateway = bool(key) if prepared_gateway is None else prepared_gateway
+    public_profile = dataset_public_profile(llm_env)
+    if gateway and not all(
+        public_profile.get(k) for k in ("DF_API_URL", "DF_MODEL_NAME")
+    ):
         raise ValueError("Dataset replay needs a stable DataFlow endpoint and model")
     if any(
         "?" in url or "@" in url
@@ -85,8 +161,10 @@ def compose_recipe(
     prefix = [
         f"export {name}={shlex.quote(value)}" for name, value in public_profile.items()
     ]
-    if key:
-        prefix += ['export DF_API_KEY="$param"', "unset param"]
+    if prepared_gateway is not None and public_profile:
+        prefix = dataset_gateway_exports(public_profile)
+    if gateway:
+        prefix += [_GATEWAY_EXPORT, "unset param"]
 
     paths = {}
     checks = {}
@@ -150,22 +228,12 @@ def compose_recipe(
         batch_label_source=batch_label_source,
         assets=assets,
         fixed_validation_path=fixed_validation_path,
-        uses_labeling_gateway=bool(key),
+        uses_labeling_gateway=gateway,
         replay_of_task_id=replay_of_task_id,
     )
-    development = template.format(
-        source_batch=shlex.quote(source_path), output_uri=shlex.quote(output_directory)
-    )
-    if replay_of_task_id:
-        # Fail before DataFlow calls the model if a replay points at the full corpus.
-        limit = (
-            "awk 'NF && ++n > 5 { exit 1 } END { if (!n) exit 1 }' "
-            '"$recipe_input"'
-            ' || { echo "Replay requires 1-5 manifest rows" >&2; exit 1; }'
-        )
-        development = development.replace(
-            pipeline_step, limit + "\n" + pipeline_step, 1
-        )
+    development = _development_command(receipt)
+    if prepared_gateway is not None:
+        return receipt, _RECIPE_COMMENT + receipt.model_dump_json() + "\n" + development
     if key:
         development = development.replace(
             'export DF_API_KEY="$param"',
