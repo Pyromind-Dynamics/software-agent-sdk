@@ -22,9 +22,13 @@
 |---|---|
 | Agent 的 `read` / `terminal` / `write` | `/workspace/datasets/my_data/train.jsonl` |
 | 训练节点访问挂载数据 | `/workspace/datasets/my_data/train.jsonl` |
-| `submit_workflow.workflow_path` | `public_data/workflow_canvas/workflow.py`, or an existing `/workspace/.../workflow.py` |
+| 工作流准备函数或已有提交入口读取的 DSL 路径 | `public_data/workflow_canvas/workflow.py`, or an existing `/workspace/.../workflow.py` |
 
-`public_data/...` 是会话文件路径，`submit_workflow` 直接接受该路径并在执行边界解析；
+`public_data/...` 是会话文件路径，按 [workflow-execution](../../workflow-execution/SKILL.md)
+从该路径读取 DSL，调用保留的校验 Tool 后直接读取 content 提供的
+`validated_workflow_path` 实际图文件，再调用 SDK。没有路径或 `artifact_unavailable`
+时停止 SDK 提交，不重建图绕过保存检查。准备身份或依赖不具备且
+`submit_workflow` 仍列出时使用该已有入口。
 不要先上传或复制 `workflow.py`。已有 Storage 工作流直接使用 `/workspace/...`，
 正式的 Storage 输入和输出统一使用 `/workspace/...`。
 

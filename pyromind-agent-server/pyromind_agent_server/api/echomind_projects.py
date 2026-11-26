@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from functools import cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
@@ -11,9 +12,17 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from filelock import Timeout as FileLockTimeout
-from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    model_validator,
+)
 
 from pyromind_agent_server.api.router import (
+    _product_error,
     _require_profile,
     configure_session,
     context_for_profile,
@@ -36,6 +45,20 @@ from pyromind_agent_server.echomind_acquisition_runtime import (
 from pyromind_agent_server.echomind_acquisition_tasks import (
     EchoMindAcquisitionTaskManager,
 )
+from pyromind_agent_server.echomind_consolidation import (
+    ConsolidationBlocker,
+    ConsolidationContext,
+    ConsolidationProposal,
+    ConsolidationRecipe,
+    ConsolidationReview,
+    apply_consolidation,
+    consolidation_context,
+)
+from pyromind_agent_server.echomind_consolidation_references import (
+    consolidation_evaluation_reference,
+    consolidation_references,
+)
+from pyromind_agent_server.echomind_consolidation_replay import recheck_dataset_replay
 from pyromind_agent_server.echomind_failure_evidence import (
     read_graph_failure_diagnostics,
     redact_graph_failure_text,
@@ -109,6 +132,15 @@ from pyromind_agent_server.echomind_runtime_slots import (
     RuntimeSlotSetupRequest,
     RuntimeSlotStore,
 )
+from pyromind_agent_server.echomind_sandbox_storage import (
+    build_acquisition_storage,
+    build_bound_evaluation_storage,
+)
+from pyromind_agent_server.echomind_script_consolidation import (
+    build_script_compilation,
+    load_script_compilation,
+    save_script_compilation,
+)
 from pyromind_agent_server.echomind_stage_executors import (
     get_project_node_executor,
 )
@@ -118,7 +150,9 @@ from pyromind_agent_server.echomind_stage_runs import (
     StageRun,
     run_project_node,
 )
-from pyromind_agent_server.echomind_storage import ProjectLeaseTimeout
+from pyromind_agent_server.echomind_storage import (
+    ProjectLeaseTimeout,
+)
 from pyromind_agent_server.echomind_tracer_admin import (
     build_tracer_admin_cipher,
     load_tracer_admin_key,
@@ -138,12 +172,22 @@ from pyromind_common.tools.utils.pyromind_api_client import (
     get_api_key,
     get_pyromind_api_client,
 )
-from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.application.consolidation_repairs import (
+    ConsolidationRepair,
+    conversation_has_work,
+    plan_repair,
+    repair_recipe_path,
+)
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.commands import CommandReceipt, UserMessageCommand
 from pyromind_runtime.domain.content import JsonObject, JsonValue, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.project_storage import StorageProxyConfig
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
+from pyromind_runtime.domain.workflow_execution import DatasetRecipeReceipt
+from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
@@ -173,6 +217,47 @@ class StartEchoMindProjectNodeResponse(BaseModel):
 class RuntimeContractApplyRequest(BaseModel):
     expected_draft_sha256: str
     validation_project_id: str | None = None
+
+
+class ConsolidationTaskSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str | None = Field(default=None, pattern=r"^[0-9]{1,64}$")
+    train: str | None = Field(default=None, pattern=r"^[0-9]{1,64}$")
+    eval: str | None = Field(default=None, pattern=r"^[0-9]{1,64}$")
+
+
+class RequestConsolidation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_ids: ConsolidationTaskSelection = Field(
+        default_factory=ConsolidationTaskSelection
+    )
+
+
+class ReviseConsolidation(RequestConsolidation):
+    review_note: str = Field(default="", max_length=2000)
+
+
+class CompileConsolidation(RequestConsolidation):
+    recipe_path: str | None = Field(
+        default=None,
+        max_length=240,
+        pattern=r"^public_data/execution-recipes/[A-Za-z0-9][A-Za-z0-9._-]*\.json$",
+    )
+
+
+class ApplyConsolidation(RequestConsolidation):
+    proposal_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class ConsolidationRequestReceipt(BaseModel):
+    command_id: str
+    proposal_path: str
+
+
+class _ConsolidationProposalUnavailable(RuntimeError):
+    pass
 
 
 class RuntimeImplementationAdoptionRequest(BaseModel):
@@ -449,6 +534,612 @@ async def draft_echomind_runtime_contract(
             ),
             "resource_release_id": _resource_release_id(service, project, draft),
         }
+    )
+
+
+async def _load_consolidation_context(
+    request: Request, project: ProjectInfo, task_ids: dict[str, str]
+) -> ConsolidationContext:
+    try:
+        return await asyncio.to_thread(
+            consolidation_context,
+            project,
+            get_conversation_service(request).conversations_dir,
+            task_ids=task_ids,
+        )
+    except (FileNotFoundError, PermissionError) as exc:
+        raise HTTPException(
+            404, detail="Project execution evidence not found."
+        ) from exc
+    except ValidationError as exc:
+        raise HTTPException(
+            409, detail="Project execution evidence is invalid."
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
+
+
+async def _read_consolidation_proposal(
+    request: Request, consolidation: ConsolidationContext, context: RequestContext
+) -> ConsolidationProposal | None:
+    try:
+        async with asyncio.timeout(8):
+            source = await get_product_runtime(request).read_persisted_workspace_text(
+                consolidation.evidence.conversation_id,
+                consolidation.proposal_path,
+                context,
+                max_bytes=256 * 1024,
+            )
+    except TimeoutError as exc:
+        raise _ConsolidationProposalUnavailable(
+            "读取执行方案超时，可以继续请求 Agent 准备方案。"
+        ) from exc
+    except (OSError, ProductRuntimeError) as exc:
+        raise _ConsolidationProposalUnavailable(
+            "暂时无法读取工作区中的执行方案，可以继续请求 Agent 准备方案。"
+        ) from exc
+    return (
+        ConsolidationProposal.model_validate_json(source)
+        if source is not None
+        else None
+    )
+
+
+def _consolidation_issue(error: ValueError, context: RequestContext) -> str:
+    if isinstance(error, ValidationError):
+        fields = ", ".join(
+            ".".join(map(str, item["loc"])) or "JSON"
+            for item in error.errors(include_input=False)[:4]
+        )
+        fields = redact_graph_failure_text(fields, context)[:300]
+        return f"Invalid execution proposal fields: {fields}."
+    return redact_graph_failure_text(str(error), context)[:600]
+
+
+@router.get(
+    "/projects/{project_id}/runtime-contract/consolidation",
+    response_model=ConsolidationReview,
+)
+async def get_echomind_consolidation(
+    project_id: str,
+    request: Request,
+    dataset_task_id: str | None = None,
+    train_task_id: str | None = None,
+    eval_task_id: str | None = None,
+    script_only: bool = False,
+) -> ConsolidationReview:
+    context, project, store = _load_project(request, project_id)
+    task_ids = {
+        stage: task_id
+        for stage, task_id in (
+            ("dataset", dataset_task_id),
+            ("train", train_task_id),
+            ("eval", eval_task_id),
+        )
+        if task_id is not None
+    }
+    consolidation = await _load_consolidation_context(request, project, task_ids)
+    review = ConsolidationReview(
+        context=consolidation, proposal_path=consolidation.proposal_path
+    )
+    try:
+        compilation = await asyncio.to_thread(
+            load_script_compilation, store, consolidation
+        )
+        if compilation is not None:
+            return await asyncio.to_thread(compilation.review, project, consolidation)
+        if script_only:
+            return review
+        proposal = await _read_consolidation_proposal(request, consolidation, context)
+        if proposal is None:
+            return review
+
+    except _ConsolidationProposalUnavailable as exc:
+        return review.model_copy(update={"issue": str(exc)})
+    except ValueError as exc:
+        return review.model_copy(update={"issue": _consolidation_issue(exc, context)})
+    return review.model_copy(
+        update={"issue": "已有静态提案，请生成并验证执行方案以校验换批小样。"}
+    )
+
+
+@router.post(
+    "/projects/{project_id}/runtime-contract/consolidation/compile",
+    response_model=ConsolidationReview,
+)
+async def compile_echomind_script_plan(
+    project_id: str, body: CompileConsolidation, request: Request
+) -> ConsolidationReview:
+    context, project, store = _load_project(request, project_id, require_cluster=True)
+    consolidation = await _load_consolidation_context(
+        request, project, body.task_ids.model_dump(exclude_none=True)
+    )
+    runtime = get_product_runtime(request)
+    conversations_root = get_conversation_service(request).conversations_dir
+    try:
+        recipe = None
+        if body.recipe_path is not None:
+            async with asyncio.timeout(8):
+                source = await runtime.read_persisted_workspace_text(
+                    consolidation.evidence.conversation_id,
+                    body.recipe_path,
+                    context,
+                    max_bytes=256 * 1024,
+                )
+            if source is None:
+                raise ValueError("工作区中找不到配方，请确认已保存并具有读取权限。")
+            recipe = ConsolidationRecipe.model_validate_json(source)
+        read, check = _replay_checks(
+            request,
+            store.root,
+            project_id,
+            context,
+            await runtime.development_storage_proxy(
+                consolidation.evidence.conversation_id, context
+            ),
+            consolidation.source_batch,
+        )
+        compiled = await asyncio.to_thread(
+            build_script_compilation,
+            project,
+            consolidation,
+            conversations_root,
+            context,
+            versions=runtime.versions,
+            recipe=recipe,
+            read_replay_file=read,
+            check_replay=check,
+        )
+        return await asyncio.to_thread(
+            save_script_compilation,
+            store,
+            project,
+            consolidation,
+            compiled,
+            conversations_root,
+        )
+    except ProductRuntimeError as exc:
+        raise _product_error(exc) from exc
+    except ProjectLeaseTimeout as exc:
+        raise HTTPException(409, detail="Project 正在更新，请稍后重新编译。") from exc
+    except (TimeoutError, OSError) as exc:
+        raise HTTPException(503, detail="暂时无法读取或保存执行方案，请重试。") from exc
+    except ValueError as exc:
+        raise HTTPException(409, detail=_consolidation_issue(exc, context)) from exc
+
+
+class GenerateConsolidation(RequestConsolidation):
+    retry_command_id: str | None = Field(default=None, max_length=180)
+
+
+class GeneratedConsolidation(BaseModel):
+    review: ConsolidationReview
+    repair: ConsolidationRepair | None = None
+
+
+def _replay_checks(
+    request: Request,
+    root: Path,
+    project_id: str,
+    ctx: RequestContext,
+    development_proxy: StorageProxyConfig | None,
+    approved_source: str,
+):
+    @cache
+    def storage() -> EvaluationStorage:
+        return build_bound_evaluation_storage(
+            projects_root=root,
+            project_id=project_id,
+            context=ctx,
+            credential_store=build_runtime_credential_store(
+                root, request.app.state.config
+            ),
+            development_proxy=development_proxy,
+        ) or build_evaluation_storage(ctx)
+
+    def read(path: str) -> bytes:
+        return storage().read(to_storage_api_path(path))
+
+    def check(receipt: DatasetRecipeReceipt) -> bytes:
+        return recheck_dataset_replay(
+            storage(), receipt, approved_source=approved_source
+        )
+
+    return read, check
+
+
+async def _read_repair_recipes(
+    runtime: ConversationRuntime,
+    context: ConsolidationContext,
+    ctx: RequestContext,
+    receipts: tuple[CommandReceipt, ...],
+) -> tuple[ConsolidationRecipe, list[ConsolidationBlocker], dict[str, str]]:
+    recipe_fields: JsonObject = {"evidence_sha256": context.evidence_sha256}
+    invalid: list[ConsolidationBlocker] = []
+    revisions: dict[str, str] = {}
+    conversation = context.evidence.conversation_id
+    for stage in ("train", "eval"):
+        prefix = f"consolidation-{context.evidence_sha256[7:]}-{stage}-"
+        if not any(r.command_id.startswith(prefix) for r in receipts):
+            continue
+        path = repair_recipe_path(context.evidence_sha256, stage)
+        async with asyncio.timeout(12):
+            source = await runtime.read_persisted_workspace_text(
+                conversation, path, ctx, max_bytes=256 * 1024
+            )
+        if source is None:
+            continue
+        revisions[stage] = sha256(source.encode()).hexdigest()
+        field = "evaluator_runtime" if stage == "eval" else f"{stage}_runtime"
+        try:
+            patch = ConsolidationRecipe.model_validate_json(source)
+            if (
+                patch.evidence_sha256 != context.evidence_sha256
+                or patch.model_fields_set != {"evidence_sha256", field}
+            ):
+                raise ValueError("补丁必须只包含当前证据摘要与本节点配置")
+            value = patch.model_dump()[field]
+            if not isinstance(value, dict):
+                raise ValueError("节点配置为空")
+            recipe_fields[field] = value
+        except ValueError as exc:
+            invalid.append(
+                ConsolidationBlocker(
+                    stage=stage,
+                    code="repair_invalid",
+                    message=_consolidation_issue(exc, ctx),
+                )
+            )
+    return ConsolidationRecipe.model_validate(recipe_fields), invalid, revisions
+
+
+@router.post(
+    "/projects/{project_id}/runtime-contract/consolidation/generate",
+    response_model=GeneratedConsolidation,
+)
+async def generate_echomind_consolidation(
+    project_id: str, body: GenerateConsolidation, request: Request
+) -> GeneratedConsolidation:
+    ctx, project, store = _load_project(request, project_id, require_cluster=True)
+    context = await _load_consolidation_context(
+        request, project, body.task_ids.model_dump(exclude_none=True)
+    )
+    conversation = context.evidence.conversation_id
+    runtime = get_product_runtime(request)
+    root = get_conversation_service(request).conversations_dir
+    receipts, snapshot = await runtime.consolidation_command_state(
+        conversation, context.evidence_sha256, ctx
+    )
+    prior = await asyncio.to_thread(load_script_compilation, store, context)
+    awaiting = (
+        snapshot.pending_inputs
+        or conversation_has_work(snapshot)
+        or snapshot.status
+        in {
+            "waiting_for_confirmation",
+            "waiting_for_input",
+        }
+    )
+    try:
+        revisions: dict[str, str] = {}
+        if receipts and prior and prior.blockers and awaiting:
+            review = prior.review(project, context)
+        else:
+            recipe, invalid, revisions = await _read_repair_recipes(
+                runtime, context, ctx, receipts
+            )
+            read, check = _replay_checks(
+                request,
+                store.root,
+                project_id,
+                ctx,
+                await runtime.development_storage_proxy(conversation, ctx),
+                context.source_batch,
+            )
+            compiled = await asyncio.to_thread(
+                build_script_compilation,
+                project,
+                context,
+                root,
+                ctx,
+                versions=runtime.versions,
+                recipe=recipe,
+                read_replay_file=read,
+                check_replay=check,
+            )
+            if invalid:
+                stages = {error.stage for error in invalid}
+                compiled = compiled.model_copy(
+                    update={
+                        "proposal": None,
+                        "blockers": (
+                            *invalid,
+                            *(b for b in compiled.blockers if b.stage not in stages),
+                        ),
+                        "stages": tuple(
+                            row.model_copy(update={"status": "blocked"})
+                            if row.stage in stages
+                            else row
+                            for row in compiled.stages
+                        ),
+                    }
+                )
+            review = await asyncio.to_thread(
+                save_script_compilation, store, project, context, compiled, root
+            )
+
+        if not review.blockers:
+            return GeneratedConsolidation(review=review)
+        storage_issue = next(
+            (
+                b
+                for b in review.blockers
+                if b.code == "dataset_replay_storage_unavailable"
+            ),
+            None,
+        )
+        if storage_issue:
+            return GeneratedConsolidation(
+                review=review,
+                repair=ConsolidationRepair(
+                    stage=storage_issue.stage,
+                    command_id="",
+                    status="blocked",
+                    message=storage_issue.message,
+                ),
+            )
+        stage = review.blockers[0].stage
+        evidence = context.evidence.model_dump(mode="json")[stage]
+        facts: JsonObject = {
+            "stage": stage,
+            "evidence_sha256": context.evidence_sha256,
+            "development_task": evidence,
+            "plan": [
+                redact_graph_failure_text(
+                    json.dumps(node.config.get("tasks", []), ensure_ascii=False), ctx
+                )[:6000]
+                for node in project.graph.nodes
+                if node.type == ("evaluator" if stage == "eval" else stage)
+            ],
+            "inputs": {
+                "source_batch": context.source_batch,
+                "base_model": context.base_model,
+                "fixed_eval": context.validation_dataset,
+                "training_validation": context.training_validation,
+            },
+            "assets": review.assets.get(stage),
+        }
+        repair, command = plan_repair(
+            stage=stage,
+            evidence=context.evidence_sha256,
+            facts=facts,
+            issues=[
+                f"{b.code} · {b.message}" for b in review.blockers if b.stage == stage
+            ],
+            revision=revisions.get(stage, ""),
+            receipts=receipts,
+            snapshot=snapshot,
+            retry_command_id=body.retry_command_id,
+        )
+        if command:
+            await asyncio.to_thread(
+                _require_profile, request, conversation, ECHOMIND_PRODUCT_PROFILE
+            )
+            await configure_session(request, conversation, ECHOMIND_PRODUCT_PROFILE)
+            result = await runtime.submit_command(conversation, command, ctx)
+            if result.status == "failed":
+                repair = repair.model_copy(
+                    update={
+                        "status": "blocked",
+                        "message": "修订请求未送达，稍后可重试。",
+                    }
+                )
+        return GeneratedConsolidation(review=review, repair=repair)
+    except ProductRuntimeError as exc:
+        raise _product_error(exc) from exc
+    except ProjectLeaseTimeout as exc:
+        raise HTTPException(409, detail="Project 正在更新，请稍后重试。") from exc
+    except (TimeoutError, OSError, EvaluationStorageUnavailableError) as exc:
+        raise HTTPException(
+            503, detail="读取或保存固化证据暂时失败，可以继续本次验证。"
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(409, detail=_consolidation_issue(exc, ctx)) from exc
+
+
+@router.post(
+    "/projects/{project_id}/runtime-contract/consolidation",
+    response_model=ConsolidationRequestReceipt,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def request_echomind_consolidation(
+    project_id: str, body: ReviseConsolidation, request: Request
+) -> ConsolidationRequestReceipt:
+    context, project, _ = _load_project(request, project_id, require_cluster=True)
+    conversation_id = project.project.conversation_id
+    await asyncio.to_thread(
+        _require_profile, request, conversation_id, ECHOMIND_PRODUCT_PROFILE
+    )
+    consolidation = await _load_consolidation_context(
+        request, project, body.task_ids.model_dump(exclude_none=True)
+    )
+    runtime = get_product_runtime(request)
+    try:
+        references = await asyncio.to_thread(
+            consolidation_references,
+            FileProductStore(
+                get_conversation_service(request).conversations_dir / conversation_id
+            ),
+            consolidation.evidence,
+        )
+        train_reference = references.get("train")
+        if isinstance(train_reference, dict) and "runtime_candidate" in train_reference:
+            train_reference.pop("workflow", None)
+        if runtime.versions is not None:
+            eval_reference = references.get("eval")
+            if isinstance(eval_reference, dict):
+                eval_reference.update(
+                    await asyncio.to_thread(
+                        consolidation_evaluation_reference,
+                        runtime.versions,
+                        consolidation.evidence,
+                        context,
+                    )
+                )
+        command = UserMessageCommand(
+            command_id=uuid4().hex,
+            content=(
+                TextContent(
+                    text=_consolidation_prompt(
+                        consolidation,
+                        references,
+                        review_note=redact_graph_failure_text(
+                            body.review_note.strip(), context
+                        ),
+                    )
+                ),
+            ),
+        )
+        await configure_session(request, conversation_id, ECHOMIND_PRODUCT_PROFILE)
+        receipt = await runtime.submit_command(conversation_id, command, context)
+    except ProductRuntimeError as exc:
+        if exc.code == "conversation_busy":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": exc.code,
+                    "message": "Agent 正在处理当前回合，结束后再生成执行方案。",
+                },
+            ) from exc
+        raise _product_error(exc) from exc
+    except OSError as exc:
+        raise HTTPException(
+            503, detail="Could not request an execution proposal."
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(409, detail=_consolidation_issue(exc, context)) from exc
+    if receipt.status == "failed":
+        raise HTTPException(409, detail="Could not deliver the request to Manager.")
+    return ConsolidationRequestReceipt(
+        command_id=receipt.command_id, proposal_path=consolidation.proposal_path
+    )
+
+
+@router.post(
+    "/projects/{project_id}/runtime-contract/consolidation/apply",
+    response_model=ProjectInfo,
+)
+async def apply_echomind_consolidation(
+    project_id: str, body: ApplyConsolidation, request: Request
+) -> ProjectInfo:
+    context, project, store = _load_project(request, project_id, require_cluster=True)
+    task_ids = body.task_ids.model_dump(exclude_none=True)
+    consolidation = await _load_consolidation_context(request, project, task_ids)
+    try:
+        compilation = await asyncio.to_thread(
+            load_script_compilation, store, consolidation
+        )
+        proposal = (
+            compilation.proposal
+            if compilation is not None
+            else await _read_consolidation_proposal(request, consolidation, context)
+        )
+        if proposal is None:
+            raise ValueError("The execution proposal is missing. Review it again.")
+
+        def load_current_proposal(
+            fresh: ConsolidationContext,
+        ) -> ConsolidationProposal | None:
+            current = load_script_compilation(store, fresh)
+            return current.proposal if current is not None else None
+
+        return await asyncio.to_thread(
+            apply_consolidation,
+            store,
+            project,
+            conversations_root=get_conversation_service(request).conversations_dir,
+            task_ids=task_ids,
+            proposal=proposal,
+            expected_proposal_sha256=body.proposal_sha256,
+            load_current_proposal=load_current_proposal
+            if compilation is not None
+            else None,
+        )
+    except _ConsolidationProposalUnavailable as exc:
+        raise HTTPException(503, detail=str(exc)) from exc
+    except (ValueError, ProjectLeaseTimeout) as exc:
+        issue = (
+            _consolidation_issue(exc, context)
+            if isinstance(exc, ValueError)
+            else "The Project is being updated. Try again."
+        )
+        raise HTTPException(409, detail=issue) from exc
+
+
+def _consolidation_prompt(
+    consolidation: ConsolidationContext, references: JsonObject, *, review_note: str
+) -> str:
+    evidence = (
+        json.dumps(
+            {
+                **consolidation.model_dump(mode="json"),
+                "proposal_path": consolidation.proposal_path,
+                "references": references,
+                "review_note": review_note,
+            },
+            ensure_ascii=False,
+        )
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    return (
+        "你是当前 EchoMind Project 的 Manager。根据已成功的 Dataset、Train 和 Eval "
+        "研发任务，准备该 Project 的执行方案供用户审阅。核对真实工具回执、已确认的"
+        "输入和可从平台任务容器读取的脚本与配置。只准备提案及其版本化资产。"
+        "不要提交平台任务、修改现有产物或 Project 状态。"
+        "若已有提案，补齐已核验缺口。review_note 是用户在审阅时指定的修改意见。"
+        "涉及已确认输入或标签政策变更时，向用户确认。\n\n"
+        "逐节点准备配置，每次工具调用只写一份小配置。已有的长脚本只传版本路径，"
+        "不要在回复、提案或工具参数里转抄脚本。三个节点都齐备后，用 JSON 解析"
+        "合并配置并写到 proposal_path。顶层字段是 evidence_sha256（原样填写）、"
+        "dataset_runtime、train_runtime、evaluator_runtime。每个 runtime 中的 workflow "
+        "是冻结的 Studio XYFlow JSON，包含 nodes 和 edges；不要把执行 DSL 字符串写入"
+        " workflow。workflow_bindings 是参数路径到 Graph 输入端口的映射。使用独立的"
+        " /workspace 输出目录，路径含 {graph_run_id} 和 {stage_run_id}。命令用"
+        " command_template 和 command_binding_path 写入节点参数，静态文本中的花括号"
+        "要转义。只引用已核验的平台可读资产，不把凭据写进配置或命令。\n\n"
+        "Dataset 从 source_batch 处理真实源数据，输出 train_messages.jsonl 和"
+        " val_messages.jsonl。绑定 {source_batch} 和 {output_uri}。从本 Project 的"
+        "已确认数据格式、标签策略、切分规则和成功回执提取实现。确有预处理时，将"
+        "整理源数据、生成中间清单和下游处理编入执行器支持的工作流。当前执行器直接"
+        "提交平台工作流。若需要在提交前额外执行一次沙箱命令，注明该执行能力缺口。"
+        "每轮使用独立中间目录，按实际挂载映射 Storage 路径。已封批的采集数据可按"
+        "契约直接转训练数据，保持 Project 的标签策略和训练格式。\n"
+        "Manager 只核对已知回执和明确的资产路径。仅在必须时，请 Dataset 子 Agent"
+        "用它的技能做只读核验，返回可用的 Storage 文件、校验摘要和输入输出约定。"
+        "此阶段严禁提交任务、安装环境、申请凭据或遍历无关目录。版本运行标识"
+        "仅用于追溯。原图标注缺少可执行步骤、已确认标签或受支持的授权引用时，"
+        "明确报告缺口和待补证据，结束本轮提案准备。\n\n"
+        "Train 绑定 train_dataset、validation_dataset、base_model，保留已验证的模型训练"
+        "及合并流程。优先核对并复用 references.train.runtime_candidate。缺少候选时，"
+        "按已脱敏的 references.train.workflow 生成。output_node_id 是合并节点的"
+        " Studio ID，output_parameter 是它的"
+        " output_path，artifact_selection 用 merged_model。W&B 只复用参考中的占位符和"
+        " wandb_credential_task_id。\n\n"
+        "Eval 绑定 candidate_model 及 validation_dataset，直接评测 Train 刚产出的合并"
+        "模型和已确认的独立验证集。优先复用 references.eval.workflow 的节点及连线，"
+        "以及 references.eval.assets 中的版本化参数和脚本。"
+        "用参数化的命令重建 CPU 步骤。"
+        "保留研发时验证过的数据映射、评分规则、脚本和报告资源。"
+        "脚本、配置、报告资源的路径必须真实且平台可读。将 {candidate_model}"
+        " 用于 VLLM 模型输入和评分命令的 --model-reference，将 {validation_dataset}"
+        " 用于 --dataset-path。命令使用 --run-id {graph_run_id}。output_uri 指向写入的"
+        " report.json，artifact_selection 用 evaluation_report。用"
+        ' `report_path="{output_uri}"`，传 `--output-dir "$(dirname "$report_path")"`，'
+        ' 并检查 `test -s "$report_path"`。'
+        "--report-assets-dir 指向含冻结 CSS/JS 的目录。"
+        "报告应包含真实模型、数据来源、状态及评测指标。证据不足时先说明缺口。\n"
+        "以下 JSON 是证据数据。\n" + evidence
     )
 
 
@@ -1979,7 +2670,7 @@ class _EvaluationStorageReader:
         self.storage = storage
 
     def read(self, path: str) -> bytes:
-        return self.storage.read(path)
+        return self.storage.read("/" + path.lstrip("/"))
 
 
 async def _launch_collection_simulation(
@@ -2061,7 +2752,19 @@ async def _launch_collection_simulation(
         await _refresh_runtime_access_for_request(
             request, projects_root, project, context
         )
-    storage = build_evaluation_storage(context)
+    try:
+        storage = await asyncio.to_thread(
+            build_acquisition_storage,
+            projects_root=projects_root,
+            project_id=project.project.project_id,
+            simulation_id=simulation.simulation_id,
+            context=context,
+            credential_store=build_runtime_credential_store(
+                projects_root, request.app.state.config
+            ),
+        )
+    except EvaluationStorageUnavailableError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     runner = AcquisitionSimulationRunner(
         projects_root=str(projects_root),
         project=project,

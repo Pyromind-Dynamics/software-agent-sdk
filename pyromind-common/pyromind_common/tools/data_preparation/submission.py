@@ -15,6 +15,9 @@ from typing import TYPE_CHECKING, Any, cast
 from pydantic import Field, field_validator
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import (
+    validate_pipeline_topology as validate_pipeline_topology,
+)
 from pyromind_common.sdk.conversation.state import ActiveLongTask
 from pyromind_common.sdk.llm import ImageContent, TextContent
 from pyromind_common.sdk.tool import Observation
@@ -258,55 +261,3 @@ def submission_files(conversation: ToolConversation) -> Iterator[SubmissionFiles
 MODEL_PREPARATION_NODES = frozenset(
     {"CloneAndCacheModel", "DownloadAndCacheModel", "ModelMergeLoraNode"}
 )
-
-
-def validate_pipeline_topology(
-    workflow: dict[str, Any], *, require_inference: bool = False
-) -> None:
-    nodes, edges = workflow.get("nodes", []), workflow.get("edges", [])
-    kinds = [node["data"]["nodeType"] for node in nodes]
-    if not require_inference and kinds == ["CustomCommandCPUNode"] and not edges:
-        return
-    preparation = [
-        node for node in nodes if node["data"]["nodeType"] in MODEL_PREPARATION_NODES
-    ]
-    expected = ["CustomCommandCPUNode", "VLLMInference"]
-    if len(preparation) == 1:
-        expected.append(preparation[0]["data"]["nodeType"])
-    if sorted(kinds) != sorted(expected) or len(edges) != len(nodes) - 1:
-        raise ValueError(
-            "evaluation requires inference -> CPU with at most one "
-            "clone or download node"
-        )
-    if len({str(node["id"]) for node in nodes}) != len(nodes):
-        raise ValueError("evaluation node IDs must be unique")
-    source = next(node for node in nodes if node["data"]["nodeType"] == "VLLMInference")
-    target = next(
-        node for node in nodes if node["data"]["nodeType"] == "CustomCommandCPUNode"
-    )
-    expected_edges = {(str(source["id"]), str(target["id"]), "endpoint", "param")}
-    if preparation:
-        expected_edges.add(
-            (
-                str(preparation[0]["id"]),
-                str(source["id"]),
-                "merged_model_path"
-                if preparation[0]["data"]["nodeType"] == "ModelMergeLoraNode"
-                else "model_path",
-                "model_path",
-            )
-        )
-    actual_edges = {
-        (
-            str(edge.get("source")),
-            str(edge.get("target")),
-            edge.get("sourceHandle"),
-            edge.get("targetHandle"),
-        )
-        for edge in edges
-    }
-    if actual_edges != expected_edges:
-        raise ValueError(
-            "pipeline must connect preparation.model_path to inference.model_path "
-            "and inference.endpoint to CPU.param"
-        )

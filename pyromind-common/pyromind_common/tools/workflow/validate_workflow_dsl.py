@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import httpx
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import prepare_debug_workflow
 from pyromind_common.sdk.tool.registry import register_tool
 from pyromind_common.sdk.tool.tool import (
     Action,
@@ -143,6 +145,13 @@ class ValidateWorkflowDslAction(Action):
     # the sole DSL input.
     dsl: SkipJsonSchema[str | None] = Field(default=None, exclude=True)
     name: str = Field(default="workflow", description="Workflow name.")
+    test_mode: bool = Field(
+        default=False,
+        description=(
+            "Prepare a fixed test-mode graph for debugging without submitting it. "
+            "The returned raw_response.data.workflow is the graph to submit."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_source(self) -> ValidateWorkflowDslAction:
@@ -281,6 +290,10 @@ errors must be fixed instead of retried.
 Note: a successful tool call can still return valid=false. In that case, use
 the returned node_id, node_type, edge_id, field, and detail line information to
 fix the workflow DSL.
+
+For an explicitly requested debug run, use test_mode=true. Validation prepares
+the fixed test graph and returns it in raw_response.data.workflow; this call
+does not create a platform task or consume the debug submission budget.
 """
 
 
@@ -379,7 +392,30 @@ class ValidateWorkflowDslExecutor(ToolExecutor):
                 failure_stage="transport",
             )
 
-        return _observation_from_payload(payload)
+        observation = _observation_from_payload(payload)
+        if not action.test_mode or observation.valid is not True:
+            return observation
+        prepared_payload = deepcopy(payload)
+        data = prepared_payload.get("data")
+        workflow = data.get("workflow") if isinstance(data, dict) else None
+        if not isinstance(workflow, dict):
+            return ValidateWorkflowDslObservation.from_text(
+                text="Validation returned no graph for test-mode preparation.",
+                valid=False,
+                is_error=True,
+                failure_stage="platform_schema",
+            )
+        assert isinstance(data, dict)
+        try:
+            data["workflow"] = prepare_debug_workflow(workflow)
+        except ValueError as exc:
+            return ValidateWorkflowDslObservation.from_text(
+                text=str(exc),
+                valid=False,
+                is_error=True,
+                failure_stage="platform_schema",
+            )
+        return _observation_from_payload(prepared_payload)
 
     def _resolve_dsl(
         self,

@@ -40,7 +40,8 @@ import {
 } from "./workspace-policy.js";
 
 import type { ExecutionAccess } from "./workflow-execution.js";
-import { createTerminalTool } from "./terminal-tool.js";
+import { createTerminalTool, type TerminalEnvironmentProvider } from "./terminal-tool.js";
+import { platformSdkNetworkDomains, platformSdkReadRoots } from "./sdk-environment.js";
 import { bounded } from "./terminal-channel.js";
 
 const OMITTED_IMAGE_TEXT = "[Image omitted: Pi only accepts inline base64 image data.]";
@@ -64,6 +65,7 @@ export interface SkillRootConfig {
 export interface CreateToolsOptions {
   toolContext?: () => JsonObject;
   terminalEnvironment?: Record<string, string>;
+  platformSdkEnvironment?: TerminalEnvironmentProvider;
   terminalTimeouts?: SandboxTerminalTimeouts;
   /** Base64 characters one staging line carries; see the sandbox transport. */
   scriptChunkChars?: number;
@@ -71,6 +73,7 @@ export interface CreateToolsOptions {
   terminalConnect?: SandboxTerminalConnector;
   onExecutionReady?: (access: ExecutionAccess) => void;
   onSandboxToolsReady?: (tools: SandboxTools) => void;
+  onChildTerminalReady?: (tool: AgentTool) => void;
   skillsDirectory?: string;
   /** Present only when the session runs its execution plane in a sandbox. */
   sandbox?: SandboxEndpointProvider;
@@ -131,7 +134,13 @@ export async function createTools(
   const terminalOperations = await createWorkspaceBashOperations(
     terminalBackend,
     policy,
-    { resourceLimits },
+    {
+      resourceLimits,
+      ...(options.platformSdkEnvironment ? {
+        allowedNetworkDomains: platformSdkNetworkDomains,
+        runtimeReadRootsForEnvironment: platformSdkReadRoots,
+      } : {}),
+    },
   );
   const allowedReadRoots = [policy.publicDataRoot, ...policy.readOnlyRoots];
   options.onExecutionReady?.({ operations: terminalOperations, cwd: workspaceRoot,
@@ -158,15 +167,22 @@ export async function createTools(
   process.env.TMPDIR = terminalOutputTemp;
   process.env.TMP = terminalOutputTemp;
   process.env.TEMP = terminalOutputTemp;
-  const terminal = createTerminalTool(workspaceRoot, {
+  const terminalOptions = {
     operations: terminalOperations,
     exposeSessionEnvironment: false,
-    spawnHook: ({ command }) => ({
+    spawnHook: ({ command }: { command: string }) => ({
       command,
       cwd: workspaceRoot,
       env: { ...safeShellEnvironment(), ...options.terminalEnvironment },
     }),
+  };
+  const terminal = createTerminalTool(workspaceRoot, {
+    ...terminalOptions,
+    environmentProvider: options.platformSdkEnvironment,
   });
+  if (options.platformSdkEnvironment) {
+    options.onChildTerminalReady?.(createTerminalTool(workspaceRoot, terminalOptions));
+  }
   return [
     bindPathTool(
       read,
@@ -268,6 +284,7 @@ async function createSandboxTools(
     const fileClient = new FallbackSandboxFileClient(
       fileApi,
       new SandboxTerminalFileClient(terminal, { chunkChars: scriptChunkChars }),
+      { endpoints },
     );
     const access: ExecutionAccess = {
       operations: terminal, cwd: laneWorkspace, env: options.terminalEnvironment, allowedReadRoots,
@@ -275,7 +292,10 @@ async function createSandboxTools(
       readFile: (path, limit) => fileClient.read(path, limit),
       resolvePath: resolveLanePath,
     };
-    const tools = createSandboxLaneTools(laneWorkspace, access, fileClient, options);
+    const tools = createSandboxLaneTools(laneWorkspace, access, fileClient, {
+      ...options,
+      platformSdkEnvironment: owner === "main" ? options.platformSdkEnvironment : undefined,
+    });
     return { tools, access, terminal };
   };
   const main = createLane("main");
@@ -305,6 +325,7 @@ function createSandboxLaneTools(
   const edit = fileTool((files) => createCodingEditTool(sandboxCwd, { operations: files.edit }));
   const terminal = createTerminalTool(sandboxCwd, {
     operations: access.operations,
+    environmentProvider: options.platformSdkEnvironment,
     exposeSessionEnvironment: false,
     spawnHook: ({ command }) => ({
       command,

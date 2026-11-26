@@ -9,23 +9,24 @@ Pipelines must never hardcode secrets.
 
 from __future__ import annotations
 
-import ast
-import hashlib
 import json
 import os
-import shlex
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterable
-from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
+from pyromind_common.platform.scene_core import (
+    dataflow_pip_install_commands as dataflow_pip_install_commands,
+    runtime_bundle_fingerprint as runtime_bundle_fingerprint,
+    runtime_public_names as runtime_public_names,
+    validate_managed_image_pipeline as validate_managed_image_pipeline,
+)
 from pyromind_common.sdk.utils.redact import redact_text_secrets
 from pyromind_common.tools.utils.dataflow_config import (
     DEFAULT_DATAFLOW_API_BASE_URL,
@@ -62,16 +63,6 @@ _FORBIDDEN_MANAGED_IMAGE_IMPORTS = {
     "requests",
     "urllib",
 }
-
-
-def dataflow_pip_install_commands(
-    *, pip_path: str, requirements_path: str
-) -> tuple[str, str]:
-    pip = shlex.quote(pip_path)
-    return (
-        f"{pip} install -r {shlex.quote(requirements_path)}",
-        f"{pip} install --no-deps open-dataflow=={SUPPORTED_DATAFLOW_VERSION}",
-    )
 
 
 def resolve_dataflow_python(override: str | None = None) -> str:
@@ -136,110 +127,6 @@ def check_dataflow_version(
     if actual != expected:
         return False, f"expected {expected}, found {actual or 'unknown'}"
     return True, actual
-
-
-def runtime_bundle_fingerprint(
-    runtime_dir: Path,
-    filenames: Iterable[str],
-) -> str:
-    """Hash runtime names and bytes in a stable order."""
-
-    digest = hashlib.sha256()
-    for filename in sorted(filenames):
-        path = runtime_dir / filename
-        if not path.is_file():
-            raise ValueError(f"DataFlow runtime file is missing: {path}")
-        digest.update(filename.encode("utf-8"))
-        digest.update(b"\0")
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def runtime_public_names(path: Path) -> set[str]:
-    """Read a literal ``__all__`` contract without importing the runtime."""
-
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (OSError, SyntaxError) as exc:
-        raise ValueError(f"Could not inspect image_utils public API: {exc}") from exc
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(
-            isinstance(target, ast.Name) and target.id == "__all__"
-            for target in targets
-        ):
-            continue
-        if node.value is None:
-            break
-        try:
-            value = ast.literal_eval(node.value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("image_utils __all__ must be a literal list") from exc
-        if not isinstance(value, list) or not all(
-            isinstance(name, str) for name in value
-        ):
-            raise ValueError("image_utils __all__ must contain only strings")
-        return set(value)
-    raise ValueError("image_utils does not define a public __all__ contract")
-
-
-def validate_managed_image_pipeline(
-    pipeline: Path,
-    public_names: set[str],
-) -> None:
-    """Enforce the configuration-only managed image pipeline contract."""
-
-    try:
-        source = pipeline.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(pipeline))
-        compile(tree, str(pipeline), "exec")
-    except (OSError, SyntaxError) as exc:
-        raise ValueError(f"Could not parse image pipeline: {exc}") from exc
-
-    imported_image_utils: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.comprehension)):
-            raise ValueError(
-                "Managed image pipelines must be configuration-only and cannot "
-                "contain for/while loops."
-            )
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".", 1)[0]
-                if alias.name == "image_utils":
-                    raise ValueError(
-                        "Use explicit `from image_utils import ...` imports."
-                    )
-                if root in _FORBIDDEN_MANAGED_IMAGE_IMPORTS:
-                    raise ValueError(f"Managed image pipelines cannot import {root}.")
-        if not isinstance(node, ast.ImportFrom):
-            continue
-        module = node.module or ""
-        root = module.split(".", 1)[0]
-        if root in _FORBIDDEN_MANAGED_IMAGE_IMPORTS:
-            raise ValueError(f"Managed image pipelines cannot import {root}.")
-        if module != "image_utils":
-            continue
-        imported = {alias.name for alias in node.names}
-        if "*" in imported:
-            raise ValueError("image_utils wildcard imports are not allowed.")
-        unknown = sorted(imported - public_names)
-        if unknown:
-            raise ValueError(
-                "Managed image pipeline imports unsupported image_utils APIs: "
-                + ", ".join(unknown)
-            )
-        imported_image_utils.update(imported)
-
-    required = {"ImagePipelineConfig", "run_image_pipeline_from_cli"}
-    missing = sorted(required - imported_image_utils)
-    if missing:
-        raise ValueError("Managed image pipeline must import: " + ", ".join(missing))
 
 
 _LITELLM_PROVIDER_PREFIXES = frozenset(

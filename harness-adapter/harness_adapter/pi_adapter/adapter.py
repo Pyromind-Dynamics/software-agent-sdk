@@ -15,11 +15,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
+import httpx
+from pydantic import SecretStr
+
 from harness_adapter.pi_adapter.business_tool_host import (
+    PLATFORM_SDK_TOOL_NAMES,
     PyromindBusinessToolHost,
     RuntimeResourceProposer,
     ToolExecutionContext,
@@ -31,8 +35,10 @@ from harness_adapter.pi_adapter.event_translator import (
     tool_operation_id,
     translate_runner_event,
 )
+from harness_adapter.pi_adapter.fixed_actor import FixedActorExecutionManager
 from harness_adapter.pi_adapter.permissions import TerminalPermissionPolicy
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.platform_helper_bundle import prepare_host_sdk
 from harness_adapter.pi_adapter.protocol import (
     PROTOCOL_VERSION,
     SandboxAuthorizationRequired,
@@ -47,11 +53,19 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     SandboxExecutionManager,
     SandboxSettings,
 )
+from harness_adapter.pi_adapter.sdk_environment import (
+    PLATFORM_SDK_INSTRUCTIONS,
+    SDK_ATOMIC_TOOL_NAMES,
+    SDK_REMOTE_STORAGE_TOOL_NAMES,
+    PlatformSDKSetupError,
+)
 from harness_adapter.pi_adapter.terminal_backend import validate_pi_terminal_backend
 from harness_adapter.pi_adapter.tool_output import (
     parse_business_tool_output_filename,
 )
 from harness_adapter.version_tools import ExecutionCall, VersionCall
+from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
+from pyromind_common.sdk.secret import StaticSecret
 from pyromind_common.sdk.workspace.base import BaseWorkspace
 from pyromind_common.sdk.workspace.local import LocalWorkspace
 from pyromind_common.tools.pyromind_dataset.definition import (
@@ -93,10 +107,12 @@ from pyromind_runtime.domain.preparation import (
     PREPARATION_REVIEW_TOOLS,
     PREPARATION_TOOLS,
 )
+from pyromind_runtime.domain.project_storage import StorageProxyConfig
 from pyromind_runtime.domain.reward_bundle import GET_PROJECT_REWARD
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
+    ExternalTaskState,
     OperationActivity,
     WorkflowState,
 )
@@ -156,6 +172,18 @@ ASK_USER_TOOL_DESCRIPTION = (
     "until the user answers or cancels; their answers arrive as the tool result."
 )
 _PLANNED_SUBMISSIONS = {"df_submit_evaluation", "df_submit_pipeline", "submit_workflow"}
+_SDK_DIRECT_SUBMISSION_TOOLS = frozenset(
+    {
+        "df_submit_pipeline",
+        "submit_workflow",
+        "workflow_debug",
+        "run_dataset_cleaning",
+        "edp_render",
+        "edp_submit",
+        "edp_aggregate",
+        "df_submit_evaluation",
+    }
+)
 _WORKFLOW_PATH = Path("public_data/workflow_canvas/workflow.py")
 _MAX_WORKFLOW_DSL_BYTES = 2 * 1024 * 1024
 _SYSTEM_PROMPT = """You are a coding agent inside one conversation workspace.
@@ -183,11 +211,14 @@ remove or replace that prefix. Storage is writable: to hand a workspace file to
 a platform task, write it under {root}/<dir>/<name> and pass that same path.
 Every dataset this session works on is a Storage path you can read directly.
 
-Platform task state comes from the platform tools, never from this workspace.
-Task status and logs for any workflow node are reported by inspect_workflow_task.
-Data-processing task progress and workflow runs are reported by df_check_progress
-and the workflow tools. Do not search the filesystem or Storage for them, and do
-not read a platform failure out of local files.
+Platform task state comes from platform APIs, never from this workspace.
+With SDK access, query task and node status or logs using the SDK inspection
+reference in knowledge/sdk/agent-operations.mdx. Otherwise use the available
+inspect_workflow_task tool.
+Read business progress.json, report.json and bounded record tails directly in the
+known Storage run output directory. Use df_check_progress only when it is listed.
+Do not search the filesystem or Storage for platform task state; query its APIs.
+Business progress files do not establish a platform task's failure or termination.
 
 To show the user an image, HTML page, PDF, or another artifact, call
 get_storage_url on its paths and embed the returned URLs in your reply as
@@ -203,13 +234,26 @@ report the actual failure and provide the verified path instead. Showing a file
 never depends on image support in your own model."""
 
 
-def _sandbox_system_prompt(mount_path: str, conversation_id: str) -> str:
+_ACTOR_SYSTEM_PROMPT = """
+
+Terminal commands and workspace file tools use the development Actor. Its
+writable user disk is mounted at {root}. Scripts run here can call the platform
+SDK using the environment supplied to the main terminal. Query platform APIs for
+task status and logs. A platform job or download link can use a file on this disk
+only if the same data is available in the user's platform Storage. For an
+artifact that exists only on the Actor, give the workspace path."""
+
+
+def _sandbox_system_prompt(
+    mount_path: str, conversation_id: str, *, fixed_actor: bool = False
+) -> str:
     """Add the sandbox's absolute paths, which survive a ``cd`` in terminal."""
     root = mount_path.rstrip("/")
     workspace = f"{root}{PYROMIND_AGENT_STORAGE_ROOT}/{conversation_id}"
     skills = f"{workspace}/.agents/skills"
+    environment = _ACTOR_SYSTEM_PROMPT if fixed_actor else _SANDBOX_SYSTEM_PROMPT
     return (
-        f"{_SANDBOX_SYSTEM_PROMPT.replace('{root}', root)}\n\n"
+        f"{environment.replace('{root}', root)}\n\n"
         f"The skills tree is unpacked inside this sandbox (not outside the "
         f"workspace) at {skills}. Every terminal call starts at the workspace "
         "root, so .agents/skills/<skill>/... works as written, and "
@@ -259,6 +303,7 @@ class _PiSession:
     delegated_input_ids: set[str] = field(default_factory=set)
     message_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     submission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    sdk_secrets: SecretRegistry = field(default_factory=SecretRegistry, repr=False)
 
 
 class PiAdapter:
@@ -267,6 +312,7 @@ class PiAdapter:
         conversation_root: Path | str,
         *,
         terminal_backend: str,
+        platform_sdk_enabled: bool = True,
         skill_root: Path | None = None,
         skill_roots: list[Path] | None = None,
         knowledge_root: Path | None = None,
@@ -274,6 +320,8 @@ class PiAdapter:
         pipeline_runs: Callable[[str], PipelineRuns] | None = None,
         workflow_call: WorkflowCall | None = None,
     ) -> None:
+        if workflow_call is not None:
+            raise ValueError("Historical experience workflows are unavailable")
         if getattr(sys, "frozen", False):
             # PyInstaller: __file__ lives under the _MEIPASS extraction dir, so
             # parents[3] would escape the bundle; bundled skill datas sit at
@@ -281,8 +329,13 @@ class PiAdapter:
             repository = Path(getattr(sys, "_MEIPASS", ""))
         else:
             repository = Path(__file__).parents[3]
-        self._workflow_call = workflow_call
         self._plan_submission: Callable[..., Awaitable[str | None]] | None = None
+        self._external_wait_provider: (
+            Callable[[str, str, RequestContext], Awaitable[tuple[str, ...]]] | None
+        ) = None
+        self._sdk_context_provider: (
+            Callable[[str, RequestContext], Awaitable[dict[str, str]]] | None
+        ) = None
         self._echo_chat_call: (
             Callable[
                 [str, str, JsonObject, str, RequestContext, str | None],
@@ -304,6 +357,7 @@ class PiAdapter:
         ) = None
         self._execution_outputs: dict[str, tuple[str, WorkflowEventSink]] = {}
         self._terminal_backend = validate_pi_terminal_backend(terminal_backend)
+        self._platform_sdk_configured = platform_sdk_enabled
         self._conversation_root = Path(conversation_root).resolve()
         self._skills_directory = Path(
             os.getenv("PYROMIND_SKILLS_PATH") or repository / ".agents" / "skills"
@@ -358,7 +412,14 @@ class PiAdapter:
                 Path(eval_delivery.__file__),
             )
         )
-        self._sandbox = SandboxExecutionManager(resource_roots=resource_roots)
+        fixed_actor = (
+            FixedActorExecutionManager.from_env(resource_roots=resource_roots)
+            if self._terminal_backend == "sandbox"
+            else None
+        )
+        self._sandbox = fixed_actor or SandboxExecutionManager(
+            resource_roots=resource_roots
+        )
 
     def execution_request(
         self, conversation_id: str
@@ -406,6 +467,18 @@ class PiAdapter:
         self, callback: Callable[..., Awaitable[str | None]]
     ) -> None:
         self._plan_submission = callback
+
+    def set_sdk_context_provider(
+        self,
+        callback: Callable[[str, RequestContext], Awaitable[dict[str, str]]],
+    ) -> None:
+        self._sdk_context_provider = callback
+
+    def set_external_wait_provider(
+        self,
+        callback: Callable[[str, str, RequestContext], Awaitable[tuple[str, ...]]],
+    ) -> None:
+        self._external_wait_provider = callback
 
     @staticmethod
     def _queues_messages(session: _PiSession) -> bool:
@@ -550,8 +623,44 @@ class PiAdapter:
         allowed = session.config.get("tool_allowlist")
         return allowed is None or name in allowed
 
+    def _platform_sdk_enabled(self, session: _PiSession) -> bool:
+        origin = session.context.task_origin
+        allowed = session.config.get("tool_allowlist")
+        profile = session.config.get("profile_id") or "pyromind"
+        return (
+            self._platform_sdk_configured
+            and profile in {"pyromind", "echomind"}
+            and (session.context.profile_id or "pyromind") == profile
+            and session.context.user_id != "anonymous"
+            and not session.config.get("delegated_roles")
+            and (origin is None or origin.type == "main")
+            and _auth_token(session.context) is not None
+            and self._tool_allowed(session, "terminal")
+            and (
+                profile == "echomind"
+                or (
+                    (allowed is None or PLATFORM_SDK_TOOL_NAMES.issubset(allowed))
+                    and any(
+                        spec["name"] == "sandbox_read_file"
+                        for spec in self._business_tools.specs(
+                            sandbox=self._terminal_backend == "sandbox"
+                        )
+                    )
+                )
+            )
+        )
+
     def _tool_specs(self, session: _PiSession) -> list[dict[str, Any]]:
         specs = self._business_tools.specs(sandbox=self._terminal_backend == "sandbox")
+        if self._platform_sdk_enabled(session):
+            migrated_tools = SDK_ATOMIC_TOOL_NAMES
+            if self._terminal_backend == "os-sandbox":
+                migrated_tools = migrated_tools - {"sandbox_terminal"}
+            else:
+                migrated_tools = migrated_tools | SDK_REMOTE_STORAGE_TOOL_NAMES
+            if self._sdk_context_provider is not None:
+                migrated_tools = migrated_tools | _SDK_DIRECT_SUBMISSION_TOOLS
+            specs = [spec for spec in specs if spec["name"] not in migrated_tools]
         if self._echo_chat_call is not None:
             specs += [
                 {
@@ -656,6 +765,11 @@ class PiAdapter:
         """False when a sandbox session never materialized its execution workspace."""
         if self._terminal_backend == "os-sandbox":
             return True
+        if isinstance(self._sandbox, FixedActorExecutionManager):
+            return (
+                self._sandbox.recorded_workspace(session.session_id, session.files)
+                is not None
+            )
         return session.files.load_sandbox() is not None
 
     def _execution_workspace_root(self, session: _PiSession) -> str | None:
@@ -664,6 +778,9 @@ class PiAdapter:
         live = self._sandbox.execution_workspace_path(session.session_id)
         if live is not None:
             return live
+        if isinstance(self._sandbox, FixedActorExecutionManager):
+            actor = self._sandbox.recorded_workspace(session.session_id, session.files)
+            return actor.working_dir if actor is not None else None
         record = session.files.load_sandbox() or {}
         recorded = record.get("workspace_path")
         return recorded if isinstance(recorded, str) and recorded else None
@@ -806,6 +923,25 @@ class PiAdapter:
             max_bytes=max_bytes,
         )
 
+    async def development_storage_proxy(
+        self, conversation_id: str
+    ) -> StorageProxyConfig | None:
+        if self._terminal_backend != "sandbox" or isinstance(
+            self._sandbox, FixedActorExecutionManager
+        ):
+            return None
+        root = self._safe_conversation_dir(conversation_id)
+        record = await asyncio.to_thread(PiSessionFiles(root).load_sandbox)
+        if not record or record.get("storage_host_path") != "/workspace":
+            return None
+        sandbox_id, mount = record.get("sandbox_id"), record.get("mount_path")
+        if not isinstance(sandbox_id, str) or not isinstance(mount, str):
+            return None
+        try:
+            return StorageProxyConfig(sandbox_id=sandbox_id, mount_root=mount)
+        except ValueError:
+            return None
+
     async def read_persisted_workspace_text(
         self,
         handle: SessionHandle,
@@ -838,7 +974,8 @@ class PiAdapter:
         max_bytes: int | None = None,
     ) -> str | None:
         if self._terminal_backend == "sandbox" and (
-            not self._has_execution_workspace(session)
+            isinstance(self._sandbox, FixedActorExecutionManager)
+            or not self._has_execution_workspace(session)
             or (
                 PurePosixPath(path) == PurePosixPath("public_data/workflowPLAN.json")
                 and (session.context.cookie or session.context.authorization)
@@ -872,6 +1009,8 @@ class PiAdapter:
     ) -> dict[str, Any]:
         if self._terminal_backend != "sandbox" or tool_name != "validate_workflow_dsl":
             return arguments
+        if arguments.get("dsl") is not None:
+            return arguments
         dsl_path = arguments.get("dsl_path")
         if dsl_path is not None and not isinstance(dsl_path, str):
             return arguments
@@ -886,7 +1025,10 @@ class PiAdapter:
             return arguments
         if dsl is None:
             return arguments
-        return {**arguments, "dsl": dsl}
+        resolved = arguments.copy()
+        resolved.pop("dsl_path", None)
+        resolved["dsl"] = dsl
+        return resolved
 
     async def _read_stored_workspace_text(
         self,
@@ -902,6 +1044,29 @@ class PiAdapter:
         relative = PurePosixPath(path)
         if relative.is_absolute() or ".." in relative.parts or "\\" in path:
             raise ValueError("Path must stay inside the conversation workspace")
+        if isinstance(self._sandbox, FixedActorExecutionManager):
+            files = PiSessionFiles(self._safe_conversation_dir(session_id))
+            workspace = self._sandbox.recorded_workspace(session_id, files)
+            if workspace is None:
+                return None
+            try:
+                body = await asyncio.to_thread(
+                    workspace.transport.read_file,
+                    str(PurePosixPath(workspace.working_dir) / relative),
+                    max_bytes=max_bytes if max_bytes is not None else 2 * 1024 * 1024,
+                    timeout=timeout,
+                )
+                return body.decode("utf-8")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    return None
+                raise ProductRuntimeError(
+                    "harness_operation_failed", "Actor workspace file is unavailable"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise ProductRuntimeError(
+                    "harness_operation_failed", "Actor workspace is unreachable"
+                ) from exc
         if not context.cookie and not context.authorization:
             return None
         base_url = (
@@ -1145,7 +1310,20 @@ class PiAdapter:
         session = self._session(handle.session_id)
         session.context = context
         if isinstance(command, UserMessageCommand):
-            return await self._send_user_message(session, command)
+            try:
+                return await self._send_user_message(session, command)
+            except PiRunnerError as exc:
+                if exc.code == "input_pending":
+                    raise ProductRuntimeError("input_pending", str(exc)) from exc
+                if exc.code == "conversation_busy" or (
+                    exc.code == "request_failed"
+                    and str(exc) == "request_failed: Pi agent is already running"
+                ):
+                    raise ProductRuntimeError(
+                        "conversation_busy",
+                        "Conversation is busy. Retry after the current turn.",
+                    ) from exc
+                raise
         if isinstance(command, CancelCommand):
             if handle.adapter_delivers_delegated_results or self._queues_messages(
                 session
@@ -1161,14 +1339,23 @@ class PiAdapter:
                     runner_cancel_error = type(exc).__name__
             self._interrupt_session_inputs(session)
             stop_results = []
+            session.active_external_tasks.update(
+                _restore_active_external_tasks(session.workspace_root)
+            )
             for task_id in tuple(session.active_external_tasks):
                 stop_result = await self._business_tools.stop_platform_task(
                     task_id, await self._tool_context(session)
                 )
                 stop_results.append(stop_result)
-                if not stop_result.get("is_error"):
-                    self._emit_external_task_stopped(session, task_id)
-                session.active_external_tasks.pop(task_id, None)
+                details = stop_result.get("details")
+                status = (
+                    _confirmed_stop_status(details)
+                    if not stop_result.get("is_error") and isinstance(details, dict)
+                    else None
+                )
+                if status is not None:
+                    self._emit_external_task_stopped(session, task_id, status=status)
+                    session.active_external_tasks.pop(task_id, None)
             return {
                 "cancelled": runner_cancel_error is None,
                 "runner_error": runner_cancel_error,
@@ -1226,10 +1413,6 @@ class PiAdapter:
                         update={"automatic_turns_suspended": False}
                     )
                 return result
-            except PiRunnerError as exc:
-                if exc.code == "input_pending":
-                    raise ProductRuntimeError("input_pending", str(exc)) from exc
-                raise
             finally:
                 if prepared and not accepted and runner.running:
                     await runner.request(
@@ -1641,6 +1824,12 @@ class PiAdapter:
         task_id = notification.task_id
         if notification.reset_attempt_budget:
             self._business_tools.reset_attempt_budget(session.workspace_root)
+            if self._terminal_backend == "sandbox" and self._has_execution_workspace(
+                session
+            ):
+                await self._sandbox.push_debug_budget(
+                    self._control_tool_context(session), session.files
+                )
         result = await session.runner.request(
             "recipient.notify"
             if notification.correlation is not None
@@ -1863,12 +2052,16 @@ class PiAdapter:
         system_prompt = (
             _SYSTEM_PROMPT + "\n" + str(session.config.get("product_instructions", ""))
         )
+        if self._platform_sdk_enabled(session):
+            system_prompt += "\n" + PLATFORM_SDK_INSTRUCTIONS
         if self._terminal_backend == "sandbox":
             system_prompt += _sandbox_system_prompt(
                 SandboxSettings.from_extra(session.extra).mount_path,
                 session.session_id,
+                fixed_actor=isinstance(self._sandbox, FixedActorExecutionManager),
             )
         recovery = session.attach_recovery
+        tool_allowlist = session.config.get("tool_allowlist")
         await runner.start(
             {
                 "session_id": session.session_id,
@@ -1880,6 +2073,8 @@ class PiAdapter:
                 "chat_turn_history": self._chat_history is not None
                 and session.config.get("profile_id") == "echomind-chat",
                 "queue_user_messages": self._queues_messages(session),
+                "await_external_tasks": self._external_wait_provider is not None
+                and self._queues_messages(session),
                 "execution_policy": {
                     "automatic_turns_suspended": bool(
                         recovery and recovery.automatic_turns_suspended
@@ -1905,6 +2100,7 @@ class PiAdapter:
                 ),
                 "workspace_root": str(session.workspace_root),
                 "terminal_backend": self._terminal_backend,
+                "platform_sdk_enabled": self._platform_sdk_enabled(session),
                 "session_path": str(session.files.session_log_path),
                 "skills_directory": str(self._skills_directory),
                 "skill_roots": [
@@ -1918,7 +2114,7 @@ class PiAdapter:
                 "system_prompt": system_prompt,
                 "model": {**session.config["model"], "api_key": api_key},
                 "tools": self._tool_specs(session),
-                "tool_allowlist": session.config.get("tool_allowlist"),
+                "tool_allowlist": tool_allowlist,
                 "skill_allowlist": session.config.get("skill_allowlist"),
                 "delegated_roles": self._delegated_definitions(session)
                 if session.config.get("delegated_roles") is not None
@@ -1968,9 +2164,8 @@ class PiAdapter:
         self, session: _PiSession, run_id: str, content: list[dict[str, Any]]
     ) -> JsonObject:
         assert session.runner is not None
-        method = "steer" if session.running else "prompt"
         result = await session.runner.request(
-            method,
+            "prompt",
             {
                 "run_id": run_id,
                 "content": content,
@@ -1993,6 +2188,100 @@ class PiAdapter:
     async def _runner_request(
         self, session: _PiSession, method: str, params: dict[str, Any]
     ) -> Any:
+        if method == "external_task.waiting":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("external task wait requires a run_id")
+            if self._external_wait_provider is None:
+                return {"task_ids": []}
+            tasks = await self._external_wait_provider(
+                session.session_id, run_id, session.context
+            )
+            return {"task_ids": list(tasks)}
+        if method == "platform.sdk_environment":
+            if params:
+                raise PermissionError("Platform SDK access is not enabled")
+            if not self._platform_sdk_enabled(session):
+                return {}
+            context = self._control_tool_context(session)
+            try:
+                environment = await self._business_tools.sdk_environment(context)
+            except PermissionError:
+                if isinstance(self._sandbox, FixedActorExecutionManager):
+                    python = await self._sandbox.sdk_python(context, session.files)
+                    return {"PYROMIND_SDK_PYTHON": python}
+                return {}
+            api_key = environment.get("PYROMIND_API_KEY")
+            if api_key:
+                credentials = {
+                    value
+                    for key in ("PYROMIND_API_KEY", "LLM_AUTH_TOKEN", "DF_API_KEY")
+                    if (value := environment.get(key))
+                }
+                model_environment = self._business_tools.terminal_environment(context)
+                profiles = json.loads(
+                    model_environment.get("PYROMIND_DATAFLOW_PROFILES", "{}")
+                )
+                credentials.update(
+                    profile["DF_API_KEY"]
+                    for profile in profiles.values()
+                    if profile.get("DF_API_KEY")
+                )
+                for credential in credentials:
+                    name = (
+                        "PLATFORM_SDK_SECRET_"
+                        + hashlib.sha256(credential.encode()).hexdigest()
+                    )
+                    session.sdk_secrets.update_secrets(
+                        {name: StaticSecret(value=SecretStr(credential))}
+                    )
+                    session.sdk_secrets.get_secret_value(name)
+                try:
+                    if self._terminal_backend == "sandbox":
+                        environment[
+                            "PYROMIND_SDK_PYTHON"
+                        ] = await self._sandbox.sdk_python(context, session.files)
+                        environment[
+                            "PYROMIND_DEBUG_STATE_PATH"
+                        ] = await self._sandbox.debug_state_path(context, session.files)
+                    else:
+                        environment["PYROMIND_SDK_PYTHON"] = await asyncio.to_thread(
+                            prepare_host_sdk
+                        )
+                        environment["PYROMIND_DEBUG_STATE_PATH"] = str(
+                            await asyncio.to_thread(
+                                self._business_tools.prepare_debug_budget,
+                                session.workspace_root,
+                            )
+                        )
+                except PlatformSDKSetupError as exc:
+                    logger.warning(
+                        "platform_sdk.prepare_failed conversation_id=%s %s",
+                        session.session_id,
+                        exc,
+                    )
+                    raise RuntimeError(
+                        f"Platform SDK setup failed for the terminal: {exc}"
+                    ) from None
+                except Exception as exc:
+                    logger.warning(
+                        "platform_sdk.prepare_failed conversation_id=%s error=%s",
+                        session.session_id,
+                        type(exc).__name__,
+                    )
+                    raise RuntimeError(
+                        "Platform SDK setup failed for the terminal"
+                    ) from None
+                if self._sdk_context_provider is not None:
+                    sdk_context = await self._sdk_context_provider(
+                        session.session_id, context.request_context
+                    )
+                    associations = json.loads(
+                        sdk_context.get("PYROMIND_TASK_ASSOCIATIONS", "[]")
+                    ) + json.loads(environment.get("PYROMIND_TASK_ASSOCIATIONS", "[]"))
+                    environment.update(sdk_context)
+                    environment["PYROMIND_TASK_ASSOCIATIONS"] = json.dumps(associations)
+            return environment
         if method == "role.tool.execute":
             role, name = params.get("role"), params.get("tool_name")
             configured = next(
@@ -2025,44 +2314,20 @@ class PiAdapter:
                 name,
                 arguments,
             )
-            result = await self._business_tools.execute(
-                name, arguments, tool_context, tool_call_id=params.get("tool_call_id")
+            result = await self._execute_business_tool(
+                session,
+                name,
+                arguments,
+                tool_context,
+                tool_call_id=params.get("tool_call_id"),
             )
             self._emit_tool_signals(session, name, result)
             return result
-        if method == "workflow.invoke":
-            if not self._tool_allowed(
-                session, "genome_" + str(params.get("action", ""))
-            ):
-                raise PermissionError("workflow tool is not enabled")
-            if self._workflow_call is None:
-                raise ValueError("workflows are not configured")
-            action, arguments, request_id = (
-                params.get("action"),
-                params.get("arguments"),
-                params.get("request_id"),
-            )
-            if (
-                not isinstance(action, str)
-                or not isinstance(arguments, dict)
-                or not isinstance(request_id, str)
-            ):
-                raise ValueError("invalid workflow request")
-            inflight = session.files.load_inflight() or {}
-            origin = inflight.get("run_id")
-            if action in {"run", "capture", "confirm_distill"} and not isinstance(
-                origin, str
-            ):
-                raise ValueError("workflow start requires an active originating turn")
-            return await self._workflow_call(
-                session.session_id,
-                action,
-                arguments,
-                request_id,
-                session.context,
-                origin if isinstance(origin, str) else None,
-            )
         if method == "execution.output":
+            params = {
+                name: _mask_sdk_output(session.sdk_secrets, value)
+                for name, value in params.items()
+            }
             execution_id = params.get("id")
             if (
                 isinstance(execution_id, str)
@@ -2165,8 +2430,15 @@ class PiAdapter:
                 arguments,
             )
 
-            async def execute(tool_arguments: dict[str, Any]) -> JsonObject:
-                return await self._business_tools.execute(
+            if tool_name == "df_submit_pipeline" and arguments.get("replay_of_task_id"):
+                # A consolidation replay has its own receipt outside the planned run.
+                arguments = dict(arguments)
+                arguments.pop("plan_task_id", None)
+                arguments.pop("plan_attempt", None)
+
+            async def execute(tool_arguments: JsonObject) -> JsonObject:
+                return await self._execute_business_tool(
+                    session,
                     tool_name,
                     tool_arguments,
                     tool_context,
@@ -2319,14 +2591,15 @@ class PiAdapter:
         details = result.get("details")
         if not isinstance(signals, list) or not isinstance(details, dict):
             return
+        stop_status = _confirmed_stop_status(details)
         if (
             tool_name == "df_stop_task"
             and not result.get("is_error")
-            and details.get("stopped") is True
+            and stop_status is not None
             and isinstance(details.get("task_id"), str)
         ):
             task_id = details["task_id"]
-            self._emit_external_task_stopped(session, task_id)
+            self._emit_external_task_stopped(session, task_id, status=stop_status)
             session.active_external_tasks.pop(task_id, None)
         for signal in signals:
             if not isinstance(signal, dict):
@@ -2386,15 +2659,20 @@ class PiAdapter:
                     )
 
     @staticmethod
-    def _emit_external_task_stopped(session: _PiSession, task_id: str) -> None:
+    def _emit_external_task_stopped(
+        session: _PiSession,
+        task_id: str,
+        *,
+        status: Literal["stopped", "terminated"] = "stopped",
+    ) -> None:
         session.queue.put_nowait(
             HarnessEvent(
-                event_id=f"external-task:{task_id}:stopped",
+                event_id=f"external-task:{task_id}:{status}",
                 session_id=session.session_id,
                 type="external_task.completed",
                 payload={
                     "task_id": task_id,
-                    "status": "stopped",
+                    "status": status,
                     "updated_at": datetime.now().astimezone().isoformat(),
                     "resume_pending": False,
                 },
@@ -2409,12 +2687,42 @@ class PiAdapter:
             request_context=session.context,
             model_configuration=session.model_configuration,
             extra=session.extra,
+            sdk_secrets=session.sdk_secrets,
         )
+
+    async def _execute_business_tool(
+        self,
+        session: _PiSession,
+        name: str,
+        arguments: JsonObject,
+        context: ToolExecutionContext,
+        *,
+        tool_call_id: str | None = None,
+        origin_run_id: str | None = None,
+    ) -> JsonObject:
+        remote_debug = name == "workflow_debug" and self._terminal_backend == "sandbox"
+        if remote_debug:
+            await self._sandbox.debug_state_path(context, session.files)
+        try:
+            return await self._business_tools.execute(
+                name,
+                arguments,
+                context,
+                tool_call_id=tool_call_id,
+                origin_run_id=origin_run_id,
+            )
+        finally:
+            if remote_debug:
+                await self._sandbox.push_debug_budget(context, session.files)
 
     async def _tool_context(self, session: _PiSession) -> ToolExecutionContext:
         return replace(
             self._control_tool_context(session),
             workspace=await self._workspace(session),
+            sdk_submissions_enabled=(
+                self._platform_sdk_enabled(session)
+                and self._sdk_context_provider is not None
+            ),
         )
 
     @staticmethod
@@ -2517,6 +2825,10 @@ class PiAdapter:
         )
 
     async def _runner_event(self, session: _PiSession, frame: dict[str, Any]) -> None:
+        frame = {
+            name: _mask_sdk_output(session.sdk_secrets, value)
+            for name, value in frame.items()
+        }
         kind = frame.get("kind")
         payload = frame.get("payload")
         if not isinstance(payload, dict):
@@ -2648,6 +2960,14 @@ class PiAdapter:
         frame: dict[str, Any],
         run_id: str,
     ) -> None:
+        if kind not in (
+            "message.started",
+            "message.completed",
+            "tool.started",
+            "tool.completed",
+            "tool.failed",
+        ):
+            return
         inflight = session.files.load_inflight() or {"run_id": run_id}
         if kind == "message.started":
             if isinstance(frame.get("turnId"), str):
@@ -2731,6 +3051,9 @@ class PiAdapter:
         if inflight is None:
             return
         run_id = str(inflight.get("run_id") or "")
+        if run_id.startswith("usage:") and set(inflight) == {"run_id"}:
+            session.files.clear_inflight()
+            return
         if run_id in pending:
             return
         if inflight.get("workflow_modified"):
@@ -2909,6 +3232,16 @@ class PiAdapter:
                 update={"user_input_reply": session.user_input_enabled}
             ),
         )
+
+
+def _mask_sdk_output(secrets: SecretRegistry, value: Any) -> Any:
+    if isinstance(value, str):
+        return secrets.mask_secrets_in_output(value)
+    if isinstance(value, dict):
+        return {name: _mask_sdk_output(secrets, item) for name, item in value.items()}
+    if isinstance(value, list):
+        return [_mask_sdk_output(secrets, item) for item in value]
+    return value
 
 
 def _session_config(spec: SessionSpec) -> dict[str, Any]:
@@ -3121,6 +3454,23 @@ def _history_synced(session_id: str) -> HarnessEvent:
     )
 
 
+def _confirmed_stop_status(
+    details: dict[str, Any],
+) -> Literal["stopped", "terminated"] | None:
+    if (
+        details.get("stopped") is not True
+        or details.get("terminal_confirmed") is not True
+    ):
+        return None
+    value = details.get("platform_status")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"stopped", "cancelled", "canceled"}:
+        return "stopped"
+    return "terminated" if normalized == "terminated" else None
+
+
 def _external_task_status(value: Any) -> str:
     normalized = str(value or "pending").strip().lower()
     return {
@@ -3136,16 +3486,20 @@ def _external_task_status(value: Any) -> str:
     }.get(normalized, "pending")
 
 
-def _restore_active_external_tasks(root: Path) -> dict[str, str]:
+def _restore_external_tasks(root: Path) -> tuple[ExternalTaskState, ...]:
     try:
         snapshot = ConversationSnapshot.model_validate_json(
             (root / "product" / "snapshot.json").read_bytes()
         )
     except (OSError, ValueError):
-        return {}
+        return ()
+    return snapshot.external_tasks
+
+
+def _restore_active_external_tasks(root: Path) -> dict[str, str]:
     return {
         task.task_id: task.kind
-        for task in snapshot.external_tasks
+        for task in _restore_external_tasks(root)
         if task.status in {"pending", "running"}
     }
 

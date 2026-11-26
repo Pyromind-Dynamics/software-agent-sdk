@@ -61,6 +61,30 @@ def config():
     }
 
 
+@pytest.mark.parametrize(
+    ("source", "image_root", "expected"),
+    [
+        ("/workspace/conversation/source.jsonl", "/workspace", "/workspace"),
+        ("/workspace/other.jsonl", "/workspace", "/workspace/conversation"),
+        ("/workspace/conversation/source.jsonl", "/", "/workspace/conversation"),
+    ],
+)
+def test_vision_validation_uses_only_matching_managed_image_roots(
+    runtime, tmp_path, source, image_root, expected
+):
+    (tmp_path / "runtime_metadata.json").write_text(
+        json.dumps(
+            {"source_path": source, "image_root": image_root, "output_format": "vision"}
+        )
+    )
+    spec = {
+        "image_root": "/workspace/conversation",
+        "input_path": "/workspace/conversation/source.jsonl",
+        "state_dir": str(tmp_path),
+    }
+    assert runtime._validation_image_root(spec) == expected
+
+
 def test_cli_executes_validates_and_generates_report(workspace):
     path = workspace / "public_data/run.json"
     path.write_text(json.dumps(config()))
@@ -428,6 +452,7 @@ def test_prepare_installs_once_and_then_reuses_the_cached_venv(
 ):
     monkeypatch.setattr(runtime, "_image_interpreters", lambda: ())
     monkeypatch.setattr(runtime, "_interpreter_version", lambda python: None)
+    monkeypatch.setattr(runtime, "_venv_prerequisite_error", lambda python: None)
     venv = tmp_path / "venv"
     python = venv / "bin/python"
     requirements = tmp_path / "requirements-cpu.txt"
@@ -453,3 +478,72 @@ def test_prepare_installs_once_and_then_reuses_the_cached_venv(
         [*pip_install, "-r", str(requirements)],
         [*pip_install, "--no-deps", "open-dataflow==1.0.13"],
     ]
+
+
+def test_prepare_uses_compatible_sandbox_python_and_scopes_pip_index(
+    runtime, tmp_path, monkeypatch
+):
+    system_python = "/opt/miniconda3/envs/testbed/bin/python3"
+    fallback = "/usr/local/bin/python3.11"
+    available = {"python3": system_python, "python3.11": fallback}
+    monkeypatch.setattr(runtime.shutil, "which", available.get)
+    monkeypatch.setattr(runtime, "_image_interpreters", lambda: ())
+    monkeypatch.setattr(runtime, "_interpreter_version", lambda python: None)
+    monkeypatch.setenv("PIP_INDEX_URL", "https://pypi.org/simple/")
+    monkeypatch.setenv(
+        "PYROMIND_SANDBOX_DATAFLOW_PIP_INDEX_URL", "https://mirror.example/simple/"
+    )
+    venv = tmp_path / "venv"
+    requirements = tmp_path / "requirements-cpu.txt"
+    requirements.write_text("requests\n")
+    checked = []
+    install_indexes = []
+
+    def run(argv, **kwargs):
+        if argv[1] == "-c":
+            checked.append(argv[0])
+            if argv[0] == system_python:
+                return subprocess.CompletedProcess(argv, 1, stdout="found Python 3.9")
+        elif argv[1:3] == ["-m", "venv"]:
+            assert argv[0] == fallback
+            assert "env" not in kwargs
+            (venv / "bin").mkdir(parents=True)
+            (venv / "bin/python").touch()
+        else:
+            install_indexes.append(kwargs["env"]["PIP_INDEX_URL"])
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    spec = interpreter_spec(venv, runtime_dir=tmp_path, system_python=None)
+    report = runtime._interpreter_report(spec, prepare=True)
+
+    assert report["ready"] is True
+    assert checked == [system_python, fallback]
+    assert install_indexes == ["https://mirror.example/simple/"] * 2
+    assert runtime.os.environ["PIP_INDEX_URL"] == "https://pypi.org/simple/"
+
+
+def test_prepare_reports_invalid_explicit_python_before_replacing_venv(
+    runtime, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(runtime, "_image_interpreters", lambda: ())
+    monkeypatch.setattr(runtime, "_interpreter_version", lambda python: None)
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    sentinel = venv / "existing.txt"
+    sentinel.touch()
+    (tmp_path / "requirements-cpu.txt").write_text("requests\n")
+    configured = "/opt/venv/bin/python"
+
+    def run(argv, **kwargs):
+        assert argv[:2] == [configured, "-c"]
+        return subprocess.CompletedProcess(argv, 1, stdout="missing ensurepip")
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    spec = interpreter_spec(venv, runtime_dir=tmp_path, system_python=configured)
+    report = runtime._interpreter_report(spec, prepare=True)
+
+    assert report["ready"] is False
+    assert "PYROMIND_SANDBOX_SYSTEM_PYTHON" in report["detail"]
+    assert f"{configured}: missing ensurepip" in report["detail"]
+    assert sentinel.is_file()

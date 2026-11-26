@@ -10,16 +10,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shlex
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import Field
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import (
+    _build_dataflow_command as _build_dataflow_command,
+    _build_dataflow_workflow as _build_dataflow_workflow,
+)
+from pyromind_common.platform.scene_options import (
+    PipelineOptions,
+    ReuseAssessment as ReuseAssessment,
+)
 from pyromind_common.sdk.tool import (
     Action,
     ToolAnnotations,
@@ -27,13 +34,17 @@ from pyromind_common.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from pyromind_common.tools.data_preparation.recipe import (
+    RECIPE_INPUT,
+    RECIPE_OUTPUT,
+    compose_recipe,
+    recipe_asset,
+)
 from pyromind_common.tools.data_preparation.runner import (
-    DATAFLOW_REQUIREMENTS_FILENAME,
     DATAFLOW_RUNTIME_FILENAMES,
     SUPPORTED_DATAFLOW_VERSION,
     LabelingModelGateway,
     build_dataflow_env,
-    dataflow_pip_install_commands,
     runtime_bundle_fingerprint,
     runtime_public_names,
     validate_managed_image_pipeline,
@@ -58,10 +69,7 @@ from pyromind_common.tools.pyromind_dataset.definition import (
 )
 from pyromind_common.tools.utils.conversation_dirs import conversation_state_dir
 from pyromind_common.tools.utils.dataflow_config import (
-    ENV_DF_API_BASE_URL,
     ENV_DF_API_KEY,
-    ENV_DF_API_URL,
-    ENV_DF_MODEL_NAME,
 )
 from pyromind_common.tools.utils.storage_paths import (
     StoragePathError,
@@ -72,9 +80,14 @@ from pyromind_common.tools.workflow.task_submission import (
     WorkflowResourceValidationError,
     submit_workflow_task,
 )
+from pyromind_runtime.domain.workflow_execution import (
+    DatasetRecipeAsset,
+)
 
 
 if TYPE_CHECKING:
+    from pyromind_sdk.client.models import TrainingTaskCreateResponse
+
     from pyromind_common.sdk.conversation.base import ToolConversation
     from pyromind_common.sdk.conversation.state import ToolState
 
@@ -150,69 +163,7 @@ preparation_runtime.py.
 # ---------------------------------------------------------------------------
 
 
-class ReuseAssessment(BaseModel):
-    """Agent-authored evidence that committed output remains reusable."""
-
-    decision: Literal["compatible_resume"] = "compatible_resume"
-    changed_dimensions: list[
-        Literal["pipeline", "prompt", "model", "schema", "runtime"]
-    ] = Field(default_factory=list)
-    change_summary: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-    verification_samples: list[str] = Field(min_length=1)
-    verification_result: Literal["passed"]
-
-
-class DfSubmitPipelineAction(Action):
-    """Submit a DataFlow-compatible Python pipeline to Pyromind Studio."""
-
-    script_path: str | None = Field(
-        default=None,
-        description=(
-            "Workspace-relative pipeline script for a new run or compatible resume,"
-            " e.g. 'public_data/data-preparation/pipeline.py'."
-            " A strict resume may omit it and reuse the prior frozen script."
-        ),
-    )
-    input_path: str = Field(
-        description=(
-            "Source data path in user Storage, e.g. '/workspace/datasets/data.jsonl'."
-        )
-    )
-    support_file_path: str | None = Field(
-        default=None,
-        description=(
-            "Optional workspace JSON contract staged beside the frozen script and "
-            "passed as its third positional argument, for example taxonomy.json, "
-            "analysis_spec.json, or augmentation_plan.json."
-        ),
-    )
-    mode: Literal["full", "resume"] = Field(default="full")
-    resume_run_id: uuid.UUID | None = Field(
-        default=None,
-        description="Existing run UUID. Required when mode='resume'.",
-    )
-    reuse_assessment: ReuseAssessment | None = Field(
-        default=None,
-        description=(
-            "Required when a resume changes pipeline, prompt, model, schema, or "
-            "runtime but the agent judges committed records reusable."
-        ),
-    )
-    prompt_fingerprint: str | None = Field(
-        default=None,
-        description=(
-            "Optional stable hash/version for prompts loaded outside the script."
-        ),
-    )
-    model_profile: Literal["none", "text", "vision"] | None = Field(
-        default=None,
-        description=(
-            "Use none for pure Python/AVI work without model credentials, text "
-            "for the conversation model, or vision for managed image work. "
-            "Resume inherits the prior profile when omitted."
-        ),
-    )
+class DfSubmitPipelineAction(PipelineOptions, Action):
     labeling_gateway: LabelingModelGateway | None = Field(
         default=None,
         description=(
@@ -222,55 +173,6 @@ class DfSubmitPipelineAction(Action):
             "vision profile."
         ),
     )
-    output_schema: OutputSchema | None = Field(
-        default=None,
-        description=(
-            "Canonical output schema: text, dpo, vision, structured, multiturn, "
-            "function_call, "
-            "quality_evaluation, text2sql, or artifacts. New standard runs should "
-            "always set this; None is retained only for legacy pipelines. "
-            "Use structured for direct image annotations, vision for training "
-            "messages; "
-            "match ImagePipelineConfig.output_format."
-        ),
-    )
-    convert_format: Literal["messages", "preference", "none"] = Field(
-        default="none",
-        description=(
-            "Optional format conversion after pipeline completes."
-            " 'none' skips conversion."
-        ),
-    )
-    cpu: int = Field(
-        default=4,
-        ge=1,
-        le=64,
-        description=("CPU cores for the pipeline pod (1-64, default 4)."),
-    )
-    memory: int = Field(
-        default=32,
-        ge=1,
-        le=256,
-        description=(
-            "Memory for the pipeline pod in GiB (1-256, default 32). "
-            "32 is enough for typical text pipelines; use 64 for image/"
-            "multimodal data. Memory is per-pod, not per-dataset, so it does "
-            "not scale with dataset size."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def execution_options(self) -> Self:
-        if self.mode == "full" and self.script_path is None:
-            raise ValueError(
-                "df_submit_pipeline full requires script_path; "
-                "use df_submit_evaluation for model evaluation"
-            )
-        if self.mode == "resume" and self.resume_run_id is None:
-            raise ValueError("resume requires resume_run_id")
-        if self.mode == "full" and self.resume_run_id is not None:
-            raise ValueError("resume_run_id is only valid when mode='resume'")
-        return self
 
     @property
     def visualize(self) -> Text:
@@ -318,6 +220,7 @@ class DataPreparationTaskAssociation:
         support_file_name: str | None = None,
         support_file_fingerprint: str | None = None,
         resumed: bool = False,
+        used_recipe: bool = False,
         reuse_assessment: dict[str, Any] | None = None,
         status: str = "Pending",
     ):
@@ -342,6 +245,7 @@ class DataPreparationTaskAssociation:
         self.task_kind: PersistedTaskKind = task_kind
         self.support_file_name = support_file_name
         self.support_file_fingerprint = support_file_fingerprint
+        self.used_recipe = used_recipe
         self.resumed = resumed
         self.reuse_assessment = reuse_assessment
         self.status = status
@@ -372,6 +276,7 @@ class DataPreparationTaskAssociation:
             "support_file_name": self.support_file_name,
             "support_file_fingerprint": self.support_file_fingerprint,
             "resumed": self.resumed,
+            **({"used_recipe": True} if self.used_recipe else {}),
             "reuse_assessment": self.reuse_assessment,
             "status": self.status,
             "submitted_at": self.submitted_at,
@@ -408,6 +313,7 @@ class DataPreparationTaskAssociation:
             support_file_name=data.get("support_file_name"),
             support_file_fingerprint=data.get("support_file_fingerprint"),
             resumed=bool(data.get("resumed", False)),
+            used_recipe=bool(data.get("used_recipe", False)),
             reuse_assessment=data.get("reuse_assessment"),
             status=data.get("status", "Pending"),
         )
@@ -485,9 +391,7 @@ class DataPreparationTaskStore:
 # ---------------------------------------------------------------------------
 
 
-class DfSubmitPipelineExecutor(
-    ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservation]
-):
+class PipelineSubmissionRunner:
     """Build and submit a Python pipeline workflow to Pyromind Studio."""
 
     def __init__(
@@ -528,11 +432,13 @@ class DfSubmitPipelineExecutor(
         ).rstrip("/")
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
-        self.submission_handler = None
+        self.submission_handler: (
+            Callable[[dict, str, str | None], TrainingTaskCreateResponse] | None
+        ) = None
         self._managed_run_id = managed_run_id
         self._submission_guard = submission_guard
 
-    def __call__(
+    def run(
         self,
         action: DfSubmitPipelineAction,
         conversation: ToolConversation | None = None,
@@ -571,6 +477,10 @@ class DfSubmitPipelineExecutor(
                 if prior_run is None:
                     raise ValueError(
                         f"Cannot resume unknown data-preparation run {run_id}."
+                    )
+                if prior_run.used_recipe:
+                    raise ValueError(
+                        "Replay a Dataset recipe with full mode and a fresh directory"
                     )
                 if prior_run.task_kind != "data_preparation":
                     raise ValueError(
@@ -725,10 +635,45 @@ class DfSubmitPipelineExecutor(
                     self._preflight_managed_image_pipeline(Path(local_script_path))
                 changed_dimensions = []
 
+            recipe = None
+            staged_assets: list[tuple[DatasetRecipeAsset, Path]] = []
+            if action.sft_export_script_path:
+                assert local_script_path is not None
+                if self._runtime_dir is None:
+                    raise ValueError("Dataset verification runtime unavailable")
+                asset_root = (
+                    f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation.id}"
+                    "/data_preparation/recipe-assets"
+                )
+                pipeline = Path(local_script_path)
+                exporter = Path(
+                    _validate_pipeline(files, action.sft_export_script_path)[0]
+                )
+                verifier = self._runtime_dir / "verify_training_splits.py"
+                if not verifier.is_file():
+                    raise ValueError("Dataset verification runtime unavailable")
+                staged_assets = [
+                    (recipe_asset("pipeline", pipeline, asset_root), pipeline),
+                    (recipe_asset("export", exporter, asset_root), exporter),
+                    (recipe_asset("verifier", verifier, asset_root), verifier),
+                ]
+                if local_support_file_path:
+                    support = Path(local_support_file_path)
+                    staged_assets.append(
+                        (recipe_asset("support_file", support, asset_root), support)
+                    )
+                if action.prepare_script_path:
+                    prepare = Path(
+                        _validate_pipeline(files, action.prepare_script_path)[0]
+                    )
+                    staged_assets.append(
+                        (recipe_asset("prepare", prepare, asset_root), prepare)
+                    )
+
             command = _build_dataflow_command(
-                input_path=input_path,
-                output_dir=output_dir,
-                llm_env=llm_env,
+                input_path=RECIPE_INPUT if staged_assets else input_path,
+                output_dir=RECIPE_OUTPUT if staged_assets else output_dir,
+                llm_env={} if staged_assets else llm_env,
                 convert_format=action.convert_format,
                 frozen_script_name=frozen_script_name,
                 resumed=resumed,
@@ -746,6 +691,23 @@ class DfSubmitPipelineExecutor(
                 ),
                 support_file_name=support_file_name,
             )
+            if staged_assets:
+                recipe, command = compose_recipe(
+                    input_path=input_path,
+                    output_dir=output_dir,
+                    assets=tuple(asset for asset, _ in staged_assets),
+                    dataflow_command=command,
+                    llm_env=llm_env,
+                    fixed_validation_path=to_agent_storage_path(
+                        _normalize_storage_path(
+                            action.fixed_validation_path, "fixed_validation_path"
+                        )
+                    )
+                    if action.fixed_validation_path
+                    else None,
+                    replay_of_task_id=action.replay_of_task_id,
+                    batch_label_source=action.batch_label_source,
+                )
             workflow = _build_dataflow_workflow(action, run_id, command)
             validate_pipeline_topology(workflow)
         except PipelineResolutionError as exc:
@@ -787,7 +749,17 @@ class DfSubmitPipelineExecutor(
                 if runtime_storage_dir is None:
                     raise ValueError("DataFlow runtime cache path is unavailable.")
                 self._stage_runtime_files(runtime_storage_dir, conversation)
-            if should_stage_script:
+            for asset, local in staged_assets:
+                api_path = PurePosixPath(
+                    _normalize_storage_path(asset.path, "recipe asset")
+                )
+                self._stage_script(
+                    str(local),
+                    str(api_path.parent),
+                    conversation,
+                    frozen_script_name=api_path.name,
+                )
+            if should_stage_script and not staged_assets:
                 if local_script_path is None:
                     raise ValueError("Resolved pipeline script is unavailable.")
                 self._stage_script(
@@ -796,7 +768,7 @@ class DfSubmitPipelineExecutor(
                     conversation,
                     frozen_script_name=frozen_script_name,
                 )
-            if should_stage_support_file:
+            if should_stage_support_file and not staged_assets:
                 if local_support_file_path is None or support_file_name is None:
                     raise ValueError("Resolved dataset job spec is unavailable.")
                 self._stage_script(
@@ -814,7 +786,8 @@ class DfSubmitPipelineExecutor(
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
                 task_kind="data_preparation",
-                retry_create=self._submission_guard is None,
+                dataset_recipe=recipe,
+                retry_create=False,
                 submission_handler=self.submission_handler,
             )
             task_id = response.task_id
@@ -860,6 +833,7 @@ class DfSubmitPipelineExecutor(
             support_file_name=support_file_name,
             support_file_fingerprint=support_file_fingerprint,
             resumed=resumed,
+            used_recipe=recipe is not None,
             reuse_assessment=(
                 action.reuse_assessment.model_dump()
                 if action.reuse_assessment is not None
@@ -1016,9 +990,42 @@ class DfSubmitPipelineExecutor(
         return resolved_storage_headers(self._submission_config, conversation)
 
 
-# ---------------------------------------------------------------------------
-# Tool Definition
-# ---------------------------------------------------------------------------
+class DfSubmitPipelineExecutor(
+    PipelineSubmissionRunner,
+    ToolExecutor[DfSubmitPipelineAction, DfSubmitPipelineObservation],
+):
+    def __call__(
+        self,
+        action: DfSubmitPipelineAction,
+        conversation: ToolConversation | None = None,
+    ) -> DfSubmitPipelineObservation:
+        return self.run(action, conversation)
+
+
+def _pipeline_runner_options(params: dict[str, Any]) -> dict[str, Any]:
+    config = submission_config(params)
+    options = {
+        "env": config.env,
+        "cluster": config.cluster,
+        "headers": config.headers,
+        "storage_base_url": config.storage_base_url,
+        "storage_headers": config.storage_headers,
+        "storage_secret_headers": config.storage_secret_headers,
+        "timeout": config.timeout,
+        "output_root": params.pop("output_root", None),
+        "runtime_dir": params.pop("runtime_dir", None),
+        "task_store_dir": params.pop("task_store_dir", None),
+        "managed_run_id": params.pop("managed_run_id", None),
+        "submission_guard": params.pop("submission_guard", None),
+    }
+    if params:
+        names = ", ".join(sorted(params))
+        raise ValueError(f"DfSubmitPipelineTool got unknown params: {names}")
+    return options
+
+
+def create_pipeline_runner(**params: Any) -> PipelineSubmissionRunner:
+    return PipelineSubmissionRunner(**_pipeline_runner_options(params))
 
 
 class DfSubmitPipelineTool(
@@ -1032,36 +1039,12 @@ class DfSubmitPipelineTool(
         conv_state: ToolState | None = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        config = submission_config(params)
-        output_root = params.pop("output_root", None)
-        runtime_dir = params.pop("runtime_dir", None)
-        task_store_dir = params.pop("task_store_dir", None)
-        managed_run_id = params.pop("managed_run_id", None)
-        submission_guard = params.pop("submission_guard", None)
-        if params:
-            names = ", ".join(sorted(params))
-            raise ValueError(f"DfSubmitPipelineTool got unknown params: {names}")
-        if output_root is not None:
-            _normalize_storage_path(output_root, "output_root")
         return [
             cls(
                 description=TOOL_DESCRIPTION,
                 action_type=DfSubmitPipelineAction,
                 observation_type=DfSubmitPipelineObservation,
-                executor=DfSubmitPipelineExecutor(
-                    env=config.env,
-                    cluster=config.cluster,
-                    output_root=output_root,
-                    headers=config.headers,
-                    runtime_dir=runtime_dir,
-                    storage_base_url=config.storage_base_url,
-                    storage_headers=config.storage_headers,
-                    storage_secret_headers=config.storage_secret_headers,
-                    task_store_dir=task_store_dir,
-                    timeout=config.timeout,
-                    managed_run_id=managed_run_id,
-                    submission_guard=submission_guard,
-                ),
+                executor=DfSubmitPipelineExecutor(**_pipeline_runner_options(params)),
                 annotations=ToolAnnotations(
                     title="df_submit_pipeline",
                     readOnlyHint=False,
@@ -1076,241 +1059,6 @@ class DfSubmitPipelineTool(
 # ---------------------------------------------------------------------------
 # Command / Workflow builders
 # ---------------------------------------------------------------------------
-
-
-def _build_dataflow_command(
-    *,
-    input_path: str,
-    output_dir: str,
-    llm_env: dict[str, str],
-    convert_format: str,  # noqa: ARG001
-    frozen_script_name: str = "pipeline.py",
-    resumed: bool = False,
-    execution_revision: int = 1,
-    runtime_dir_name: str = "",
-    runtime_storage_dir: str | None = None,
-    runtime_fingerprint: str | None = None,
-    reuse_runtime: bool = False,
-    image_utils_api_version: str | None = None,
-    output_schema: str | None = None,
-    reuse_assessment: dict[str, Any] | None = None,
-    support_file_name: str | None = None,
-) -> str:
-    """Assemble the shell command executed inside the CustomCommandNode Pod."""
-    pod_input = _pod_path(input_path)
-    pod_output_dir = _pod_path(output_dir)
-    if runtime_storage_dir:
-        pod_runtime_dir = _pod_path(runtime_storage_dir)
-    else:
-        pod_runtime_dir = (
-            f"{pod_output_dir}/{runtime_dir_name}"
-            if runtime_dir_name
-            else pod_output_dir
-        )
-    frozen_script = f"{pod_output_dir}/{frozen_script_name}"
-    output_file = f"{pod_output_dir}/processed.jsonl"
-    venv_python = "/tmp/df-venv/bin/python"
-    setup_log = f"{pod_output_dir}/setup.log"
-    pipeline_log = f"{pod_output_dir}/pipeline.log"
-    validation_log = f"{pod_output_dir}/validation.log"
-    report_log = f"{pod_output_dir}/report.log"
-    runtime_files = (
-        RUNTIME_FILENAMES
-        if runtime_dir_name or runtime_storage_dir
-        else tuple(name for name in RUNTIME_FILENAMES if name != "image_utils.py")
-    )
-    requirements = f"{pod_runtime_dir}/{DATAFLOW_REQUIREMENTS_FILENAME}"
-
-    # Environment variables for LLM access
-    env_parts = []
-    for key in (
-        ENV_DF_API_KEY,
-        ENV_DF_API_URL,
-        ENV_DF_API_BASE_URL,
-        ENV_DF_MODEL_NAME,
-    ):
-        value = llm_env.get(key, "")
-        if value:
-            env_parts.append(f"{key}={shlex.quote(value)}")
-    env_parts.append(f"DF_LOG_DIR={shlex.quote(pod_output_dir)}")
-    env_parts.append(f"DF_STATE_DIR={shlex.quote(pod_output_dir)}")
-    if output_schema is not None:
-        env_parts.append(f"DF_OUTPUT_SCHEMA={shlex.quote(output_schema)}")
-    env_parts.append(f"DF_RESUME={'1' if resumed else '0'}")
-    env_parts.append(f"DF_EXECUTION_REVISION={execution_revision}")
-    env_parts.append(f"PYTHONPATH={shlex.quote(pod_runtime_dir)}")
-    if runtime_fingerprint:
-        env_parts.append(f"DF_RUNTIME_FINGERPRINT={shlex.quote(runtime_fingerprint)}")
-    if reuse_assessment is not None:
-        env_parts.append(
-            "DF_REUSE_ASSESSMENT_JSON="
-            + shlex.quote(json.dumps(reuse_assessment, ensure_ascii=False))
-        )
-    env_prefix = " ".join(env_parts)
-
-    # Pipeline arguments
-    pipeline_args = [shlex.quote(pod_input), shlex.quote(output_file)]
-    if support_file_name:
-        pipeline_args.append(shlex.quote(f"{pod_output_dir}/{support_file_name}"))
-
-    # Build the full command chain
-    pip_path = "/tmp/df-venv/bin/pip"
-    install_commands = dataflow_pip_install_commands(
-        pip_path=pip_path, requirements_path=requirements
-    )
-    setup_output = f">> {shlex.quote(setup_log)} 2>&1"
-    install = " && ".join(f"{command} {setup_output}" for command in install_commands)
-    required_runtime_files = runtime_files
-    if reuse_runtime:
-        # Older runtime bundles were published without the dependency manifest.
-        legacy_packages = " ".join(
-            shlex.quote(item) for item in _LEGACY_RUNTIME_PACKAGES
-        )
-        install = (
-            f"if [ -f {shlex.quote(requirements)} ]; then {install}; else "
-            f"{pip_path} install --use-deprecated=legacy-resolver "
-            f"{legacy_packages} {setup_output}; fi"
-        )
-        required_runtime_files = tuple(
-            name for name in runtime_files if name != DATAFLOW_REQUIREMENTS_FILENAME
-        )
-    setup_steps = [
-        f"mkdir -p {shlex.quote(pod_output_dir)}",
-        f"test -f {shlex.quote(frozen_script)}",
-        *[
-            f"test -f {shlex.quote(f'{pod_runtime_dir}/{filename}')}"
-            for filename in required_runtime_files
-        ],
-        f"python3 -m venv /tmp/df-venv > {shlex.quote(setup_log)} 2>&1",
-        install,
-    ]
-    fingerprint_tool = f"{pod_runtime_dir}/source_fingerprint.py"
-    setup_steps.append(
-        "source_fingerprint_before=$("
-        f"{venv_python} {shlex.quote(fingerprint_tool)} "
-        f"{shlex.quote(pod_input)})"
-    )
-    if resumed:
-        setup_steps.append(
-            "{ resume_source_guard_rc=0; "
-            f"{venv_python} {shlex.quote(fingerprint_tool)} "
-            f"{shlex.quote(pod_input)} --expected-report "
-            f"{shlex.quote(f'{pod_output_dir}/source_integrity.json')} "
-            ">/dev/null || resume_source_guard_rc=$?; "
-            '[ "$resume_source_guard_rc" -eq 0 ]; }'
-        )
-    compare_source_integrity_step = (
-        "source_fingerprint_after=$("
-        f"{venv_python} {shlex.quote(fingerprint_tool)} "
-        f"{shlex.quote(pod_input)}) || source_integrity_rc=$?; "
-        f'printf \'{{"before":"%s","after":"%s","unchanged":%s}}\' '
-        '"$source_fingerprint_before" "$source_fingerprint_after" '
-        '"$(if [ "$source_fingerprint_before" = "$source_fingerprint_after" ]; '
-        'then printf true; else printf false; fi)" '
-        f"> {shlex.quote(f'{pod_output_dir}/source_integrity.json')}; "
-        'if [ "$source_integrity_rc" -eq 0 ] && '
-        '[ "$source_fingerprint_before" != "$source_fingerprint_after" ]; '
-        "then source_integrity_rc=90; fi"
-    )
-    source_integrity_step = (
-        'if [ "${resume_source_guard_rc:-0}" -ne 0 ]; then '
-        'source_integrity_rc="$resume_source_guard_rc"; else '
-        f"source_integrity_rc=0; {compare_source_integrity_step}; fi"
-    )
-    pipeline_step = (
-        f"{env_prefix} {venv_python} {shlex.quote(frozen_script)}"
-        f" {' '.join(pipeline_args)}"
-        f" > {shlex.quote(pipeline_log)} 2>&1"
-    )
-    validation_step = "validation_rc=0"
-    if output_schema is not None and output_schema != "structured":
-        validator = f"{pod_runtime_dir}/validate_prepared_data.py"
-        validation_report = f"{pod_output_dir}/validation.json"
-        image_root_arg = (
-            '--image-root "$image_root" ' if output_schema == "vision" else ""
-        )
-        validation_step = (
-            "validation_rc=0; "
-            'if [ "$pipeline_rc" -eq 0 ]; then '
-            f"if [ -d {shlex.quote(pod_input)} ]; then "
-            f"image_root={shlex.quote(pod_input)}; else "
-            f"image_root=$(dirname {shlex.quote(pod_input)}); fi; "
-            f"{venv_python} {shlex.quote(validator)} "
-            f"{shlex.quote(output_file)} --schema {shlex.quote(output_schema)} "
-            f"{image_root_arg}"
-            f"--report {shlex.quote(validation_report)}"
-            f" > {shlex.quote(validation_log)} 2>&1"
-            " || validation_rc=$?; fi"
-        )
-    report_step = (
-        f"{venv_python} {shlex.quote(pod_runtime_dir)}/generate_report.py"
-        f" --log-dir {shlex.quote(pod_output_dir)}"
-        f' --pipeline-exit-code "$pipeline_rc"'
-        f" --execution-revision {execution_revision}"
-        f" --resumed {'true' if resumed else 'false'}"
-        f" --runtime-dir-name {shlex.quote(runtime_dir_name)}"
-    )
-    if image_utils_api_version:
-        report_step += " --image-utils-api-version " + shlex.quote(
-            image_utils_api_version
-        )
-    if runtime_fingerprint:
-        report_step += " --runtime-fingerprint " + shlex.quote(runtime_fingerprint)
-    if reuse_assessment is not None:
-        report_step += " --reuse-assessment-json " + shlex.quote(
-            json.dumps(reuse_assessment, ensure_ascii=False)
-        )
-    report_step += f" >> {shlex.quote(report_log)} 2>&1 || true"
-    final_step = (
-        'if [ "$source_integrity_rc" -ne 0 ]; then '
-        f'echo "Data processing failed during source integrity check; '
-        f'see {pod_output_dir}/source_integrity.json" >&2; '
-        'exit "$source_integrity_rc"; fi; '
-        'if [ "$pipeline_rc" -ne 0 ]; then '
-        f'echo "Data processing failed with exit code $pipeline_rc; '
-        f'last log lines:" >&2; tail -n 40 {shlex.quote(pipeline_log)} >&2; '
-        'exit "$pipeline_rc"; fi; '
-        'if [ "$validation_rc" -ne 0 ]; then '
-        f'echo "Output validation failed; '
-        f'last log lines:" >&2; tail -n 40 {shlex.quote(validation_log)} >&2; '
-        'exit "$validation_rc"; fi; '
-        f'echo "Data preparation completed: {output_file}"'
-    )
-    return (
-        " && ".join([*setup_steps, pipeline_step])
-        + f"; pipeline_rc=$?; {validation_step}; {source_integrity_step}; "
-        + f"{report_step}; {final_step}"
-    )
-
-
-def _build_dataflow_workflow(
-    action: DfSubmitPipelineAction,
-    run_id: uuid.UUID,
-    command: str,
-) -> dict[str, Any]:
-    return {
-        "id": str(run_id),
-        "name": f"agent-data-prep-{str(run_id)[:8]}",
-        "nodes": [
-            {
-                "id": "1",
-                "type": "default",
-                "position": {"x": 0, "y": 0},
-                "data": {
-                    "display_name": "Data Processing Pipeline",
-                    "nodeType": DATAFLOW_NODE_TYPE,
-                    "config": {
-                        "command": command,
-                        "cpu": action.cpu,
-                        "memory": action.memory,
-                    },
-                },
-            }
-        ],
-        "edges": [],
-        "viewport": {"x": 0, "y": 0, "zoom": 1},
-        "timestamp": datetime.now(UTC).isoformat(),
-    }
 
 
 # ---------------------------------------------------------------------------

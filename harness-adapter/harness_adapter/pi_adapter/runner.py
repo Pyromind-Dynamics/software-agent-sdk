@@ -17,7 +17,7 @@ from harness_adapter.pi_adapter.protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     PiProtocolError,
-    SandboxAuthorizationRequired,
+    SandboxEndpointError,
     decode_frame,
     encode_frame,
 )
@@ -317,8 +317,8 @@ class PiRunnerProcess:
                 "type": "response",
                 "requestId": request_id,
                 "error": {
-                    "code": "sandbox_authorization_required"
-                    if isinstance(exc, SandboxAuthorizationRequired)
+                    "code": exc.code
+                    if isinstance(exc, SandboxEndpointError)
                     else "request_failed",
                     "message": str(exc),
                 },

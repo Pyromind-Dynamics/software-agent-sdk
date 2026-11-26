@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import ast
-import shlex
 import uuid
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Self, cast
 
@@ -14,6 +11,13 @@ from pydantic import Field
 from pyromind_sdk import PyroMindAPIError
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import (
+    _build_cleaning_command as _build_cleaning_command,
+    _build_cleaning_workflow as _build_cleaning_workflow,
+    _runtime_public_names as _runtime_public_names,
+    validate_cleaning_script as validate_cleaning_script,
+)
+from pyromind_common.platform.scene_options import CleaningOptions
 from pyromind_common.sdk.conversation.state import ActiveLongTask
 from pyromind_common.sdk.tool import (
     Action,
@@ -50,6 +54,8 @@ from pyromind_common.tools.workflow.task_submission import (
 
 
 if TYPE_CHECKING:
+    from pyromind_sdk.client.models import TrainingTaskCreateResponse
+
     from pyromind_common.sdk.conversation.base import ToolConversation
     from pyromind_common.sdk.conversation.state import ToolState
 
@@ -78,30 +84,7 @@ def _submit_error_text(exc: Exception) -> str:
     return f"{exc}\nPlatform response: {message}"
 
 
-class RunDatasetCleaningAction(Action):
-    """Submit a dataset cleaning script as a Studio workflow."""
-
-    input_path: str = Field(
-        description="Source dataset path under /workspace in the user's Storage.",
-    )
-    script_path: str | None = Field(
-        default=None,
-        description=(
-            "Uploaded Python cleaning script path for a new run. Resume uses the "
-            "frozen script and may omit this field."
-        ),
-    )
-    limit: int | None = Field(
-        default=None,
-        ge=1,
-        description="Optional maximum number of source records for this run.",
-    )
-    resume_run_id: uuid.UUID | None = Field(
-        default=None,
-        description=("Existing cleaning run UUID to resume. Omit to create a new run."),
-    )
-    cpu: int = Field(default=4, ge=1, le=64)
-    memory: int = Field(default=32, ge=1, le=256)
+class RunDatasetCleaningAction(CleaningOptions, Action):
     continue_after_completion: bool = Field(
         default=False,
         description="Enable only when the user asks for work after cleaning completes.",
@@ -171,9 +154,7 @@ Do not re-run the cleaning pipeline locally to validate platform output.
 """
 
 
-class RunDatasetCleaningExecutor(
-    ToolExecutor[RunDatasetCleaningAction, RunDatasetCleaningObservation]
-):
+class DatasetCleaningRunner:
     """Build and submit a fixed CustomCommandNode cleaning workflow."""
 
     def __init__(
@@ -206,9 +187,59 @@ class RunDatasetCleaningExecutor(
         self._storage_secret_headers = dict(storage_secret_headers or {})
         self._task_store_dir = Path(task_store_dir) if task_store_dir else None
         self._timeout = timeout
-        self.submission_handler = None
+        self.submission_handler: (
+            Callable[[dict, str, str | None], TrainingTaskCreateResponse] | None
+        ) = None
 
-    def __call__(
+    @classmethod
+    def from_options(cls, **params: Any) -> Self:
+        env_value = params.pop("env", None)
+        env = str(env_value) if env_value is not None else None
+        cluster_value = params.pop("cluster", None)
+        cluster = str(cluster_value) if cluster_value is not None else None
+        params.pop("current_user", None)
+        output_root_value = params.pop("output_root", None)
+        output_root = str(output_root_value) if output_root_value is not None else None
+        headers = _normalize_headers(params.pop("headers", None))
+        runtime_dir_value = params.pop("runtime_dir", None)
+        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
+        storage_base_url_value = params.pop("storage_base_url", None)
+        storage_base_url = (
+            str(storage_base_url_value) if storage_base_url_value is not None else None
+        )
+        storage_headers = _normalize_headers(params.pop("storage_headers", None))
+        legacy_secret_headers = params.pop("secret_headers", None)
+        storage_secret_headers = _normalize_headers(
+            params.pop("storage_secret_headers", legacy_secret_headers)
+        )
+        env, cluster = _resolve_execution_target(env, cluster, headers)
+        params.pop("endpoint_url", None)
+        task_store_dir_value = params.pop("task_store_dir", None)
+        task_store_dir = (
+            str(task_store_dir_value) if task_store_dir_value is not None else None
+        )
+        timeout = int(params.pop("timeout", 30))
+        if params:
+            names = ", ".join(sorted(params))
+            raise ValueError(f"RunDatasetCleaningTool got unknown params: {names}")
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than 0")
+        if output_root is not None:
+            _normalize_storage_path(output_root, "output_root")
+        return cls(
+            env=env,
+            cluster=cluster,
+            output_root=output_root,
+            headers=headers,
+            runtime_dir=runtime_dir,
+            storage_base_url=storage_base_url,
+            storage_headers=storage_headers,
+            storage_secret_headers=storage_secret_headers,
+            task_store_dir=task_store_dir,
+            timeout=timeout,
+        )
+
+    def run(
         self,
         action: RunDatasetCleaningAction,
         conversation: ToolConversation | None = None,
@@ -293,6 +324,7 @@ class RunDatasetCleaningExecutor(
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
                 task_kind="data_cleaning",
+                retry_create=False,
                 submission_handler=self.submission_handler,
             )
             task_id = response.task_id
@@ -438,39 +470,23 @@ class RunDatasetCleaningExecutor(
             raise ValueError(
                 f"Failed to read dataset cleaning script for preflight: {exc}"
             ) from exc
-        try:
-            tree = ast.parse(source, filename=script_path)
-            compile(tree, script_path, "exec")
-        except SyntaxError as exc:
-            location = f"line {exc.lineno}"
-            if exc.offset is not None:
-                location += f", column {exc.offset}"
-            raise ValueError(
-                f"Dataset cleaning script syntax error at {location}: {exc.msg}"
-            ) from exc
+        validate_cleaning_script(source, utils_path, filename=script_path)
 
-        public_names = _runtime_public_names(utils_path)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import) and any(
-                alias.name == "cleaning_utils" for alias in node.names
-            ):
-                raise ValueError(
-                    "Dataset cleaning script must use explicit "
-                    "from cleaning_utils import ... APIs."
-                )
-            if not isinstance(node, ast.ImportFrom) or node.module != "cleaning_utils":
-                continue
-            imported = {alias.name for alias in node.names}
-            if "*" in imported:
-                raise ValueError(
-                    "Dataset cleaning script must import explicit cleaning_utils APIs."
-                )
-            unknown = sorted(imported - public_names)
-            if unknown:
-                raise ValueError(
-                    "Dataset cleaning script imports unsupported cleaning_utils APIs: "
-                    + ", ".join(unknown)
-                )
+
+class RunDatasetCleaningExecutor(
+    DatasetCleaningRunner,
+    ToolExecutor[RunDatasetCleaningAction, RunDatasetCleaningObservation],
+):
+    def __call__(
+        self,
+        action: RunDatasetCleaningAction,
+        conversation: ToolConversation | None = None,
+    ) -> RunDatasetCleaningObservation:
+        return self.run(action, conversation)
+
+
+def create_dataset_cleaning_runner(**params: Any) -> DatasetCleaningRunner:
+    return DatasetCleaningRunner.from_options(**params)
 
 
 class RunDatasetCleaningTool(
@@ -484,56 +500,12 @@ class RunDatasetCleaningTool(
         conv_state: ToolState | None = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        env_value = params.pop("env", None)
-        env = str(env_value) if env_value is not None else None
-        cluster_value = params.pop("cluster", None)
-        cluster = str(cluster_value) if cluster_value is not None else None
-        params.pop("current_user", None)
-        output_root_value = params.pop("output_root", None)
-        output_root = str(output_root_value) if output_root_value is not None else None
-        headers = _normalize_headers(params.pop("headers", None))
-        runtime_dir_value = params.pop("runtime_dir", None)
-        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
-        storage_base_url_value = params.pop("storage_base_url", None)
-        storage_base_url = (
-            str(storage_base_url_value) if storage_base_url_value is not None else None
-        )
-        storage_headers = _normalize_headers(params.pop("storage_headers", None))
-        legacy_secret_headers = params.pop("secret_headers", None)
-        storage_secret_headers = _normalize_headers(
-            params.pop("storage_secret_headers", legacy_secret_headers)
-        )
-        env, cluster = _resolve_execution_target(env, cluster, headers)
-        params.pop("endpoint_url", None)
-        task_store_dir_value = params.pop("task_store_dir", None)
-        task_store_dir = (
-            str(task_store_dir_value) if task_store_dir_value is not None else None
-        )
-        timeout = int(params.pop("timeout", 30))
-        if params:
-            names = ", ".join(sorted(params))
-            raise ValueError(f"RunDatasetCleaningTool got unknown params: {names}")
-        if timeout <= 0:
-            raise ValueError("timeout must be greater than 0")
-        if output_root is not None:
-            _normalize_storage_path(output_root, "output_root")
         return [
             cls(
                 description=TOOL_DESCRIPTION,
                 action_type=RunDatasetCleaningAction,
                 observation_type=RunDatasetCleaningObservation,
-                executor=RunDatasetCleaningExecutor(
-                    env=env,
-                    cluster=cluster,
-                    output_root=output_root,
-                    headers=headers,
-                    runtime_dir=runtime_dir,
-                    storage_base_url=storage_base_url,
-                    storage_headers=storage_headers,
-                    storage_secret_headers=storage_secret_headers,
-                    task_store_dir=task_store_dir,
-                    timeout=timeout,
-                ),
+                executor=RunDatasetCleaningExecutor.from_options(**params),
                 annotations=ToolAnnotations(
                     title="run_dataset_cleaning",
                     readOnlyHint=False,
@@ -551,37 +523,6 @@ def _normalize_headers(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         raise ValueError("headers must be a dictionary when provided")
     return {str(name): str(header_value) for name, header_value in value.items()}
-
-
-def _runtime_public_names(utils_path: Path) -> set[str]:
-    try:
-        tree = ast.parse(
-            utils_path.read_text(encoding="utf-8"),
-            filename=str(utils_path),
-        )
-    except (OSError, SyntaxError) as exc:
-        raise ValueError(f"Could not inspect cleaning_utils public API: {exc}") from exc
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(
-            isinstance(target, ast.Name) and target.id == "__all__"
-            for target in targets
-        ):
-            continue
-        if node.value is None:
-            raise ValueError("cleaning_utils __all__ must have a literal value")
-        try:
-            value = ast.literal_eval(node.value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("cleaning_utils __all__ must be a literal list") from exc
-        if not isinstance(value, list) or not all(
-            isinstance(name, str) for name in value
-        ):
-            raise ValueError("cleaning_utils __all__ must contain only strings")
-        return set(value)
-    raise ValueError("cleaning_utils does not define a public __all__ contract")
 
 
 def _resolve_execution_target(
@@ -615,94 +556,6 @@ def _normalize_storage_path(value: str, field_name: str) -> str:
 
 def _pod_path(storage_path: str) -> str:
     return f"/target-workspace{storage_path}"
-
-
-def _build_cleaning_command(
-    *,
-    input_path: str,
-    script_path: str,
-    output_root: str,
-    output_dir: str,
-    limit: int | None,
-    resumed: bool,
-) -> str:
-    pod_input = _pod_path(input_path)
-    pod_output_root = _pod_path(output_root)
-    pod_output_dir = _pod_path(output_dir)
-    frozen_script = f"{pod_output_dir}/clean_script.py"
-    cleaning_utils = f"{pod_output_dir}/cleaning_utils.py"
-    validator = f"{pod_output_dir}/validate_format.py"
-    output_file = f"{pod_output_dir}/output.jsonl"
-    report_file = f"{pod_output_dir}/report.json"
-
-    command_parts = [
-        "python3",
-        shlex.quote(frozen_script),
-        "--input",
-        shlex.quote(pod_input),
-        "--output",
-        shlex.quote(output_file),
-        "--state-dir",
-        shlex.quote(pod_output_dir),
-    ]
-    if resumed:
-        command_parts.append("--resume")
-        prefix = " && ".join(
-            f"test -f {shlex.quote(path)}"
-            for path in (frozen_script, cleaning_utils, validator)
-        )
-    else:
-        prefix = " && ".join(
-            [
-                f"mkdir -p {shlex.quote(pod_output_root)}",
-                f"mkdir -p {shlex.quote(pod_output_dir)}",
-                (
-                    f"cp {shlex.quote(_pod_path(script_path))} "
-                    f"{shlex.quote(frozen_script)}"
-                ),
-            ]
-        )
-    if limit is not None:
-        command_parts.extend(["--limit", str(limit)])
-    validator_parts = [
-        "python3",
-        shlex.quote(validator),
-        "--input",
-        shlex.quote(output_file),
-        "--report",
-        shlex.quote(report_file),
-    ]
-    return f"{prefix} && {' '.join(command_parts)} && {' '.join(validator_parts)}"
-
-
-def _build_cleaning_workflow(
-    action: RunDatasetCleaningAction,
-    run_id: uuid.UUID,
-    command: str,
-) -> dict[str, Any]:
-    return {
-        "id": str(run_id),
-        "name": f"agent-data-clean-{str(run_id)[:8]}",
-        "nodes": [
-            {
-                "id": "1",
-                "type": "default",
-                "position": {"x": 0, "y": 0},
-                "data": {
-                    "display_name": "Custom Command",
-                    "nodeType": "CustomCommandCPUNode",
-                    "config": {
-                        "command": command,
-                        "cpu": action.cpu,
-                        "memory": action.memory,
-                    },
-                },
-            }
-        ],
-        "edges": [],
-        "viewport": {"x": 0, "y": 0, "zoom": 1},
-        "timestamp": datetime.now(UTC).isoformat(),
-    }
 
 
 register_tool(RunDatasetCleaningTool.name, RunDatasetCleaningTool)

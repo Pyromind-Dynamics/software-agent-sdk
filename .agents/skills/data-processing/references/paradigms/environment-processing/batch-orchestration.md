@@ -1,5 +1,8 @@
 # 批量编排(batch-orchestration)
 
+准备、SDK 提交与兼容入口见 [playbook](playbook.md)。
+本页提到的分片和恢复字段是各阶段的业务参数，保留每片真实平台任务 ID。
+
 ## 输入清单 manifest.jsonl
 
 每行一条待验证数据,字段:
@@ -15,10 +18,11 @@
 }
 ```
 
-清单本身由 `edp_render` 在平台节点分片写入 storage
+清单本身由 EDP 渲染任务 在平台节点分片写入 storage
 (`<root>/batch-XXX/manifest.jsonl` + `shards.json` 索引),agent 不在本地构造;
-直接读 `/workspace/<root>/batch-XXX/...`(或需要时用 `sandbox_download`
-拉进沙箱工作目录)。
+直接读已挂载的 `/workspace/<root>/batch-XXX/...`，不经下载 Tool 中转。
+其他 SDK 沙箱若未共享此挂载，按 sandbox Skill 的 SDK 文件读写参考传递所需文件，
+核对目标内容后再执行。
 
 ## verdict 结构(输出)
 
@@ -58,8 +62,8 @@
 1. 会话中断/超时后,先读取已有 `verdicts.jsonl`,提取已处理的 `task_id` 集合
 2. 从 manifest 中跳过已处理项,继续验证剩余项
 3. 已处理项的判定结果**不重跑、不覆盖**
-4. 平台路径:`edp_submit` 同 `run_id` 重提交即自动续跑;聚合用
-   `edp_aggregate` 同 `out_dir` 重提交(可追加新 run_dirs),已合并的
+4. 平台路径：已确认需恢复时，创建新的 EDP 分片任务 请求并沿用原 `run_id` 即自动续跑；聚合用
+   EDP 聚合任务 新请求沿用原 `out_dir`(可追加新 run_dirs),已合并的
    task_id 自动跳过;本地 runner 场景同 `--output-dir` 重跑原命令即续跑
 
 ## 镜像复用语义(pi 链路)
@@ -76,15 +80,15 @@
 |------|------|------|
 | smoke | 第一片 limit=3 | 全量链路,确认 verdict 分布与 error 主因 |
 | **用户决策** | - | **向用户提问确认三选一:串行全量 / 显式并发批(2-5 片) / 停**,禁止 agent 自行选择并发容量 |
-| 串行全量 | 每次一片 | `edp_submit(shards=..., shard_offset=...)`,默认 `shard_count=1`;该片终态并检查后再提交下一片 |
+| 串行全量 | 每次一片 | EDP 分片任务填写 `shards`、`shard_offset`，默认 `shard_count=1`;该片终态并检查后再提交下一片 |
 | 显式并发批 | 每批 2-5 片 | 仅当用户明确要求时使用 `shard_count=N`;每片独立 workflow/回调 |
 | 批间确认 | - | 串行全量每片终态后自动进入下一片;并发批全部片终态后汇报统计并再次向用户提问确认 |
 
 - agent 给推荐批容量时附推算依据:单条均时 × 片内条数 vs 12h 任务配额、
   同镜像拉取风暴约束;3 条样本不符合预期的全量成本很高,决策权在用户。
   并发容量上限为 5,未获用户明确要求时必须保持默认 1
-- 运行中用 `df_check_progress(output_dir=<run 目录>,
-  tail_filename="verdicts.jsonl")` 看进度(节点日志亦逐条一行);
+- 运行中按[挂载进度参考](../../storage-progress.md)，从实际 `<output_dir>/run`
+  调用普通 `read_progress(..., tail_filename="verdicts.jsonl")` 看进度；节点日志亦逐条一行。
   串行模式下每片终态回调唤醒会话,检查该片后提交下一片;并发模式下先
   判断"本批是否全部终态"再决定是否询问下一批
 
@@ -95,15 +99,17 @@
 - 单条默认配额:create wait ≤600s,probe 60s,pi 安装 ≤600s,pi 解题总预算
   ≤1800s(runner 内部 nohup 后台 + 退出码文件轮询,不受单命令 600s 上限
   约束),verifier ≤600s
-- 进度观测:三段平台化后统一走 `progress.json`(edp_render/edp_submit/
-  edp_aggregate 同一契约,`df_check_progress` 可读),节点日志逐条一行;
-  需介入时先 `df_stop_task(task_id)` 停平台任务再改再提交
+- 进度观测：三段平台化后统一写 `progress.json`，渲染、分片执行、聚合沿用同一契约；
+  从已知挂载目录有界读取，不根据文件缺失推断平台终态，节点日志逐条一行。
+  需介入时先停止平台任务；启用 SDK 时按 [停止参考](../../sdk-stop-task.md) 执行，
+  其他会话使用 `df_stop_task(task_id)`，确认终态后再改再提交
 
 ## 手工兜底(runner 不可用时)
 
 按 SKILL.md 模式 B 组装沙箱工具,判定口径与上文一致:verifier 正常跑完且
 reward 可读(或 exit 0)→ usable;verifier 本身报错(语法错误、缺依赖、命令
-不存在)→ error。无论成败每条必须 `sandbox_delete`(Running 态先 pause 再删)。
+不存在)→ error。无论成败每条都释放沙箱（Running 态先 pause 并确认，再删）；
+启用 SDK 时按 sandbox Skill 的生命周期参考执行，其他会话使用 `sandbox_delete`。
 
 手工装 pi 时已验证的环境适配方法(runner 的 install_pi 已内置同样逻辑,
 此处供模式 B 参考):

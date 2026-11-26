@@ -3,7 +3,11 @@ name = "harness-adapter"
 version = "0.1.0"
 description = "Harness adapters for the Pyromind runtime"
 requires-python = ">=3.12"
-dependencies = ["pyromind-runtime", "pyromind-common", "agentgenome==0.6.49"]
+dependencies = [
+    "pyromind-runtime",
+    "pyromind-common",
+    "wheel>=0.45",
+]
 
 
 [build-system]

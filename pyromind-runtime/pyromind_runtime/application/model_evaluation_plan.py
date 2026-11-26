@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import PurePosixPath
 
 from pyromind_runtime.domain.content import JsonObject
@@ -13,7 +14,19 @@ from pyromind_runtime.domain.storage_paths import StoragePathError, to_storage_a
 
 
 _MODEL_INPUTS = {"model", "merged_model", "checkpoint"}
-_DATA_INPUTS = {"dataset", "val_dataset", "test_dataset", "validation_dataset"}
+_DATA_INPUTS = {
+    "dataset",
+    "val_dataset",
+    "test_dataset",
+    "validation_dataset",
+    "eval_data",
+    "evaluation_dataset",
+}
+
+
+def has_model_evaluation_inputs(task: ExperimentTask) -> bool:
+    names = {item.name for item in task.inputs}
+    return "model" in names and bool(names & _DATA_INPUTS)
 
 
 def model_evaluation_tasks(
@@ -137,8 +150,16 @@ def submission_paths(
 
 
 def check_inference_receipt(
-    run: ExperimentExecutionView, receipts: dict[str, PipelineRun]
+    run: ExperimentExecutionView,
+    receipts: dict[str, PipelineRun],
+    *,
+    sdk_receipts: dict[str, tuple[str, str]] | None = None,
 ) -> ExperimentExecutionView:
+    identities = run.platform_task_ids or (
+        (run.platform_task_id,) if run.platform_task_id else ()
+    )
+    if sdk_receipts and any(identity in sdk_receipts for identity in identities):
+        return run
     receipt = receipts.get(run.platform_task_id) if run.platform_task_id else None
     if not inference_paths(receipt) and (
         receipt is not None or run.state == "succeeded"
@@ -153,3 +174,89 @@ def check_inference_receipt(
             }
         )
     return run
+
+
+def sdk_inference_paths(workflow: JsonObject) -> tuple[str, str] | None:
+    """Recognize the frozen inference topology emitted by the SDK evaluation helper."""
+    nodes = workflow.get("nodes")
+    edges = workflow.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return None
+    data = {
+        str(node["id"]): node["data"]
+        for node in nodes
+        if isinstance(node, dict)
+        and isinstance(node.get("id"), str)
+        and isinstance(node.get("data"), dict)
+    }
+    matches = set()
+    for edge in edges:
+        if not isinstance(edge, dict) or (
+            edge.get("sourceHandle"),
+            edge.get("targetHandle"),
+        ) != ("endpoint", "param"):
+            continue
+        serving, scoring = (
+            data.get(str(edge.get("source"))),
+            data.get(str(edge.get("target"))),
+        )
+        if not isinstance(serving, dict) or not isinstance(scoring, dict):
+            continue
+        serving_config, scoring_config = serving.get("config"), scoring.get("config")
+        if (
+            serving.get("nodeType") != "VLLMInference"
+            or scoring.get("nodeType") != "CustomCommandCPUNode"
+            or not isinstance(serving_config, dict)
+            or not isinstance(scoring_config, dict)
+        ):
+            continue
+        command = scoring_config.get("command")
+        if not isinstance(command, str):
+            continue
+        try:
+            arguments = shlex.split(command)
+        except ValueError:
+            continue
+        if (
+            len(arguments) < 4
+            or len(arguments) % 2
+            or not PurePosixPath(arguments[0]).name.startswith("python")
+            or PurePosixPath(arguments[1]).name != "evaluate_inference.py"
+        ):
+            continue
+        flags = dict(zip(arguments[2::2], arguments[3::2], strict=True))
+        model, dataset = flags.get("--model-reference"), flags.get("--dataset-path")
+        if not model or not dataset or flags.get("--endpoint") != "$param":
+            continue
+        actual_model = serving_config.get("model_path")
+        if not actual_model:
+            sources = [
+                data.get(str(source.get("source")))
+                for source in edges
+                if isinstance(source, dict)
+                and source.get("target") == edge.get("source")
+                and source.get("targetHandle") == "model_path"
+                and source.get("sourceHandle") in {"model_path", "merged_model_path"}
+            ]
+            if len(sources) == 1 and isinstance(source := sources[0], dict):
+                config = source.get("config")
+                field = {
+                    "ModelMergeLoraNode": "lora_path",
+                    "CloneAndCacheModel": "model",
+                    "DownloadAndCacheModel": "modelname",
+                }.get(str(source.get("nodeType")))
+                if isinstance(config, dict) and field:
+                    actual_model = config.get(field)
+        if not isinstance(actual_model, str):
+            continue
+        try:
+            if model.startswith("/") and actual_model.startswith("/"):
+                same = to_storage_api_path(model) == to_storage_api_path(actual_model)
+            else:
+                same = model == actual_model
+            to_storage_api_path(dataset)
+        except StoragePathError:
+            continue
+        if same:
+            matches.add((model, dataset))
+    return next(iter(matches)) if len(matches) == 1 else None

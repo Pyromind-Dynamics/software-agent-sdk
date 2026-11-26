@@ -3,16 +3,54 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from pyromind_agent_server.pyromind_router import (
     PyromindDebugCallbackRequest,
     PyromindWorkflowCallbackRequest,
     pyromind_debug_callback,
+    pyromind_debug_webhook_router,
     pyromind_workflow_callback,
 )
 from pyromind_agent_server.workflow_status import WorkflowCallbackResult
 from pyromind_common.tools.pyromind_debug.broker import get_debug_result_broker
+
+
+def test_http_workflow_callback_cannot_claim_platform_trust(monkeypatch):
+    captured = {}
+
+    async def deliver(**kwargs):
+        captured.update(kwargs)
+        return WorkflowCallbackResult(
+            outcome="delivered_async",
+            task_id=kwargs["task_id"],
+            normalized_status="Succeeded",
+            conversation_id=kwargs["conversation_id"],
+        )
+
+    monkeypatch.setattr(
+        "pyromind_agent_server.pyromind_router.deliver_workflow_status", deliver
+    )
+    app = FastAPI()
+    app.include_router(pyromind_debug_webhook_router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/pyromind/workflow/callback?trusted_platform=true",
+            json={
+                "task_id": "claimed-sdk-task",
+                "status": "Succeeded",
+                "conversation_id": "conversation-1",
+                "trusted_platform": True,
+                "correlation": {"signature": "a" * 64},
+                "out_id": "caller-controlled",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured.get("trusted_platform", False) is False
+    assert "correlation" not in captured
+    assert "out_id" not in captured
 
 
 @pytest.mark.asyncio
@@ -187,3 +225,21 @@ async def test_workflow_callback_unknown_conversation_returns_404(
         )
 
     assert exc_info.value.status_code == 404
+
+
+def test_http_workflow_callback_reports_untrusted_sdk_status_as_forbidden(monkeypatch):
+    async def deliver(**kwargs):
+        raise PermissionError("private ownership details")
+
+    monkeypatch.setattr(
+        "pyromind_agent_server.pyromind_router.deliver_workflow_status", deliver
+    )
+    app = FastAPI()
+    app.include_router(pyromind_debug_webhook_router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/pyromind/workflow/callback",
+            json={"task_id": "sdk-task", "status": "Succeeded"},
+        )
+    assert response.status_code == 403
+    assert "private ownership" not in response.text

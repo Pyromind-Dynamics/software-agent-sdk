@@ -9,6 +9,7 @@ export type RunnerEventKind =
   | "agent.started"
   | "run.finished"
   | "execution.policy.updated"
+  | "context_compaction.updated"
   | "message.started"
   | "message.delta"
   | "message.completed"

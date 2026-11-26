@@ -5,8 +5,9 @@ import os
 import signal
 
 import certifi
-import harness_adapter.pi_adapter.runner as runner_module
 import pytest
+
+import harness_adapter.pi_adapter.runner as runner_module
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from harness_adapter.pi_adapter.protocol import (
     PROTOCOL_VERSION,
@@ -324,6 +325,28 @@ def test_runner_tool_event_has_product_operation_shape_and_object_details() -> N
     assert events[0].type == "operation.completed"
     assert events[0].payload["operation_id"] == "t1"
     assert events[0].payload["details"] is None
+
+
+def test_context_compaction_projects_progress_before_model_output() -> None:
+    snapshot = ConversationSnapshot(
+        conversation_id="s1", capabilities=HarnessCapabilities()
+    )
+    for seq, status in enumerate(("started", "completed"), start=1):
+        (harness_event,) = translate_runner_event(
+            {
+                "eventId": f"compaction-{seq}",
+                "sessionId": "s1",
+                "runId": "r1",
+                "kind": "context_compaction.updated",
+                "payload": {"status": status},
+            }
+        )
+        product_event = ProductEventProjector().project("s1", harness_event)
+        assert product_event is not None
+        snapshot = SnapshotProjector().reduce(
+            snapshot, product_event.model_copy(update={"seq": seq})
+        )
+        assert snapshot.compaction_status == status
 
 
 @pytest.mark.parametrize("error_code", [None, "ENUM_VALUE_INVALID"])

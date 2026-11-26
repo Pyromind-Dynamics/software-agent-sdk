@@ -1,4 +1,5 @@
 import ast
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -366,17 +367,15 @@ def test_reusable_workflow_runtime_has_no_engine_or_harness_imports() -> None:
         ), relative
 
 
-def test_legacy_genome_bridge_stays_isolated_from_the_product_runner() -> None:
+def test_agentgenome_is_absent_from_runtime_dependencies_and_injection() -> None:
     adapter = ROOT / "harness-adapter"
-    bridge = (adapter / "harness_adapter/agentgenome_bridge.py").read_text()
-    imports = {
-        node.module
-        for node in ast.walk(ast.parse(bridge))
-        if isinstance(node, ast.ImportFrom)
-    }
-    assert "agentgenome.dispatch" in imports
-    assert not imports.intersection(
-        {"agentgenome.local_host", "agentgenome.local_service"}
+    bootstrap = ROOT / "pyromind-agent-server/pyromind_agent_server/bootstrap.py"
+    assert not (adapter / "harness_adapter/agentgenome_bridge.py").exists()
+    assert "agentgenome" not in (adapter / "pyproject.toml").read_text()
+    assert "agentgenome" not in (adapter / "pi-runtime/package.json").read_text()
+    assert "agentgenome" not in bootstrap.read_text()
+    assert (
+        "genomeHostAccess" not in (adapter / "pi-runtime/src/pi-session.ts").read_text()
     )
     session = (adapter / "pi-runtime/src/pi-session.ts").read_text()
     manifest = (adapter / "pi-runtime/package.json").read_text()
@@ -506,11 +505,24 @@ def test_return_addresses_stay_in_the_product_contract_and_out_of_model_argument
         "type",
         "subagent_id",
         "task_kind",
+        "cluster",
+        "execution",
+        "origin_run_id",
+        "signature",
     }
+    legacy = TaskCorrelation(conversation_id="c", task_kind="workflow_run").to_out_id()
+    assert not {"cluster", "execution", "origin_run_id", "signature"}.intersection(
+        json.loads(legacy)
+    )
     for action in (SubmitWorkflowAction, WorkflowDebugAction, DfSubmitPipelineAction):
-        assert not {"correlation", "origin", "subagent_id"}.intersection(
-            action.model_fields
-        )
+        assert not {
+            "correlation",
+            "origin",
+            "subagent_id",
+            "signature",
+            "execution",
+            "origin_run_id",
+        }.intersection(action.model_fields)
 
 
 def test_preparation_policy_is_trusted_profile_configuration():

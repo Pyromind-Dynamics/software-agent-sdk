@@ -14,6 +14,7 @@ from pydantic import JsonValue, SecretStr
 
 import harness_adapter.pi_adapter.adapter as pi_adapter_module
 from harness_adapter.pi_adapter import PiAdapter
+from pyromind_agent_server import echomind_consolidation
 from pyromind_agent_server.api import echomind_projects as echomind_project_api
 from pyromind_agent_server.api.echomind_projects import router as echomind_router
 from pyromind_agent_server.api.router import (
@@ -50,16 +51,22 @@ from pyromind_agent_server.echomind_runtime_slots import (
     TracerBufferConfig,
     TracerRuntime,
 )
+from pyromind_agent_server.echomind_script_consolidation import ConsolidationCompilation
 from pyromind_agent_server.echomind_stage_runs import ProjectRunStore
 from pyromind_agent_server.echomind_tracer_admin import load_tracer_admin_key
 from pyromind_agent_server.profiles import (
     ConversationProfile,
 )
 from pyromind_agent_server.service_context import ProductServiceContext
+from pyromind_runtime.application.consolidation_evidence import (
+    ConsolidationEvidence,
+    ConsolidationStageEvidence,
+)
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
+from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
@@ -145,6 +152,163 @@ def test_composed_app_mounts_echomind_project_routes(tmp_path) -> None:
     assert "/api/echomind/projects/{project_id}/graph-runs/{run_id}/retry" in paths
     assert "/api/echomind/conversations" not in paths
     assert not any("project-request" in path for path in paths)
+
+
+async def test_project_consolidation_rejects_other_owner_and_stale_review(
+    tmp_path, monkeypatch
+):
+    runtime = ConversationRuntime(tmp_path / "conversations", FakeAdapter())
+    app = _app(tmp_path, runtime)
+    app.include_router(echomind_router)
+    projects = ProjectStore.for_conversations_dir(tmp_path / "conversations")
+    project_id = str(uuid4())
+    conversation_id = uuid4().hex
+    cluster = "us-west-1#pre"
+    project = projects.save(
+        ProjectInfo(
+            project=ProjectRecord(
+                project_id=project_id,
+                name="PCB AVI",
+                description="Development",
+                skill="experiment-planning",
+                owner_user_id="42",
+                conversation_id=conversation_id,
+                cluster=cluster,
+            ),
+            graph=ProjectGraph(graph_id=str(uuid4()), project_id=project_id),
+        )
+    )
+    (tmp_path / "conversations" / conversation_id).mkdir(parents=True)
+    await runtime.create_conversation(
+        SessionSpec(
+            conversation_id=conversation_id,
+            user_id="42",
+            workspace_root=str(tmp_path),
+            profile_id="echomind",
+        ),
+        RequestContext(user_id="42", profile_id="echomind"),
+    )
+    receipt = ConsolidationStageEvidence(
+        task_id="101",
+        source="workflow_execution_request",
+        definition_sha256="sha256:" + "a" * 64,
+        revision=2,
+    )
+    evidence = ConsolidationEvidence(
+        conversation_id=conversation_id,
+        dataset=receipt,
+        train=receipt.model_copy(update={"task_id": "102"}),
+        eval=receipt.model_copy(update={"task_id": "103", "source": "pipeline_run"}),
+    )
+    context = echomind_consolidation.ConsolidationContext(
+        project_id=project_id,
+        evidence=evidence,
+        source_graph_sha256="sha256:" + "b" * 64,
+        evidence_sha256="sha256:" + "c" * 64,
+        source_batch="/workspace/images",
+        validation_dataset="/workspace/validation.jsonl",
+        base_model="/workspace/models/base",
+    )
+    proposal = echomind_consolidation.ConsolidationProposal(
+        evidence_sha256=context.evidence_sha256,
+        dataset_runtime={},
+        train_runtime={},
+        evaluator_runtime={},
+    )
+    load_context = Mock(return_value=context)
+    monkeypatch.setattr(echomind_project_api, "consolidation_context", load_context)
+    monkeypatch.setattr(echomind_consolidation, "consolidation_context", load_context)
+    read = AsyncMock(side_effect=[TimeoutError(), proposal.model_dump_json()])
+    monkeypatch.setattr(runtime, "read_persisted_workspace_text", read)
+    monkeypatch.setattr(echomind_project_api, "_require_profile", Mock())
+    monkeypatch.setattr(echomind_project_api, "configure_session", AsyncMock())
+    monkeypatch.setattr(
+        echomind_project_api, "consolidation_references", Mock(return_value={})
+    )
+    command = AsyncMock(return_value=Mock(status="accepted", command_id="requested"))
+    monkeypatch.setattr(runtime, "submit_command", command)
+    scheduler = Mock(side_effect=AssertionError("Consolidation must not start tasks"))
+    monkeypatch.setattr(echomind_project_api, "_runtime_scheduler", scheduler)
+
+    url = f"/api/echomind/projects/{project_id}/runtime-contract/consolidation"
+    headers = {"x-pyromind-debug-user-id": "42", "x-cluster": cluster}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers
+    ) as client:
+        denied = await client.get(url, headers={"x-pyromind-debug-user-id": "7"})
+        assert denied.status_code == 404
+        read.assert_not_awaited()
+        review = await client.get(url, params={"dataset_task_id": "101"})
+        assert review.status_code == 200
+        assert review.json()["context"]["evidence"]["dataset"]["task_id"] == "101"
+        assert "超时" in review.json()["issue"]
+        assert load_context.call_args.kwargs["task_ids"] == {"dataset": "101"}
+        requested = await client.post(
+            url,
+            json={"task_ids": {"train": "102"}, "review_note": "保留固定验证集"},
+        )
+        assert requested.status_code == 202
+        assert requested.json() == {
+            "command_id": "requested",
+            "proposal_path": context.proposal_path,
+        }
+        command.assert_awaited_once()
+        assert "保留固定验证集" in command.call_args.args[1].content[0].text
+        command.side_effect = ProductRuntimeError("conversation_busy", "Active turn.")
+        conflict = await client.post(url, json={"task_ids": {"train": "102"}})
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "conversation_busy"
+        stale = await client.post(
+            url + "/apply", json={"proposal_sha256": "sha256:" + "d" * 64}
+        )
+        assert stale.status_code == 409
+        assert "changed" in stale.json()["detail"]
+        compiled = ConsolidationCompilation(
+            evidence_sha256=context.evidence_sha256,
+            stages=(
+                echomind_consolidation.ConsolidationStageStatus(
+                    stage="dataset", status="blocked"
+                ),
+            ),
+            blockers=(
+                echomind_consolidation.ConsolidationBlocker(
+                    stage="dataset", code="recipe_required", message="缺少配方"
+                ),
+            ),
+        )
+        build = Mock(return_value=compiled)
+        monkeypatch.setattr(echomind_project_api, "build_script_compilation", build)
+        monkeypatch.setattr(
+            echomind_project_api,
+            "save_script_compilation",
+            Mock(return_value=compiled.review(project, context)),
+        )
+        result = await client.post(
+            url + "/compile", json={"task_ids": {"train": "102"}}
+        )
+        assert result.status_code == 200, result.text
+        assert result.json()["blockers"][0]["code"] == "recipe_required"
+        assert result.json()["draft"] is None
+        assert build.call_args.kwargs["recipe"] is None
+        assert command.await_count == 2
+        conversation = FileProductStore(tmp_path / "conversations" / conversation_id)
+        command.side_effect = lambda _id, work, ctx: conversation.claim_command(work)[0]
+        first = await client.post(url + "/generate", json={})
+        assert first.status_code == 200, first.text
+        active = first.json()["repair"]
+        assert active["stage"] == "dataset" and active["status"] == "working"
+        assert command.await_count == 3
+        duplicate = await client.post(url + "/generate", json={})
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["repair"]["command_id"] == active["command_id"]
+        assert command.await_count == 3
+        wrong_owner = await client.post(
+            url + "/generate", headers={"x-pyromind-debug-user-id": "7"}, json={}
+        )
+        assert wrong_owner.status_code == 404
+    scheduler.assert_not_called()
+    assert projects.load(project_id, owner_user_id="42") == project
+    await runtime.close()
 
 
 async def test_tracer_admin_is_verified_and_scoped_to_the_project(

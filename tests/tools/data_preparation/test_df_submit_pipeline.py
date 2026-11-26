@@ -26,6 +26,7 @@ from pyromind_common.tools.data_preparation.platform_submit import (
     _normalize_storage_path,
     _pod_path,
     _validate_pipeline,
+    create_pipeline_runner,
 )
 from pyromind_common.tools.data_preparation.runner import LabelingModelGateway
 from pyromind_common.tools.data_preparation.submission import (
@@ -158,9 +159,8 @@ def test_resume_command_rejects_a_changed_source_fingerprint() -> None:
         "if [ -f "
         "/target-workspace/output/run-resume/runtime-r1/requirements-cpu.txt ]; then"
     ) in command
-    assert (
-        "else /tmp/df-venv/bin/pip install --use-deprecated=legacy-resolver" in command
-    )
+    assert "else python3 -c" in command
+    assert command.count("install --no-deps open-dataflow==1.0.13") == 2
     syntax = subprocess.run(
         ["bash", "-n"], input=command, text=True, capture_output=True, check=False
     )
@@ -446,9 +446,7 @@ def test_task_association_reads_legacy_runtime_location() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_executor(
-    tmp_path: Path, *, from_tool: bool = False, **kwargs: Any
-) -> DfSubmitPipelineExecutor:
+def _pipeline_runner_params(tmp_path: Path, **kwargs: Any) -> dict[str, Any]:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir(exist_ok=True)
     for filename in RUNTIME_FILENAMES:
@@ -466,6 +464,13 @@ def _make_executor(
         "task_store_dir": str(tmp_path / "tasks"),
     }
     defaults.update(kwargs)
+    return defaults
+
+
+def _make_executor(
+    tmp_path: Path, *, from_tool: bool = False, **kwargs: Any
+) -> DfSubmitPipelineExecutor:
+    defaults = _pipeline_runner_params(tmp_path, **kwargs)
     if from_tool:
         executor = DfSubmitPipelineTool.create(**defaults)[0].executor
         assert isinstance(executor, DfSubmitPipelineExecutor)
@@ -825,23 +830,26 @@ def test_compatible_resume_accepts_agent_assessment(
 
 
 @pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("direct_runner", [False, True])
 def test_new_full_run_uses_conversation_scoped_output_root(
     monkeypatch,
     tmp_path: Path,
     managed: bool,
+    direct_runner: bool,
 ) -> None:
     guarded = []
-    executor = _make_executor(
-        tmp_path,
-        from_tool=True,
-        **(
-            {
-                "managed_run_id": "a8d15e82-1290-46ba-a264-be02242162a4",
-                "submission_guard": lambda: guarded.append(True),
-            }
-            if managed
-            else {}
-        ),
+    params = (
+        {
+            "managed_run_id": "a8d15e82-1290-46ba-a264-be02242162a4",
+            "submission_guard": lambda: guarded.append(True),
+        }
+        if managed
+        else {}
+    )
+    executor = (
+        create_pipeline_runner(**_pipeline_runner_params(tmp_path, **params))
+        if direct_runner
+        else _make_executor(tmp_path, from_tool=True, **params)
     )
     script = tmp_path / "public_data" / "data-preparation" / "pipeline.py"
     script.parent.mkdir(parents=True)
@@ -868,7 +876,7 @@ def test_new_full_run_uses_conversation_scoped_output_root(
     response.status = "Pending"
 
     def submit(**kwargs):
-        assert kwargs["retry_create"] is not managed
+        assert kwargs["retry_create"] is False
         assert guarded == ([True] if managed else [])
         return response
 
@@ -877,7 +885,7 @@ def test_new_full_run_uses_conversation_scoped_output_root(
         submit,
     )
 
-    observation = executor(
+    observation = executor.run(
         DfSubmitPipelineAction(
             script_path="public_data/data-preparation/pipeline.py",
             input_path="/data/in.jsonl",
@@ -908,6 +916,81 @@ def test_new_full_run_uses_conversation_scoped_output_root(
         "status": "Pending",
     }
     conversation.send_agent_message.assert_not_called()
+
+
+@pytest.mark.parametrize("label_source", ["dataset", "collection", None])
+def test_reusable_submission_freezes_real_steps_and_redacts_the_template(
+    tmp_path, monkeypatch, label_source
+):
+    executor = _make_executor(tmp_path)
+    workspace = tmp_path / "public_data"
+    workspace.mkdir()
+    for name in ("pipeline", "prepare", "export"):
+        (workspace / f"{name}.py").write_text(f"# {name} script")
+    (tmp_path / "runtime/verify_training_splits.py").write_text("# host verifier")
+    conversation = _make_conversation_with_llm(workspace_dir=tmp_path)
+    conversation.id = "conv-1"
+    submit = MagicMock(return_value=MagicMock(task_id="11", status="Pending"))
+    stage = MagicMock()
+    monkeypatch.setattr(executor, "_stage_runtime_files", MagicMock())
+    monkeypatch.setattr(executor, "_stage_script", stage)
+    monkeypatch.setattr(
+        "pyromind_common.tools.data_preparation.submission.create_workflow_api_client",
+        MagicMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        "pyromind_common.tools.data_preparation.platform_submit.submit_workflow_task",
+        submit,
+    )
+    monkeypatch.setattr(
+        "pyromind_common.tools.data_preparation.platform_submit._build_llm_env",
+        lambda *args: {
+            "DF_API_URL": "https://example.test/inference",
+            "DF_MODEL_NAME": "vision",
+            "DF_API_KEY": "private-test-value",
+        },
+    )
+    result = executor(
+        DfSubmitPipelineAction(
+            input_path="/workspace/source 2",
+            prepare_script_path="public_data/prepare.py",
+            script_path="public_data/pipeline.py",
+            sft_export_script_path="public_data/export.py",
+            fixed_validation_path="/workspace/fixed.jsonl",
+            replay_of_task_id="10",
+            batch_label_source=label_source,
+        ),
+        conversation=conversation,
+    )
+    assert not result.is_error
+    receipt = submit.call_args.kwargs["dataset_recipe"]
+    assert {a.role for a in receipt.assets} == {
+        "prepare",
+        "pipeline",
+        "export",
+        "verifier",
+    }
+    assert len(stage.call_args_list) == 4
+    for asset in receipt.assets:
+        assert asset.sha256 in asset.path and asset.sha256 in receipt.command_template
+    assert receipt.source_path == "/workspace/source 2"
+    assert receipt.fixed_validation_path == "/workspace/fixed.jsonl"
+    assert receipt.replay_of_task_id == "10"
+    assert receipt.batch_label_source == label_source
+    assert ("batch_label_source" in receipt.model_dump()) == (label_source is not None)
+    assert "private-test-value" not in receipt.model_dump_json()
+    command = submit.call_args.kwargs["workflow"]["nodes"][0]["data"]["config"][
+        "command"
+    ]
+    assert "private-test-value" in command and "'/workspace/source 2'" in command
+    assert "Replay requires 1-5 manifest rows" in command
+    rerender = receipt.command_template.format(
+        source_batch="/workspace/next", output_uri="/workspace/results"
+    )
+    assert "/workspace/source 2" not in rerender
+    assert "Replay requires 1-5 manifest rows" not in rerender
+    for script in (command, rerender):
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
 def test_remote_workspace_submission_stages_pipeline_script(

@@ -55,13 +55,15 @@ original pages before answering.
 
 | Page | Summary | Tags |
 |---|---|---|
+| [Agent 操作索引](sdk/agent-operations.mdx) | 任务到 SDK 方法的映射；区分 SDK 0.1.17 已覆盖能力、Runtime 提交职责、Storage 客户端与迁移缺口 | sdk, agent, tool, studio, storage, migration |
 | [Custom Nodes](sdk/custom-nodes.mdx) | Pyromind SDK Custom Nodes 接口与使用说明 | sdk, custom-nodes |
 | [Echo Mind](sdk/echo-mind.mdx) | Pyromind SDK Echo Mind 接口与使用说明 | sdk, echo-mind |
-| [Index](sdk/index.mdx) | Pyromind SDK Index 接口与使用说明 | sdk, index |
+| [SDK 任务索引](sdk/index.mdx) | SDK 按任务渐进查阅入口；先选择能力，再读取精确文档 | sdk, index, progressive-disclosure |
 | [Inference](sdk/inference.mdx) | Pyromind SDK Inference 接口与使用说明 | sdk, inference |
 | [Installation](sdk/installation.mdx) | Pyromind SDK Installation 接口与使用说明 | sdk, installation |
 | [Jupyterlab](sdk/jupyterlab.mdx) | Pyromind SDK Jupyterlab 接口与使用说明 | sdk, jupyterlab |
 | [More](sdk/more.mdx) | Pyromind SDK More 接口与使用说明 | sdk, more |
+| [CUSTOM 沙箱 SDK](sdk/sandboxes.mdx) | 沙箱生命周期、等待就绪、二进制文件读写、命令退出码与超时；标记待集群验证的迁移项 | sdk, sandbox, custom, exec, files |
 | [Storage](sdk/storage.mdx) | Pyromind SDK Storage 接口与使用说明 | sdk, storage |
 | [Training Workflow](sdk/training-workflow.mdx) | Pyromind SDK Training Workflow 接口与使用说明 | sdk, training-workflow |
 | [User Profile](sdk/user-profile.mdx) | Pyromind SDK User Profile 接口与使用说明 | sdk, user-profile |

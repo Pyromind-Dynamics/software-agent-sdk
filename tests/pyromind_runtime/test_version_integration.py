@@ -2,7 +2,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -24,18 +24,25 @@ from pyromind_common.tools.workflow.task_submission import (
     submit_workflow_task,
     workflow_submission_scope,
 )
+from pyromind_runtime.application.consolidation_evidence import (
+    ConsolidationEvidence,
+    ConsolidationStageEvidence,
+    consolidation_definition_sha256,
+    successful_dataset_recipe_runs,
+)
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
-from pyromind_runtime.domain.task_correlation import TaskOrigin
+from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
 from pyromind_runtime.domain.versions import (
     SaveVersion,
     SnapshotSource,
     VersionToolRequest,
 )
+from pyromind_runtime.domain.workflow_execution import DatasetRecipeReceipt
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
@@ -513,6 +520,65 @@ async def test_delegated_submission_checks_once_before_receipt(
     assert client.studio.create.call_args.args[0].workflow == checked[0]
 
 
+async def test_dataset_receipt_is_available_for_consolidation_after_callback(
+    version_runtime,
+    monkeypatch,
+):
+    runtime, submission, context = version_runtime
+    submit = AsyncMock(return_value="123")
+    monkeypatch.setattr(submission, "submit", submit)
+    correlation = TaskCorrelation(conversation_id="c", task_kind="data_preparation")
+    recipe = DatasetRecipeReceipt(
+        source_path="/workspace/batch.jsonl",
+        output_directory="/workspace/output",
+        command_template="{source_batch} {output_uri}",
+        assets=(),
+        uses_labeling_gateway=False,
+    )
+    await runtime.submit_versioned_workflow(
+        "c",
+        "dataset",
+        submission.workflow,
+        None,
+        context,
+        correlation=correlation,
+        dataset_recipe=recipe,
+    )
+    store = runtime._store("c")
+    saved = store.load_workflow_execution_requests()["tool:dataset"]
+    assert saved.dataset_recipe == recipe and saved.task_id == "123"
+    assert store.load_snapshot().external_tasks[0].output_dir == recipe.output_directory
+    stage = ConsolidationStageEvidence(
+        task_id=saved.task_id,
+        source="workflow_execution_request",
+        definition_sha256=consolidation_definition_sha256(saved.workflow),
+        revision=saved.revision,
+    )
+    evidence = ConsolidationEvidence(
+        conversation_id="c", dataset=stage, train=stage, eval=stage
+    )
+    assert successful_dataset_recipe_runs(store, evidence) == []
+    await runtime.deliver_external_task_status(
+        "c",
+        task_id=saved.task_id,
+        status="succeeded",
+        auto_run=False,
+        correlation=correlation,
+    )
+    assert successful_dataset_recipe_runs(store, evidence) == [saved]
+    with pytest.raises(ValueError, match="successful Dataset"):
+        await runtime.submit_versioned_workflow(
+            "c",
+            "replay",
+            submission.workflow,
+            None,
+            context,
+            correlation=correlation,
+            dataset_recipe=recipe.model_copy(update={"replay_of_task_id": "999"}),
+        )
+    submit.assert_awaited_once()
+
+
 async def test_graph_submission_registers_the_await_owner_immediately(
     version_runtime,
 ):
@@ -542,10 +608,10 @@ async def test_uncertain_submission_never_auto_retries(version_runtime, monkeypa
 
     async def timeout(*args, **kwargs):
         calls.append(args)
-        raise TimeoutError("platform may have accepted it")
+        raise TimeoutError("platform may have accepted it: private-submission-key")
 
     monkeypatch.setattr(runtime._workflow_submission, "submit", timeout)
-    with pytest.raises(ValueError, match="platform may have accepted it"):
+    with pytest.raises(ValueError, match="uncertain.*TimeoutError"):
         await runtime.submit_versioned_workflow(
             "c", "same-call", {"name": "train"}, None, context
         )
@@ -554,6 +620,11 @@ async def test_uncertain_submission_never_auto_retries(version_runtime, monkeypa
             "c", "same-call", {"name": "train"}, None, context
         )
     assert len(calls) == 1
+    request = runtime._store("c").load_workflow_execution_requests()["tool:same-call"]
+    assert request.error == "TimeoutError"
+    for path in runtime.conversation_root.rglob("*"):
+        if path.is_file():
+            assert b"private-submission-key" not in path.read_bytes()
 
 
 async def test_callback_snapshot_failure_replay_recovers_once(

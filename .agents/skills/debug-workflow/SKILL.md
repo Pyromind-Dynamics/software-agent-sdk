@@ -3,8 +3,7 @@ name: debug-workflow
 description: >-
   仅当用户要求在不修改节点、模型或参数的前提下，对当前 Pyromind 工作流进行测试/调试/debug/试跑
   （在平台上真实执行一次并根据报错修复）时使用。若请求同时包含换模型、改参数、改结构或生成
-  workflow，使用 generate-workflow-dsl，本轮不得调用 workflow_debug。调用 `workflow_debug`
-  工具，使用固定 test mode 的调试提交实现。
+  workflow，使用 generate-workflow-dsl，本轮不提交调试。使用固定 test mode 执行，保留次数限制与回调。
   用户可能会用"测试"“test”“调试”“debug”“试跑”等任意说法表达同一个诉求：把工作流提交到平台
   真实跑一次。驱动"触发测试 → Kafka/callback 终态自动续跑会话 → 失败则按报错内容局部修改
   再测；成功则简短通知用户并等待后续输入"。
@@ -24,80 +23,48 @@ triggers:
 
 # 测试 / 调试 Pyromind 工作流
 
-边界：请求同时要求修改配置与“跑一下/看看效果”时，先用 `generate-workflow-dsl` 完成 DSL 修改，
-本轮停止；不要调用 `workflow_debug`。本 Skill 只接收不含配置修改的显式测试/调试请求。
+只处理未同时要求更换模型、节点或参数的显式测试请求。请求含配置修改时，
+使用 generate-workflow-dsl 完成 DSL 修改并结束本轮；本轮不得调用 workflow_debug，
+也不得通过 SDK 提交测试任务。
 
-## 概述
+## 入口与准备
 
-用户说"测试”“test”“调试”“debug”“试跑"这个工作流，指的都是同一件事：调用
-**`workflow_debug`**，把当前工作目录下的 `workflow.py` DSL 提交到 Pyromind 平台**真实
-test 执行**一次（平台侧附加 `execution_mode=test`）。
+启用 SDK 时，读取[SDK 提交与回调](../workflow-execution/references/sdk-execution.md)，
+调用保留的 `validate_workflow_dsl(test_mode=True)`，直接读取其模型可见 content 返回的
+`validated_workflow_path`，文件内是实际测试图；以当前 `workflow_debug` 关联直接调用 SDK。
+不要从内部 `raw_response` 搬写 JSON，也不将测试图重新转换为 DSL。
+没有路径或出现 `artifact_unavailable` 时停止 SDK 提交，即使 `valid=true`。
+轻量 helper 由执行层自动安装，
+预算路径由 `PYROMIND_DEBUG_STATE_PATH` 提供。缺少这些条件且
+`workflow_debug` 仍列出时，使用该已有入口。
+`dsl_path` 缺省为 `public_data/workflow_canvas/workflow.py`；从真实文件读取 DSL。
 
-这是**异步提交**：工具在平台接受任务后返回 `task_id`、初始状态（如 `Pending`/`Running`）
-和 `keep_ui_lock=true`。提交关联信息标记 `task_kind=workflow_debug`。平台终态经 Kafka
-或回调入口分发给 Product Runtime，再按任务归属将运行结果送回当前会话。
+先确认当前 DSL 已存在；测试提交前先用上述测试模式校验。不要用本地
+bash/Python 执行声明式 `workflow.py`。正式运行使用 workflow-execution，
+不能把测试成功当成已正式发布。
 
-只有调试任务才执行本技能中的成功等待或失败修复逻辑。正式运行通过 `submit_workflow`
-进入 Product Runtime 提交链路。
+## 提交与回调
 
-## 工具与参数
+`submit_debug_workflow` 固定平台 `execution_mode=test`，受理后更新调用方提供的
+`DebugBudget.load(...)`；helper 在共享文件锁内持久化，沿用旧调试计数。
+使用当前环境提供的调试关联；不要另建计数器。预算保存失败但带实际任务 ID 时只修预算，不再创建任务。
+提交成功返回 `task_id` 和初始状态；告知已提交后结束本轮，
+等待 Kafka/callback 自动续跑。Pending/Running 时不重复提交，也不在 terminal 轮询等待。
 
-```python
-workflow_debug(
-    dsl_path="public_data/workflow_canvas/workflow.py",  # 可选：工作区相对路径，默认此文件
-    name="workflow",          # 可选
-    note="optional",          # 可选：本轮改动说明
-)
-```
+超时、断连或未取得任务 ID 时，先核对回调和平台，不自动重投。
+已终止的失败调试经修复后属于新尝试，继续消耗本轮预算。
 
-工具直接读取工作区里 `dsl_path` 指向的文件（缺省为
-`public_data/workflow_canvas/workflow.py`），**不要把 DSL 全文传入参数**。不要用
-bash/Python 本地执行 `workflow.py`（声明式 DSL）。
+收到对应调试任务的终态后：
 
-## 与 `validate_workflow_dsl` 的区别
+| 终态 | 下一步 |
+|---|---|
+| Succeeded | 简短告知本次 test 成功，等待用户后续输入；不自动发布或继续修改 DSL。 |
+| Failed / Error | 读取实际错误和节点文档，局部修复或重生成相关 DSL，校验后按用户已授权的调试范围再测。 |
+| Terminated | 说明终止结果，结合错误决定是否需要修复或用户决策。 |
 
-| 工具 | 作用 | 何时使用 |
-|------|------|----------|
-| `validate_workflow_dsl` | 新 workflow 的结构与资源校验 | 每次写入/修改 `workflow.py` 后 |
-| `workflow_debug` | 平台真实 test；Kafka callback 终态 + auto_run | 用户要求测试/调试/试跑 |
-| `submit_workflow` | 经 Product Runtime 正式提交 | 用户要求正式运行/发布 |
+每轮最多接受 10 次调试任务。达到上限后停止；只有用户明确要求继续调试时才重置预算。
+旧 Tool 路径使用其 `reset_round=true` 开始新一轮；SDK 路径更新并保存同一共享预算记录。
+同一报错连续两轮没有进展时，重新核对相关节点文档，避免机械重复。
 
-## 前置条件
-
-- 工作目录已有 `workflow.py`；否则先生成，不要直接 `workflow_debug`
-- 若本轮刚改过且未校验，先 `validate_workflow_dsl`，通过后再 `workflow_debug`
-
-## 循环步骤
-
-1. 调用 `workflow_debug`（缺省 `dsl_path` 即读取工作区 `workflow.py`）
-2. 提交失败（`is_error` / `Failed`/`Error`）：按 observation 处理，勿盲目重试
-3. 提交成功：告知用户已提交、正在等待平台结果；**等待 Kafka callback**（会自动续跑）
-4. 收到终态 `<system_reminder>` 后：
-
-   | 终态 | 下一步 |
-   |------|--------|
-   | **Succeeded** | **仅简短告知用户：本次 test 工作流成功**，然后**停止并等待用户后续输入**；不要再调 `workflow_debug`，也不要主动继续改 DSL |
-   | **Failed / Error** | 运行错误多半说明 **DSL 有问题**。根据 `error_log` **重新生成或修复** `workflow.py`（必要时先 `validate_workflow_dsl`），再调用 `workflow_debug` **继续测试** |
-   | Terminated | 向用户说明；按 `error_log` 决定是否修复后再测 |
-   | Pending / Running | 仍在跑；等待 callback，勿重复提交同一轮 |
-
-5. `attempt`/`max_attempts`（上限 10）：达上限后如实告知用户，停止再调 `workflow_debug`
-
-## 失败时如何改 DSL
-
-- 仔细读 `error_log`，对照 `knowledge/nodes/<NodeType>/<NodeType>.md`
-- 优先按报错修复或**按错误语义重生成相关节点/整份 DSL**（use.md：可能需要重新生成）
-- 改完校验通过后必须再 `workflow_debug`，形成闭环
-- 同一报错连续两轮无进展时，重读文档后再换修法，不要机械重复同一修改
-
-## 成功时如何沟通
-
-- **仅当终态来自 `workflow_debug` 任务时**：只提示一句「本次 test 工作流成功」，然后
-  **等待用户下一步指示**（不要自动发布、不要继续改文件、不要再调 `workflow_debug`）
-- 若终态来自正式 `submit_workflow`，按通用会话指引继续，不要套用本条「仅提示并等待」
-
-## 与用户的沟通（进行中）
-
-- 提交后：说明已提交并等待平台结果
-- 失败修复循环中：一两句进展即可，不必整段粘贴 `error_log`
-- 仅在达最大次数或明显是平台资源/权限问题时再向用户确认下一步
+正式运行的终态按 workflow-execution 处理；不要套用调试任务“成功后等待”的规则。
+反馈只报告实际状态与关键证据，不整段粘贴日志。

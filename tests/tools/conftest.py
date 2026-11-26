@@ -2,14 +2,80 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
+from typing import Any
 
 import pytest
+from pyromind_sdk import PyroMindAPIClient
 
 from pyromind_common.sdk.workspace.models import CommandResult, FileOperationResult
+
+
+@dataclass
+class StudioHTTPFixture:
+    url: str = ""
+    requests: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    headers: list[dict[str, str]] = field(default_factory=list)
+    responses: deque[tuple[int, dict[str, Any]]] = field(default_factory=deque)
+
+
+@pytest.fixture
+def studio_http() -> Iterator[StudioHTTPFixture]:
+    fixture = StudioHTTPFixture()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            size = int(self.headers["Content-Length"])
+            self._respond(json.loads(self.rfile.read(size)))
+
+        def do_GET(self) -> None:
+            self._respond({})
+
+        def _respond(self, request: dict[str, Any]) -> None:
+            fixture.requests.append((self.path, request))
+            fixture.headers.append(dict(self.headers.items()))
+            status, document = fixture.responses.popleft()
+            payload = json.dumps(document).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    fixture.url = f"http://127.0.0.1:{server.server_port}"
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield fixture
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def direct_sdk(studio_http: StudioHTTPFixture) -> Iterator[PyroMindAPIClient]:
+    with PyroMindAPIClient(
+        api_key="test-key",
+        base_url=studio_http.url,
+        cluster="us-west-1",
+        max_retries=0,
+    ) as client:
+        client.studio.session.trust_env = False
+        yield client
 
 
 class HostBackedSandboxWorkspace:

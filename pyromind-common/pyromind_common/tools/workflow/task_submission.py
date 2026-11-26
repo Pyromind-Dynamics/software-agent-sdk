@@ -26,6 +26,7 @@ from pyromind_common.tools.utils.pyromind_api_client import (
     get_pyromind_api_client,
 )
 from pyromind_runtime.domain.task_correlation import TaskCorrelation, TaskOrigin
+from pyromind_runtime.domain.workflow_execution import DatasetRecipeReceipt
 
 
 PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET = "auth_token"
@@ -54,11 +55,25 @@ class WorkflowSubmissionScope:
     origin: TaskOrigin
     submissions: dict[str, TaskCorrelation] = field(default_factory=dict)
     direct_tasks: set[str] = field(default_factory=set)
+    outcome_uncertain: bool = False
+    on_submitted: Callable[[str, TaskCorrelation], None] | None = field(
+        default=None, repr=False
+    )
+    on_credential: Callable[[str], None] | None = field(default=None, repr=False)
 
 
 _current_correlation: ContextVar[TaskCorrelation | None] = ContextVar(
     "current_task_correlation", default=None
 )
+
+
+_current_dataset_recipe: ContextVar[DatasetRecipeReceipt | None] = ContextVar(
+    "current_dataset_recipe", default=None
+)
+
+
+def current_dataset_recipe() -> DatasetRecipeReceipt | None:
+    return _current_dataset_recipe.get()
 
 
 def current_task_correlation() -> TaskCorrelation | None:
@@ -78,8 +93,12 @@ def workflow_submission_scope(
     origin: TaskOrigin,
     *,
     resource_validator: Callable[[dict], None] | None = None,
+    on_submitted: Callable[[str, TaskCorrelation], None] | None = None,
+    on_credential: Callable[[str], None] | None = None,
 ) -> Iterator[WorkflowSubmissionScope]:
-    scope = WorkflowSubmissionScope(origin)
+    scope = WorkflowSubmissionScope(
+        origin, on_submitted=on_submitted, on_credential=on_credential
+    )
     token = _submission_scope.set(scope)
     resource_token = _resource_validator.set(resource_validator)
     try:
@@ -95,6 +114,21 @@ class WorkflowTaskSubmissionError(RuntimeError):
 
 class WorkflowResourceValidationError(ValueError):
     """资源检查未通过，尚未调用平台创建任务。"""
+
+
+def _capture_submission(
+    operation: Callable[[], TrainingTaskCreateResponse],
+    scope: WorkflowSubmissionScope | None,
+) -> TrainingTaskCreateResponse:
+    try:
+        response = operation()
+        if response is None or not response.task_id:
+            raise WorkflowTaskSubmissionError("Workflow create returned no task ID")
+        return response
+    except Exception:
+        if scope is not None:
+            scope.outcome_uncertain = True
+        raise
 
 
 def _retry_transient[T](
@@ -132,11 +166,15 @@ def create_workflow_api_client(
             timeout=timeout,
         )
     )
+    scope = _submission_scope.get()
+    if scope is not None and scope.on_credential is not None:
+        scope.on_credential(access_key)
     return get_pyromind_api_client(
         env=env,
         cluster=route,
         api_key=access_key,
         timeout=timeout,
+        max_retries=0,
     )
 
 
@@ -176,10 +214,11 @@ def submit_workflow_task(
     test_mode: bool = False,
     task_kind: str = "workflow_run",
     origin: TaskOrigin | None = None,
-    retry_create: bool = True,
+    retry_create: bool = False,
     submission_handler: Callable[[dict, str, str | None], TrainingTaskCreateResponse]
     | None = None,
     source_code: str | None = None,
+    dataset_recipe: DatasetRecipeReceipt | None = None,
 ) -> TrainingTaskCreateResponse:
     """Submit a Studio task carrying the caller's return address as JSON text."""
     workflow = _workflow_for_cluster(workflow, str(client.studio.cluster))
@@ -192,13 +231,17 @@ def submit_workflow_task(
     )
     if submission_handler is not None and not test_mode:
         token = _current_correlation.set(correlation)
+        recipe_token = _current_dataset_recipe.set(dataset_recipe)
         # 受托的 Runtime 会检查解析后的实际定义，不能在写回执后重复检查。
         resource_token = _resource_validator.set(None)
         try:
-            response = submission_handler(workflow, name, source_code)
+            response = _capture_submission(
+                lambda: submission_handler(workflow, name, source_code), scope
+            )
         finally:
             _resource_validator.reset(resource_token)
             _current_correlation.reset(token)
+            _current_dataset_recipe.reset(recipe_token)
     else:
         validator = _resource_validator.get()
         if validator is not None:
@@ -209,17 +252,22 @@ def submit_workflow_task(
         request = TrainingTaskCreateRequest(
             name=name, workflow=workflow, out_id=correlation.to_out_id()
         )
-        response = (
-            _retry_transient(lambda: client.studio.create(request))
-            if retry_create
-            else client.studio.create(request)
+        response = _capture_submission(
+            lambda: (
+                _retry_transient(lambda: client.studio.create(request))
+                if retry_create
+                else client.studio.create(request)
+            ),
+            scope,
         )
-    if response is None:
-        raise WorkflowTaskSubmissionError("Workflow create failed, response is None")
-    if not response.task_id:
-        raise WorkflowTaskSubmissionError("Workflow create failed, task_id is None")
     if scope is not None:
         scope.submissions[str(response.task_id)] = correlation
         if submission_handler is None or test_mode:
             scope.direct_tasks.add(str(response.task_id))
+        if scope.on_submitted is not None:
+            try:
+                scope.on_submitted(str(response.task_id), correlation)
+            except Exception:
+                scope.outcome_uncertain = True
+                raise
     return response

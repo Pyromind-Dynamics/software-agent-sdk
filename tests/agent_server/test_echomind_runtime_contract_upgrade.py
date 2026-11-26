@@ -129,7 +129,7 @@ def test_6742_shape_can_upgrade_publish_and_execute_without_mutating_source(
     )
 
     assert run.status == "succeeded"
-    assert run.outcome == "baseline_retained"
+    assert run.outcome == "candidate_recorded"
     scheduler = RuntimeGraphScheduler(projects_root=store.root)
     stages = scheduler.stage_run_store.list_for_graph_run(
         project_id=frozen.project.project_id,
@@ -148,6 +148,37 @@ def test_6742_shape_can_upgrade_publish_and_execute_without_mutating_source(
     )
     assert original == source
     assert original.project.lifecycle == "development"
+
+
+@pytest.mark.parametrize(
+    ("held_out_path", "valid"),
+    [
+        ("/workspace/datasets/held-out/val.jsonl", True),
+        ("/workspace/datasets/../val.jsonl", False),
+    ],
+)
+def test_runtime_draft_preserves_fixed_eval_dataset(tmp_path, held_out_path, valid):
+    _, source = _golden_shape_project(tmp_path)
+    dataset, train, evaluator = source.graph.nodes
+    validation = ProjectNodeInput(
+        artifact_type="dataset.messages.validation",
+        schema_ref="echomind://schemas/messages-dataset/v1",
+        binding=ProjectNodeInputBinding(kind="literal", value=held_out_path),
+    )
+    evaluator = evaluator.model_copy(
+        update={"inputs": {"validation_dataset": validation}}
+    )
+    source = store_project_graph(source, nodes=[dataset, train, evaluator])
+    draft = build_runtime_contract_draft(source)
+    assert draft.nodes[-1].inputs["validation_dataset"] == validation
+    assert draft.nodes[1].inputs["validation_dataset"].binding.kind == "node_output"
+    prepared = store_project_graph(source, nodes=draft.nodes)
+    preflight = build_publication_preflight(prepared)
+    assert preflight.ready == valid
+    if not valid:
+        assert {issue.code for issue in preflight.issues} == {
+            "input_binding_source_invalid"
+        }
 
 
 async def test_runtime_validation_recipe_applies_to_copy_without_mutating_source(

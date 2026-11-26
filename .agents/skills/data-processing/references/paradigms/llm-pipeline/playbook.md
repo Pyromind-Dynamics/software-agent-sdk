@@ -2,7 +2,7 @@
 
 - **基底**：沙箱小样（`sandbox_sample.py` 直参优先，用法见 [terminal-cli](../../terminal-cli.md)；
   它在会话沙箱内隔离子进程执行 DataFlow 算子）→
-  用户确认后平台全量（`df_submit_pipeline`）
+  用户确认后平台全量（普通准备函数 + SDK）
 - **适用**：内容级处理——规则清洗（词数/语言/MinHash 去重/PII/毒性/HTML）、
   LLM 生成与改写、质量评分、格式化；覆盖 SFT、推理、代码、知识问答、
   Agentic RAG、多轮对话、Function Call、质量评估、Text2SQL、化学抽取和
@@ -11,14 +11,22 @@
   需在特定环境执行复杂流程的编排式处理（验证/筛选/执行判定）→ environment-processing
 
 先在沙箱验证最多 3 条 Sample；用户明确确认后，才提交 Pyromind 全量任务。
+提交时读取[SDK 提交与回调](../../../../workflow-execution/references/sdk-execution.md)。
+本页字段是 `PipelineOptions` 的业务参数。普通 `prepare_pipeline` 支持
+`model_profile="none"`、`"text"`、`"vision"`，冻结脚本、运行库、输入及执行修订后，
+通过服务端节点与资源校验，再用普通 `submit_workflow` 调用 SDK。
+SDK Main 不再注入 `df_submit_pipeline`。含 runtime 环境声明的图不能直接
+`studio.create`；helper 在 SDK POST 前才将必要环境值填入内存请求。
+本地冻结资产与 Project 元数据不保存密钥；最终平台任务定义仍可能包含 command 环境，
+不要保存、打印或回传绑定后的图。
 
 ## 强制边界
 
 - 工作区中间文件放在 `public_data/data-preparation/`。
 - Storage 挂载为 `/workspace`，直接用 `read`/`terminal` 查看数据和平台产物，
   `sandbox_sample.py` 的输入也直接写 `/workspace/...`。
-- `sandbox_sample.py` 只运行沙箱小样；用户确认前不得调用 `df_submit_pipeline`。
-- 平台全量输入必须已经存在于 Storage：`df_submit_pipeline` 不接受工作区路径。
+- `sandbox_sample.py` 只运行沙箱小样；用户确认前不得提交平台全量。
+- 平台全量输入必须已经存在于 Storage：`input_path` 不接受工作区路径。
   工作区写好的 Manifest 直接写到图片所在的 Storage 目录 `/workspace/<dir>/`
   （见[平台全量输入](#平台全量输入)）。
 - Sample 结果不符合预期时自行修正并重跑，迭代过程不向用户展示；只展示符合预期的结果。
@@ -26,26 +34,29 @@
 - 新链路优先复用 DataFlow Storage 和 Operator 编排；生成、打分、过滤、去重等已有
   算子能覆盖的环节，尽量不要手写重复实现。
 - 使用 LLM 的 DataFlow 算子必须由 `LoggingLLMServing` 包装。
-- 用户提供打标模型网关时，把 `api_url`/`model`/`api_key` 作为
-  CLI 使用 `gateway`（密钥只引用 `api_key_env`）；平台提交使用 `labeling_gateway` 传给 `df_submit_pipeline`（配
-  `model_profile="vision"`），本地试跑和平台全量用同一个网关；用户没有网关时
-  不要传，走平台 `DF_*` 配置。网关整体替换平台视觉模型，不与平台配置混用。
+- 用户提供打标模型网关时，CLI 使用 `gateway`（密钥只引用 `api_key_env`）；
+  平台准备和提交脚本在当前 Python 进程内存中，将 `PYROMIND_DATAFLOW_PROFILES` 的
+  `vision` 项整体替换为同一网关的端点、模型与已授权环境中的密钥。
+  本地试跑和全量使用同一网关；用户未指定时沿用执行环境的 profile。
+  不把网关地址与原平台 key 混用，具体构造见 SDK 提交参考。
+  经校验 Tool 后的新 Python 进程必须重建相同配置；公开配置指纹不一致会拒绝提交。
 - LLM 批处理必须分批调用（`BATCH_SIZE`，可用 `DF_BATCH_SIZE` 调整）、增量写入
   （append 模式，每批 flush 落盘）、每批更新 `progress.json`（供
-  `df_check_progress` 观测），并内置断点续跑（启动时统计已处理行数并跳过）；
+  [挂载进度读取](../../storage-progress.md) 观测），并内置断点续跑（启动时统计已处理行数并跳过）；
   否则全量运行无法观测进度、中断后只能从头重跑。
 
 ## 平台全量输入
 
-本地试跑只验证链路是否打通，正式批量和正规化执行在平台侧完成。`df_submit_pipeline`
-的 `input_path` 统一使用 `/workspace/...`；工具负责转换成平台 Pod 的内部挂载路径。
+本地试跑只验证链路是否打通，正式批量和正规化执行在平台侧完成。
+`input_path` 统一使用 `/workspace/...`；普通准备函数转换成平台 Pod 的内部挂载路径。
 工作区文件不会自动上传。按输入形态二选一：
 
 - **目录输入**：数据都在同一 Storage 目录时可直接传该目录。目录输入按**直接子项**
   划分样本：每个子目录算一个样本（递归收集其中的图片），散落的单张图片各算一个
   样本。同目录多组图对（如 PCB 待检图 + CAM 参考图）两种划分都不对，必须用 Manifest。
-- **Manifest 输入**：Manifest 必须与它引用的图片处于同一 Storage 目录树内 —— 运行时
-  按 Manifest 所在目录解析其中的相对图片路径，越出该目录的路径会被拒绝。
+- **Manifest 输入**：相对图片引用按 Manifest 所在目录解析，并限制在该目录内。
+  清单另存到会话目录时，将图片引用按原清单目录转换为 `/workspace/...` 绝对路径；
+  图片必须在当前用户挂载的 Storage 内，平台的 `/target-workspace` 挂载由运行时适配。
 
 工作区写好的 Manifest 直接写到
 `/workspace/<图片所在的 Storage 目录>/<name>`，并把同一路径直接作为
@@ -75,8 +86,11 @@
 5. Sample 结果不符合预期（质量、格式、字段映射等问题）时，直接修正 pipeline 并
    重新试跑，直到结果符合预期；迭代过程不向用户展示。
 6. 展示符合预期的 Sample 结果并等待用户明确确认。
-7. 确认输入已按[平台全量输入](#平台全量输入)落到 Storage 后，调用
-   `df_submit_pipeline(mode="full")`。收到 Kafka callback 后，直接读取
+7. 确认输入已按[平台全量输入](#平台全量输入)落到 Storage 后，提交
+   DataFlow 全量任务，业务参数使用 `mode="full"`；先准备并发布冻结资产，通过保留的
+   `validate_workflow_dsl` 取得实际图，再调用普通 `submit_workflow`。
+   取得真实任务 ID 后结束本轮等待回调。可信回调确认归属后单独登记 Recipe、工作流、代码与
+   输出元数据，登记失败不重新 create。收到 Kafka callback 后，直接读取
    `/workspace/<output_dir>/report.json`；如失败，再查看同目录的
    `failure.json`、`validation.json` 和必要的
    `llm_calls.jsonl`。
@@ -84,11 +98,15 @@
    `label_corrections.jsonl`，并向用户说明修正数量、原/新标签和证据；训练数据中不写
    审计字段。
 8. Agent 修复后先在本地重跑失败记录、失败前一条和同类成功记录：
-   - 旧结果仍可用：`mode="resume"`，提交 `reuse_assessment` 和可选新脚本。
+   - 旧结果仍可用：`mode="resume"`，沿用原 `resume_run_id` 和冻结目录；无变更时省略
+     脚本复用冻结运行库，有变更时提供覆盖 pipeline/prompt/model/schema/runtime 实际变化的
+     `reuse_assessment` 和可选新脚本。修订另存，原资产不覆盖；不得更换原输入。
    - 旧结果不可用：重新执行 Sample、人工确认并创建新的 full run。
-9. 提交后可用 `df_check_progress`（传 `output_dir`）查看实时进度、ETA 和最近产出。
-   若用户预览后发现不符合预期、要介入调整，**先调用 `df_stop_task`**（传 `task_id`，
-   或 `df_submit_pipeline` 返回的 `run_id` / `output_dir`）停掉平台任务，再修改
+9. 提交后需要查看进度时，按[挂载进度参考](../../storage-progress.md)，将已保存的实际
+   `output_dir` 交给普通 `read_progress`，读取计数、ETA 和最近产出一次，不循环轮询。
+   若用户预览后发现不符合预期、要介入调整，先停掉平台任务。已启用 SDK 时按
+   [停止参考](../../sdk-stop-task.md) 调用 SDK；其他会话使用 `df_stop_task`（传
+   `task_id` 或业务回执返回的 `run_id` / `output_dir`）。确认终态后再修改
    pipeline 并重新提交，避免旧任务继续消耗资源或覆盖输出目录。
 ## 运行规则（范式内 case 路由）
 

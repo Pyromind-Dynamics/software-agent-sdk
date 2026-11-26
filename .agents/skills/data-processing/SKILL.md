@@ -31,7 +31,17 @@ Storage 根路径。不要把脚本读取文件时的容器路径直接写进输
 
 领域参考（如 PCB AVI/AOI）不内联在本文件：由对应 case 文档按需引入，并在那里
 给出运行时知识库逻辑路径的读取方式。执行方式遵循对应范式：模型批处理在小样确认后
-用 `df_submit_pipeline` 执行全量；确定性格式转换可以在会话沙箱执行并写回 Storage。
+通过平台任务执行全量；确定性格式转换可以在会话沙箱执行并写回 Storage。
+
+需要平台提交时，读取[SDK 提交与回调](../workflow-execution/references/sdk-execution.md)，
+按 playbook 保留脚本冻结、小样与产物约定，再以当前场景关联调用 SDK。
+SDK Main 不再注入 Pipeline、评测、正式工作流、调试、清洗及 EDP 三段共八个提交 Tool，
+不按历史任务恢复注入。Pipeline 支持 none/text/vision，EDP 分片也通过普通准备函数与 SDK
+执行。依赖未就绪先修复执行环境；SDK 未启用的部署按当前实际清单使用原入口。
+一次任务只执行一次平台 create，不因元数据绑定失败重复提交。
+含 runtime 环境声明的校验图用普通 `submit_workflow` / `submit_workflow_batch` 提交，
+不能直接 `studio.create`。本地冻结资产不保存密钥；helper 仅在最终 Studio POST 前将
+必要环境值填入内存请求。平台可能保存该任务定义，不保存或打印绑定后的图。
 
 ## 范式路由（先做这一步）
 
@@ -78,29 +88,43 @@ debug-workflow。不要为搬运或组装 Pipeline 的 Storage 输入另起独�
    什么、该改传什么。
    普通 Python 脚本直接通过 terminal 执行。需要 DataFlow 环境、模型配置、格式校验和报告时，
    阅读 [terminal-cli.md](references/terminal-cli.md)，通过 terminal 调用运行脚本；
-   不要调用旧的专用执行 Tool。模型配置由 SDK 注入，不在命令或配置文件中填写密钥。
-   运行 Pipeline 的解释器由脚本自身解析（镜像内置解释器 → 缓存 venv 首次安装）；
-   terminal 的默认 `python3` 不是那个解释器，不要用 `import dataflow`、全盘 `find`
-   或翻 site-packages 判断环境是否可用。要确认用 `--check`，要提前准备用 `--prepare`。
+   不要调用旧的专用执行 Tool。模型配置由执行环境注入，不在命令或配置文件中填写密钥。
+   直接执行小样入口，由脚本选择解释器并复用或等待后台预热；无需先探查环境。
+   需要单独确认时只用 `--check`。`ready=false` 也可以运行小样，脚本会按需安装。
+   如果托管安装失败，记录脚本报告的具体原因与已完成的输入准备，等待环境修复后续跑。
+   不要使用默认 `python3` 反复测试导入、手动 `pip install`，或另写原生图片解码器来绕过依赖。
    算子导入路径照抄
    `references/paradigms/llm-pipeline/pipeline-reference.md` 的导入路径表，算子名、参数与
    语义以 case 文档为准；不要用 `import dataflow` 加 `getattr` 探测，或翻
    site-packages 反查算子签名。
 4. **门禁**：Taxonomy 与合成小样通过后必须获得用户明确确认才提交后续全量；
    已有标签的确定性全量统计不设人工门禁，且模型调用必须为零。
-5. **全量**：需要平台执行时统一用 `df_submit_pipeline`；提交前先按
+5. **全量**：需要平台执行时，按范式准备实际图并通过 SDK 提交。提交前先按
    llm-pipeline playbook 的「平台全量输入」确认 `input_path` 已指向 Storage 输入，
    工作区文件直接写入 `/workspace/<dir>/` 落位（Storage 已挂载且可写）。
+   EchoMind 面向 SFT 的可复用 Dataset 使用真实源路径作为 `input_path`。需要生成
+   manifest 时传 `prepare_script_path`（原始输入、输出 manifest 两个位置参数）；
+   传 `sft_export_script_path`（processed.jsonl、输出目录、可选固定训练中验证集）。
+   按已确认的业务口径传 `batch_label_source`。原始采集由 Dataset 标注选 `dataset`，
+   封批数据已经包含可训练标签选 `collection`。口径待定时先确认。
+   脚本使用已通过小样的同一实现。指定 `fixed_validation_path` 时原样保留该固定集。
+   验证可复用性时，传原成功 Dataset 的 `replay_of_task_id` 和另一份 1–5 条的小样。
+   固化回放独立登记，省略原研发的 `plan_task_id` 与 `plan_attempt`。先核对已成功的回执，只补缺少的小样。
+   可信回调确认任务归属后，单独登记真实 task ID、Recipe、代码、工作流及输出元数据；
+   登记失败只补登记，不重新提交。EDP 保存每片 task ID、run ID、manifest 与输出目录，
+   部分成功后不整批重投。
    DataFlow/EDP 平台任务（含具身
-   case 的逐 episode 执行）等待终态回调，运行中用 df_check_progress 观察。
-   需介入平台任务时先 df_stop_task 停任务。
+   case 的逐 episode 执行）等待终态回调。用户需要查看运行进度时，按
+   [挂载进度参考](references/storage-progress.md) 从已知输出目录读取一次；不循环轮询。
+   需介入平台任务时先停止；启用 SDK 时按 [停止参考](references/sdk-stop-task.md)
+   调用 SDK 并确认终态，其他会话使用 `df_stop_task`。
 6. **分诊**：回调后先看 report.json / validation / verdicts，按失败分类决定
    resume 还是新 run；终止/失败不自动重提交，交用户决策。
    report.failures 非空时（failures.jsonl：无响应/截止/解析失败的记录），
    把其中的 input 行重组为子集输入补跑同一 pipeline 并合并产出，单条挂起
-   不再阻塞整轮（墙钟截止见 llm-pipeline 的 pipeline-reference.md）。子集文件须与原 source
-   放在**同一目录** —— input 行保留的是相对图片路径，只有同目录才能解析
-   回原图（绝对路径会被 pipeline 以"必须是相对 POSIX 路径"拒绝）。
+   不再阻塞整轮（墙钟截止见 llm-pipeline 的 pipeline-reference.md）。子集保留相对图片路径时，
+   文件与原 source 放在同一目录；另存到其他目录时，先将图片引用按原清单目录转换为
+   `/workspace/...` 绝对路径。图片必须在当前用户挂载的 Storage 内，禁止 `..` 和符号链接越界。
 7. **交付**：展示产物与统计；场景内的产物契约与失败分类学以 playbook 为准。
    生成平铺 Vision 数据准备脚本时，train 和 val 共用同一导出逻辑：写每行 JSON 前，
    按该样本的源图片根将图片列转换为训练容器可读的 `/workspace/...` 绝对路径，

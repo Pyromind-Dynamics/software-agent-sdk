@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI
+
 from pyromind_agent_server.config import Config
 from pyromind_agent_server.http_app import api_lifespan
 from pyromind_agent_server.kafka_bus.handlers.studio_workflow_notify_handler import (
@@ -479,6 +480,7 @@ async def test_studio_workflow_handler_delivers_terminal_status():
         auto_run=True,
         from_workflow_debug=False,
         correlation=TaskCorrelation(conversation_id="c1", task_kind="workflow_run"),
+        trusted_platform=True,
     )
 
 
@@ -521,6 +523,7 @@ async def test_studio_workflow_handler_delivers_debug_terminal_status():
         auto_run=True,
         from_workflow_debug=True,
         correlation=TaskCorrelation(conversation_id="c1", task_kind="workflow_debug"),
+        trusted_platform=True,
     )
 
 

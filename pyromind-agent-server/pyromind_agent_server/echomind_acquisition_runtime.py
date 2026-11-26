@@ -78,7 +78,8 @@ class AcquisitionSample(BaseModel):
     system_prompt: str = Field(min_length=1)
     user_prompt: str = Field(min_length=1)
     images: list[str] = Field(default_factory=list)
-    ground_truth: str = Field(min_length=1)
+    ground_truth: str | None = Field(min_length=1)
+    image_sha256: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
 
 
 class TracerCollectionStatus(BaseModel):
@@ -122,8 +123,8 @@ class TracerAcquisitionTransport(Protocol):
         endpoint: str,
         access_key: str,
         task_id: str,
-        final_reward: float,
-        ground_truth: str,
+        final_reward: float | None,
+        ground_truth: str | None,
     ) -> Mapping[str, Any]: ...
 
     def seal_batch(
@@ -207,8 +208,8 @@ class HttpTracerAcquisitionTransport:
         endpoint: str,
         access_key: str,
         task_id: str,
-        final_reward: float,
-        ground_truth: str,
+        final_reward: float | None,
+        ground_truth: str | None,
     ) -> Mapping[str, Any]:
         return self._request_json(
             "POST",
@@ -217,8 +218,8 @@ class HttpTracerAcquisitionTransport:
             access_key=access_key,
             body={
                 "task_id": task_id,
-                "final_reward": final_reward,
-                "gt": ground_truth,
+                **({"final_reward": final_reward} if final_reward is not None else {}),
+                **({"gt": ground_truth} if ground_truth is not None else {}),
             },
         )
 
@@ -325,6 +326,7 @@ class JsonlAcquisitionSampleSource:
         splits: Sequence[AcquisitionSplit],
         limit: int,
         balance_splits: bool = False,
+        dataset_labels: bool = False,
     ) -> list[AcquisitionSample]:
         if limit <= 0:
             return []
@@ -364,6 +366,7 @@ class JsonlAcquisitionSampleSource:
                     split=split,
                     source=source,
                     location=f"{uri}:{line_number}",
+                    dataset_labels=dataset_labels,
                 )
                 if sample.sample_id in seen:
                     continue
@@ -407,12 +410,28 @@ class TracerBatchMaterializer:
             default=None,
         )
 
-    def platform_batch_ready(self, tracer_resource_id: str, batch_index: int) -> bool:
+    def platform_batch_ready(
+        self, tracer_resource_id: str, batch_index: int, *, expected_samples: int
+    ) -> bool:
         prefix = self._tracer_data_path(tracer_resource_id)
         try:
             marker = self.storage.read(f"{prefix}/project-batches/{batch_index}.json")
         except EvaluationStorageMissingError:
-            return False
+            # A full buffer can prevent opening the next slot before the hook runs.
+            try:
+                metadata = json.loads(
+                    self.storage.read(f"{prefix}/spans/{batch_index}/batch.json")
+                )
+            except (EvaluationStorageMissingError, ValueError):
+                return False
+            return (
+                isinstance(metadata, dict)
+                and type(metadata.get("index")) is int
+                and metadata["index"] == batch_index
+                and metadata.get("state") in ("ready", "in_training")
+                and type(metadata.get("collected")) is int
+                and metadata["collected"] == expected_samples
+            )
         try:
             payload = json.loads(marker)
         except ValueError as exc:
@@ -437,6 +456,7 @@ class TracerBatchMaterializer:
         batch: AcquisitionBatch,
         samples: Sequence[AcquisitionSample],
         completed_sample_ids: set[str] | None = None,
+        fixed_validation: bool = False,
     ) -> dict[AcquisitionSplit, list[dict[str, Any]]]:
         expected = {
             (
@@ -457,7 +477,7 @@ class TracerBatchMaterializer:
             for name in self.storage.list(prefix)
             if re.fullmatch(r"spans_[A-Za-z0-9_-]+\.parquet", name)
         )
-        traces: dict[str, str] = {}
+        traces: dict[str, str | None] = {}
         if not shards:
             raise AcquisitionPaused(f"Tracer batch {batch.index} has no Parquet shards")
         for name in shards:
@@ -492,6 +512,14 @@ class TracerBatchMaterializer:
                 if not isinstance(attributes, dict):
                     raise AcquisitionPaused("Tracer span attributes are not an object")
                 sample = expected[task_id]
+                if sample.ground_truth is None:
+                    if (
+                        completed_sample_ids is None
+                        or sample.sample_id not in completed_sample_ids
+                    ):
+                        raise AcquisitionPaused("Missing finalized raw sample receipt")
+                    traces[task_id] = None
+                    continue
                 ground_truths = [
                     attributes[key]
                     for key in ("gt", "task.gt")
@@ -514,7 +542,7 @@ class TracerBatchMaterializer:
                 ):
                     raise AcquisitionPaused("Tracer spans disagree on ground truth")
                 if task_id in traces and _extract_json_result(
-                    traces[task_id]
+                    traces[task_id] or ""
                 ) != _extract_json_result(ground_truth):
                     raise AcquisitionPaused("Tracer spans disagree on ground truth")
                 traces[task_id] = ground_truth
@@ -524,28 +552,35 @@ class TracerBatchMaterializer:
             )
         rows: dict[AcquisitionSplit, list[dict[str, Any]]] = {"train": [], "val": []}
         for task_id, sample in expected.items():
-            gt = _extract_json_result(traces[task_id])
+            image_paths = [from_storage_api_path(f"/{path}") for path in sample.images]
+            row = {
+                "id": sample.sample_id,
+                "images": image_paths,
+                "system_prompt": sample.system_prompt,
+                "user_prompt": sample.user_prompt,
+            }
+            if sample.ground_truth is None:
+                if sample.image_sha256:
+                    row["image_sha256"] = sample.image_sha256
+                rows[sample.split].append(row)
+                continue
+            gt = _extract_json_result(traces[task_id] or "")
             if gt is None or gt != _extract_json_result(sample.ground_truth):
                 raise AcquisitionPaused(
                     "Tracer ground truth differs from the source row"
                 )
             result = gt.get("result")
-            if result not in {"pass", "defect", "fail"}:
+            if result not in ("pass", "defect", "fail", "真点", "假点"):
                 raise AcquisitionPaused(
                     "Tracer row does not have a supported SFT label"
                 )
             boxes = gt.get("boxes")
             rows[sample.split].append(
                 {
-                    "id": sample.sample_id,
+                    **row,
                     "label": result,
-                    "category": str(gt.get("reason") or ""),
+                    "category": _result_category(gt),
                     "boxes": boxes if isinstance(boxes, list) else [],
-                    "images": [
-                        from_storage_api_path(f"/{path}") for path in sample.images
-                    ],
-                    "system_prompt": sample.system_prompt,
-                    "user_prompt": sample.user_prompt,
                     "gt": sample.ground_truth,
                     # Some published Dataset parsers require result as the first key.
                     "assistant_output": json.dumps(
@@ -553,7 +588,12 @@ class TracerBatchMaterializer:
                     ),
                 }
             )
-        if not all(rows.values()):
+        if fixed_validation:
+            if not rows["train"] or rows["val"]:
+                raise AcquisitionPaused(
+                    "Fixed-validation batch must supply training images only"
+                )
+        elif not all(rows.values()):
             raise AcquisitionPaused("A platform SFT batch requires both source splits")
         return rows
 
@@ -569,13 +609,15 @@ class TracerBatchMaterializer:
                 json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
                 for record in records
             ).encode("utf-8")
+            # Sandbox uploads require at least one chunk, even for an empty split.
+            payload = payload or b"\n"
             path = f"{prefix}/{split}.jsonl"
             try:
                 existing = self.storage.read(path)
             except EvaluationStorageMissingError:
                 self.storage.write(path, payload)
             else:
-                if existing != payload:
+                if existing != payload and not (existing == b"" and not records):
                     raise AcquisitionPaused(
                         f"Batch input differs from its receipt: {path}"
                     )
@@ -699,10 +741,19 @@ class AcquisitionSimulationRunner:
         materialize = (
             current.auto_start_graph_run and self.batch_materializer is not None
         )
+        fixed_validation = self.platform_batch_trigger and fixed_batch_validation(
+            self.published
+        )
+        required_splits = {"train"} if fixed_validation else {"train", "val"}
         if materialize and (
-            set(current.splits) != {"train", "val"}
-            or current.requested_samples < 2 * current.requested_rounds
+            set(current.splits) != required_splits
+            or current.requested_samples
+            < len(required_splits) * current.requested_rounds
         ):
+            if fixed_validation:
+                raise AcquisitionPaused(
+                    "This release requires train-only input with fixed validation"
+                )
             raise AcquisitionPaused(
                 "Every platform SFT batch needs train and val samples"
             )
@@ -724,6 +775,8 @@ class AcquisitionSimulationRunner:
             splits=current.splits,
             limit=current.requested_samples,
             balance_splits=materialize,
+            dataset_labels=self.platform_batch_trigger
+            and dataset_labels_batch(self.published),
         )
         attempted = set(current.attempted_sample_ids)
         completed = set(current.completed_sample_ids)
@@ -770,7 +823,7 @@ class AcquisitionSimulationRunner:
                 raise AcquisitionPaused(
                     "Acquisition source does not contain enough unprocessed samples"
                 )
-            elif materialize:
+            elif materialize and not fixed_validation:
                 train = [sample for sample in unprocessed if sample.split == "train"]
                 val = [sample for sample in unprocessed if sample.split == "val"]
                 train_count = min(
@@ -790,6 +843,7 @@ class AcquisitionSimulationRunner:
                 before_status = self._wait_for_capacity(
                     endpoint=endpoint,
                     access_key=self.tracer_secret,
+                    round_size=len(round_samples),
                 )
             else:
                 before_status = self._collection_status(
@@ -798,12 +852,21 @@ class AcquisitionSimulationRunner:
                 )
                 if not before_status.batch_mode:
                     raise AcquisitionPaused("Tracer batch mode is not enabled")
-                if before_status.current_batch_index != pending.index and not set(
-                    pending.sample_ids
-                ).issubset(current.completed_sample_ids):
-                    raise AcquisitionPaused(
-                        "Tracer collecting batch changed before its samples completed"
-                    )
+            if pending is None or (
+                pending.index == before_status.current_batch_index + 1
+                and set(pending.sample_ids).isdisjoint(current.attempted_sample_ids)
+            ):
+                before_status = self._next_collection_status(
+                    before_status, round_size=len(round_samples)
+                )
+            if (
+                pending is not None
+                and before_status.current_batch_index != pending.index
+                and not set(pending.sample_ids).issubset(current.completed_sample_ids)
+            ):
+                raise AcquisitionPaused(
+                    "Tracer collecting batch changed before its samples completed"
+                )
             if (materialize or self.platform_batch_trigger) and pending is None:
                 if before_status.collected_data_size:
                     raise AcquisitionPaused(
@@ -841,7 +904,7 @@ class AcquisitionSimulationRunner:
             if self.platform_batch_trigger:
                 assert pending is not None
                 sealed_index = self._wait_for_platform_batch(
-                    tracer.resource_id, pending.index
+                    tracer.resource_id, pending
                 )
             else:
                 sealed_index = self._seal_batch(
@@ -936,9 +999,17 @@ class AcquisitionSimulationRunner:
                 task_id=task_id,
                 messages=messages,
             )
-            prediction = _extract_json_result(_assistant_text(response))
-            expected = _extract_json_result(sample.ground_truth)
-            reward = _score_prediction(expected, prediction)
+            assistant_text = _assistant_text(response)
+            reward = None
+            if sample.ground_truth is not None:
+                expected = _extract_json_result(sample.ground_truth)
+                reward = _score_prediction(
+                    expected, _extract_json_result(assistant_text)
+                )
+            elif not assistant_text.strip():
+                raise AcquisitionRuntimeError(
+                    "Tracer returned no prediction for the image"
+                )
             receipt = self.transport.end_task(
                 endpoint=endpoint,
                 access_key=self.tracer_secret,
@@ -1023,11 +1094,40 @@ class AcquisitionSimulationRunner:
             }
         )
 
+    def _next_collection_status(
+        self, status: TracerCollectionStatus, *, round_size: int
+    ) -> TracerCollectionStatus:
+        if (
+            not self.platform_batch_trigger
+            or status.capacity is None
+            or status.capacity - status.held < round_size
+            or status.buffer_size == 0
+            or status.collected_data_size != status.buffer_size
+        ):
+            return status
+        tracer = self.slot.tracer
+        materializer = self.batch_materializer
+        assert tracer is not None and tracer.resource_id and materializer is not None
+        if not materializer.platform_batch_ready(
+            tracer.resource_id,
+            status.current_batch_index,
+            expected_samples=status.buffer_size,
+        ):
+            return status
+        # Tracer opens the next index when it receives the first span after release.
+        return status.model_copy(
+            update={
+                "collected_data_size": 0,
+                "current_batch_index": status.current_batch_index + 1,
+            }
+        )
+
     def _wait_for_capacity(
         self,
         *,
         endpoint: str,
         access_key: str,
+        round_size: int,
     ) -> TracerCollectionStatus:
         deadline = time.monotonic() + self.backpressure_timeout_seconds
         while True:
@@ -1037,30 +1137,43 @@ class AcquisitionSimulationRunner:
             )
             if not status.batch_mode or status.capacity is None:
                 raise AcquisitionPaused("Tracer batch mode is not enabled")
-            capacity_full = status.held >= status.capacity
-            pipeline_full = status.inflight_count >= self.max_inflight_batches
-            if not capacity_full and not pipeline_full:
+            free_slots = max(0, status.capacity - status.held)
+            if self.platform_batch_trigger:
+                # Sealed platform batches remain in the inventory after GraphRun ends.
+                can_collect = free_slots >= round_size
+            else:
+                can_collect = (
+                    free_slots > 0 and status.inflight_count < self.max_inflight_batches
+                )
+            if can_collect:
                 return status
             if time.monotonic() >= deadline:
+                if self.platform_batch_trigger:
+                    raise AcquisitionPaused(
+                        f"Tracer has {free_slots} free sample slots; "
+                        f"this round needs {round_size}"
+                    )
                 raise AcquisitionPaused(
                     "Tracer backpressure did not clear before the timeout"
                 )
             self.sleep(self.poll_seconds)
 
     def _wait_for_platform_batch(
-        self, tracer_resource_id: str, batch_index: int
+        self, tracer_resource_id: str, batch: AcquisitionBatch
     ) -> int:
         materializer = self.batch_materializer
         assert materializer is not None
         deadline = time.monotonic() + self.backpressure_timeout_seconds
-        while not materializer.platform_batch_ready(tracer_resource_id, batch_index):
+        while not materializer.platform_batch_ready(
+            tracer_resource_id, batch.index, expected_samples=len(batch.sample_ids)
+        ):
             if time.monotonic() >= deadline:
                 raise AcquisitionPaused(
-                    f"Platform Tracer batch {batch_index} did not publish its trigger "
-                    "marker before the timeout"
+                    f"Platform Tracer batch {batch.index} did not publish its trigger "
+                    "marker or sealed batch metadata before the timeout"
                 )
             self.sleep(self.poll_seconds)
-        return batch_index
+        return batch.index
 
     def _seal_batch(
         self,
@@ -1125,6 +1238,8 @@ class AcquisitionSimulationRunner:
             batch=batch,
             samples=samples,
             completed_sample_ids=completed_sample_ids,
+            fixed_validation=self.platform_batch_trigger
+            and fixed_batch_validation(self.published),
         )
         if not batch.claimed:
             if not self.platform_batch_trigger and not self.transport.claim_batch(
@@ -1163,62 +1278,7 @@ class AcquisitionSimulationRunner:
         )
 
     def _platform_inputs(self) -> tuple[str, dict[str, str]]:
-        dataset = next(
-            (node for node in self.published.nodes if node.type == "dataset"), None
-        )
-        if dataset is None or "dataset_runtime" not in dataset.config:
-            raise AcquisitionPaused(
-                "The active release needs a platform Dataset workflow"
-            )
-        port = dataset.inputs.get("source_batch")
-        if port is None or port.binding.kind != "run_input" or not port.binding.name:
-            raise AcquisitionPaused("Dataset source_batch must bind to a run input")
-        inputs: dict[str, str] = {}
-        defaults: dict[str, str] = {}
-        for node in self.published.nodes:
-            declared = node.config.get("runtime_input_defaults")
-            if isinstance(declared, dict):
-                defaults.update(
-                    {
-                        name: value
-                        for name, value in declared.items()
-                        if isinstance(value, str)
-                    }
-                )
-        serving = self.slot.serving_inference
-        frozen_models: set[str] | None = None
-        for node in self.published.nodes:
-            for name, input_port in node.inputs.items():
-                binding = input_port.binding
-                if (
-                    binding.kind != "run_input"
-                    or binding.name is None
-                    or binding.name == port.binding.name
-                ):
-                    continue
-                value = defaults.get(binding.name)
-                if not value and name == "base_model":
-                    if frozen_models is None:
-                        frozen_models = {
-                            model
-                            for node in self.published.nodes
-                            if node.type in {"train", "evaluator"}
-                            for model in _workflow_base_models(node)
-                        }
-                    if len(frozen_models) > 1:
-                        raise AcquisitionPaused(
-                            "Release Train and Eval bind different base models"
-                        )
-                    value = next(
-                        iter(frozen_models), serving.model_uri if serving else None
-                    )
-                if value:
-                    inputs[binding.name] = value
-                elif input_port.required:
-                    raise AcquisitionPaused(
-                        f"Missing runtime input default: {binding.name}"
-                    )
-        return port.binding.name, inputs
+        return platform_run_inputs(self.published, self.slot)
 
     def _ready_batch(
         self, simulation: AcquisitionSimulation, batch_id: str
@@ -1356,6 +1416,7 @@ def _sample_from_row(
     split: AcquisitionSplit,
     source: AcquisitionSource,
     location: str,
+    dataset_labels: bool = False,
 ) -> AcquisitionSample:
     sample_id = str(row.get("id") or "").strip()
     user_prompt = str(row.get("user_prompt") or row.get("prompt") or "").strip()
@@ -1367,7 +1428,7 @@ def _sample_from_row(
         raise AcquisitionRuntimeError(f"Acquisition sample has no id at {location}")
     if not user_prompt:
         raise AcquisitionRuntimeError(f"Acquisition sample has no prompt at {location}")
-    if raw_gt is None or not str(raw_gt).strip():
+    if not dataset_labels and (raw_gt is None or not str(raw_gt).strip()):
         raise AcquisitionRuntimeError(
             f"Acquisition sample has no ground truth at {location}"
         )
@@ -1385,9 +1446,24 @@ def _sample_from_row(
     ]
     if not images:
         raise AcquisitionRuntimeError(f"Acquisition sample has no images at {location}")
-    ground_truth = (
-        raw_gt if isinstance(raw_gt, str) else json.dumps(raw_gt, ensure_ascii=False)
-    )
+    ground_truth = None
+    if not dataset_labels:
+        ground_truth = (
+            raw_gt
+            if isinstance(raw_gt, str)
+            else json.dumps(raw_gt, ensure_ascii=False)
+        )
+    hashes = row.get("image_sha256", []) if dataset_labels else []
+    if not isinstance(hashes, list) or (
+        hashes
+        and (
+            len(hashes) != len(images)
+            or not all(
+                isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes
+            )
+        )
+    ):
+        raise AcquisitionRuntimeError(f"Invalid image fingerprints at {location}")
     return AcquisitionSample(
         sample_id=sample_id,
         split=split,
@@ -1395,7 +1471,77 @@ def _sample_from_row(
         user_prompt=user_prompt,
         images=images,
         ground_truth=ground_truth,
+        image_sha256=hashes,
     )
+
+
+def dataset_labels_batch(published: PublishedGraph) -> bool:
+    dataset = next((node for node in published.nodes if node.type == "dataset"), None)
+    return dataset is not None and dataset.config.get("batch_label_source") == "dataset"
+
+
+def fixed_batch_validation(published: PublishedGraph) -> bool:
+    dataset = next((node for node in published.nodes if node.type == "dataset"), None)
+    return (
+        dataset is not None and dataset.config.get("batch_validation_source") == "fixed"
+    )
+
+
+def platform_run_inputs(
+    published: PublishedGraph, slot: RuntimeSlot
+) -> tuple[str, dict[str, str]]:
+    dataset = next((node for node in published.nodes if node.type == "dataset"), None)
+    if dataset is None or "dataset_runtime" not in dataset.config:
+        raise AcquisitionPaused("The active release needs a platform Dataset workflow")
+    port = dataset.inputs.get("source_batch")
+    if port is None or port.binding.kind != "run_input" or not port.binding.name:
+        raise AcquisitionPaused("Dataset source_batch must bind to a run input")
+    inputs: dict[str, str] = {}
+    defaults: dict[str, str] = {}
+    for node in published.nodes:
+        declared = node.config.get("runtime_input_defaults")
+        if isinstance(declared, dict):
+            defaults.update(
+                {
+                    name: value
+                    for name, value in declared.items()
+                    if isinstance(value, str)
+                }
+            )
+    serving = slot.serving_inference
+    frozen_models: set[str] | None = None
+    for node in published.nodes:
+        for name, input_port in node.inputs.items():
+            binding = input_port.binding
+            if (
+                binding.kind != "run_input"
+                or binding.name is None
+                or binding.name == port.binding.name
+            ):
+                continue
+            value = defaults.get(binding.name)
+            if not value and name == "base_model":
+                if frozen_models is None:
+                    frozen_models = {
+                        model
+                        for node in published.nodes
+                        if node.type in {"train", "evaluator"}
+                        for model in _workflow_base_models(node)
+                    }
+                if len(frozen_models) > 1:
+                    raise AcquisitionPaused(
+                        "Release Train and Eval bind different base models"
+                    )
+                value = next(
+                    iter(frozen_models), serving.model_uri if serving else None
+                )
+            if value:
+                inputs[binding.name] = value
+            elif input_port.required:
+                raise AcquisitionPaused(
+                    f"Missing runtime input default: {binding.name}"
+                )
+    return port.binding.name, inputs
 
 
 def _workflow_base_models(node: ProjectNode) -> set[str]:
@@ -1427,13 +1573,20 @@ def _messages(
     reader: AcquisitionStorageReader,
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "text", "text": sample.user_prompt}]
-    for path in sample.images:
+    for index, path in enumerate(sample.images):
         try:
             payload = reader.read(path)
         except Exception as exc:
             raise AcquisitionRuntimeError(
                 f"Could not read acquisition image: {path}"
             ) from exc
+        if (
+            sample.image_sha256
+            and hashlib.sha256(payload).hexdigest() != sample.image_sha256[index]
+        ):
+            raise AcquisitionRuntimeError(
+                f"Acquisition image changed since selection: {path}"
+            )
         mime_type = mimetypes.guess_type(path)[0] or "image/jpeg"
         encoded = base64.b64encode(payload).decode("ascii")
         content.append(
@@ -1483,10 +1636,20 @@ def _extract_json_result(text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             index = start + 1
             continue
-        if isinstance(value, dict) and "result" in value and "reason" in value:
+        if (
+            isinstance(value, dict)
+            and "result" in value
+            and ("reason" in value or "category" in value)
+        ):
             candidates.append(value)
         index = end
     return candidates[-1] if candidates else None
+
+
+def _result_category(value: dict[str, Any]) -> str:
+    if value.get("result") in ("真点", "假点") and "category" in value:
+        return str(value["category"]).strip()
+    return str(value.get("reason") or value.get("category") or "").strip()
 
 
 def _score_prediction(
@@ -1500,10 +1663,7 @@ def _score_prediction(
         != str(prediction.get("result", "")).strip()
     ):
         return 0.0
-    if (
-        str(expected.get("reason", "")).strip()
-        != str(prediction.get("reason", "")).strip()
-    ):
+    if _result_category(expected) != _result_category(prediction):
         return 0.0
     return 1.0
 

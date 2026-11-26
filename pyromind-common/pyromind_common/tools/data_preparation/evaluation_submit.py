@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Self
 
-from pydantic import Field, model_validator
-
+from pyromind_common.platform.evaluation_core import (
+    _COMMON_FIELDS as _COMMON_FIELDS,
+    _INFERENCE_FIELDS as _INFERENCE_FIELDS,
+    _PRODUCT_FIELDS as _PRODUCT_FIELDS,
+    _REQUIRED_FIELDS as _REQUIRED_FIELDS,
+    _SCORE_FIELDS as _SCORE_FIELDS,
+    EvaluationOperation as EvaluationOperation,
+    EvaluationOptions,
+    EvaluationRequest as EvaluationRequest,
+)
 from pyromind_common.sdk.tool import (
     Action,
     ToolAnnotations,
@@ -16,16 +22,9 @@ from pyromind_common.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
-from pyromind_common.tools.data_preparation.evaluation_products import (
-    EvaluationProductsOptions,
-)
 from pyromind_common.tools.data_preparation.inference import (
     EvaluationConfigurationError,
-    InferenceOptions,
     InferencePipelineHandler,
-)
-from pyromind_common.tools.data_preparation.prediction_evaluation import (
-    PredictionEvaluationOptions,
 )
 from pyromind_common.tools.data_preparation.submission import (
     SubmissionConfig,
@@ -39,22 +38,6 @@ if TYPE_CHECKING:
     from pyromind_common.sdk.conversation.base import ToolConversation
     from pyromind_common.sdk.conversation.state import ToolState
 
-EvaluationOperation = Literal[
-    "inference", "score", "profile", "review", "report", "resume"
-]
-
-_INFERENCE_FIELDS = frozenset(InferenceOptions.model_fields)
-_SCORE_FIELDS = frozenset(PredictionEvaluationOptions.model_fields)
-_PRODUCT_FIELDS = frozenset({"manifest_path", "extraction_script_path"})
-_COMMON_FIELDS = frozenset({"operation", "input_path", "cpu", "memory"})
-_REQUIRED_FIELDS = {
-    "inference": ("model_path", "dataset_config_path", "evaluation_config_path"),
-    "score": ("source_manifest_path",),
-    "profile": ("manifest_path", "extraction_script_path"),
-    "review": ("manifest_path",),
-    "report": ("manifest_path",),
-    "resume": ("resume_run_id",),
-}
 
 TOOL_DESCRIPTION = """\
 Submit model evaluation, prediction scoring or report artifacts to Pyromind.
@@ -87,197 +70,15 @@ blindly resubmit when platform acceptance is uncertain.
 """
 
 
-class DfSubmitEvaluationAction(Action):
-    """Submit an evaluation operation with flat, operation-specific fields."""
-
-    operation: EvaluationOperation = Field(
-        description="Task: inference, score, profile, review, report, or resume."
-    )
-    input_path: str = Field(
-        min_length=1,
-        description=(
-            "Source data path in user Storage, e.g. "
-            "'/workspace/datasets/test.jsonl'; unchanged on resume. "
-            "For inference, a directory uses its val.jsonl."
-        ),
-    )
-    model_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="inference: model reference; source is in evaluation config JSON.",
-    )
-    dataset_config_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="inference: workspace JSON mapping input and reference fields.",
-    )
-    evaluation_config_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="inference: workspace rubric, generation and model_source JSON.",
-    )
-    source_checkpoint_version_id: str | None = Field(
-        default=None,
-        min_length=1,
-        description="Version ID of the checkpoint used as model_path.",
-    )
-    selection_run_id: str | None = Field(
-        default=None,
-        min_length=1,
-        description="inference: validation selection run authorizing independent test.",
-    )
-    report_spec_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="inference: optional workspace report specification JSON.",
-    )
-    served_model_name: str | None = Field(default=None, min_length=1)
-    gpu_product: str | None = Field(default=None, min_length=1)
-    gpu_count: int | None = Field(default=None, ge=1)
-    port: int | None = Field(default=None, ge=1, le=65535)
-    max_model_len: int | None = Field(default=None, ge=1)
-    source_manifest_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="score: workspace prediction sources and checkpoints manifest.",
-    )
-    scoring_spec_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="score: workspace business rules and validation examples JSON.",
-    )
-    scoring_script_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="score: workspace Python with parse_record and score_case.",
-    )
-    manifest_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="profile/review/report: workspace artifact manifest JSON.",
-    )
-    extraction_script_path: str | None = Field(
-        default=None,
-        min_length=1,
-        description="profile only: workspace Python script defining parse_record.",
-    )
-    resume_run_id: uuid.UUID | None = Field(
-        default=None, description="resume only: existing evaluation run UUID."
-    )
-    cpu: int | None = Field(
-        default=None,
-        ge=1,
-        le=64,
-        description="CPU cores; new runs default to 4, resume inherits when omitted.",
-    )
-    memory: int | None = Field(
-        default=None,
-        ge=1,
-        le=256,
-        description="Memory GiB; new runs default to 32, resume inherits when omitted.",
-    )
-
-    @model_validator(mode="after")
-    def operation_fields(self) -> Self:
-        missing = [
-            key
-            for key in _REQUIRED_FIELDS[self.operation]
-            if getattr(self, key) is None
-        ]
-        if self.operation == "score" and bool(self.scoring_spec_path) != bool(
-            self.scoring_script_path
-        ):
-            raise ValueError(
-                "Supply scoring_spec_path and scoring_script_path together. "
-                "Omit both when using the frozen Reward."
-            )
-        if missing:
-            raise ValueError(
-                f"operation={self.operation} requires top-level fields: "
-                + ", ".join(missing)
-            )
-        allowed = (
-            _COMMON_FIELDS
-            | {
-                "inference": _INFERENCE_FIELDS,
-                "score": _SCORE_FIELDS,
-                "profile": _PRODUCT_FIELDS,
-                "review": frozenset({"manifest_path"}),
-                "report": frozenset({"manifest_path"}),
-                "resume": frozenset({"resume_run_id"}),
-            }[self.operation]
-        )
-        supplied = {
-            key for key in self.model_fields_set if getattr(self, key, None) is not None
-        }
-        invalid = supplied - allowed - {"kind"}
-        if invalid:
-            raise ValueError(
-                f"operation={self.operation} does not accept: "
-                + ", ".join(sorted(invalid))
-            )
-        return self
-
-    def request(self) -> EvaluationRequest:
-        """Build one typed request independent of the script tool."""
-        values = self.model_dump(exclude_none=True)
-        options: (
-            InferenceOptions
-            | PredictionEvaluationOptions
-            | EvaluationProductsOptions
-            | None
-        )
-        if self.operation == "inference":
-            options = InferenceOptions.model_validate(
-                {key: values[key] for key in _INFERENCE_FIELDS if key in values}
-            )
-        elif self.operation == "score":
-            options = PredictionEvaluationOptions.model_validate(
-                {key: values[key] for key in _SCORE_FIELDS if key in values}
-            )
-        elif self.operation in {"profile", "review", "report"}:
-            options = EvaluationProductsOptions.model_validate(
-                {
-                    "operation": self.operation,
-                    **{key: values[key] for key in _PRODUCT_FIELDS if key in values},
-                }
-            )
-        else:
-            options = None
-        return EvaluationRequest(
-            input_path=self.input_path,
-            options=options,
-            resume_run_id=self.resume_run_id,
-            cpu=self.cpu if self.cpu is not None else 4,
-            memory=self.memory if self.memory is not None else 32,
-            resource_overrides=frozenset(
-                key for key in ("cpu", "memory") if values.get(key) is not None
-            ),
-        )
-
-
-@dataclass(frozen=True, kw_only=True)
-class EvaluationRequest:
-    input_path: str
-    options: (
-        InferenceOptions
-        | PredictionEvaluationOptions
-        | EvaluationProductsOptions
-        | None
-    )
-    resume_run_id: uuid.UUID | None = None
-    cpu: int = 4
-    memory: int = 32
-    resource_overrides: frozenset[str] = frozenset()
+class DfSubmitEvaluationAction(EvaluationOptions, Action):
+    """Legacy Tool schema backed by the plain evaluation contract."""
 
 
 class DfSubmitEvaluationObservation(SubmissionObservation):
     """Asynchronous evaluation receipt or submission error."""
 
 
-class DfSubmitEvaluationExecutor(
-    ToolExecutor[DfSubmitEvaluationAction, DfSubmitEvaluationObservation]
-):
+class EvaluationSubmissionRunner:
     def __init__(
         self,
         *,
@@ -287,7 +88,7 @@ class DfSubmitEvaluationExecutor(
         self.config = config or SubmissionConfig()
         self.inference_handler = inference_handler
 
-    def __call__(
+    def run(
         self,
         action: DfSubmitEvaluationAction,
         conversation: ToolConversation | None = None,
@@ -321,6 +122,32 @@ class DfSubmitEvaluationExecutor(
             )
 
 
+class DfSubmitEvaluationExecutor(
+    EvaluationSubmissionRunner,
+    ToolExecutor[DfSubmitEvaluationAction, DfSubmitEvaluationObservation],
+):
+    def __call__(
+        self,
+        action: DfSubmitEvaluationAction,
+        conversation: ToolConversation | None = None,
+    ) -> DfSubmitEvaluationObservation:
+        return self.run(action, conversation)
+
+
+def _evaluation_runner_options(params: dict[str, Any]) -> dict[str, Any]:
+    config = submission_config(params)
+    handler = params.pop("inference_handler", None)
+    if params:
+        raise ValueError(
+            "DfSubmitEvaluationTool got unknown params: " + ", ".join(sorted(params))
+        )
+    return {"config": config, "inference_handler": handler}
+
+
+def create_evaluation_runner(**params: Any) -> EvaluationSubmissionRunner:
+    return EvaluationSubmissionRunner(**_evaluation_runner_options(params))
+
+
 class DfSubmitEvaluationTool(
     ToolDefinition[DfSubmitEvaluationAction, DfSubmitEvaluationObservation]
 ):
@@ -330,20 +157,13 @@ class DfSubmitEvaluationTool(
         conv_state: ToolState | None = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        config = submission_config(params)
-        handler = params.pop("inference_handler", None)
-        if params:
-            raise ValueError(
-                "DfSubmitEvaluationTool got unknown params: "
-                + ", ".join(sorted(params))
-            )
         return [
             cls(
                 description=TOOL_DESCRIPTION,
                 action_type=DfSubmitEvaluationAction,
                 observation_type=DfSubmitEvaluationObservation,
                 executor=DfSubmitEvaluationExecutor(
-                    config=config, inference_handler=handler
+                    **_evaluation_runner_options(params)
                 ),
                 annotations=ToolAnnotations(
                     title="df_submit_evaluation",

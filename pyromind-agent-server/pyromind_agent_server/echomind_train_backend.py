@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
@@ -33,7 +33,10 @@ from pyromind_agent_server.echomind_train_runtime import (
     TrainWorkflowSpec,
     prepare_workflow_for_submission,
 )
-from pyromind_agent_server.echomind_workflow_storage import build_runtime_storage
+from pyromind_agent_server.echomind_workflow_storage import (
+    WorkflowStorageReader,
+    build_runtime_storage,
+)
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_common.tools.utils.platform_env import (
     platform_cluster_route,
@@ -107,9 +110,11 @@ class PlatformTrainWorkflowBackend:
         task_kind: str = "echomind_train",
         credential_store: RuntimeCredentialStore | None = None,
         conversations_dir: Path | str | None = None,
+        projects_root: Path | str | None = None,
     ) -> None:
         self.task_kind = task_kind
         self.credential_store = credential_store
+        self.projects_root = Path(projects_root) if projects_root is not None else None
         self.conversations_dir = (
             Path(conversations_dir) if conversations_dir is not None else None
         )
@@ -130,6 +135,9 @@ class PlatformTrainWorkflowBackend:
                 "The project owner's Pyromind credential could not be loaded."
             ) from exc
 
+    def _task_read_scope(self, spec: TrainWorkflowSpec) -> AbstractContextManager[None]:
+        return _read_task_status(spec.wandb_credential_task_id is not None)
+
     def find_task_by_name(
         self,
         *,
@@ -143,7 +151,7 @@ class PlatformTrainWorkflowBackend:
             access_key=self._access_key(spec, request_context),
         )
         try:
-            with _read_task_status(spec.wandb_credential_task_id is not None):
+            with self._task_read_scope(spec):
                 matches = [task for task in client.studio.list() if task.name == name]
         finally:
             client.close()
@@ -168,7 +176,7 @@ class PlatformTrainWorkflowBackend:
                 workflow,
                 spec=spec,
             )
-            wandb_keys = self._bind_archived_wandb_credentials(
+            sensitive_values = self._bind_submission_credentials(
                 workflow, spec=spec, request_context=request_context
             )
             client = _client(
@@ -181,7 +189,7 @@ class PlatformTrainWorkflowBackend:
         except Exception as exc:
             raise RuntimeSubmissionNotAttemptedError(str(exc)) from exc
         try:
-            with _without_sensitive_sdk_logs(bool(wandb_keys)):
+            with _without_sensitive_sdk_logs(bool(sensitive_values)):
                 response = submit_workflow_task(
                     client=client,
                     workflow=workflow,
@@ -199,23 +207,23 @@ class PlatformTrainWorkflowBackend:
                 raise RuntimeCredentialUnavailableError(
                     "Pyromind rejected the project owner's workflow credential."
                 ) from None
-            if wandb_keys:
+            if sensitive_values:
                 raise PyroMindAPIError(
-                    message=_redact_wandb_keys(str(exc), wandb_keys),
+                    message=_redact_keys(str(exc), sensitive_values),
                     status_code=exc.status_code,
                 ) from None
             raise
         except Exception as exc:
-            if wandb_keys:
+            if sensitive_values:
                 raise TrainRuntimeError(
-                    _redact_wandb_keys(str(exc), wandb_keys)
+                    _redact_keys(str(exc), sensitive_values)
                 ) from None
             raise
         finally:
             client.close()
         return str(response.task_id)
 
-    def _bind_archived_wandb_credentials(
+    def _bind_submission_credentials(
         self,
         workflow: dict[str, Any],
         *,
@@ -225,38 +233,10 @@ class PlatformTrainWorkflowBackend:
         task_id = spec.wandb_credential_task_id
         if task_id is None:
             return ()
-        owner = spec.owner_user_id
-        if self.conversations_dir is None or not owner:
-            raise TrainRuntimeError("The W&B credential source is unavailable.")
-        if request_context is not None and (
-            request_context.user_id != owner
-            or (request_context.x_cluster or spec.cluster) != spec.cluster
-        ):
-            raise TrainRuntimeError(
-                "The W&B credential source is outside this Project."
-            )
-
-        try:
-            conversation_id = UUID(spec.conversation_id).hex
-            store = FileProductStore(self.conversations_dir / conversation_id)
-            store.authorize(owner, ECHOMIND_PRODUCT_PROFILE.profile_id)
-            if store.load_x_cluster() != spec.cluster:
-                raise PermissionError("conversation cluster mismatch")
-            archived = [
-                request.workflow
-                for request in store.load_workflow_execution_requests().values()
-                if request.task_id == task_id
-                and request.conversation_id == conversation_id
-                and request.status == "submitted"
-            ]
-        except (OSError, ProductStoreError, ValidationError, ValueError):
-            raise TrainRuntimeError(
-                "The W&B credential source is unavailable for this Project."
-            ) from None
-        if len(archived) != 1:
-            raise TrainRuntimeError("The referenced W&B credential task was not found.")
-
-        source_nodes = _wandb_builder_configs(archived[0])
+        archived = self._archived_credential_workflow(
+            spec, request_context, task_id=task_id
+        )
+        source_nodes = _wandb_builder_configs(archived)
         targets = [
             (node_id, config)
             for node_id, config in _wandb_builder_configs(workflow).items()
@@ -277,6 +257,51 @@ class PlatformTrainWorkflowBackend:
             keys.append(key)
         return tuple(keys)
 
+    def _archived_credential_workflow(
+        self,
+        spec: TrainWorkflowSpec,
+        request_context: RequestContext | None,
+        *,
+        task_id: str,
+        task_kind: str | None = None,
+    ) -> dict[str, Any]:
+        owner = spec.owner_user_id
+        if self.conversations_dir is None or not owner:
+            raise TrainRuntimeError("The credential source is unavailable.")
+        if request_context is not None and (
+            request_context.user_id != owner
+            or (request_context.x_cluster or spec.cluster) != spec.cluster
+        ):
+            raise TrainRuntimeError("The credential source is outside this Project.")
+
+        try:
+            conversation_id = UUID(spec.conversation_id).hex
+            store = FileProductStore(self.conversations_dir / conversation_id)
+            store.authorize(owner, ECHOMIND_PRODUCT_PROFILE.profile_id)
+            if store.load_x_cluster() != spec.cluster:
+                raise PermissionError("conversation cluster mismatch")
+            archived = [
+                request.workflow
+                for request in store.load_workflow_execution_requests().values()
+                if request.task_id == task_id
+                and request.conversation_id == conversation_id
+                and request.status == "submitted"
+                and (
+                    task_kind is None
+                    or (
+                        request.correlation is not None
+                        and request.correlation.task_kind == task_kind
+                    )
+                )
+            ]
+        except (OSError, ProductStoreError, ValidationError, ValueError):
+            raise TrainRuntimeError(
+                "The credential source is unavailable for this Project."
+            ) from None
+        if len(archived) != 1:
+            raise TrainRuntimeError("The referenced credential task was not found.")
+        return archived[0]
+
     def query_task(
         self,
         *,
@@ -290,7 +315,7 @@ class PlatformTrainWorkflowBackend:
         )
         redact_wandb_key = spec.wandb_credential_task_id is not None
         try:
-            with _read_task_status(redact_wandb_key):
+            with self._task_read_scope(spec):
                 task = client.studio.get_task(task_id)
                 status = _status(task)
                 output_uri = (
@@ -302,7 +327,11 @@ class PlatformTrainWorkflowBackend:
             client.close()
         if status == "succeeded" and spec.artifact_selection is not None:
             output_uri = _verified_artifact_uri(
-                spec, request_context=request_context, access_key=access_key
+                spec,
+                request_context=request_context,
+                access_key=access_key,
+                projects_root=self.projects_root,
+                credential_store=self.credential_store,
             )
             if output_uri is None:
                 return TrainTaskState(
@@ -338,7 +367,7 @@ class PlatformTrainWorkflowBackend:
             access_key=self._access_key(spec, request_context),
         )
         try:
-            with _read_task_status(spec.wandb_credential_task_id is not None):
+            with self._task_read_scope(spec):
                 if _status(client.studio.get_task(task_id)) in {"pending", "running"}:
                     stopped = client.studio.stop(task_id)
                     if _status(stopped) in {"pending", "running"}:
@@ -352,10 +381,16 @@ def _verified_artifact_uri(
     *,
     request_context: RequestContext | None,
     access_key: str | None,
+    projects_root: Path | str | None = None,
+    credential_store: RuntimeCredentialStore | None = None,
 ) -> str | None:
     assert spec.output_uri is not None
     storage = build_runtime_storage(
-        spec=spec, request_context=request_context, access_key=access_key
+        spec=spec,
+        request_context=request_context,
+        access_key=access_key,
+        projects_root=projects_root,
+        credential_store=credential_store,
     )
     path = to_storage_api_path(spec.output_uri)
     if spec.artifact_selection == "evaluation_report":
@@ -373,6 +408,8 @@ def _verified_artifact_uri(
         return None
 
     files = storage.list(path)
+    if spec.artifact_selection == "merged_model":
+        return spec.output_uri if _has_merged_model(storage, path, files) else None
     checkpoints = [
         (int(match[1]), name)
         for name in files
@@ -383,6 +420,41 @@ def _verified_artifact_uri(
         if _is_lora_adapter(storage.list(checkpoint)):
             return f"{spec.output_uri.rstrip('/')}/{name}"
     return spec.output_uri if _is_lora_adapter(files) else None
+
+
+def _has_merged_model(
+    storage: WorkflowStorageReader, path: str, files: set[str]
+) -> bool:
+    if "config.json" not in files or "adapter_config.json" in files:
+        return False
+    directory = PurePosixPath(path)
+    try:
+        config = json.loads(storage.read(str(directory / "config.json")))
+        if not isinstance(config, dict) or not config:
+            return False
+        for weights in ("model.safetensors", "pytorch_model.bin"):
+            if weights in files:
+                return True
+            index_name = f"{weights}.index.json"
+            if index_name in files:
+                index = json.loads(storage.read(str(directory / index_name)))
+                weight_map = (
+                    index.get("weight_map") if isinstance(index, dict) else None
+                )
+                return bool(
+                    isinstance(weight_map, dict)
+                    and weight_map
+                    and all(
+                        isinstance(name, str)
+                        and PurePosixPath(name).name == name
+                        and name.endswith(PurePosixPath(weights).suffix)
+                        and name in files
+                        for name in weight_map.values()
+                    )
+                )
+    except (EvaluationStorageMissingError, ValueError):
+        return False
+    return False
 
 
 def _is_lora_adapter(files: set[str]) -> bool:
@@ -415,7 +487,7 @@ def _wandb_builder_configs(workflow: Mapping[str, Any]) -> dict[str, dict[str, A
     return builders
 
 
-def _redact_wandb_keys(message: str, keys: tuple[str, ...]) -> str:
+def _redact_keys(message: str, keys: tuple[str, ...]) -> str:
     for key in keys:
         message = message.replace(key, "[REDACTED]")
     return message

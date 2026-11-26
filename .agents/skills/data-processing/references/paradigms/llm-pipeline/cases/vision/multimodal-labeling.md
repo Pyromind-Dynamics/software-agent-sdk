@@ -58,7 +58,7 @@ DataFlow checkpoint 决定已提交 batch；输出先写原子分片，再合并
 只有 flags 覆盖不到的字段才用 --config，见 references/terminal-cli.md
 ```
 
-用户确认后使用 `df_submit_pipeline(mode="full")`；提交前按 playbook 的
+用户确认后按 playbook 准备并提交 DataFlow 全量任务，业务参数 `mode="full"`；提交前按其
 [平台全量输入](../../playbook.md#平台全量输入)把 Manifest 与它引用的图片落到同一
 Storage 目录树（目录输入按直接子项划分样本，多图样本用 Manifest）。平台产物在
 Kafka callback 后直接读 `/workspace`。

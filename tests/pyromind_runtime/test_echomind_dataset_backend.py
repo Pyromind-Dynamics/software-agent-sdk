@@ -17,6 +17,7 @@ from pyromind_agent_server.echomind_dataset_runtime import DatasetWorkflowSpec
 from pyromind_agent_server.echomind_runtime_contracts import (
     RuntimeCredentialUnavailableError,
 )
+from pyromind_agent_server.echomind_runtime_credentials import RuntimeCredentialStore
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.ports.storage import (
     EvaluationStorageMissingError,
@@ -83,6 +84,101 @@ def test_workflow_storage_does_not_use_global_service_key(dataset_spec, monkeypa
     monkeypatch.setenv("PYROMIND_RUNTIME_API_KEY", "unrelated-service-key")
     with pytest.raises(RuntimeCredentialUnavailableError, match="owner's"):
         storage_module.build_runtime_storage(spec=dataset_spec, request_context=None)
+
+
+@pytest.fixture
+def bound_dataset_spec(dataset_spec):
+    return dataset_spec.model_copy(
+        update={
+            "owner_user_id": "owner",
+            "template_values": {"project_id": "6742edad-2fd1-419e-9e6c-979847463fe2"},
+        }
+    )
+
+
+def test_workflow_storage_uses_explicit_project_binding_without_browser(
+    bound_dataset_spec, monkeypatch, tmp_path
+):
+    bound = Mock()
+    credentials = Mock(spec=RuntimeCredentialStore)
+    legacy = Mock()
+    monkeypatch.setattr(storage_module, "build_bound_evaluation_storage", bound)
+    monkeypatch.setattr(storage_module, "_build_api_key_storage", legacy)
+
+    storage = storage_module.build_runtime_storage(
+        spec=bound_dataset_spec,
+        request_context=None,
+        access_key="owner-key",
+        projects_root=tmp_path,
+        credential_store=credentials,
+    )
+
+    assert storage is bound.return_value
+    bound.assert_called_once_with(
+        projects_root=tmp_path,
+        project_id=bound_dataset_spec.template_values["project_id"],
+        context=RequestContext(user_id="owner", x_cluster=bound_dataset_spec.cluster),
+        credential_store=credentials,
+        max_read_bytes=storage_module.REPORT_MAX_BYTES,
+    )
+    legacy.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        RequestContext(user_id="another-owner"),
+        RequestContext(user_id="owner", x_cluster="cn-east-1"),
+    ],
+)
+def test_workflow_storage_rejects_mismatched_request_scope(
+    bound_dataset_spec, monkeypatch, tmp_path, context
+):
+    bound = Mock()
+    monkeypatch.setattr(storage_module, "build_bound_evaluation_storage", bound)
+    with pytest.raises(PermissionError, match="another owner or cluster"):
+        storage_module.build_runtime_storage(
+            spec=bound_dataset_spec, request_context=context, projects_root=tmp_path
+        )
+    bound.assert_not_called()
+
+
+def test_unavailable_bound_storage_does_not_silently_switch_to_browser(
+    bound_dataset_spec, monkeypatch, tmp_path
+):
+    bound = Mock(side_effect=EvaluationStorageUnavailableError("Bound Sandbox stopped"))
+    browser = Mock()
+    monkeypatch.setattr(storage_module, "build_bound_evaluation_storage", bound)
+    monkeypatch.setattr(storage_module, "build_evaluation_storage", browser)
+    context = RequestContext(user_id="owner", cookie="session-cookie")
+
+    with pytest.raises(EvaluationStorageUnavailableError, match="Sandbox stopped"):
+        storage_module.build_runtime_storage(
+            spec=bound_dataset_spec, request_context=context, projects_root=tmp_path
+        )
+    browser.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit_project", [True, False])
+def test_unbound_workflow_keeps_legacy_storage_and_never_infers_project(
+    bound_dataset_spec, monkeypatch, tmp_path, explicit_project
+):
+    bound = Mock(return_value=None)
+    browser = Mock()
+    monkeypatch.setattr(storage_module, "build_bound_evaluation_storage", bound)
+    monkeypatch.setattr(storage_module, "build_evaluation_storage", browser)
+    spec = (
+        bound_dataset_spec
+        if explicit_project
+        else bound_dataset_spec.model_copy(update={"template_values": {}})
+    )
+    storage = storage_module.build_runtime_storage(
+        spec=spec,
+        request_context=RequestContext(user_id="owner", cookie="session-cookie"),
+        projects_root=tmp_path,
+    )
+    assert storage is browser.return_value
+    assert bound.call_count == int(explicit_project)
 
 
 @pytest.mark.parametrize(

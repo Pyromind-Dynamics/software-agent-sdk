@@ -60,6 +60,10 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
 
 ## 控制面 SOP
 
+当前标准 Main 使用统一入口 `label_studio_project(operation=...)`。
+reference 中的操作名和字段沿用；只有其他部署的实际清单列出了 `label_studio_*` 独立入口时，
+才使用对应别名，不根据文档中的名字假定该 Tool 已注入。
+
 1. **探查**：用 `read` 读 `/workspace/<dataset_path>` 先看清数据结构
    （样本目录 + meta 字段，或 JSONL 行内字段和图片路径）；一次看完多个样本，
    不要一个样本调一次。
@@ -76,9 +80,9 @@ Label Studio 本身支持的控件（画笔、多边形、关键点）转换器�
    洗数据、改 XML、反复重试；也不要凭常识刻意收窄。
 4. **校验**（可选）：自检脚本用法见 `references/operations.md`，跳过结论一致，
    create 会在转换**之前**做同样的校验并返回可读错误。
-5. **创建**：优先用 `label_studio_create_project`，传入 `dataset_path` 和
-   `label_config_path`；仅当环境只提供旧入口时，用
+5. **创建**：使用
    `label_studio_project(operation="create", dataset_path=..., label_config_path=..., ...)`。
+   其他部署若实际只列出 `label_studio_create_project`，按同样的创建字段调用该入口。
 6. **交付**：给项目名、导入样本数，和一个能点的标注入口（格式见下）。
 
 路径契约：dataset、XML、field map 中的 Storage 文件统一使用

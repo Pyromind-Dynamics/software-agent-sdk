@@ -12,6 +12,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from pyromind_sdk.client.models import TrainingTaskResponse
 
 from harness_adapter.pi_adapter import business_tool_host
 from harness_adapter.pi_adapter.business_tool_host import (
@@ -28,6 +29,7 @@ from pyromind_common.tools.data_preparation import (
 from pyromind_common.tools.data_preparation.evaluation_submit import (
     DfSubmitEvaluationAction,
     DfSubmitEvaluationExecutor,
+    create_evaluation_runner,
 )
 from pyromind_common.tools.data_preparation.inference import (
     InferencePipelineHandler,
@@ -696,10 +698,18 @@ def test_resume_rejects_changed_model_source_reference_or_rubric(
     ctx.submit.assert_called_once()
 
 
-def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
+@pytest.mark.parametrize("direct_runner", [False, True])
+def test_fixed_two_node_submission_and_frozen_resume(
+    inference_submission, direct_runner
+):
     ctx = inference_submission
+    if direct_runner:
+        ctx.executor = create_evaluation_runner(
+            env="pre", cluster="test", inference_handler=ctx.handler
+        ).run
     result = ctx.executor(ctx.action, cast(Any, ctx.conversation))
     assert not result.is_error, result.text
+    assert result.run_id is not None
     workflow = ctx.submit.call_args.kwargs["workflow"]
     validate_pipeline_topology(workflow, require_inference=True)
     assert len(workflow["nodes"]) == 2
@@ -733,7 +743,7 @@ def test_fixed_two_node_submission_and_frozen_resume(inference_submission):
         DfSubmitEvaluationAction(
             operation="resume",
             input_path=ctx.action.input_path,
-            resume_run_id=result.run_id,
+            resume_run_id=UUID(result.run_id),
         ),
         cast(Any, ctx.conversation),
     )
@@ -1001,16 +1011,21 @@ def test_stop_resolves_product_run_without_legacy_task_file(inference_submission
     tool = DfStopTaskTool.create(task_resolver=ctx.runs.task_for)[0]
     executor = tool.executor
     assert isinstance(executor, DfStopTaskExecutor)
-    executor._post_stop = Mock(return_value={})
+    executor._stop_task = Mock(
+        return_value=TrainingTaskResponse(
+            task_id="task-1", name="eval", status="stopped"
+        )
+    )
     stopped = tool(DfStopTaskAction(run_id=result.run_id), cast(Any, ctx.conversation))
     assert isinstance(stopped, DfStopTaskObservation)
     assert stopped.stopped
-    executor._post_stop.assert_called_once_with(
+    executor._stop_task.assert_called_once_with(
         "task-1",
         {
             "accept": "*/*",
             "content-type": "application/json",
         },
+        ctx.conversation,
     )
 
 

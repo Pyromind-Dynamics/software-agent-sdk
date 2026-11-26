@@ -12,13 +12,14 @@ Usage:
         --manifest /path/to/manifest.jsonl \\
         --output-dir /path/to/run-dir \\
         --env pre --cluster us-west-1 \\
-        [--auth-token <token>] \
+        [--api-key <key> | --auth-token <token>] \
         [--set LLM_BASE_URL=...] [--set LLM_AUTH_TOKEN=...] \
         [--set LLM_MODEL=...] \
         [--limit N]
 
-``--auth-token`` falls back to the ``PYROMIND_AUTH_TOKEN`` environment
-variable. Step params may reference CLI-provided secrets via
+``--api-key`` falls back to ``PYROMIND_API_KEY``. ``--auth-token`` retains
+the older ``PYROMIND_AUTH_TOKEN`` authentication path. Step params may reference
+CLI-provided secrets via
 ``{secret:KEY}`` placeholders; substituted values never reach the verdicts
 file. The verdicts file under ``--output-dir`` doubles as the resume
 checkpoint: re-running the same command skips already-judged records and
@@ -41,6 +42,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import (
     ResourceConfig,
     SandboxRequest,
@@ -1039,8 +1041,20 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
 
 
 def _default_client_factory(
-    *, env: str, cluster: str, auth_token: str
+    *,
+    env: str,
+    cluster: str,
+    auth_token: str | None = None,
+    api_key: str | None = None,
 ) -> SandboxClient:
+    if api_key:
+        client = PyroMindAPIClient(
+            api_key=api_key,
+            base_url=os.environ.get("PYROMIND_BASE_URL"),
+            cluster=cluster,
+            max_retries=0,
+        )
+        return client.sandboxes
     client = create_sandbox_api_client(
         env=env, cluster=cluster, auth_token=auth_token, headers={}
     )
@@ -1059,6 +1073,7 @@ def main(
     parser.add_argument("--env", required=True)
     parser.add_argument("--cluster", required=True)
     parser.add_argument("--auth-token", default=None)
+    parser.add_argument("--api-key", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--set",
@@ -1083,8 +1098,9 @@ def main(
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     auth_token = args.auth_token or os.environ.get("PYROMIND_AUTH_TOKEN")
-    if not auth_token:
-        logger.error("auth token required via --auth-token or PYROMIND_AUTH_TOKEN")
+    api_key = args.api_key or os.environ.get("PYROMIND_API_KEY")
+    if not auth_token and not api_key:
+        logger.error("platform API key or auth token is required")
         return 2
 
     secrets: dict[str, str] = {}
@@ -1098,7 +1114,8 @@ def main(
     profile = load_profile(args.profile)
     records = load_manifest(args.manifest)
     factory = client_factory or _default_client_factory
-    client = factory(env=args.env, cluster=args.cluster, auth_token=auth_token)
+    identity = {"api_key": api_key} if api_key else {"auth_token": auth_token}
+    client = factory(env=args.env, cluster=args.cluster, **identity)
 
     summary = run_batch(
         profile,

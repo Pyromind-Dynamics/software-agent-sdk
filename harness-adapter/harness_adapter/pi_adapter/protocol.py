@@ -8,8 +8,18 @@ PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 1024 * 1024
 
 
-class SandboxAuthorizationRequired(ValueError):
+class SandboxEndpointError(ValueError):
+    code: str
+
+
+class SandboxAuthorizationRequired(SandboxEndpointError):
     """Sandbox access requires a new authenticated request."""
+
+    code = "sandbox_authorization_required"
+
+
+class FixedActorUnavailable(SandboxEndpointError):
+    code = "fixed_actor_unavailable"
 
 
 class PiProtocolError(RuntimeError):

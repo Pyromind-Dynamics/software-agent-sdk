@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Protocol
 
 import httpx
@@ -12,6 +13,10 @@ from pyromind_sdk.client.base import DEFAULT_API_BASE_URL
 from pyromind_agent_server.echomind_runtime_contracts import (
     RuntimeCredentialUnavailableError,
 )
+from pyromind_agent_server.echomind_runtime_credentials import RuntimeCredentialStore
+from pyromind_agent_server.echomind_sandbox_storage import (
+    build_bound_evaluation_storage,
+)
 from pyromind_agent_server.echomind_train_runtime import TrainWorkflowSpec
 from pyromind_agent_server.evaluation_storage import (
     REPORT_MAX_BYTES,
@@ -19,6 +24,7 @@ from pyromind_agent_server.evaluation_storage import (
     build_evaluation_storage,
 )
 from pyromind_common.tools.utils.platform_env import (
+    platform_cluster_route,
     platform_headers,
     platform_portal_url,
 )
@@ -141,7 +147,40 @@ def build_runtime_storage(
     spec: TrainWorkflowSpec,
     request_context: RequestContext | None,
     access_key: str | None = None,
+    projects_root: Path | str | None = None,
+    credential_store: RuntimeCredentialStore | None = None,
 ) -> WorkflowStorageReader:
+    project_id = spec.template_values.get("project_id")
+    if projects_root is not None and project_id:
+        if spec.owner_user_id is None:
+            raise RuntimeCredentialUnavailableError(
+                "Project Storage verification requires the workflow owner's identity."
+            )
+        if request_context is not None and (
+            request_context.user_id != spec.owner_user_id
+            or (
+                request_context.x_cluster is not None
+                and platform_cluster_route(request_context.x_cluster)
+                != platform_cluster_route(spec.cluster)
+            )
+        ):
+            raise PermissionError(
+                "Workflow Storage context belongs to another owner or cluster."
+            )
+        context = (
+            replace(request_context, x_cluster=spec.cluster)
+            if request_context is not None
+            else RequestContext(user_id=spec.owner_user_id, x_cluster=spec.cluster)
+        )
+        storage = build_bound_evaluation_storage(
+            projects_root=projects_root,
+            project_id=project_id,
+            context=context,
+            credential_store=credential_store,
+            max_read_bytes=REPORT_MAX_BYTES,
+        )
+        if storage is not None:
+            return storage
     if request_context is not None and (
         request_context.cookie or request_context.authorization
     ):

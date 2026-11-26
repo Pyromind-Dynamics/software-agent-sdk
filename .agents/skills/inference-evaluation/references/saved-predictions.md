@@ -5,18 +5,30 @@
 
 ## 提交
 
-```python
-df_submit_evaluation(
-    operation="score",
-    input_path="/models/training-output",
-    source_manifest_path="public_data/source_manifest.json",
-    scoring_spec_path="public_data/scoring_spec.json",
-    scoring_script_path="public_data/score_eval.py",
-)
+平台提交遵循 [SDK 执行与回调](../../workflow-execution/references/sdk-execution.md)。
+以下参数构造 `pyromind_common.platform.evaluation_core.EvaluationOptions`，再交给
+`pyromind_common.platform.evaluation.stage_evaluation` 冻结输入、脚本和运行时，不发 HTTP。
+按[执行契约](command-node-pipeline.md)用 `staged.workflow_path` 的工作区相对路径和
+`staged.name` 调用保留的 `validate_workflow_dsl`。从工具 content 取
+`validated_workflow_path`，用 `Path` 读取已保存的实际图，再调用普通 `submit_workflow` 函数提交 SDK。
+`artifact_unavailable` 时即使 valid=true 也停止，不重构或重写图绕过。
+无需旧评测提交 Tool，也不假定 SDK Key 能替代校验 Cookie。
+
+```json
+{
+  "operation": "score",
+  "input_path": "/models/training-output",
+  "source_manifest_path": "public_data/source_manifest.json",
+  "scoring_spec_path": "public_data/scoring_spec.json",
+  "scoring_script_path": "public_data/score_eval.py"
+}
 ```
 
-此操作不接受推理、产物或清洗脚本参数。工具冻结脚本、说明、清单和运行时，生成
+此操作不接受推理、产物或清洗脚本参数。准备流程冻结脚本、说明、清单和运行时，生成
 CustomCommandCPUNode 工作流；全量处理，无 GPU、无模型调用。
+SDK 提交使用当前执行上下文的 out_id，客户端设置 `max_retries=0`。
+取得 task_id 后保存回执并更新对应 Project task/attempt；关联失败只补元数据。
+提交结果不明确时先等回调或核对实际任务，不重复 create。
 恢复使用 `operation="resume"`、原 `resume_run_id` 和不变的 input_path，不传评分配置；同一冻结
 输入恢复，不修改旧评分口径。脚本、源文件或配置变化需要新建 full run。
 
@@ -97,7 +109,7 @@ passed=false、prediction_label=null；脚本异常会记录为评分故障，�
 evaluation 仍必须提供能跨文件对应的 `id` 或 `input_key`。
 
 validation_examples 是 `{"record": 原始样例, "passed": 预期布尔值}` 的列表，至少
-包含应通过、应失败的案例，并覆盖业务映射与无效预测。工具在会话沙箱可用时
+包含应通过、应失败的案例，并覆盖业务映射与无效预测。准备流程在会话沙箱可用时
 提交前用 CPU worker 的同一校验逻辑执行样例。所有 step 共用该冻结脚本。
 
 ## 结果
@@ -112,17 +124,23 @@ LoRA 模型引用包含 adapter 与基模，后续推理合并该 step，不使�
 
 ## 所选 checkpoint 需要后续推理时
 
-使用 `df_submit_evaluation(operation="inference", ...)` 入口，`model_path` 填所选 checkpoint-n 的准确 Storage 路径，
+使用评测 `operation="inference"`，`model_path` 填所选 checkpoint-n 的准确 Storage 路径，
 其评测配置的 `model_source` 写 `{"type":"checkpoint","kind":"full"}`。
 LoRA 写 `{"type":"checkpoint","kind":"lora","base_model":"/models/实际基模"}`；
 基模必须已准备到 Storage，远端模型标识先通过已有 clone/download 能力解析到实际文件。
-工具生成所选 LoRA 的 Merge → Inference → CPU，合并输出位于本次推理 output_dir/merged-model，
-版本登记记录父 checkpoint。该显式引用不会被项目当前默认模型替换。
+评测准备流程生成所选 LoRA 的 Merge → Inference → CPU，合并输出位于本次推理 output_dir/merged-model，
+更新 Project 元数据时记录父 checkpoint；普通准备函数不自动登记版本。
+该显式引用不会被项目当前默认模型替换。
 评测已合并的模型时使用其实际 Storage 路径和 storage 来源，在指定数据集上重新生成预测。
 
 仅调整已有预测的 rubric 时重新执行 CPU 评分。存在独立 test 时，先完成
-验证集选模，再在工具顶层传 selection_run_id=选模批次 run_id，input_path 使用该批次
+验证集选模，再传 selection_run_id=选模批次 run_id，input_path 使用该批次
 清单 datasets.test.path，model_path 与 model_source 精确对应选中 checkpoint。
+从已有 Project 版本、训练产物与选模报告取得已授权证据，以 `ValidationSelection`
+传给 `stage_evaluation(..., selection=...)`。字段与校验规则见
+[独立测试准备](command-node-pipeline.md#验证集选模后的独立测试)；非 Reward 评分传原评分代码
+正文 `scoring_script` 与对象 `scoring_spec`，不以新脚本或新规则替换原验证口径。
+准备函数冻结 validation-selection.json，resume 使用同一冻结文件，不重新选模。
 测试集文件必须与 train/validation 不同且指纹不同；应由数据来源确认独立划分，路径和指纹
 检查不能证明无近重复或业务泄漏。test 不参与选模，不把 test 的表现用于重新挑选 checkpoint。
 

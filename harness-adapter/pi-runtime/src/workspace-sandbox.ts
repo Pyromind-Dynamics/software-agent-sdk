@@ -18,6 +18,7 @@ import {
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { inside, WorkspaceAccessPolicy } from "./workspace-policy.js";
+import { ToolCoordinator } from "./tool-coordinator.js";
 
 interface SandboxController {
   checkDependencies(ripgrepConfig?: { command: string; args?: string[] }): boolean;
@@ -37,6 +38,8 @@ interface WorkspaceSandboxDependencies {
   localOperations?: BashOperations;
   userHome?: string;
   runtimeReadRoots?: string[];
+  runtimeReadRootsForEnvironment?: (environment?: NodeJS.ProcessEnv) => Promise<string[]>;
+  allowedNetworkDomains?: (environment?: NodeJS.ProcessEnv) => string[];
   resourceLimits?: ResourceLimitsConfig;
 }
 
@@ -139,11 +142,15 @@ function createWorkspaceSandbox(
   const controller = dependencies.controller ?? SandboxManager;
   const localOperations = dependencies.localOperations ?? createLocalBashOperations();
   const userHome = resolve(dependencies.userHome ?? homedir());
+  // The proxy reads process-wide config for the entire lifetime of a command.
+  const commands = dependencies.allowedNetworkDomains ? new ToolCoordinator() : undefined;
   let initialization: Promise<void> | undefined;
 
-  async function configuration(): Promise<SandboxRuntimeConfig> {
-    const runtimeReadRoots = dependencies.runtimeReadRoots
-      ?? await configuredRuntimeReadRoots();
+  async function configuration(environment?: NodeJS.ProcessEnv): Promise<SandboxRuntimeConfig> {
+    const runtimeReadRoots = [
+      ...(dependencies.runtimeReadRoots ?? await configuredRuntimeReadRoots()),
+      ...(await dependencies.runtimeReadRootsForEnvironment?.(environment) ?? []),
+    ];
     const denyRead = await workspacePolicyDenyPaths(
       policy,
       userHome,
@@ -151,7 +158,7 @@ function createWorkspaceSandbox(
     );
     return {
       network: {
-        allowedDomains: [],
+        allowedDomains: dependencies.allowedNetworkDomains?.(environment) ?? [],
         deniedDomains: [],
         allowUnixSockets: [],
         allowLocalBinding: false,
@@ -175,8 +182,8 @@ function createWorkspaceSandbox(
     };
   }
 
-  async function prepare(): Promise<SandboxRuntimeConfig> {
-    const config = await configuration();
+  async function prepare(environment?: NodeJS.ProcessEnv): Promise<SandboxRuntimeConfig> {
+    const config = await configuration(environment);
     if (!initialization) {
       initialization = (async () => {
         if (!controller.checkDependencies(config.ripgrep)) {
@@ -200,6 +207,39 @@ function createWorkspaceSandbox(
     return config;
   }
 
+  const execute: BashOperations["exec"] = async (command, cwd, options) => {
+    await assertWorkspaceCwd(cwd, policy.workspaceRoot);
+    try {
+      const config = await prepare(options.env);
+      const scopedCommand = config.network.allowedDomains.length > 0
+        ? "export NO_PROXY= no_proxy=; " + command : command;
+      const wrapped = await wrapWithPrivateTemp(
+        controller,
+        commandWithResourceCaps(scopedCommand, dependencies.resourceLimits),
+        config,
+        policy.terminalTempRoot,
+        options.signal,
+      );
+      return await localOperations.exec(wrapped, policy.workspaceRoot, {
+        ...options,
+        env: {
+          ...options.env,
+          TMPDIR: policy.terminalTempRoot,
+          TMP: policy.terminalTempRoot,
+          TEMP: policy.terminalTempRoot,
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof Error
+        && (error.message.startsWith("WORKSPACE_")
+          || error.message.startsWith("sandboxed command"))
+      ) {
+        throw error;
+      }
+      throw sandboxUnavailable(error);
+    }
+  };
   return {
     async initialize() {
       try {
@@ -209,37 +249,8 @@ function createWorkspaceSandbox(
       }
     },
     operations: {
-      async exec(command, cwd, options) {
-        await assertWorkspaceCwd(cwd, policy.workspaceRoot);
-        try {
-          const config = await prepare();
-          const wrapped = await wrapWithPrivateTemp(
-            controller,
-            commandWithResourceCaps(command, dependencies.resourceLimits),
-            config,
-            policy.terminalTempRoot,
-            options.signal,
-          );
-          return await localOperations.exec(wrapped, policy.workspaceRoot, {
-            ...options,
-            env: {
-              ...options.env,
-              TMPDIR: policy.terminalTempRoot,
-              TMP: policy.terminalTempRoot,
-              TEMP: policy.terminalTempRoot,
-            },
-          });
-        } catch (error) {
-          if (
-            error instanceof Error
-            && (error.message.startsWith("WORKSPACE_")
-              || error.message.startsWith("sandboxed command"))
-          ) {
-            throw error;
-          }
-          throw sandboxUnavailable(error);
-        }
-      },
+      exec: (...args) => commands
+        ? commands.run(args[2].signal, () => execute(...args)) : execute(...args),
     },
   };
 }

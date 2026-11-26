@@ -46,6 +46,7 @@ export class PiAgentRuntime {
   private terminalBackend: string | undefined;
   private hasDelegatedRoles = false;
   private queueUserMessages = false;
+  private externalTaskWaitBypassed = false;
   private normalizer: PiEventNormalizer | undefined;
   private readonly storageUrls = new Map<string, string>();
   /** Blocks automatic scheduling (notifications, stages) until a user prompt. */
@@ -105,7 +106,7 @@ export class PiAgentRuntime {
     if (method === "prompt.prepare") {
       const session = this.requireSession();
       parsePromptContent(params.content);
-      if (!this.queueUserMessages && this.normalizer && !session.isStreaming) throw new Error("Pi agent is already running");
+      if (!this.queueUserMessages && this.normalizer && !session.isStreaming) throw conversationBusyError();
       this.userInput.reservePrompt(requiredString(params, "run_id"));
       return { admitted: true };
     }
@@ -153,6 +154,7 @@ export class PiAgentRuntime {
     this.subagents = subagents;
     const preparation = params.preparation_dialogue === true;
     const projectDialogue = params.project_dialogue === true;
+    if (params.await_external_tasks === true) this.installExternalTaskWaitBoundary(session);
     const publicUpdates = Array.isArray(params.tools) && params.tools.some(tool => isObject(tool) && tool.name === "publish_echomind_update");
     session.subscribe((event) => {
       if (event.type === "agent_start" && !this.normalizer) {
@@ -226,6 +228,39 @@ export class PiAgentRuntime {
     this.repairInterruptedInputs(session, params.pending_input_records);
     setImmediate(() => this.drainNotifications());
     return { ready: true };
+  }
+
+  private installExternalTaskWaitBoundary(session: AgentSession): void {
+    const finishTurn = session.agent.finishTurn;
+    session.agent.finishTurn = async (turn, signal) => {
+      const decision = await finishTurn?.(turn, signal) ?? undefined;
+      if (decision?.action === "end" || signal?.aborted) return decision;
+      return await this.waitingForExternalTask(signal) ? { action: "end" } : decision;
+    };
+    const beforeToolCall = session.agent.beforeToolCall;
+    session.agent.beforeToolCall = async (call, signal) => {
+      const decision = await beforeToolCall?.(call, signal);
+      if (decision?.block || signal?.aborted) return decision;
+      if (!await this.waitingForExternalTask(signal)) return decision;
+      return {
+        ...decision,
+        block: true,
+        terminate: true,
+        reason: "A submitted platform task is pending. Its terminal callback will resume this task.",
+      };
+    };
+  }
+
+  private async waitingForExternalTask(signal?: AbortSignal): Promise<boolean> {
+    const runId = this.activeRunId;
+    if (!runId || this.externalTaskWaitBypassed) return false;
+    if (this.pendingNotifications.some(item => item.message.details.run_id === runId)) return true;
+    const result = await this.peer.request("external_task.waiting", { run_id: runId }, signal);
+    if (!isObject(result) || !Array.isArray(result.task_ids) ||
+        !result.task_ids.every(id => typeof id === "string" && id.length > 0)) {
+      throw new Error("invalid external task waiting response");
+    }
+    return this.activeRunId === runId && result.task_ids.length > 0;
   }
 
   private createAskUserTool(
@@ -338,12 +373,14 @@ export class PiAgentRuntime {
           else await session.steer(prompt.text, prompt.images);
         }
         catch (error) { this.discardCommand(runId); throw error; }
+        this.externalTaskWaitBypassed = true;
         if (this.suspensionRevision === suspensionRevision) this.executionSuspended = false;
         return this.queueUserMessages ? { accepted: true, queued: true } : { accepted: true, steered: true };
       }
-      if (this.normalizer) throw new Error("Pi agent is already running");
+      if (this.normalizer) throw conversationBusyError();
       this.normalizer = new PiEventNormalizer(this.sessionId!, runId, this.pendingCommandIds, this.storageUrls);
       this.activeRunId = runId;
+      this.externalTaskWaitBypassed = false;
       this.executionSuspended = false;
       this.outcome.reset();
       this.pendingCommandIds.push(runId);
@@ -547,6 +584,7 @@ export class PiAgentRuntime {
     this.normalizer = new PiEventNormalizer(this.sessionId!, executionRunId, this.pendingCommandIds, this.storageUrls,
       typeof message.details.task_id === "string" ? message.details.task_id : undefined);
     this.activeRunId = executionRunId;
+    this.externalTaskWaitBypassed = false;
     this.outcome.reset();
     setImmediate(() => void this.runNotification(executionRunId, message, runId));
   }
@@ -671,6 +709,10 @@ export class PiAgentRuntime {
     if (!this.session) throw new Error("Pi session is not started");
     return this.session;
   }
+}
+
+function conversationBusyError(): Error & { code: string } {
+  return Object.assign(new Error("Pi agent is already running"), { code: "conversation_busy" });
 }
 
 function isObject(value: unknown): value is JsonObject {

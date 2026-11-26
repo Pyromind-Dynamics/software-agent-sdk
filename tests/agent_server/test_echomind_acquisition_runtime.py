@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -170,15 +171,57 @@ def test_runner_pauses_and_preserves_progress_when_tracer_is_unavailable(tmp_pat
     assert "AcquisitionRuntimeError" in (paused.error or "")
 
 
-@pytest.mark.parametrize("platform_batch_trigger", [False, True])
-def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
-    tmp_path, platform_batch_trigger
+@pytest.mark.parametrize(
+    ("platform_batch_trigger", "held", "accepts"),
+    [(True, 10, True), (True, 11, False), (False, 10, False)],
+)
+def test_capacity_check_for_sealed_batches(
+    tmp_path, platform_batch_trigger, held, accepts
 ):
     project_id = "6a1170d0-c1ce-4e37-9cd8-336fcfcff625"
-    conversation_id = "f5a9bf4181ed4a25b75bc545d217a1f1"
+    transport = Mock()
+    status = TracerCollectionStatus(
+        capacity=15, held=held, inflight_count=2, buffer_size=5, batch_mode=True
+    )
+    transport.status.return_value = status
+    runner = AcquisitionSimulationRunner(
+        projects_root=str(tmp_path),
+        project=cast(ProjectInfo, SimpleNamespace()),
+        published=cast(PublishedGraph, SimpleNamespace()),
+        slot=_slot(project_id),
+        tracer_secret="tracer-secret",
+        sample_source=JsonlAcquisitionSampleSource(_MemoryReader({})),
+        batch_materializer=TracerBatchMaterializer(_BatchStorage({})),
+        platform_batch_trigger=platform_batch_trigger,
+        backpressure_timeout_seconds=0,
+        transport=transport,
+    )
+    params = {"endpoint": "https://tracer.example", "access_key": "tracer-secret"}
+    if accepts:
+        assert runner._wait_for_capacity(round_size=5, **params) == status
+    else:
+        with pytest.raises(AcquisitionPaused, match="free sample slots|backpressure"):
+            runner._wait_for_capacity(round_size=5, **params)
+
+
+@pytest.mark.parametrize(
+    ("saved_reservation", "collected", "sealed_count", "should_collect"),
+    [
+        (False, 2, 2, True),
+        (True, 2, 2, True),
+        (False, 2, 1, False),
+        (False, 1, 2, False),
+    ],
+)
+def test_next_round_after_tracer_fills_its_current_batch(
+    tmp_path, saved_reservation, collected, sealed_count, should_collect
+):
+    project_id = "6a1170d0-c1ce-4e37-9cd8-336fcfcff625"
     root = tmp_path / "projects"
     project, published, slot = _published_platform_inputs(
-        root, project_id=project_id, conversation_id=conversation_id
+        root,
+        project_id=project_id,
+        conversation_id="f5a9bf4181ed4a25b75bc545d217a1f1",
     )
     store = AcquisitionSimulationStore(root)
     simulation = _simulation(store=store, project_id=project_id).model_copy(
@@ -188,14 +231,115 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
             "splits": ["train", "val"],
         }
     )
+    if saved_reservation:
+        simulation = simulation.model_copy(
+            update={
+                "collecting_batch": AcquisitionBatch(
+                    index=3, sample_ids=["train-sample", "val-sample"]
+                )
+            }
+        )
+    store.save(simulation)
+    storage = _BatchStorage(
+        {
+            "datasets/avi/train.jsonl": _jsonl(
+                [_sample_row("train-sample", "images/1.jpg")]
+            ),
+            "datasets/avi/val.jsonl": _jsonl(
+                [_sample_row("val-sample", "images/2.jpg")]
+            ),
+            "datasets/avi/images/1.jpg": b"image-1",
+            "datasets/avi/images/2.jpg": b"image-2",
+            "/EchoMind/tracer-1/data/spans/2/batch.json": json.dumps(
+                {"index": 2, "state": "ready", "collected": sealed_count}
+            ).encode(),
+        }
+    )
+    transport = Mock(wraps=_FakeTransport())
+    transport.status.return_value = TracerCollectionStatus(
+        capacity=6,
+        held=4,
+        buffer_size=2,
+        collected_data_size=collected,
+        current_batch_index=2,
+        inflight_count=2,
+        batch_mode=True,
+    )
+    runner = AcquisitionSimulationRunner(
+        projects_root=str(root),
+        project=project,
+        published=published,
+        slot=slot,
+        tracer_secret="tracer-secret",
+        sample_source=JsonlAcquisitionSampleSource(storage),
+        batch_materializer=TracerBatchMaterializer(storage),
+        platform_batch_trigger=True,
+        backpressure_timeout_seconds=0,
+        transport=transport,
+    )
+
+    result = runner.run(simulation)
+    assert result.status == "paused"
+    if should_collect:
+        assert "Platform Tracer batch 3 did not publish" in (result.error or "")
+        assert result.collecting_batch is not None
+        assert result.collecting_batch.index == 3
+        assert result.completed_samples == 2
+        assert runner.run(result).completed_samples == 2
+        assert transport.chat_completion.call_count == 2
+        assert transport.end_task.call_count == 2
+    else:
+        assert "already contains data" in (result.error or "")
+        transport.chat_completion.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("platform_batch_trigger", "dataset_labels", "fixed_validation"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+        (True, False, True),
+    ],
+)
+@pytest.mark.parametrize(
+    ("label", "category_field"), [("defect", "reason"), ("真点", "category")]
+)
+def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
+    tmp_path,
+    platform_batch_trigger,
+    label,
+    category_field,
+    dataset_labels,
+    fixed_validation,
+):
+    project_id = "6a1170d0-c1ce-4e37-9cd8-336fcfcff625"
+    conversation_id = "f5a9bf4181ed4a25b75bc545d217a1f1"
+    root = tmp_path / "projects"
+    project, published, slot = _published_platform_inputs(
+        root,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        dataset_labels=dataset_labels,
+        fixed_validation=fixed_validation,
+    )
+    store = AcquisitionSimulationStore(root)
+    simulation = _simulation(store=store, project_id=project_id).model_copy(
+        update={
+            "requested_samples": 2,
+            "requested_rounds": 1,
+            "splits": ["train"] if fixed_validation else ["train", "val"],
+        }
+    )
     store.save(simulation)
     image_root = "/workspace/datasets/avi/images"
     train_images = [f"{image_root}/{index}.jpg" for index in range(1, 4)]
     val_images = [f"{image_root}/{index}.jpg" for index in range(4, 7)]
     ground_truth = {
         "boxes": [{"x": 2, "y": 3}],
-        "reason": "scratch",
-        "result": "defect",
+        category_field: "scratch",
+        "result": label,
     }
     train_row = {
         **_sample_row("training", train_images[0]),
@@ -207,10 +351,17 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
         "images": [f"images/{index}.jpg" for index in range(4, 7)],
         "gt": ground_truth,
     }
+    if dataset_labels:
+        for row in (train_row, val_row):
+            del row["gt"]
+            row["image_sha256"] = [hashlib.sha256(b"image").hexdigest()] * len(
+                row["images"]
+            )
+    source_train_rows = [train_row, val_row] if fixed_validation else [train_row]
     storage = _BatchStorage(
         {
-            "datasets/avi/train.jsonl": _jsonl([train_row]),
-            "datasets/avi/val.jsonl": _jsonl([val_row]),
+            "datasets/avi/train.jsonl": _jsonl(source_train_rows),
+            "datasets/avi/val.jsonl": b"" if fixed_validation else _jsonl([val_row]),
             **{
                 path.removeprefix("/workspace/"): b"image"
                 for path in train_images + val_images
@@ -219,7 +370,11 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
     )
     sample_source = JsonlAcquisitionSampleSource(storage)
     samples = sample_source.load(
-        source=simulation.source, splits=["train", "val"], limit=2, balance_splits=True
+        source=simulation.source,
+        splits=simulation.splits,
+        limit=2,
+        balance_splits=True,
+        dataset_labels=dataset_labels,
     )
     task_ids = [
         _platform_task_id(simulation.simulation_id, sample)
@@ -236,6 +391,7 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
         if platform_batch_trigger
         else _BatchTransport()
     )
+    transport.prediction = json.dumps({"result": label, category_field: "scratch"})
     backend = Mock()
     backend.find_task_by_name.return_value = None
     backend.submit_workflow.return_value = "dataset-task-1"
@@ -287,15 +443,26 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
         rejected = runner.run(waiting)
         assert "invalid trigger marker" in (rejected.error or "")
         assert rejected.completed_rounds == 0
-        storage.files[marker] = b'{"batch_index": 0}'
+        if fixed_validation:
+            del storage.files[marker]
+            storage.files[f"{prefix}/batch.json"] = (
+                b'{"index": 0, "state": "ready", "collected": 2}'
+            )
+        else:
+            storage.files[marker] = b'{"batch_index": 0}'
 
+        changed_source = (
+            {"user_prompt": "different prompt"}
+            if dataset_labels
+            else {"gt": {"result": "pass"}}
+        )
         storage.files["datasets/avi/train.jsonl"] = _jsonl(
-            [{**train_row, "gt": {"result": "pass"}}]
+            [{**train_row, **changed_source}, *source_train_rows[1:]]
         )
         unmatched = runner.run(rejected)
         assert "changed source row" in (unmatched.error or "")
         assert GraphRunStore(root).list(project_id) == []
-        storage.files["datasets/avi/train.jsonl"] = _jsonl([train_row])
+        storage.files["datasets/avi/train.jsonl"] = _jsonl(source_train_rows)
         simulation = unmatched
 
     paused = runner.run(simulation)
@@ -332,6 +499,20 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
     assert spec.workflow is not None
     command = spec.workflow["nodes"][0]["data"]["config"]["command"]
     assert command == f"convert {directory} {spec.output_directory}"
+    if fixed_validation:
+        base = directory.removeprefix("/workspace")
+        assert storage.files[f"{base}/val.jsonl"] == b"\n"
+        roster = [
+            json.loads(r) for r in storage.files[f"{base}/train.jsonl"].splitlines()
+        ]
+        assert [r["id"] for r in roster] == [train_row["id"], val_row["id"]]
+        if dataset_labels:
+            assert all("gt" not in r and "assistant_output" not in r for r in roster)
+        else:
+            assert [json.loads(r["assistant_output"]) for r in roster] == [
+                r["gt"] for r in source_train_rows
+            ]
+        return
     for split, source, images in (
         ("train", train_row, train_images),
         ("val", val_row, val_images),
@@ -339,12 +520,21 @@ def test_sealed_tracer_batch_materializes_platform_dataset_and_recovers(
         payload = storage.files[f"{directory.removeprefix('/workspace')}/{split}.jsonl"]
         row = json.loads(payload)
         assert row["id"] == source["id"]
-        assert re.match(
-            r'\{"result"\s*:\s*"(?:pass|defect|fail)"', row["assistant_output"]
-        )
-        assert json.loads(row["assistant_output"]) == source["gt"]
-        assert row["label"] == "defect"
         assert row["images"] == images
+        if dataset_labels:
+            assert set(row) == {
+                "id",
+                "images",
+                "image_sha256",
+                "user_prompt",
+                "system_prompt",
+            }
+            assert row["image_sha256"] == source["image_sha256"]
+            continue
+        assert re.match(rf'\{{"result"\s*:\s*"{label}"', row["assistant_output"])
+        assert json.loads(row["assistant_output"]) == source["gt"]
+        assert row["label"] == label
+        assert row["category"] == "scratch"
 
 
 @pytest.mark.parametrize(
@@ -390,7 +580,12 @@ def test_materializer_refuses_a_batch_with_unverified_rows(
 
 
 def _published_platform_inputs(
-    root, *, project_id: str, conversation_id: str
+    root,
+    *,
+    project_id: str,
+    conversation_id: str,
+    dataset_labels: bool = False,
+    fixed_validation: bool = False,
 ) -> tuple[ProjectInfo, PublishedGraph, RuntimeSlot]:
     def input_for(name: str) -> ProjectNodeInput:
         return ProjectNodeInput(
@@ -449,6 +644,10 @@ def _published_platform_inputs(
             },
         ),
     ]
+    if dataset_labels:
+        nodes[0].config["batch_label_source"] = "dataset"
+    if fixed_validation:
+        nodes[0].config["batch_validation_source"] = "fixed"
     release_id, graph_id = str(uuid4()), str(uuid4())
     edges = [ProjectEdge(source="dataset", target="train")]
     published = PublishedGraph.build(
@@ -614,6 +813,14 @@ def test_http_transport_uses_tracer_task_and_batch_endpoints():
     assert requests[2].headers["X-Task-ID"] == "task-1"
     assert requests[2].headers["X-Task-Trace"] == "true"
     assert requests[4].headers["Authorization"] == "Bearer admin-secret"
+    transport.end_task(
+        endpoint=endpoint,
+        access_key="secret",
+        task_id="raw-task",
+        final_reward=None,
+        ground_truth=None,
+    )
+    assert json.loads(requests[-1].content) == {"task_id": "raw-task"}
 
 
 class _MemoryReader:
@@ -658,6 +865,7 @@ class _FakeTransport:
     ) -> None:
         self.block_once = block_once
         self.legacy_status = legacy_status
+        self.prediction = '{"result": "defect", "reason": "scratch"}'
         self.status_count = 0
         self.chat_task_ids: list[str] = []
         self.end_task_ids: list[str] = []
@@ -705,11 +913,7 @@ class _FakeTransport:
         assert model == "tracer-model"
         assert messages
         self.chat_task_ids.append(task_id)
-        return {
-            "choices": [
-                {"message": {"content": '{"result": "defect", "reason": "scratch"}'}}
-            ]
-        }
+        return {"choices": [{"message": {"content": self.prediction}}]}
 
     def end_task(
         self,
@@ -717,11 +921,11 @@ class _FakeTransport:
         endpoint: str,
         access_key: str,
         task_id: str,
-        final_reward: float,
-        ground_truth: str,
+        final_reward: float | None,
+        ground_truth: str | None,
     ) -> Mapping[str, Any]:
-        del endpoint, access_key, ground_truth
-        assert final_reward == 1.0
+        del endpoint, access_key
+        assert final_reward == (1.0 if ground_truth is not None else None)
         self.end_task_ids.append(task_id)
         return {"task_id": task_id}
 

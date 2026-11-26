@@ -18,7 +18,8 @@
 先探查 schema：直接读 `/workspace/<input_path>`。已有标签且源文件在本地可处理范围内
 时，生成纯 Python Pipeline，通过 terminal 直接执行；需要标准格式校验和报告时，使用 `model_profile=none` 的 DataFlow CLI
 对 `/workspace` 源路径做全量聚合；超出本地可处理范围时，先对 sample 的逻辑小样验证
-同一脚本，再用 `df_submit_pipeline` 对 Storage 源路径全量执行。
+同一脚本，再按 [llm-pipeline 的提交入口](llm-pipeline/playbook.md)准备并提交
+平台任务，对 Storage 源路径全量执行。
 
 Taxonomy 确认后，`N <= 1000` 全量标注；否则按 `sample_id`、固定 seed 做稳定
 哈希抽样，严格取 1000 个唯一训练样本。文本选 DataFlow PromptedGenerator /

@@ -49,6 +49,8 @@ function structuredExcerpt(value: unknown, budget: { remaining: number }): unkno
   return value;
 }
 
+export function redact(value: string, secrets?: readonly string[]): string;
+export function redact(value: unknown, secrets?: readonly string[]): unknown;
 export function redact(value: unknown, secrets: readonly string[] = []): unknown {
   if (typeof value === "string") {
     let text = value.replace(/\b(?:[sp]k-lf-|sk-or-v1-|sk-)[\w-]+\b/g, "[REDACTED]");

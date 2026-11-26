@@ -115,3 +115,73 @@ test("terminal preserves native streaming and full output metadata even on a fai
     assert.equal(result.details.resultCategory, code === 0 ? "success" : "failure");
   }
 });
+
+test("terminal obtains current SDK environment without retaining credentials on later calls", async () => {
+  const base = { PATH: "/bin", MODEL: "existing-model" };
+  const environments: Array<NodeJS.ProcessEnv | undefined> = [];
+  let calls = 0;
+  const tool = createTerminalTool(".", {
+    environmentProvider: async () => ++calls === 1 ? {
+      PYROMIND_API_KEY: "sdk-access-key",
+      LLM_BASE_URL: "https://model.example",
+      LLM_AUTH_TOKEN: "model-access-key",
+      LLM_MODEL: "session-model",
+    } : {},
+    spawnHook: ({ command }) => ({ command, cwd: ".", env: base }),
+    operations: {
+      async exec(_command, _cwd, options) {
+        environments.push(options.env);
+        options.onData(Buffer.from("ok"));
+        return { exitCode: 0 };
+      },
+    },
+  });
+  await tool.execute("first", { command: "python3 script.py" });
+  await tool.execute("second", { command: "pwd" });
+  assert.equal(environments[0]?.PYROMIND_API_KEY, "sdk-access-key");
+  assert.equal(environments[0]?.LLM_AUTH_TOKEN, "model-access-key");
+  assert.equal(environments[0]?.LLM_MODEL, "session-model");
+  assert.deepEqual(environments[1], base);
+  assert.deepEqual(base, { PATH: "/bin", MODEL: "existing-model" });
+});
+
+test("SDK and model secrets are filtered across chunks before streaming or full-output persistence", async (context) => {
+  const secrets = ["derived-sdk-key-1234567890", "model-access-key-1234567890",
+    "dataflow-profile-key-1234567890", "direct-model-key-1234567890"];
+  for (const fail of [false, true]) {
+    const updates: string[] = [];
+    const tool = createTerminalTool(".", {
+      environmentProvider: async () => ({ PYROMIND_API_KEY: secrets[0]!, LLM_AUTH_TOKEN: secrets[1]! }),
+      spawnHook: ({ command }) => ({ command, cwd: ".", env: {
+        DF_API_KEY: secrets[3]!,
+        PYROMIND_DATAFLOW_PROFILES: JSON.stringify({ text: { DF_API_KEY: secrets[2] }, vision: {} }),
+      } }),
+      operations: {
+        async exec(_command, _cwd, options) {
+          for (const secret of secrets) {
+            options.onData(Buffer.from(secret.slice(0, 9)));
+            options.onData(Buffer.from(secret.slice(9) + "\n"));
+          }
+          options.onData(Buffer.from("a line\n".repeat(12000)));
+          for (const secret of secrets) {
+            options.onData(Buffer.from(secret.slice(0, 5)));
+            options.onData(Buffer.from(secret.slice(5)));
+          }
+          if (fail) throw new Error("request failed: " + secrets.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+    const result = await tool.execute(String(fail), { command: "run SDK script" }, undefined,
+      (partial) => { updates.push(JSON.stringify(partial)); });
+    assert(secrets.every((secret) => !JSON.stringify(result).includes(secret)));
+    assert(updates.every((update) => secrets.every((secret) => !update.includes(secret))));
+    const path = result.details.fullOutputPath;
+    assert(path);
+    context.after(() => rm(path, { force: true }));
+    const content = await readFile(path, "utf8");
+    assert(secrets.every((secret) => !content.includes(secret)));
+    assert(content.includes("[REDACTED]"));
+    assert.equal(result.details.resultCategory, fail ? "failure" : "success");
+  }
+});

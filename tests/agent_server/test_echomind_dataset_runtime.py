@@ -231,6 +231,7 @@ def test_platform_dataset_binds_inputs_and_emits_both_splits(platform_dataset):
     submitted = executor.submit(context, task)
     assert submitted.provider_run_id == "task-12"
     spec = backend.submit_workflow.call_args.kwargs["spec"]
+    assert spec.template_values["project_id"] == context.project_id
     command = spec.workflow["nodes"][0]["data"]["config"]["command"]
     assert command == (
         f"source_path='/workspace/raw/batch 2'; out={output_uri}; "
@@ -251,6 +252,10 @@ def test_platform_dataset_binds_inputs_and_emits_both_splits(platform_dataset):
     completed = executor.poll(
         context,
         task.model_copy(update={"provider_run_id": "task-12"}),
+    )
+    assert (
+        backend.query_task.call_args.kwargs["spec"].template_values["project_id"]
+        == context.project_id
     )
 
     assert completed.status == "completed"

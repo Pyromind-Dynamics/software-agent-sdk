@@ -38,6 +38,10 @@ _LEGACY_AGENT_REQUEST_SECRET_ENV = "PYROMIND_AGENT_ACCESS_KEY_REQUEST_SECRET"
 _DEV_SECRET_KEY = "Kij823420JITRE21i21248cbsxhuexvS"
 
 
+class AccessKeyExchangeError(RuntimeError):
+    """A credential-free diagnostic for the Portal access-key exchange."""
+
+
 def _get_domain(env: str | None, api_uri: str) -> str:
     if env in _PROD_ENVS:
         return f"https://{_BASE_DOMAIN}{api_uri}"
@@ -110,10 +114,10 @@ def _user_id_from_auth_token(auth_token: str) -> int:
             options={"verify_signature": False, "verify_exp": False},
         )
     except jwt.InvalidTokenError as exc:
-        raise RuntimeError("Invalid auth token") from exc
+        raise AccessKeyExchangeError("Invalid auth token") from exc
     user_id = payload.get("user_id")
     if type(user_id) is not int:
-        raise RuntimeError("Auth token is missing user_id")
+        raise AccessKeyExchangeError("Auth token has no integer user_id")
     return user_id
 
 
@@ -181,24 +185,26 @@ def get_api_key(
     )
 
     if response.status_code != 200:
-        raise RuntimeError(f"Failed to get api key: HTTP {response.status_code}")
+        raise AccessKeyExchangeError(f"Portal access-key HTTP {response.status_code}")
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise AccessKeyExchangeError("Portal returned invalid JSON") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("Invalid api key response: expected JSON object")
+        raise AccessKeyExchangeError("Portal response must be a JSON object")
     if not payload.get("success"):
-        message = payload.get("message") or payload.get("error") or "unknown error"
-        raise RuntimeError(f"Api key request failed: {message}")
+        raise AccessKeyExchangeError("Portal rejected the access-key request")
 
     data = payload.get("data")
     if not isinstance(data, dict):
-        raise RuntimeError("Invalid api key response: missing data object")
+        raise AccessKeyExchangeError("Portal response is missing data")
 
     access_key = data.get("accessKey")
-    if not access_key:
-        raise RuntimeError("Invalid api key response: missing accessKey")
+    if not isinstance(access_key, str) or not access_key.strip():
+        raise AccessKeyExchangeError("Portal response is missing accessKey")
 
-    return str(access_key)
+    return access_key
 
 
 def decompress_gzip_base64_data(value: str) -> Any:

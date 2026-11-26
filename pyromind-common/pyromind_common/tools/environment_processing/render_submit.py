@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import io
 import json
-import shlex
 import struct
 import tempfile
 import uuid
@@ -28,6 +27,13 @@ from typing import TYPE_CHECKING, Any, Self, cast
 from pydantic import Field
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import (
+    _check_column_refs as _check_column_refs,
+    _collect_column_refs as _collect_column_refs,
+    _spec_column_refs as _spec_column_refs,
+    build_render_command as build_render_command,
+)
+from pyromind_common.platform.scene_options import RenderOptions
 from pyromind_common.sdk.conversation.state import ActiveLongTask
 from pyromind_common.sdk.tool import (
     Action,
@@ -78,42 +84,7 @@ PREFLIGHT_TAIL_BYTES = 64 * 1024
 PREFLIGHT_MAX_FOOTER_BYTES = 8 * 1024 * 1024
 
 
-class EdpRenderAction(Action):
-    """Submit a template-driven manifest render to Pyromind Studio."""
-
-    template_path: str = Field(
-        description=(
-            "Local render template JSON (field mapping + shard_size). Pass "
-            "the same workspace-relative path you gave file_editor/apply_patch "
-            "when writing the template (e.g. 'public_data/render_template.json'); "
-            "absolute paths work too. The tool stages it into the task and the "
-            "node renders against it."
-        )
-    )
-    data_source: str = Field(
-        description=(
-            "User Storage path of the source data (e.g. "
-            "'/workspace/datasets/tmax/data/train-*.parquet'). The node reads it from "
-            "its Storage mount."
-        )
-    )
-    output_root: str | None = Field(
-        default=None,
-        description=(
-            "User Storage root for batch-XXX/ shards and shards.json, e.g. "
-            "'/workspace/datasets/rendered'. Defaults to the conversation's "
-            "edp_render directory."
-        ),
-    )
-    shard_size: int = Field(
-        default=500, ge=1, description="Records per shard manifest."
-    )
-    limit: int | None = Field(
-        default=None, ge=1, description="Optional caps on rendered records."
-    )
-    cpu: int = Field(default=4, ge=1, le=64)
-    memory: int = Field(default=16, ge=1, le=256)
-
+class EdpRenderAction(RenderOptions, Action):
     @property
     def visualize(self) -> Text:
         content = Text()
@@ -145,66 +116,6 @@ class EdpRenderObservation(Observation):
 
 def _pod_path(storage_path: str) -> str:
     return f"/target-workspace{storage_path}"
-
-
-def _spec_column_refs(name: str, spec: Any) -> list[tuple[str, str]]:
-    """Collect (field, column) references a template spec reads from the row."""
-    if isinstance(spec, str):
-        return [(name, spec)]
-    if not isinstance(spec, dict):
-        return []
-    if "field" in spec:
-        return [(name, str(spec["field"]))]
-    kind = spec.get("kind")
-    if kind == "message":
-        return [(name, str(spec.get("source_field", "messages")))]
-    if kind == "pytest_wrapper":
-        source = spec.get("source", spec.get("source_field"))
-        if source is not None:
-            return _spec_column_refs(name, source)
-    return []
-
-
-def _collect_column_refs(fields: dict[str, Any]) -> list[tuple[str, str]]:
-    refs: list[tuple[str, str]] = []
-    for name, spec in fields.items():
-        refs.extend(_spec_column_refs(name, spec))
-    return refs
-
-
-def _check_column_refs(schema: Any, refs: list[tuple[str, str]]) -> list[str]:
-    import pyarrow as pa
-
-    errors: list[str] = []
-    top_names = list(schema.names)
-    for field_name, column in refs:
-        parts = column.split(".")
-        if parts[0] not in top_names:
-            errors.append(
-                f"field {field_name!r} references top-level column "
-                f"{parts[0]!r} which does not exist (available columns: "
-                f"{top_names})"
-            )
-            continue
-        arrow_field = schema.field(parts[0])
-        for depth, part in enumerate(parts[1:], start=1):
-            field_type = arrow_field.type
-            if not pa.types.is_struct(field_type):
-                errors.append(
-                    f"field {field_name!r}: column {column!r} descends into "
-                    f"{part!r} but {parts[depth - 1]!r} is {field_type}, "
-                    "not a struct"
-                )
-                break
-            if part not in field_type.names:
-                errors.append(
-                    f"field {field_name!r}: column {column!r} references "
-                    f"missing nested field {part!r} (struct fields: "
-                    f"{list(field_type.names)})"
-                )
-                break
-            arrow_field = field_type.field(part)
-    return errors
 
 
 class _ParquetTailFile(io.RawIOBase):
@@ -328,43 +239,6 @@ def _preflight_template(
     return None
 
 
-def build_render_command(
-    *,
-    output_dir: str,
-    data_source: str,
-    shard_size: int,
-    limit: int | None,
-) -> str:
-    """Assemble the render command: install minimal deps, run render_manifest."""
-    pod_output = _pod_path(to_tool_storage_path(output_dir, field="output_dir"))
-    venv = "/tmp/edp-venv"
-    data_pod = _pod_path(to_tool_storage_path(data_source, field="data_source"))
-    out_pod = pod_output
-
-    steps = [
-        f"python3 -m venv {venv}",
-        (
-            f"{venv}/bin/pip install --quiet --use-deprecated=legacy-resolver "
-            f"-r {pod_output}/{RENDER_REQUIREMENTS}"
-            " > /tmp/edp-render-install.log 2>&1"
-            " || { echo 'render dependencies install failed; "
-            "last install log lines:'; tail -n 100 "
-            "/tmp/edp-render-install.log; exit 1; }"
-        ),
-        f"test -f {pod_output}/{RENDER_FILENAME}",
-        f"test -f {pod_output}/{RENDER_TEMPLATE_FILENAME}",
-        (
-            f"{venv}/bin/python {pod_output}/{RENDER_FILENAME} "
-            f"--template {pod_output}/{RENDER_TEMPLATE_FILENAME} "
-            f"--data-source {shlex.quote(data_pod)} "
-            f"--output-root {shlex.quote(out_pod)} "
-            f"--shard-size {int(shard_size)}"
-        )
-        + (f" --limit {int(limit)}" if limit is not None else ""),
-    ]
-    return " && ".join(steps)
-
-
 def _resolve_render_template(
     template_path: str,
     conversation: ToolConversation,
@@ -404,7 +278,7 @@ def _resolve_render_template(
     return resolved
 
 
-class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
+class EdpRenderRunner:
     """Stage template/render script and submit the render task."""
 
     def __init__(
@@ -433,6 +307,40 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
         self._storage_headers = storage_headers or {}
         self._storage_secret_headers = storage_secret_headers or {}
         self._timeout = timeout
+
+    @classmethod
+    def from_options(cls, **params: Any) -> Self:
+        env_value = params.pop("env", None)
+        env = str(env_value) if env_value is not None else None
+        cluster_value = params.pop("cluster", None)
+        cluster = str(cluster_value) if cluster_value is not None else None
+        params.pop("current_user", None)
+        headers = params.pop("headers", None) or {}
+        runtime_dir_value = params.pop("runtime_dir", None)
+        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
+        output_root_value = params.pop("output_root", None)
+        output_root = str(output_root_value) if output_root_value is not None else None
+        storage_base_url_value = params.pop("storage_base_url", None)
+        storage_base_url = (
+            str(storage_base_url_value) if storage_base_url_value is not None else None
+        )
+        storage_headers = params.pop("storage_headers", None) or None
+        storage_secret_headers = params.pop("storage_secret_headers", None) or None
+        timeout = int(params.pop("timeout", 30))
+        if params:
+            names = ", ".join(sorted(params))
+            raise ValueError(f"EdpRenderTool got unknown params: {names}")
+        return cls(
+            env=env,
+            cluster=cluster,
+            headers=headers,
+            runtime_dir=runtime_dir,
+            output_root=output_root,
+            storage_base_url=storage_base_url,
+            storage_headers=storage_headers,
+            storage_secret_headers=storage_secret_headers,
+            timeout=timeout,
+        )
 
     def _storage_headers_for(self, conversation: ToolConversation) -> dict[str, str]:
         headers = {**self._storage_headers}
@@ -463,7 +371,7 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
             timeout=float(self._timeout),
         )
 
-    def __call__(
+    def run(
         self,
         action: EdpRenderAction,
         conversation: ToolConversation | None = None,
@@ -614,6 +522,7 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
                 task_kind="environment_processing_render",
+                retry_create=False,
             )
             task_id = response.task_id
         except Exception as exc:  # noqa: BLE001
@@ -651,6 +560,21 @@ class EdpRenderExecutor(ToolExecutor[EdpRenderAction, EdpRenderObservation]):
         )
 
 
+class EdpRenderExecutor(
+    EdpRenderRunner, ToolExecutor[EdpRenderAction, EdpRenderObservation]
+):
+    def __call__(
+        self,
+        action: EdpRenderAction,
+        conversation: ToolConversation | None = None,
+    ) -> EdpRenderObservation:
+        return self.run(action, conversation)
+
+
+def create_edp_render_runner(**params: Any) -> EdpRenderRunner:
+    return EdpRenderRunner.from_options(**params)
+
+
 class EdpRenderTool(ToolDefinition[EdpRenderAction, EdpRenderObservation]):
     """Submit a template-driven manifest render to Pyromind Studio."""
 
@@ -660,26 +584,6 @@ class EdpRenderTool(ToolDefinition[EdpRenderAction, EdpRenderObservation]):
         conv_state: Any = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        env_value = params.pop("env", None)
-        env = str(env_value) if env_value is not None else None
-        cluster_value = params.pop("cluster", None)
-        cluster = str(cluster_value) if cluster_value is not None else None
-        params.pop("current_user", None)
-        headers = params.pop("headers", None) or {}
-        runtime_dir_value = params.pop("runtime_dir", None)
-        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
-        output_root_value = params.pop("output_root", None)
-        output_root = str(output_root_value) if output_root_value is not None else None
-        storage_base_url_value = params.pop("storage_base_url", None)
-        storage_base_url = (
-            str(storage_base_url_value) if storage_base_url_value is not None else None
-        )
-        storage_headers = params.pop("storage_headers", None) or None
-        storage_secret_headers = params.pop("storage_secret_headers", None) or None
-        timeout = int(params.pop("timeout", 30))
-        if params:
-            names = ", ".join(sorted(params))
-            raise ValueError(f"EdpRenderTool got unknown params: {names}")
         return [
             cls(
                 description=(
@@ -690,17 +594,7 @@ class EdpRenderTool(ToolDefinition[EdpRenderAction, EdpRenderObservation]):
                 ),
                 action_type=EdpRenderAction,
                 observation_type=EdpRenderObservation,
-                executor=EdpRenderExecutor(
-                    env=env,
-                    cluster=cluster,
-                    headers=headers,
-                    runtime_dir=runtime_dir,
-                    output_root=output_root,
-                    storage_base_url=storage_base_url,
-                    storage_headers=storage_headers,
-                    storage_secret_headers=storage_secret_headers,
-                    timeout=timeout,
-                ),
+                executor=EdpRenderExecutor.from_options(**params),
                 annotations=ToolAnnotations(
                     title="edp_render",
                     readOnlyHint=False,

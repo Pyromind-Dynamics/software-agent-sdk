@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 from PIL import Image
 
-from pyromind_common.tools.data_preparation.runner import (
+from pyromind_common.platform.scene_core import (
     runtime_public_names,
     validate_managed_image_pipeline,
 )
@@ -141,6 +141,95 @@ def test_pcb_predictions_round_trip_through_dataflow(
     with Image.open(call.args[0][0][0]) as image:
         assert image.size == (320, 160)
     assert not (output.parent / "failures.jsonl").exists()
+
+
+@pytest.mark.parametrize("output_format", ["structured", "vision"])
+def test_absolute_storage_images_survive_a_relocated_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: Any, output_format: str
+) -> None:
+    storage = tmp_path / "storage"
+    pictures = storage / "dataset"
+    pictures.mkdir(parents=True)
+    sample = _sample(pictures, "board")
+    manifest_dir = storage / "conversation"
+    manifest_dir.mkdir()
+    source = manifest_dir / "input.jsonl"
+    sample["images"] = [str(pictures / path) for path in sample["images"]]
+    source.write_text(json.dumps(sample) + "\n")
+    monkeypatch.setattr(runtime, "WORKSPACE_ROOT", str(storage))
+    monkeypatch.setattr(runtime, "PLATFORM_STORAGE_MOUNT", str(tmp_path / "pod-mount"))
+    config = runtime.ImagePipelineConfig(
+        labeling_system_prompt="Label the images.",
+        training_system_prompt="Inspect the board.",
+        user_prompt_template="Inspect {id}.",
+        output_format=output_format,
+    )
+    serving = Mock()
+    serving.generate_from_input_multi_images.return_value = [
+        '{"reasoning":"Checked images","answer":"pass"}'
+    ]
+    monkeypatch.setattr(runtime, "_create_vlm_serving", lambda _: serving)
+    output = manifest_dir / "output" / "processed.jsonl"
+
+    runtime.run_image_pipeline(config, str(source), str(output))
+
+    frozen = json.loads((output.parent / "source_manifest.jsonl").read_text())
+    assert frozen["images"] == ["dataset/board.bmp", "dataset/board_cam.bmp"]
+    row = json.loads(output.read_text())
+    if output_format == "vision":
+        assert [item["value"] for item in row["messages"][1]["content"][:-1]] == (
+            frozen["images"]
+        )
+    else:
+        assert row["source_images"] == dict(
+            zip(sample["image_labels"], sample["images"], strict=True)
+        )
+    metadata = json.loads((output.parent / "runtime_metadata.json").read_text())
+    assert metadata["image_root"] == str(storage)
+    assert sample["images"][0] in source.read_text()
+
+
+def test_absolute_storage_images_resolve_the_platform_mount_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: Any, config: Any
+) -> None:
+    storage = tmp_path / "workspace"
+    platform = tmp_path / "target-workspace"
+    platform.mkdir()
+    sample = _sample(platform, "board")
+    sample["images"] = [str(storage / path) for path in sample["images"]]
+    source = platform / "input.jsonl"
+    source.write_text(json.dumps(sample) + "\n")
+    monkeypatch.setattr(runtime, "WORKSPACE_ROOT", str(storage))
+    monkeypatch.setattr(runtime, "PLATFORM_STORAGE_MOUNT", str(platform))
+    records, root = runtime._load_source_records(source, config, None)
+    assert root == platform
+    assert records[0]["images"] == ["board.bmp", "board_cam.bmp"]
+    assert records[0]["_local_images"] == [
+        str(platform / "board.bmp"),
+        str(platform / "board_cam.bmp"),
+    ]
+
+
+def test_absolute_local_images_remain_inside_the_input_root(
+    tmp_path: Path, runtime: Any, config: Any
+) -> None:
+    sample = _sample(tmp_path, "board")
+    source = tmp_path / "input.jsonl"
+    sample["images"] = [str(tmp_path / path) for path in sample["images"]]
+    source.write_text(json.dumps(sample) + "\n")
+    records, root = runtime._load_source_records(source, config, None)
+    assert root == tmp_path
+    assert records[0]["images"] == ["board.bmp", "board_cam.bmp"]
+
+    sibling = tmp_path.parent / "outside.bmp"
+    Image.new("RGB", (1, 1)).save(sibling, format="PNG")
+    link = tmp_path / "linked.bmp"
+    link.symlink_to(sibling)
+    for path in (str(sibling), str(link), "../outside.bmp"):
+        sample["images"] = [path]
+        source.write_text(json.dumps(sample) + "\n")
+        with pytest.raises(ValueError, match="input root|POSIX"):
+            runtime._load_source_records(source, config, None)
 
 
 @pytest.mark.parametrize(

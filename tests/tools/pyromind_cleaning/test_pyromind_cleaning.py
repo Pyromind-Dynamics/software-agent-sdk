@@ -12,12 +12,16 @@ from pyromind_common.sdk.conversation.secret_registry import SecretRegistry
 from pyromind_common.sdk.conversation.state import (
     ActiveLongTask,
 )
+from pyromind_common.sdk.tool import ToolExecutor
 from pyromind_common.tools.pyromind_cleaning import (
     DatasetCleaningTaskAssociation,
     DatasetCleaningTaskStore,
     RunDatasetCleaningAction,
     RunDatasetCleaningExecutor,
     RunDatasetCleaningTool,
+)
+from pyromind_common.tools.pyromind_cleaning.definition import (
+    create_dataset_cleaning_runner,
 )
 
 
@@ -94,7 +98,7 @@ def test_cleaning_tool_derives_execution_target_from_legacy_headers():
     assert executor._cluster == "us-west-1"
 
 
-def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
+def test_cleaning_runner_submits_fixed_workflow_and_persists_task(
     monkeypatch,
     tmp_path,
 ):
@@ -126,7 +130,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     (runtime_dir / "cleaning_utils.py").write_text("__all__ = []\n")
     (runtime_dir / "validate_format.py").write_text("# validator\n")
 
-    observation = RunDatasetCleaningExecutor(
+    runner = create_dataset_cleaning_runner(
         env="pre",
         cluster="us-west-1",
         headers={"x-cluster": "us-west-1#pre", "request-app": "openhands"},
@@ -135,9 +139,11 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
         storage_headers={"x-cluster": "us-west-1"},
         task_store_dir=str(task_store_dir),
         timeout=5,
-    )(
+    )
+    assert not isinstance(runner, ToolExecutor)
+    observation = runner.run(
         RunDatasetCleaningAction(
-            input_path="datasets/source.jsonl",
+            input_path="/datasets/source.jsonl",
             script_path="/agentTest/clean.py",
             limit=25,
         ),
@@ -226,7 +232,7 @@ def test_run_dataset_cleaning_submits_fixed_workflow_and_persists_task(
     assert "异步执行" in cast(Any, conversation).agent_messages[0]
 
 
-def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
+def test_cleaning_runner_resume_uses_frozen_script(monkeypatch, tmp_path):
     mock_client = MagicMock()
     mock_client.studio.create.return_value = TrainingTaskCreateResponse(
         task_id="task-2",
@@ -251,11 +257,11 @@ def test_run_dataset_cleaning_resume_uses_frozen_script(monkeypatch, tmp_path):
         )
     )
 
-    observation = RunDatasetCleaningExecutor(
+    observation = create_dataset_cleaning_runner(
         env="pre",
         cluster="us-west-1",
         task_store_dir=str(task_store_dir),
-    )(
+    ).run(
         RunDatasetCleaningAction(
             input_path="/datasets/source.jsonl",
             resume_run_id=run_id,
@@ -324,7 +330,7 @@ def test_run_dataset_cleaning_submit_failure_omits_progress_fields(
         task_store_dir=str(tmp_path / "tasks"),
     )(
         RunDatasetCleaningAction(
-            input_path="datasets/source.jsonl",
+            input_path="/datasets/source.jsonl",
             script_path="/agentTest/clean.py",
         ),
         cast(Any, _fake_conversation(tmp_path)),
@@ -374,7 +380,7 @@ def test_run_dataset_cleaning_submit_failure_includes_platform_response(
         task_store_dir=str(tmp_path / "tasks"),
     )(
         RunDatasetCleaningAction(
-            input_path="datasets/source.jsonl",
+            input_path="/datasets/source.jsonl",
             script_path="/agentTest/clean.py",
         ),
         cast(Any, _fake_conversation(tmp_path)),

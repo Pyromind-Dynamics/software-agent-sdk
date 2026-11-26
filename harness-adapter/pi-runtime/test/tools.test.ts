@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { JsonlRpcPeer } from "../src/rpc-peer.js";
 import { restrictSkillReads } from "../src/session-policy.js";
 import {
@@ -15,6 +18,7 @@ import {
   type SandboxTools,
 } from "../src/tools.js";
 import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
+import { LazySandboxTerminalOperations } from "../src/sandbox-terminal.js";
 
 test("business tools carry trusted context separately from model arguments", async () => {
   let request: unknown;
@@ -36,6 +40,21 @@ test("business tools carry trusted context separately from model arguments", asy
     preparation_revision: 5, tool_call_id: "call",
     tool_name: "set_preparation_plan", arguments: args,
   });
+});
+
+test("encoded preparation plans still require a single object matching the tool schema", () => {
+  const tool = businessTool({} as JsonlRpcPeer, {
+    name: "set_preparation_plan", description: "",
+    inputSchema: { type: "object", properties: {
+      plan: { type: "object", properties: { goal: { type: "string" } }, required: ["goal"] },
+    }, required: ["plan"] },
+  });
+  for (const plan of ["{", "[]", "null", JSON.stringify('{"goal":"PCB"}'), '{"wrong":"field"}']) {
+    const args = tool.prepareArguments!({ plan });
+    assert.throws(() => validateToolArguments(tool, {
+      type: "toolCall", id: "plan", name: tool.name, arguments: args,
+    }), /Validation failed/);
+  }
 });
 
 test("business tool content converts OpenHands inline image URLs for Pi", () => {
@@ -182,6 +201,84 @@ test("sandbox lanes resolve logical task paths without changing Storage paths", 
     ),
     /PATH_SCOPE_ERROR/,
   );
+});
+
+test("only the main Sandbox terminal receives dynamic platform SDK credentials", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-sdk-lanes-")));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const original = LazySandboxTerminalOperations.prototype.exec;
+  context.after(() => { LazySandboxTerminalOperations.prototype.exec = original; });
+  const environments: Array<NodeJS.ProcessEnv | undefined> = [];
+  LazySandboxTerminalOperations.prototype.exec = async (_command, _cwd, options) => {
+    environments.push(options.env);
+    options.onData(Buffer.from("ok"));
+    return { exitCode: 0 };
+  };
+  let sandbox!: SandboxTools;
+  let contexts = 0;
+  await createTools(
+    {} as JsonlRpcPeer,
+    root, "sandbox", [], undefined, undefined, [],
+    {
+      sandbox: async () => { throw new Error("No endpoint resolution expected"); },
+      platformSdkEnvironment: async () => {
+        contexts++;
+        return { PYROMIND_API_KEY: "main-sdk-key" };
+      },
+      onSandboxToolsReady: (tools) => { sandbox = tools; },
+    },
+  );
+  for (const lane of [sandbox.main, sandbox.workflow, sandbox.createLane("child-worker")]) {
+    const terminal = lane.tools.find((tool) => tool.name === "terminal");
+    assert(terminal);
+    const result = await terminal.execute("call", { command: "echo ok" });
+    assert.equal(result.details.resultCategory, "success");
+    assert.equal(lane.access.env?.PYROMIND_API_KEY, undefined);
+  }
+  assert.equal(contexts, 1);
+  assert.deepEqual(environments.map((environment) => environment?.PYROMIND_API_KEY),
+    ["main-sdk-key", undefined, undefined]);
+});
+
+test("OS child terminals do not reuse the main SDK environment provider", {
+  skip: process.platform === "darwin"
+    ? !existsSync("/usr/bin/sandbox-exec") : !SandboxManager.checkDependencies(),
+}, async (context) => {
+  const { root, workspace } = await workspaceLayout("pi-sdk-os-");
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const previous = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  context.after(() => {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  });
+  let child: AgentTool | undefined;
+  let contexts = 0;
+  const tools = await createTools(
+    {} as JsonlRpcPeer,
+    workspace, "os-sandbox", [], undefined, undefined, [], {
+      platformSdkEnvironment: async () => {
+        contexts++;
+        return {
+          PYROMIND_API_KEY: "main-only-sdk-key",
+          PYROMIND_BASE_URL: "https://sdk.example/api/v1",
+          PYROMIND_SDK_PYTHON: process.execPath,
+        };
+      },
+      onChildTerminalReady: (tool) => { child = tool; },
+    },
+  );
+  assert(child);
+  const childResult = await child.execute("child", { command: "test -z \"$PYROMIND_API_KEY\"" });
+  assert.equal(childResult.details.resultCategory, "success");
+  assert.equal(contexts, 0);
+  const main = tools.find((tool) => tool.name === "terminal");
+  assert(main);
+  const result = await main.execute("main", { command: "printf '%s' \"$PYROMIND_API_KEY\"" });
+  assert.equal(result.details.resultCategory, "success");
+  assert.equal(contexts, 1);
+  assert(JSON.stringify(result).includes("[REDACTED]"));
+  assert(!JSON.stringify(result).includes("main-only-sdk-key"));
 });
 
 async function workspaceLayout(prefix = "pi-tools-") {

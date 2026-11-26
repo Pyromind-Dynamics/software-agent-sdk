@@ -1,9 +1,16 @@
 # 编排式场景数据处理(environment-processing)
 
+启用 SDK 时，先读取[SDK 提交与回调](../../../../workflow-execution/references/sdk-execution.md)，
+渲染、分片执行和聚合均由普通准备函数构图，通过服务端校验后调用 SDK。
+SDK Main 不再注入 `edp_render`、`edp_submit`、`edp_aggregate`。
+本页示例展示场景业务参数，不需要统一计划外壳。
+运行依赖未就绪时先修复环境，不重新加入提交 Tool。
+保留每片回执，部分成功后不整批重投。
+
 - **定位**:编排类的具体场景数据处理——单条数据的处理要在数据自带的
   特定环境(镜像)中执行复杂流程(跑命令/跑测试/判定),因此编排为
-  多阶段链路:`edp_render` 渲染分片 → `edp_submit` 逐条执行 →
-  `edp_aggregate` 聚合训练文件(CustomCommandCPUNode 平台任务,agent 只走
+  多阶段链路:EDP 渲染任务 渲染分片 → EDP 分片任务 逐条执行 →
+  EDP 聚合任务 聚合训练文件(CustomCommandCPUNode 平台任务,agent 只走
   控制面,不持有全量数据);冻结运行时 = `sandbox_runner.py` +
   ProcessingProfile(`scripts/edp/profiles/`),支持断点续跑与强制清理
 - **适用**:编排复杂度超出单算子/单次转换——批量逐条判定/验证/筛选,
@@ -40,14 +47,14 @@ runner,改用模式 B 对话组装。
 ## 前置条件
 
 - 目标环境可用镜像已就绪:可直接拉取的容器镜像引用,如 `eclipse-temurin:8-jdk`
-- 当前会话已配置 Pyromind 认证(`auth_token` + env/cluster;runner 走
-  `--auth-token` 或环境变量 `PYROMIND_AUTH_TOKEN`)
-- LLM 凭据三件套 fallback:会话 secret 中没有 `LLM_BASE_URL` /
-  `LLM_AUTH_TOKEN` / `LLM_MODEL` 时,从会话环境
-  `DF_API_BASE_URL`(去尾部 `/v1`)/ `DF_API_KEY` / `DF_MODEL_NAME` 对应取值,
-  再回退 legacy `ANTHROPIC_*`,经 `--set` 传给 runner(profile 的 env 声明
-  `{secret:...}` 占位符,缺一项该条记 error);不要把明文密钥写进对话或
-  manifest
+- 当前 SDK 执行环境已提供 `PYROMIND_API_KEY`、`PYROMIND_BASE_URL` 与集群。
+  Worker 使用 `--api-key` 创建原生 SDK client，不传当前请求 Cookie/JWT。
+- 解题 profile 按需使用当前环境的 `LLM_BASE_URL` / `LLM_AUTH_TOKEN` / `LLM_MODEL`，
+  runner 通过 `--set` 接收，与 profile 的 `{secret:...}` 声明对应；纯环境 profile
+  不要求 LLM。不要把明文密钥写进对话、manifest、脚本或冻结图。
+- 含 runtime 环境声明的图必须通过普通 `submit_workflow` / `submit_workflow_batch`：
+  helper 只在 SDK POST 前复制图并绑定必要环境值，最终 Studio 任务定义可能保存这些
+  command 环境。这不是 Secret 服务，不保存、打印或回传绑定后的请求图。
 
 ---
 
@@ -65,21 +72,21 @@ manifest 的构造、逐条验证、最终聚合**全部在平台节点执行**,
 
 ```text
 看字段(直读 /workspace/) → 写/确认 render 模板 JSON(几 KB)
-  ① edp_render    → 平台节点:读 parquet → 分片写 batch-XXX/manifest.jsonl + shards.json
-  ② edp_submit    → 平台节点:逐条起镜像验证 → verdicts.jsonl + traces/
-  ③ edp_aggregate → 平台节点:跨片合并去重 + 转 slime/SFT → 训练文件落 storage
+  ① EDP 渲染    → 平台节点:读 parquet → 分片写 batch-XXX/manifest.jsonl + shards.json
+  ② EDP 分片    → 平台节点:逐条起镜像验证 → verdicts.jsonl + traces/
+  ③ EDP 聚合 → 平台节点:跨片合并去重 + 转 slime/SFT → 训练文件落 storage
 每段:增量 append+flush、progress.json、节点日志逐条一行、同 run/out 目录断点续跑
 ```
 
 ### 0. 提交后简报与等待纪律(硬约束,贯穿三段)
 
-每次 `edp_render` / `edp_submit` / `edp_aggregate` 提交成功后,必须**立即**
+每次渲染、验证或聚合计划提交成功后,必须**立即**
 向用户发一条简报(提交了什么 / task_id / 预计量级 / 终态回调后自动汇报
 verdict 或 report),然后**结束当前回复**,把控制权交回平台回调。
 **禁止**用 sleep 终端命令或反复查看输出目录来消磨等待
 (对话 b32487cc 教训:agent 等待期间 23 次目录轮询 + 11 次 sleep 轮询
-约 6 分钟,用户全程零信息)。中途确需看进度用 `df_check_progress`
-(一次即回),不要反复列整个目录;终态回调会自动唤醒会话,回调之前
+约 6 分钟,用户全程零信息)。中途确需看进度按
+[挂载进度参考](../../storage-progress.md) 读取已知输出目录一次，不反复列目录；终态回调会自动唤醒会话，回调之前
 agent 不需要做任何事。
 
 ### 1. 渲染分片(manifest 由平台节点构造)
@@ -144,22 +151,25 @@ agent 直接查更快。拿到的 schema 用于写模板,列名以交接报告�
 fail fast。完整示例(join、pytest_wrapper、chat 格式)见
 [tmax case](cases/tmax.md)。
 
-提交渲染:
+EDP 渲染任务的业务参数示例：
 
-```text
-edp_render(template_path=<file_editor/apply_patch 写模板时用的同一相对路径>,
-            data_source=<storage parquet/glob/目录>,
-            shard_size=500, [limit=N])
+```json
+{
+  "template_path": "public_data/render_template.json",
+  "data_source": "/workspace/datasets/source/train-*.parquet",
+  "shard_size": 500
+}
 ```
 
-- 提交前工具会自动做**模板预检**:对照数据源 parquet schema 校验模板
+- 准备前取得数据源 parquet schema，作为 `prepare_edp_render` 的 `source_schema`
+  做**模板预检**：对照 schema 校验模板
   引用的列名(含 struct 嵌套下钻),列名写错秒级报错并给出可用列清单,
   不再浪费一轮平台任务(glob 数据源/预检自身失败时跳过预检,节点端
   渲染仍会 fail fast)
 
 - 模板用 `file_editor`/`apply_patch` 写入会话工作区(如
   `public_data/render_template.json`),`template_path` 直接传同一相对路径
-  (工具自动按会话工作区解析,也接受绝对路径);**不要**先上传 storage 再传
+  （`LocalFiles` 按指定工作目录解析）；**不要**先上传 storage 再传
   storage 路径,那多绕一步
 
 - 节点分段读 parquet(pyarrow iter_batches,内存≈单片),分片写 storage
@@ -175,23 +185,34 @@ edp_render(template_path=<file_editor/apply_patch 写模板时用的同一相对
 
 ### 2. 提交验证(smoke → 用户决策 → 分批/全量)
 
-验证以 **CustomCommandCPUNode 平台任务**提交执行(`edp_submit` 工具):
-工具冻结 `sandbox_runner.py` + profile + `pod_runtime/`(节点 shim)进每片
-run 的 storage 目录,提交含凭据注入的节点工作流;每片一个独立 workflow,
-返回 `task_ids` / `run_ids` / `output_dirs`。
+验证以 **CustomCommandCPUNode 平台任务**提交执行（EDP 分片任务 SDK 提交）:
+调用 `pyromind_common.platform.environment` 的 `EdpSubmitOptions`、
+`select_edp_manifests` 与 `prepare_edp_shard`，冻结 `sandbox_runner.py` + profile +
+`pod_runtime/`（节点 shim）及所需 wheels。每片一个独立 workflow；保留准备结果中的
+`manifest`、`run_id`、`output_dir`、`resumed`，对应 SDK 响应的真实 `task_id`。
 
 **2.1 smoke(第一片,limit=3)**
 
-```text
-edp_submit(manifest=<render 输出的 batch-001/manifest.jsonl>, limit=3)
+EDP 分片任务的业务参数：
+
+```json
+{"manifest": "/workspace/edp/batch-001/manifest.jsonl", "limit": 3}
 ```
+
+单片 `manifest` 模式直接调用 `select_edp_manifests(options)`。为该片选定 run UUID，
+使用 `StagingDirectory(local, storage=<manifest父目录>/<run UUID>)`，再调用
+`prepare_edp_shard(options, manifest=..., staging=..., runtime_dir=..., run_id=...,
+platform_env=..., cluster=...)`。`runtime_dir` 指向 `scripts/edp`。
+冻结文件发布到对应 Storage 位置后，将图转 DSL 交给保留的 `validate_workflow_dsl`，
+读取实际校验图，再用普通 `submit_workflow` 创建一次；不要把含环境声明的图直接交给
+`studio.create`。
 
 - Kafka 终态回调自动唤醒会话(Succeeded/Failed),随后查看
   `<output_dir>/run/verdicts.jsonl`(task_id / verdict / exit_code /
   error_category / reward / note)与 `<output_dir>/run/traces/`(解题轨迹):
   用 `read`/`terminal` 读 `/workspace/<output_dir>/run/...`
-- 运行中可 `df_check_progress(output_dir=<run 目录>, tail_filename="verdicts.jsonl")`
-  看实时进度(total/processed/ETA + 最近若干条 verdict);节点日志逐条一行
+- 运行中按[挂载进度参考](../../storage-progress.md)，从实际 `<output_dir>/run` 调用
+  普通 `read_progress(..., tail_filename="verdicts.jsonl")`，查看计数、ETA 和最近 verdict；节点日志逐条一行
   (`[i/N] task_id=... verdict=... reward=...`)
 - 按 verdict 分布汇报:usable 数、error 分类计数(error_category 枚举以
   profile 的 verdict 定义为准,如 [tmax](cases/tmax.md));**镜像缺件类错误
@@ -213,16 +234,25 @@ smoke 终态回调并汇报 verdict 分布 + 单条均时后,**必须向用户�
 
 **2.3 多片提交(分批与全量统一形态)**
 
-```text
-edp_submit(shards=<shards.json 路径>, shard_offset=<起始片>, shard_count=<本批片数>)
+EDP 分片任务的业务参数（片数按本次用户授权填写）：
+
+```json
+{"shards": "/workspace/edp/shards.json", "shard_offset": 0, "shard_count": 1}
 ```
 
-- 一次提交 N 片:每片独立 workflow/output_dir/终态回调,注册 N 个
-  ActiveLongTask;`shard_count` 省略 = 1。只有用户明确要求并发时才能传
-  2-5,工具会拒绝超过 5 的并发片数
+- 从 Storage 取得 `shards.json` 的小型索引，传给
+  `select_edp_manifests(options, shard_index=bytes)`，按选定路径逐片准备和校验。
+  每片独立 workflow/output_dir/终态回调；`shard_count` 省略 = 1，
+  只有用户明确要求并发时才能传 2–5，输入模型拒绝超过 5 片。
+- 可以使用 `submit_workflow_batch` 依次提交实际校验图。首次提交失败后立即停止，
+  `WorkflowBatchSubmissionError.accepted` 保留已受理的响应；按顺序对应准备结果，
+  保存每片真实 task ID、run ID、manifest、输出目录。后续未提交的片不要记为运行中，
+  部分成功后不整批重投。
 - 片 run 目录嵌套在片 manifest 目录下(`<root>/batch-XXX/<run_id>/run/`),
   checkpoint 与 manifest 同片共存;某片中断,同 `run_id` 重提交该片即续跑
-  (verdicts.jsonl 为 checkpoint,自动跳过已判条目)
+  （`EdpSubmitOptions.run_id` 传原 UUID，保留同一 staging 及冻结文件；
+  verdicts.jsonl 为 checkpoint，自动跳过已判条目）。恢复时核验冻结资产 hash，
+  不用当前部署的新 runner 覆盖原运行库。
 - 每个回调会唤醒会话。串行模式(`shard_count=1`)检查该片并提交下一片;
   并发模式先判断"**本批是否全部片终态**"(对照本次提交的 task_ids),
   未到齐就只汇报进度继续等,到齐才进 2.4
@@ -232,36 +262,37 @@ edp_submit(shards=<shards.json 路径>, shard_offset=<起始片>, shard_count=<�
 并发批全部片终态后:汇报本批统计(usable/error 分布、与前批对比、单条均时)
 → **再次向用户提问确认:继续下一批 / 调整批容量 / 停止**。不自动推进
 下一批。与既有 `Terminated` 回调约定一致:终止/失败不得自动重提交,
-交用户决策;需介入时先 `df_stop_task(task_id)` 停平台任务,再改再提交。
+交用户决策；需介入时先停止平台任务，启用 SDK 时按
+[停止参考](../../sdk-stop-task.md) 执行，其他会话使用 `df_stop_task(task_id)`，
+确认终态后再改再提交。
 
-**平台工程约束(已实测)**:节点固定 Python 3.10(conda),openhands 系包(≥3.12)
-装不上,`pod_runtime/` 提供 `processing_profile.py` 原样拷贝 +
-`create_sandbox_api_client` 等价 shim,runner 零改动;**skill 脚本必须
-兼容 Python 3.10**(如 `datetime.UTC` 是 3.11+,用 `datetime.timezone.utc`;
-对话 ebda2d49 因 render_manifest.py 的 `from datetime import UTC` 在节点
-import 阶段崩溃);storage 上传需带 `x-cluster` 头;节点命令的首段 `export`
-可能被丢弃,命令以 `true;` 开头规避,凭据同时经 `--auth-token` / `--set`
-显式引用(防丢 key)。沙箱内解题 agent 的安装与网关接入细节见对应 case
-文档(如 [tmax 的 pi 链路](cases/tmax.md))
+冻结脚本应兼容平台节点 Python 3.10，使用随包运行时。平台与模型配置从当前授权执行
+环境取值，提交前在内存绑定，不写入本地冻结资产或计划。沙箱内解题与网关适配按对应 case，
+如 [tmax](cases/tmax.md)。
 
-### 3. 聚合训练文件(edp_aggregate,平台节点)
+### 3. 聚合训练文件(EDP 聚合,平台节点)
 
 **每批片全部终态后 agent 自动聚合**(非用户触发;smoke 单片即首批):
-对本批全部 run_dirs 跑一次增量 `edp_aggregate` 到同一 out_dir,训练文件随批增长;
+对本批全部 run_dirs 跑一次增量 EDP 聚合任务 到同一 out_dir,训练文件随批增长;
 聚合幂等(同 out_dir 断点续跑 + task_id 去重),重跑无副作用。
 用户只在**换参数重派生**时才手动指定新 out_dir 重跑——验证(逐条起沙箱)
 贵、转换便宜,`min_reward`/`system_prompt` 等训练侧参数应看完 verdict
 分布后再定,换参数重派生不需要重跑昂贵的沙箱验证:
 
-```text
-edp_aggregate(run_dirs=[<各片 output_dir>...], out_dir=<聚合输出目录>,
-              [min_reward=1.0] [system_prompt=...] [limit=N])
+EDP 聚合任务的业务参数：
+
+```json
+{
+  "run_dirs": ["/workspace/edp/batch-001/run-1"],
+  "out_dir": "/workspace/edp/merged",
+  "min_reward": 1.0
+}
 ```
 
 - 节点逐条合并各片 verdicts(去重 task_id)并同趟转换:
   `<out_dir>/verdicts.jsonl`(合并 checkpoint)、`slime.jsonl`(usable →
   slime RL)、`sft.jsonl`(reward ≥ min_reward 的轨迹 → SFT)、
-  `progress.json`(可与 `df_check_progress` 复用)、`report.json`
+  `progress.json`（从已知挂载目录有界读取）、`report.json`
   (verdict 分布、error_category 计数、verifier_env_missing 单独分桶、
   转换/跳过计数、重复 task_id 数)
 - **断点续跑**:`<out_dir>/verdicts.jsonl` 已有 task_id 即 checkpoint,
@@ -278,7 +309,7 @@ edp_aggregate(run_dirs=[<各片 output_dir>...], out_dir=<聚合输出目录>,
 - 聚合节点纯标准库、无凭据注入;判定规则与批次策略见
   batch-orchestration.md
 
-### 4. 本地复现(仅工程师调试,agent 路径一律平台工具)
+### 4. 本地复现（仅工程师调试，Agent 路径提交平台任务）
 
 工程师需要本地复现单条行为时可直接跑冻结运行时(agent 不要走此通道):
 
@@ -288,10 +319,11 @@ python scripts/edp/sandbox_runner.py \
     --manifest /path/to/manifest.jsonl \
     --output-dir /path/to/run-dir \
     --env pre --cluster us-west-1 \
-    --set LLM_BASE_URL=<OpenAI 兼容端点> \
-    --set LLM_AUTH_TOKEN=<token> \
-    --set LLM_MODEL=<模型名> \
-    [--auth-token <token>] [--limit 3]
+    --api-key "$PYROMIND_API_KEY" \
+    --set LLM_BASE_URL="$LLM_BASE_URL" \
+    --set LLM_AUTH_TOKEN="$LLM_AUTH_TOKEN" \
+    --set LLM_MODEL="$LLM_MODEL" \
+    [--limit 3]
 ```
 
 - `--set KEY=VALUE` 注入 LLM 凭据(profile 中以 `{secret:KEY}` 占位),
@@ -305,7 +337,11 @@ python scripts/edp/sandbox_runner.py \
 
 ## 模式 B:对话组装沙箱工具(无匹配 profile 时)
 
-严格按序执行;工具均为独立工具,无 `operation` 字段。
+系统消息启用 SDK 时，按 sandbox Skill 的
+[生命周期](../../../../sandbox/references/sdk-lifecycle.md)、
+[写入](../../../../sandbox/references/sdk-file-write.md) 和
+[命令](../../../../sandbox/references/sdk-commands.md) 参考完成同样步骤。
+下列 Tool 示例用于对应工具仍在注入的会话；均为独立工具，无 `operation` 字段。
 
 ### 1. 明确需求与环境要求
 
@@ -354,16 +390,13 @@ sandbox_terminal(sandbox_id=<id>, command="bash /workspace/process.sh", cwd="/wo
 - 长任务改为后台 + 轮询日志:`nohup bash /workspace/process.sh > /workspace/run.log 2>&1 &`,
   之后 `sandbox_terminal(command="tail -n 50 /workspace/run.log")` 观察进度
 
-### 6. 回传产物
+### 6. 交付产物
 
-```
-sandbox_upload(sandbox_id=<id>, sandbox_path="/workspace/result.json", storage_path="/workspace/datasets/<task-name>-filtered")
-```
-
-- `storage_path` 为用户 Storage 目标目录(可省略,默认
-  `/workspace/.pyromind-agent/<conversation_id>/uploads`)
-- 反向:把 storage 文件取进沙箱用
-  `sandbox_download(sandbox_id=<id>, storage_path=..., sandbox_path=...)`
+Main 和目标沙箱共享同一 Storage 时，将结果写入已确认的挂载目录，再核对大小和 SHA-256。
+Main 直接使用实际 `/workspace/...` 路径，不经过上传或下载 Tool 中转。
+目标沙箱没有相同挂载时，使用 SDK `read_file` / `write_file` 传递必要文件，先读取 sandbox
+Skill 的文件操作参考，核对目标内容后再继续；不能把不同容器内相同的路径字符串当成同一文件。
+用户交付链接仍通过 `get_storage_url` 获取，不将容器路径作为浏览器链接。
 
 ### 7. 清理沙箱(硬约束)
 
@@ -371,15 +404,17 @@ sandbox_upload(sandbox_id=<id>, sandbox_path="/workspace/result.json", storage_p
 sandbox_delete(sandbox_id=<id>)
 ```
 
-> **无论任务成功还是失败,最后一步必须 `sandbox_delete`**,避免资源泄漏。
+> 无论任务成功还是失败，最后都释放沙箱；启用 SDK 时用 SDK，其余会话用 `sandbox_delete`。
 > 删除失败时重试一次;确实无法删除时必须明确告知用户。
 
 ## 注意事项
 
 - 每一步都检查上一步返回的 `status`/`returncode`,失败即修正,不要盲进
-- 辅助文件工具:`sandbox_read_file(sandbox_id, path)` 读文件(二进制返回
-  base64);`sandbox_delete_file(sandbox_id, path, recursive=?)` 删除沙箱内
-  文件/目录(删非空目录需 `recursive=True`)
+- 系统消息启用 SDK 时，文件操作按 sandbox Skill 的
+  [读取参考](../../../../sandbox/references/sdk-file-read.md) 与
+  [删除参考](../../../../sandbox/references/sdk-file-delete.md) 执行。
+  其他上下文使用已启用的 `sandbox_read_file`、`sandbox_delete_file`；
+  二进制按 base64 展示，删除非空目录须显式 `recursive=True`
 - custom 镜像必须自带 bash(probe/脚本依赖它);镜像缺 bash 会在探测阶段暴露
 - 沙箱内文件路径以沙箱视角为准;storage 路径与 upload 的目标目录分离
 - 若需 VNC 图形交互,用创建返回的 `web_vnc_url`(供用户人工介入)

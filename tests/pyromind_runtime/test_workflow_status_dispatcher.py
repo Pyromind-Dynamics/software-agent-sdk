@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
+import pytest
+
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_agent_server.workflow_status_dispatcher import WorkflowStatusDispatcher
 from pyromind_common.tools.data_preparation.platform_submit import (
@@ -211,6 +213,47 @@ async def test_dispatcher_routes_pi_callback_and_store_dedupes(tmp_path) -> None
     ]
 
 
+async def test_only_trusted_platform_can_adopt_and_update_signed_sdk_tasks(tmp_path):
+    conversation_id = "signed-sdk-conversation"
+    conversation = tmp_path / conversation_id
+    conversation.mkdir()
+    store = FileProductStore(conversation)
+    store.create(
+        ConversationSnapshot(
+            conversation_id=conversation_id, capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+        harness_id="pi",
+    )
+    correlation = store.issue_task_correlation(
+        TaskCorrelation(conversation_id=conversation_id, task_kind="workflow_run")
+    )
+    runtime = ConversationRuntime(tmp_path, FakeAdapter())
+    dispatcher = WorkflowStatusDispatcher(runtime)
+    arguments = {
+        "task_id": "actual-sdk-task",
+        "correlation": correlation,
+        "auto_run": False,
+    }
+    try:
+        await dispatcher.dispatch(status="Succeeded", **arguments)
+        assert store.load_snapshot().external_tasks == ()
+
+        await dispatcher.dispatch(status="Running", trusted_platform=True, **arguments)
+        assert store.load_snapshot().external_tasks[0].status == "running"
+
+        with pytest.raises(PermissionError, match="trusted platform"):
+            await dispatcher.dispatch(status="Succeeded", **arguments)
+        assert store.load_snapshot().external_tasks[0].status == "running"
+
+        await dispatcher.dispatch(
+            status="Succeeded", trusted_platform=True, **arguments
+        )
+        assert store.load_snapshot().external_tasks[0].status == "succeeded"
+    finally:
+        await runtime.close()
+
+
 async def test_dispatcher_routes_pi_through_same_runtime_path(tmp_path) -> None:
     conversations = tmp_path / "conversations"
     conversation = conversations / "conversation-2"
@@ -339,6 +382,7 @@ def test_external_task_registry_cannot_transfer_ownership_or_change_the_recipien
     tmp_path,
 ):
     import pytest
+
     from pyromind_runtime.domain.task_correlation import TaskCorrelation
 
     registry = WorkflowExternalTaskRegistry(tmp_path)
@@ -388,6 +432,7 @@ def test_retired_production_workflow_tool_cannot_be_resolved():
     from typing import Any, cast
 
     import pytest
+
     from pyromind_common.sdk.tool import Tool
     from pyromind_common.sdk.tool.registry import resolve_tool
 

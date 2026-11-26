@@ -17,7 +17,10 @@ def test_removed_openhands_adapter_cannot_be_imported():
 
 
 @pytest.mark.parametrize("configured", [None, "pi"])
-async def test_product_runtime_registers_only_pi(tmp_path, monkeypatch, configured):
+@pytest.mark.parametrize("sdk_enabled", [True, False])
+async def test_product_runtime_registers_only_pi(
+    tmp_path, monkeypatch, configured, sdk_enabled
+):
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "os-sandbox")
     if configured is None:
@@ -25,10 +28,10 @@ async def test_product_runtime_registers_only_pi(tmp_path, monkeypatch, configur
     else:
         monkeypatch.setenv("PYROMIND_HARNESS_BACKEND", configured)
     monkeypatch.setenv("PYROMIND_VERSION_DB_PATH", str(tmp_path / "versions.sqlite3"))
-    monkeypatch.setenv("PYROMIND_AGENTGENOME_ENABLED", "1")
     monkeypatch.setattr(bootstrap, "build_experiment_plan_store", lambda: None)
     monkeypatch.setattr(bootstrap, "set_workflow_status_dispatcher", lambda _: None)
     app = FastAPI()
+    app.state.config = Config(platform_sdk_enabled=sdk_enabled)
     app.state.conversation_service = SimpleNamespace(
         conversations_dir=tmp_path / "conversations", idle_eviction_timeout=0
     )
@@ -40,6 +43,7 @@ async def test_product_runtime_registers_only_pi(tmp_path, monkeypatch, configur
         assert runtime._workflows is None
         adapter = runtime.adapters["pi"]
         assert isinstance(adapter, PiAdapter)
+        assert adapter._platform_sdk_configured is sdk_enabled
         hook = adapter._business_tools.training_artifact_hook
         assert hook is not None
         record = AsyncMock(return_value=1)

@@ -46,6 +46,9 @@ from harness_adapter.pi_adapter.tool_output import (
 )
 from pyromind_agent_server.api.schemas import AgentLLMConfig
 from pyromind_common.sdk.workspace.local import LocalWorkspace
+from pyromind_common.tools.workflow.validate_workflow_dsl import (
+    ValidateWorkflowDslAction,
+)
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import UserMessageCommand
 from pyromind_runtime.domain.content import TextContent
@@ -487,7 +490,7 @@ async def test_validation_reads_the_dsl_at_the_adapter_boundary(
         _context: ToolExecutionContext,
         **_kwargs,
     ) -> dict[str, Any]:
-        captured["execute"] = {"name": name, "arguments": arguments}
+        captured["execute"] = name, ValidateWorkflowDslAction.model_validate(arguments)
         return {
             "is_error": False,
             "content": [],
@@ -508,7 +511,8 @@ async def test_validation_reads_the_dsl_at_the_adapter_boundary(
 
     arguments = {
         "dsl_path": "public_data/subagents/task/workflow_canvas/workflow.py",
-        "name": "workflow",
+        "name": "pipeline",
+        "test_mode": True,
     }
     params: dict[str, Any] = {
         "tool_name": "validate_workflow_dsl",
@@ -528,10 +532,19 @@ async def test_validation_reads_the_dsl_at_the_adapter_boundary(
         "path": arguments["dsl_path"],
         "max_bytes": 2 * 1024 * 1024,
     }
-    assert captured["execute"] == {
-        "name": "validate_workflow_dsl",
-        "arguments": {**arguments, "dsl": "workflow = InputNode()"},
-    }
+    assert captured["execute"] == (
+        "validate_workflow_dsl",
+        ValidateWorkflowDslAction(
+            dsl="workflow = InputNode()", name="pipeline", test_mode=True
+        ),
+    )
+
+    del captured["read"]
+    with pytest.raises(ValidationError, match="pass at most one"):
+        await adapter._runner_request(
+            session, method, {**params, "arguments": {**arguments, "dsl": "other"}}
+        )
+    assert "read" not in captured
 
 
 async def test_idle_unexpected_runner_exit_is_silent_and_restarts_lazily(
@@ -1188,6 +1201,7 @@ async def test_runner_loads_sandbox_skills_and_business_tools(
             "workflow_debug",
             "inspect_workflow_task",
             "training_analysis",
+            "label_studio_project",
             "label_studio_create_project",
             "label_studio_get_project",
             "label_studio_project_status",
@@ -1241,7 +1255,15 @@ async def test_sandbox_session_prompt_steers_storage_reads(
         assert "Prefer read for ordinary file inspection" in prompt
         assert "Storage is writable" in prompt
         assert "Every dataset this session" in prompt
-        assert "Platform task state comes from the platform tools" in prompt
+        assert (
+            "Platform task state comes from platform APIs, never from this workspace"
+            in prompt
+        )
+        assert (
+            "With SDK access, query task and node status or logs using the SDK"
+            in prompt
+        )
+        assert "Otherwise use the available\ninspect_workflow_task tool" in prompt
         assert "Do not search the filesystem or" in prompt
         assert f"Use {DEFAULT_MOUNT_PATH}/<path> for Storage files everywhere" in prompt
         assert "remove or replace that prefix" in prompt
@@ -1310,10 +1332,14 @@ def test_business_tool_specs_are_generated_from_openhands_definitions() -> None:
     ]
     host = PyromindBusinessToolHost(roots)
     specs = host.specs()
-    assert len(specs) == 29
-    assert {"edp_render", "edp_submit", "edp_aggregate", "update_plan"} <= {
-        spec["name"] for spec in specs
-    }
+    assert len(specs) == 30
+    assert {
+        "edp_render",
+        "edp_submit",
+        "edp_aggregate",
+        "update_plan",
+        "label_studio_project",
+    } <= {spec["name"] for spec in specs}
     assert all(spec["input_schema"].get("type") == "object" for spec in specs)
 
     sandbox_specs = host.specs(sandbox=True)
@@ -1990,14 +2016,13 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
     adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
     files = PiSessionFiles(tmp_path / "conversation-1")
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
-    session = SimpleNamespace(
+    session = pi_adapter_module._PiSession(
         session_id="conversation-1",
         workspace_root=tmp_path / "conversation-1",
-        workspace=None,
-        finished_runs=set(),
-        running=True,
         files=files,
-        queue=asyncio.Queue(),
+        config=files.load_session(),
+        context=RequestContext(user_id="42"),
+        running=True,
     )
     frame = {
         "protocolVersion": 2,
@@ -2010,11 +2035,13 @@ async def test_adapter_ignores_duplicate_run_finished(tmp_path) -> None:
         "payload": {"outcome": {"status": "completed", "stop_reason": "stop"}},
     }
 
-    await adapter._runner_event(cast(Any, session), frame)
-    await adapter._runner_event(cast(Any, session), {**frame, "eventId": "e2"})
+    await adapter._runner_event(session, frame)
+    await adapter._runner_event(session, {**frame, "eventId": "e2"})
 
     assert session.queue.qsize() == 1
-    assert (await session.queue.get()).payload["status"] == "idle"
+    completed = await session.queue.get()
+    assert completed is not None
+    assert completed.payload["status"] == "idle"
 
 
 async def test_run_failure_is_delivered_when_sandbox_snapshot_is_unavailable(
@@ -2023,12 +2050,13 @@ async def test_run_failure_is_delivered_when_sandbox_snapshot_is_unavailable(
     adapter = PiAdapter(tmp_path, terminal_backend="sandbox")
     files = PiSessionFiles(tmp_path / "conversation-1")
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
-    session = SimpleNamespace(
+    session = pi_adapter_module._PiSession(
         session_id="conversation-1",
-        finished_runs=set(),
-        running=True,
+        workspace_root=tmp_path / "conversation-1",
         files=files,
-        queue=asyncio.Queue(),
+        config=files.load_session(),
+        context=RequestContext(user_id="42"),
+        running=True,
     )
 
     async def unavailable(_session):
@@ -2036,7 +2064,7 @@ async def test_run_failure_is_delivered_when_sandbox_snapshot_is_unavailable(
 
     monkeypatch.setattr(adapter, "_read_workflow", unavailable)
     await adapter._runner_event(
-        cast(Any, session),
+        session,
         {
             "eventId": "completion-1",
             "sessionId": "conversation-1",
@@ -2049,6 +2077,7 @@ async def test_run_failure_is_delivered_when_sandbox_snapshot_is_unavailable(
     )
 
     completion = session.queue.get_nowait()
+    assert completion is not None
     assert completion.payload["status"] == "error"
     error = completion.payload["error"]
     assert isinstance(error, dict) and error["code"] == "model_error"
@@ -2061,14 +2090,13 @@ async def test_adapter_projects_generic_write_completion_to_workflow(tmp_path) -
     workspace = tmp_path / "conversation-1"
     files = PiSessionFiles(workspace)
     files.initialize({"model": {"provider": "openai", "id": "gpt-5"}})
-    session = SimpleNamespace(
+    session = pi_adapter_module._PiSession(
         session_id="conversation-1",
         workspace_root=workspace,
-        workspace=None,
-        finished_runs=set(),
-        running=True,
         files=files,
-        queue=asyncio.Queue(),
+        config=files.load_session(),
+        context=RequestContext(user_id="42"),
+        running=True,
     )
     frame = {
         "protocolVersion": 2,
@@ -2090,13 +2118,18 @@ async def test_adapter_projects_generic_write_completion_to_workflow(tmp_path) -
         },
     }
 
-    await adapter._runner_event(cast(Any, session), frame)
+    await adapter._runner_event(session, frame)
 
-    assert (await session.queue.get()).type == "operation.completed"
+    completed = await session.queue.get()
+    assert completed is not None
+    assert completed.type == "operation.completed"
     modified = await session.queue.get()
+    assert modified is not None
     assert modified.type == "workflow.modified"
     assert modified.run_id == "run-1"
-    assert session.files.load_inflight()["workflow_modified"] is True
+    inflight = session.files.load_inflight()
+    assert inflight is not None
+    assert inflight["workflow_modified"] is True
     assert session.queue.empty()
     assert not _is_workflow_mutation(
         workspace,

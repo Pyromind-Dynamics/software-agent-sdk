@@ -21,11 +21,42 @@ class TaskOrigin(ContractModel):
         return self
 
 
+PLATFORM_TASK_KINDS = (
+    "workflow_run",
+    "workflow_debug",
+    "data_preparation",
+    "evaluation",
+    "data_cleaning",
+    "environment_processing_render",
+    "environment_processing",
+    "environment_processing_aggregate",
+)
+
+
+class ProjectTaskReference(ContractModel):
+    project_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    attempt: int = Field(ge=1)
+    plan_sequence: int = Field(ge=1)
+
+
 class TaskCorrelation(TaskOrigin):
     version: Literal[1] = 1
     source: Literal["agent"] = "agent"
     conversation_id: str = Field(min_length=1)
     task_kind: str = Field(min_length=1)
+    cluster: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    execution: ProjectTaskReference | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    origin_run_id: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
+    signature: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("conversation_id")
     @classmethod

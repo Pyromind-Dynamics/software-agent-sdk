@@ -12,6 +12,7 @@ from pyromind_runtime.domain.content import ContentBlock, JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.events import HarnessEvent
 from pyromind_runtime.domain.preparation import PreparationPolicy
+from pyromind_runtime.domain.project_storage import StorageProxyConfig
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import (
     OperationActivity,
@@ -233,6 +234,15 @@ class OperationActivityReader(Protocol):
         context: RequestContext,
     ) -> dict[str, OperationActivity]:
         """Read retained activity without creating resources or a model turn."""
+        ...
+
+
+@runtime_checkable
+class DevelopmentStorageReader(Protocol):
+    async def development_storage_proxy(
+        self, conversation_id: str
+    ) -> StorageProxyConfig | None:
+        """Read registered Storage mount metadata without acquiring a workspace."""
         ...
 
 

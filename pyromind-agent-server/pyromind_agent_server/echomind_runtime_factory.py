@@ -44,7 +44,9 @@ def build_echomind_runtime_scheduler(
                 workflow_executor=PlatformDatasetRuntimeExecutor(
                     projects_root=projects_root,
                     backend=PlatformDatasetWorkflowBackend(
-                        credential_store=credential_store
+                        conversations_dir=conversations_dir,
+                        credential_store=credential_store,
+                        projects_root=projects_root,
                     ),
                     request_context=request_context,
                 ),
@@ -52,7 +54,8 @@ def build_echomind_runtime_scheduler(
             "evaluator_runtime": EvaluatorRuntimeExecutor(
                 projects_root=str(projects_root),
                 backend=PlatformEvaluatorWorkflowBackend(
-                    credential_store=credential_store
+                    credential_store=credential_store,
+                    projects_root=projects_root,
                 ),
                 request_context=request_context,
             ),
@@ -61,6 +64,7 @@ def build_echomind_runtime_scheduler(
                 backend=PlatformTrainWorkflowBackend(
                     credential_store=credential_store,
                     conversations_dir=conversations_dir,
+                    projects_root=projects_root,
                 ),
                 request_context=request_context,
             ),

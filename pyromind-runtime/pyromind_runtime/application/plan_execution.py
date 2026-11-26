@@ -63,7 +63,11 @@ def _plan_run_id(
     if receipts:
         if any(not isinstance(ref, str) or ref != receipts[0] for ref in receipts):
             return None
-        matches = [run.run_id for run in runs if run.platform_task_id == receipts[0]]
+        matches = [
+            run.run_id
+            for run in runs
+            if receipts[0] in (run.platform_task_id, *run.platform_task_ids)
+        ]
         if explicit is not None:
             return explicit if explicit in matches else None
         return matches[0] if len(matches) == 1 else None
@@ -116,6 +120,7 @@ def plan_executions(
             run_id=run_id,
             project_id=project.project_id,
             plan_sequence=project.plan_sequence,
+            plan_attempt=int(run_id.rsplit(":", 1)[1]),
             stage_id=task.stage_id,
             stage_snapshot=stage.model_dump(mode="json"),
             task_id=task.id,
@@ -414,7 +419,7 @@ def completed_callback_task(
     matches = [
         run.task_id
         for run in snapshot.experiment_executions or ()
-        if run.platform_task_id == platform_id
+        if platform_id in (run.platform_task_id, *run.platform_task_ids)
         and (project_id is None or run.project_id == project_id)
         and run.role_id == "main"
         and (
@@ -565,6 +570,8 @@ def with_platform_states(
     snapshot: ConversationSnapshot,
     model_evals: set[str] | None = None,
     pipelines: Iterable[PipelineRun] = (),
+    *,
+    sdk_receipts: dict[str, tuple[str, str]] | None = None,
 ) -> ConversationSnapshot:
     receipts = {
         pipeline.task_id: pipeline for pipeline in pipelines if pipeline.task_id
@@ -572,21 +579,30 @@ def with_platform_states(
     tasks = {item.task_id: item for item in snapshot.external_tasks}
     runs = []
     for run in snapshot.experiment_executions or ():
-        task = tasks.get(run.platform_task_id) if run.platform_task_id else None
-        if task and run.role_id == "main":
-            if task.status in {"running", "pending", "waiting"}:
+        identities = run.platform_task_ids or (
+            (run.platform_task_id,) if run.platform_task_id else ()
+        )
+        platform = [tasks[identity] for identity in identities if identity in tasks]
+        if platform and run.role_id == "main":
+            if any(
+                task.status in {"running", "pending", "waiting"} for task in platform
+            ):
                 run = run.model_copy(update={"state": "waiting_platform"})
-            elif task.status != "succeeded":
+            elif any(task.status != "succeeded" for task in platform):
+                failed = next(task for task in platform if task.status != "succeeded")
                 run = run.model_copy(
                     update={
-                        "state": "failed" if task.status == "failed" else "cancelled",
-                        "waiting_reason": task.error_summary,
+                        "state": "failed" if failed.status == "failed" else "cancelled",
+                        "waiting_reason": failed.error_summary,
                     }
                 )
-            elif run.state in {"preparing", "queued"}:
+            elif len(platform) == len(identities) and run.state in {
+                "preparing",
+                "queued",
+            }:
                 run = run.model_copy(update={"state": "waiting_analysis"})
         if run.role_id == "main" and model_evals and run.task_id in model_evals:
-            run = check_inference_receipt(run, receipts)
+            run = check_inference_receipt(run, receipts, sdk_receipts=sdk_receipts)
         runs.append(run)
     return (
         snapshot.model_copy(update={"experiment_executions": tuple(runs)})

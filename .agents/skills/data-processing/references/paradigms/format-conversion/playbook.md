@@ -1,7 +1,7 @@
 # 格式转换（format-conversion）
 
 - **基底**：会话沙箱（Storage 已挂载为 `/workspace`）。需要平台侧冻结脚本和审计报告
-  时改用 `run_dataset_cleaning` 的 Pod 路径
+  时改用 清洗任务的 Pod 路径
 - **适用**：数据集转平台训练格式（messages/DPO）、字段映射、对话结构解析、
   格式校验、SHA-256 去重；mapper 可写简单内容过滤（regex/关键词/长度）；
   断点续跑、错误隔离、report 统计
@@ -65,19 +65,25 @@ write_split(output_dir / "val.jsonl", val_rows, val_image_root)
 
 需要平台 run 目录、`report.json` 或冻结运行时时才走这里：
 
+启用 SDK 且完整清洗准备能力可用时，读取
+[SDK 提交与回调](../../../../workflow-execution/references/sdk-execution.md)，准备冻结脚本和实际图后提交。
+以下为清洗业务参数；准备依赖未就绪且
+`run_dataset_cleaning` 仍列出时，回退该旧 Tool。
+
 1. [cleaning-utils-api.md](cleaning-utils-api.md) 是正常清洗任务中唯一的
    Utils 契约。读取它和 [example_clean_script.py](example_clean_script.py)
    后编写字段映射；不要查看、搜索或反复读取 `cleaning_utils.py` 实现。只有用户明确
    要求维护 Skill/运行时，或平台行为与 API 契约矛盾时，才检查实现。
-2. 把脚本写到 `/workspace/<dir>/<name>`，再调用 `run_dataset_cleaning`，传
-   `script_path`、`input_path` 和 `limit=3`。不要自行传 `output_dir`。
-   `input_path`、`script_path` 都直接使用 `/workspace/<dir>/<name>`；工具负责转换成
-   平台内部路径，不要手工删除挂载前缀。
-   用户明确要求清洗完成后检查产物或继续处理时，设置 `continue_after_completion=true`。
-   提交后结束本轮，由后台检查任务状态并通知完成。
-3. 收到通用 callback 后，从最近一次工具 Observation 取得 `run_id` 和
-   `output_dir`（Storage 路径，如 `/workspace/runs/xxx`），直接读该目录下的 `report.json` 和
-   `output.jsonl`。
+2. 把脚本写到 `/workspace/<dir>/<name>`，准备 `script_path`、`input_path` 和
+   `limit=3`。SDK 路径由调用方选择并保存 `run_id` 及 `StagingDirectory`；
+   `staging.storage` 是冻结文件与产物的 Storage 目录，须与本地或挂载目录准确对应。
+   Tool 路径不自行传 `output_dir`。两条路径都直接使用 `/workspace/<dir>/<name>`，
+   由对应准备函数或 Tool 转换平台内部路径，不手工删除挂载前缀。
+   用户明确要求清洗完成后检查产物或继续处理时，Tool 路径设置
+   `continue_after_completion=true`。提交后结束本轮，等待完成通知。
+3. 收到通用 callback 后，SDK 路径读取调用方保存的 `run_id` 和 `staging.storage`；
+   Tool 路径从最近一次 Observation 取得 `run_id` 和 `output_dir`。
+   按该 Storage 目录（如 `/workspace/runs/xxx`）直读 `report.json` 和 `output.jsonl`。
    `report.json` 包含格式校验、统计、错误样本和 checkpoint。格式失败或存在系统性
    清洗错误时修改脚本并创建新的试跑，不恢复错误 run。失败且没有报告时按启动失败
    处理，不要解码 callback 的不透明 `error_log`。

@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import Field
+from pyromind_sdk import PyroMindAPIError
+from pyromind_sdk.client.models import TrainingTaskResponse
 from rich.text import Text
 
 from pyromind_common.sdk.tool import (
@@ -25,6 +28,7 @@ from pyromind_common.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+from pyromind_common.sdk.utils.deprecation import warn_deprecated
 from pyromind_common.tools.data_preparation.platform_submit import (
     TASK_ASSOCIATION_DIRNAME,
     DataPreparationTaskStore,
@@ -41,7 +45,12 @@ from pyromind_common.tools.utils.platform_env import (
     platform_headers,
     platform_portal_url,
 )
+from pyromind_common.tools.utils.pyromind_api_client import _parse_cookie_pairs
 from pyromind_common.tools.utils.storage_paths import to_tool_storage_path
+from pyromind_common.tools.workflow.task_submission import (
+    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
+    create_workflow_api_client,
+)
 
 
 if TYPE_CHECKING:
@@ -63,8 +72,8 @@ running task first, then edit and resubmit.
 """
 
 
-def _default_stop_url() -> str:
-    return platform_endpoint(PROD_STOP_URL, PRE_STOP_URL)
+def _default_stop_url(env: str | None = None) -> str:
+    return platform_endpoint(PROD_STOP_URL, PRE_STOP_URL, env)
 
 
 # ---------------------------------------------------------------------------
@@ -106,18 +115,30 @@ class DfStopTaskObservation(Observation):
     """Result of a stop-task request."""
 
     task_id: str | None = Field(
-        default=None, description="The resolved platform task id that was stopped."
+        default=None, description="The resolved platform task id requested to stop."
     )
     stopped: bool = Field(
         default=False, description="Whether the stop request succeeded."
     )
-    status: str = Field(default="Failed", description="Stopped or Failed.")
+    status: str = Field(
+        default="Failed", description="Stopped for an accepted request, or Failed."
+    )
+    platform_status: str | None = Field(
+        default=None,
+        description="Platform task status returned after the stop request.",
+    )
+    terminal_confirmed: bool = Field(
+        default=False,
+        description="Whether the platform confirmed a terminal task state.",
+    )
 
     @property
     def visualize(self) -> Text:
         text = Text()
         style = "bold green" if self.stopped else "bold red"
-        text.append(f"Stop task: {self.status}\n", style=style)
+        text.append(
+            f"Stop request: {'accepted' if self.stopped else 'failed'}\n", style=style
+        )
         text.append(self.text)
         return text
 
@@ -128,12 +149,14 @@ class DfStopTaskObservation(Observation):
 
 
 class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
-    """Resolve the task id and call the platform stop_task API."""
+    """Resolve the task id and request a stop through the platform SDK."""
 
     def __init__(
         self,
         *,
         stop_url: str | None = None,
+        env: str | None = None,
+        cluster: str | None = None,
         headers: dict[str, str] | None = None,
         secret_headers: dict[str, str] | None = None,
         timeout: float = 30.0,
@@ -141,7 +164,24 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         task_resolver: Callable[[str | None, str | None, str | None], str | None]
         | None = None,
     ) -> None:
-        self._stop_url = (stop_url or _default_stop_url()).rstrip("/")
+        self._stop_url = (stop_url or _default_stop_url(env)).rstrip("/")
+        endpoint = urlsplit(self._stop_url)
+        if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+            raise ValueError("stop_url must be an absolute HTTP(S) URL")
+        self._legacy_stop_url = stop_url is not None and self._stop_url not in {
+            PROD_STOP_URL,
+            PRE_STOP_URL,
+            platform_endpoint(PROD_STOP_URL, PRE_STOP_URL, "pre2"),
+        }
+        if self._legacy_stop_url:
+            warn_deprecated(
+                "DfStopTaskExecutor custom stop_url",
+                deprecated_in="1.29.3",
+                removed_in="1.34.0",
+                details="Use env and cluster to stop tasks through the platform SDK.",
+            )
+        self._env = env
+        self._cluster = cluster
         self._headers = dict(headers or {})
         self._secret_headers = dict(secret_headers or {})
         self._timeout = timeout
@@ -168,32 +208,45 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
                 is_error=True,
             )
 
-        headers = self._resolved_headers(conversation)
-        result = self._post_stop(task_id, headers)
-        if isinstance(result, str):
+        try:
+            headers = self._resolved_headers(conversation)
+            result = self._stop_task(task_id, headers, conversation)
+        except (
+            PyroMindAPIError,
+            httpx.RequestError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             return DfStopTaskObservation.from_text(
-                text=f"Failed to stop task {task_id}: {result}",
+                text=f"Failed to stop task {task_id}: {type(exc).__name__}: {exc}",
                 task_id=task_id,
                 stopped=False,
                 status="Failed",
                 is_error=True,
             )
 
-        failure = _failure_message(result)
-        if failure is not None:
-            return DfStopTaskObservation.from_text(
-                text=f"Failed to stop task {task_id}: {failure}",
-                task_id=task_id,
-                stopped=False,
-                status="Failed",
-                is_error=True,
-            )
-
+        platform_status = result.status if result is not None else None
         return DfStopTaskObservation.from_text(
             text=f"Task {task_id} stop request accepted.",
             task_id=task_id,
             stopped=True,
             status="Stopped",
+            platform_status=platform_status,
+            terminal_confirmed=platform_status is not None
+            and platform_status.strip().lower()
+            in {
+                "stopped",
+                "cancelled",
+                "canceled",
+                "terminated",
+                "completed",
+                "succeeded",
+                "success",
+                "failed",
+                "error",
+            },
         )
 
     # -- Resolution ---------------------------------------------------------
@@ -218,24 +271,22 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
             if store is None:
                 return None
             association = store.get(task_id)
-            if association is None:
+        else:
+            store = self._task_store(conversation)
+            if store is None:
                 return None
-            if str(association.conversation_id) != str(conversation.id):
-                return None
-            return task_id
-
-        store = self._task_store(conversation)
-        if store is None:
+            association = None
+            if action.run_id and action.run_id.strip():
+                association = store.get_by_run_id(action.run_id.strip())
+            if association is None and output_dir is not None:
+                association = store.get_by_output_dir(output_dir)
+        if association is None:
             return None
-        if action.run_id and action.run_id.strip():
-            association = store.get_by_run_id(action.run_id.strip())
-            if association is not None:
-                return association.task_id
-        if output_dir is not None:
-            association = store.get_by_output_dir(output_dir)
-            if association is not None:
-                return association.task_id
-        return None
+        if conversation is not None and str(association.conversation_id) != str(
+            conversation.id
+        ):
+            return None
+        return association.task_id
 
     def _task_store(
         self, conversation: ToolConversation | None
@@ -249,7 +300,7 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
             return None
         return DataPreparationTaskStore(state_dir)
 
-    # -- HTTP ---------------------------------------------------------------
+    # -- SDK ----------------------------------------------------------------
 
     def _resolved_headers(
         self, conversation: ToolConversation | None
@@ -259,35 +310,58 @@ class DfStopTaskExecutor(ToolExecutor[DfStopTaskAction, DfStopTaskObservation]):
         headers.update(_resolve_secret_headers(conversation, self._secret_headers))
         return headers
 
-    def _post_stop(self, task_id: str, headers: dict[str, str]) -> dict[str, Any] | str:
-        try:
-            response = httpx.post(
-                platform_portal_url(self._stop_url, headers),
-                headers=platform_headers(headers),
-                json={"task_id": _coerce_task_id(task_id)},
-                timeout=self._timeout,
+    def _stop_task(
+        self,
+        task_id: str,
+        headers: dict[str, str],
+        conversation: ToolConversation | None,
+    ) -> TrainingTaskResponse | None:
+        if self._legacy_stop_url:
+            self._stop_legacy_task(task_id, headers)
+            return None
+        normalized = {name.lower(): value for name, value in headers.items()}
+        auth_token = normalized.get("auth_token") or _parse_cookie_pairs(
+            normalized.get("cookie", "")
+        ).get("auth_token")
+        if conversation is not None:
+            state = cast("ToolState", conversation.state)
+            auth_token = (
+                state.secret_registry.get_secret_value(
+                    PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET
+                )
+                or auth_token
             )
-        except httpx.RequestError as exc:
-            return f"{type(exc).__name__}: {exc}"
-        return _decode_json_response(response, "Pyromind stop_task API")
+        endpoint = urlsplit(platform_portal_url(self._stop_url, headers))
+        env = self._env or {
+            "pre-api-portal.pyromind.ai": "pre",
+            "pre2-api-portal.pyromind.ai": "pre2",
+        }.get(endpoint.hostname or "", "prod")
+        with create_workflow_api_client(
+            env=env,
+            cluster=self._cluster,
+            auth_token=auth_token,
+            headers=headers,
+            timeout=int(self._timeout),
+        ) as client:
+            return client.studio.stop(task_id)
 
-
-def _coerce_task_id(task_id: str) -> int | str:
-    # The studio_api stop_task contract expects a numeric task_id; send an int
-    # when the stored id is digit-only, otherwise pass the raw value through.
-    return int(task_id) if task_id.isdigit() else task_id
-
-
-def _failure_message(payload: dict[str, Any]) -> str | None:
-    success = payload.get("success")
-    if success is False:
-        message = payload.get("message")
-        return str(message) if message else "stop_task reported failure"
-    code = payload.get("code")
-    if isinstance(code, int) and code not in (0, 200):
-        message = payload.get("message")
-        return str(message) if message else f"stop_task returned code {code}"
-    return None
+    def _stop_legacy_task(self, task_id: str, headers: dict[str, str]) -> None:
+        response = httpx.post(
+            platform_portal_url(self._stop_url, headers),
+            headers=platform_headers(headers),
+            json={"task_id": int(task_id) if task_id.isdigit() else task_id},
+            timeout=self._timeout,
+        )
+        payload = _decode_json_response(response, "Pyromind stop_task API")
+        if isinstance(payload, str):
+            raise ValueError(payload)
+        code = payload.get("code")
+        if payload.get("success") is False or (
+            isinstance(code, int) and code not in (0, 200)
+        ):
+            raise ValueError(
+                str(payload.get("message") or "stop_task reported failure")
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +380,8 @@ class DfStopTaskTool(ToolDefinition[DfStopTaskAction, DfStopTaskObservation]):
     ) -> Sequence[Self]:
         stop_url_value = params.pop("stop_url", None)
         stop_url = str(stop_url_value) if stop_url_value is not None else None
+        env = params.pop("env", None)
+        cluster = params.pop("cluster", None)
         headers = _normalize_headers(params.pop("headers", None))
         secret_headers = _normalize_headers(
             params.pop("storage_secret_headers", params.pop("secret_headers", None))
@@ -326,6 +402,8 @@ class DfStopTaskTool(ToolDefinition[DfStopTaskAction, DfStopTaskObservation]):
                 observation_type=DfStopTaskObservation,
                 executor=DfStopTaskExecutor(
                     stop_url=stop_url,
+                    env=env,
+                    cluster=cluster,
                     headers=headers,
                     secret_headers=secret_headers,
                     timeout=timeout,

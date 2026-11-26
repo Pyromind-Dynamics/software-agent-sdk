@@ -1,14 +1,19 @@
 """Tests for the frozen sandbox_runner.py skill script (edp paradigm)."""
 
 import importlib.util
+import json
 import logging
 import shlex
 import sys
 import types
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from pyromind_sdk import PyroMindAPIClient
+
+from pyromind_common.tools.utils import pyromind_api_client
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -291,3 +296,75 @@ def test_delete_sandbox_leak_is_loud_but_not_fatal(
         runner._delete_sandbox(client, "sb-1")
     assert client.deleted == ["sb-1"]
     assert "failed to delete sandbox sb-1" in caplog.text
+
+
+@pytest.mark.parametrize("explicit_api_key", [False, True])
+def test_main_uses_sdk_api_key_without_cookie_exchange(
+    runner: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_api_key: bool
+) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "name": "environment-only",
+                "steps": [{"name": "probe"}],
+                "verdict": {"kind": "exit_code"},
+            }
+        )
+    )
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("")
+    monkeypatch.setenv("PYROMIND_API_KEY", "environment-api-key")
+    monkeypatch.setenv("PYROMIND_BASE_URL", "https://private-platform.example/api/v1")
+    monkeypatch.setenv("PYROMIND_AUTH_TOKEN", "request-token-must-not-be-used")
+    forbidden_cookie_client = MagicMock(side_effect=AssertionError("Cookie path used"))
+    forbidden_key_exchange = MagicMock(side_effect=AssertionError("Key exchange used"))
+    monkeypatch.setattr(runner, "create_sandbox_api_client", forbidden_cookie_client)
+    monkeypatch.setattr(pyromind_api_client, "get_api_key", forbidden_key_exchange)
+    sdk_arguments = []
+    sdk_instances = []
+
+    def sdk_client(**kwargs: Any) -> PyroMindAPIClient:
+        sdk_arguments.append(kwargs)
+        client = PyroMindAPIClient(**kwargs)
+        sdk_instances.append(client)
+        return client
+
+    monkeypatch.setattr(runner, "PyroMindAPIClient", sdk_client)
+    arguments = [
+        "--profile",
+        str(profile),
+        "--manifest",
+        str(manifest),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--env",
+        "pre",
+        "--cluster",
+        "us-west-1#pre",
+        "--auth-token",
+        "explicit-request-token-must-not-be-used",
+    ]
+    if explicit_api_key:
+        arguments.extend(["--api-key", "explicit-api-key"])
+    try:
+        assert runner.main(arguments) == 0
+        assert sdk_arguments == [
+            {
+                "api_key": "explicit-api-key"
+                if explicit_api_key
+                else "environment-api-key",
+                "base_url": "https://private-platform.example/api/v1",
+                "cluster": "us-west-1#pre",
+                "max_retries": 0,
+            }
+        ]
+        forbidden_cookie_client.assert_not_called()
+        forbidden_key_exchange.assert_not_called()
+        for path in (tmp_path / "output").rglob("*"):
+            if path.is_file():
+                assert "api-key" not in path.read_text()
+                assert "request-token" not in path.read_text()
+    finally:
+        for client in sdk_instances:
+            client.close()

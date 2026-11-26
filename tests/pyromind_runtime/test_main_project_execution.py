@@ -455,6 +455,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                         for run in s.experiment_executions or ()
                     )
                 )
+                assert snapshot.experiment_executions
                 assert (
                     next(
                         r.stage_id
@@ -556,9 +557,8 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                 context,
             )
             snapshot = await runtime.get_snapshot(scope, context)
-            assert all(
-                r.state == "succeeded" for r in snapshot.experiment_executions or ()
-            )
+            assert snapshot.experiment_executions
+            assert all(r.state == "succeeded" for r in snapshot.experiment_executions)
             execution_prompt = requests[2]["messages"][0]["content"]
             assert profile.development_product_instructions in execution_prompt
             assert profile.instructions not in execution_prompt
@@ -566,9 +566,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                 profile.development_skill_allowlist
             )
             (training,) = (
-                r
-                for r in snapshot.experiment_executions or ()
-                if r.stage_id == "training"
+                r for r in snapshot.experiment_executions if r.stage_id == "training"
             )
             assert training.run_id.endswith(":training:3")
             assert training.platform_task_id == "task-123"
@@ -632,7 +630,8 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             )
             await runtime.submit_command(scope, follow_up, context)
             snapshot = await runtime.get_snapshot(scope, context)
-            assert [item["task_id"] for item in snapshot.experiment_queue or ()] == [
+            assert snapshot.experiment_queue
+            assert [item["task_id"] for item in snapshot.experiment_queue] == [
                 "requirement:while-reviewing"
             ]
             assert "Check sample coverage" not in json.dumps(requests[-1])
@@ -661,7 +660,7 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
     adapter = FakeAdapter()
     runtime = ConversationRuntime(root, adapter, preparation_store=preparation)
     policy = SessionPolicy(
-        configuration_version=2,
+        configuration_version=ECHOMIND_PRODUCT_PROFILE.configuration_version,
         product_instructions="Review the plan.",
         development_product_instructions="Execute the approved plan directly.",
         preparation_policy=PreparationPolicy(
@@ -689,6 +688,18 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
             ),
             context,
         )
+        previous_policy = SessionPolicy(
+            configuration_version=28,
+            preparation_policy=old_policy,
+            tool_allowlist=("read", "set_preparation_plan"),
+            development_tool_allowlist=("read", "subagent"),
+            command_allowlist=("create_project",),
+            delegated_roles=({"name": "eval"},),
+        )
+        assert await runtime.apply_session_configuration(
+            scope, previous_policy, context
+        )
+        assert runtime._store(scope).configuration_version() == 28
         await runtime.preparation_call(
             scope,
             "set_preparation_plan",
@@ -725,10 +736,12 @@ async def test_retire_roles_after_running_stage_and_recover_queued_requirement(
         assert adapter.session_policies[-1][1].product_instructions == (
             policy.development_product_instructions
         )
+        assert store.configuration_version() == policy.configuration_version
         assert store.access_policy()["delegated_roles"] == ()
         snapshot = await runtime.get_snapshot(scope, context)
         assert snapshot.project is not None
         assert snapshot.project.plan == ready_request.plan
+        assert snapshot.experiment_executions
         assert any(
             r.run_id == "legacy-run" and r.stage_id == "evaluation"
             for r in snapshot.experiment_executions or ()

@@ -1,0 +1,116 @@
+---
+title: CUSTOM 沙箱 SDK
+description: 创建并等待沙箱就绪，读取和写入文件，确认命令退出状态并释放资源。
+---
+
+适用版本：`pyromind-sdk==0.1.17`。下面是已配置鉴权的独立 SDK 脚本示例。
+系统消息明确启用 SDK 的 Workbench 主会话，使用 `$PYROMIND_SDK_PYTHON` 操作沙箱，
+身份、API 地址、集群和有效默认镜像自动注入；按 `sandbox` Skill 的操作表读取参考。
+对应 Tool 实现保留但不注入，OS 模式仍使用 `sandbox_terminal` 执行命令。
+其他上下文继续使用当前已启用的入口，完整范围见 [Agent 操作索引](agent-operations.mdx)。
+
+## 创建并等待就绪
+
+独立脚本需预先配置 `PYROMIND_API_KEY`、目标 `PYROMIND_CLUSTER` 和可用的
+`PYROMIND_SANDBOX_IMAGE`。不要从 Agent 服务端文件提取凭据。
+资源值仅为示例，按目标集群规格选择。
+
+```python
+import os
+
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import ResourceConfig, SandboxRequest, SandboxType
+
+client = PyroMindAPIClient(cluster=os.environ["PYROMIND_CLUSTER"], max_retries=0)
+sandbox = client.sandboxes.create(
+    SandboxRequest(
+        name="sdk-file-example",
+        sandbox_type=SandboxType.CUSTOM,
+        image=os.environ["PYROMIND_SANDBOX_IMAGE"],
+        resources=ResourceConfig(cpu="4", memory="8Gi"),
+    )
+)
+print(sandbox.id)
+ready = client.sandboxes.wait_for_sandbox_status(
+    sandbox.id, target_status="running", timeout=180, check_interval=3
+)
+if not ready:
+    raise RuntimeError(f"Sandbox is not running: {sandbox.id}")
+```
+
+`create()` 返回实例不代表容器已就绪。`create_and_wait(request, target_status=...)`
+即使等待失败也可能返回最近一次实例信息；使用它时仍需检查返回的 `status`。
+等待失败后保留沙箱 ID，以便查询状态或清理，不要直接重复创建。
+
+## 读取和写入文件
+
+文件 API 用于 CUSTOM 沙箱，`path` 是容器内的绝对路径。
+示例使用容器临时目录；平台 Storage 数据需使用当前沙箱实际配置的挂载路径。
+
+```python
+path = "/tmp/sdk-example.txt"
+payload = "hello\n".encode("utf-8")
+receipt = client.sandboxes.write_file(sandbox.id, path, payload)
+content = client.sandboxes.read_file(sandbox.id, path)
+if receipt["size"] != len(payload) or content != payload:
+    raise RuntimeError("Sandbox file verification failed")
+print(content.decode("utf-8"))
+```
+
+`read_file(sandbox_id, path)` 返回 `bytes`。
+`write_file(sandbox_id, path, source)` 的 `source` 若为字符串或 `PathLike`，表示调用端的本地文件路径；
+写入文本内容时传 `text.encode("utf-8")`，不要直接传文本字符串。
+它也接受二进制文件对象，返回含 `path` 和 `size` 的字典。
+这两个文件方法不直接完成平台 Storage 与沙箱之间的传输；Storage 客户端边界见 [操作索引](agent-operations.mdx#storage-客户端边界)。
+
+删除文件用 `client.sandboxes.delete_file(sandbox.id, path)`；
+目录递归删除需显式传 `recursive=True`。
+
+## 执行命令
+
+```python
+result = client.sandboxes.exec_command(
+    sandbox.id, ["cat", "/tmp/sdk-example.txt"], cwd="/tmp", timeout=60
+)
+if result.returncode != 0:
+    raise RuntimeError(f"Command exited with {result.returncode}: {result.stderr}")
+print(result.output)
+```
+
+`exec_command()` 当前通过流式执行汇总 stdout、stderr 和退出码；非零退出码不会自动抛异常。
+流被拒绝、断连且没有收到退出事件，或超时，抛出
+`pyromind_sdk.exec_stream.SandboxExecStreamError`。
+这些情况的命令结果未确认；先检查任务副作用，再决定是否重试。
+
+需要增量输出时使用
+`client.sandboxes.exec_command_stream(sandbox.id, command, cwd="/tmp", timeout=60, tty=False)`。
+迭代得到 `stdout`、`stderr` 和最终 `exit` 事件；输出字段 `data` 可能是 `bytes` 或 `str`，
+只有 `exit.returncode == 0` 才可确认命令成功。
+`exec_command` 默认超时为 600 秒；`exec_command_stream` 的 `timeout=None` 不设总时限，
+应为有界任务显式传超时。`tty=True` 不等于交互式 stdin 会话。
+
+真实集群验收需验证 WebSocket 连通性、退出码、断流、超时和大输出，以及实际挂载路径、
+空文件/分片写入和写后读取结果。原生 SDK 的 WebSocket 会话不读取环境代理，
+在当前 OS 沙箱不可直接使用，所以该模式仍注入 `sandbox_terminal`。
+
+## 暂停与删除
+
+删除运行中的沙箱前先暂停，确认停止后再删除：
+
+```python
+current = client.sandboxes.get_sandbox(sandbox.id)
+if current.status.lower() == "running":
+    client.sandboxes.pause(sandbox.id)
+    stopped = client.sandboxes.wait_for_sandbox_status(
+        sandbox.id,
+        target_status="paused",
+        timeout=60,
+        intermediate_statuses=["running", "stopping", "pausing"],
+    )
+    if not stopped:
+        raise RuntimeError(f"Sandbox has not stopped: {sandbox.id}")
+client.sandboxes.delete(sandbox.id)
+client.close()
+```
+
+需要继续使用停止的实例时调用 `client.sandboxes.resume(sandbox.id)`，然后重新等待 `running`。

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import {
   SandboxManager,
@@ -19,6 +19,7 @@ import {
   workspacePolicyDenyWritePaths,
 } from "../src/workspace-sandbox.js";
 import { WorkspaceAccessPolicy } from "../src/workspace-policy.js";
+import { platformSdkNetworkDomains, platformSdkReadRoots } from "../src/sdk-environment.js";
 
 const osSandboxAvailable = process.platform === "darwin"
   ? existsSync("/usr/bin/sandbox-exec")
@@ -181,6 +182,66 @@ test("sandboxed commands allow cd within one call and reset cwd for every call",
   assert(updated?.filesystem.denyRead.includes(await realpath(tree.repositorySource)));
   if (previousVmemLimit === undefined) delete process.env.OH_SANDBOX_VMEM_LIMIT;
   else process.env.OH_SANDBOX_VMEM_LIMIT = previousVmemLimit;
+});
+
+test("SDK network and interpreter scope stays active until completion and is removed for child commands", async (context) => {
+  const tree = await workspaceTree();
+  context.after(() => rm(dirname(tree.home), { recursive: true, force: true }));
+  const sdkRoot = join(dirname(tree.repositorySource), ".venv");
+  const interpreter = join(sdkRoot, "bin", "python3");
+  await mkdir(dirname(interpreter), { recursive: true });
+  await symlink(process.execPath, interpreter);
+  const canonicalSdkRoot = await realpath(sdkRoot);
+  const repositorySource = await realpath(tree.repositorySource);
+  const configurations: SandboxRuntimeConfig[] = [];
+  const commands: string[] = [];
+  const started = Promise.withResolvers<void>();
+  const complete = Promise.withResolvers<void>();
+  const operations = createWorkspaceSandboxedBashOperations(tree.policy, {
+    userHome: tree.home,
+    runtimeReadRoots: [],
+    runtimeReadRootsForEnvironment: platformSdkReadRoots,
+    allowedNetworkDomains: platformSdkNetworkDomains,
+    controller: {
+      checkDependencies: () => true,
+      initialize: async () => {},
+      isSandboxingEnabled: () => true,
+      updateConfig: () => {},
+      wrapWithSandbox: async (command, _shell, config) => {
+        assert(config);
+        configurations.push(config);
+        return command;
+      },
+    },
+    localOperations: {
+      exec: async (command) => {
+        commands.push(command);
+        if (commands.length === 1) { started.resolve(); await complete.promise; }
+        return { exitCode: 0 };
+      },
+    },
+  });
+  const sdk = operations.exec("SDK read", tree.workspace, {
+    onData: () => {},
+    env: {
+      PYROMIND_API_KEY: "sdk-access-key",
+      PYROMIND_BASE_URL: "https://sdk.example/api/v1",
+      PYROMIND_SDK_PYTHON: interpreter,
+    },
+  });
+  await started.promise;
+  const child = operations.exec("child work", tree.workspace, { onData: () => {}, env: {} });
+  await Promise.resolve();
+  assert.equal(configurations.length, 1);
+  complete.resolve();
+  await Promise.all([sdk, child]);
+  assert.deepEqual(configurations.map((config) => config.network.allowedDomains), [["sdk.example"], []]);
+  assert(!configurations[0]!.filesystem.denyRead.includes(canonicalSdkRoot));
+  assert(configurations[1]!.filesystem.denyRead.includes(canonicalSdkRoot));
+  assert(configurations.every((config) => config.filesystem.denyRead.includes(repositorySource)));
+  assert(configurations.every((config) => config.filesystem.denyWrite.includes(canonicalSdkRoot)));
+  assert(commands[0]!.includes("export NO_PROXY= no_proxy=; SDK read"));
+  assert(!commands[1]!.includes("NO_PROXY"));
 });
 
 test("sandbox vmem cap parses OH_SANDBOX_VMEM_LIMIT on Linux", async () => {

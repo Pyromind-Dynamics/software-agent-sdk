@@ -28,13 +28,15 @@ import shlex
 import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic import Field, field_validator, model_validator
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import (
+    build_edp_workflow as build_edp_workflow,
+)
 from pyromind_common.sdk.conversation.state import ActiveLongTask
 from pyromind_common.sdk.tool import (
     Action,
@@ -434,40 +436,12 @@ def build_edp_command(
     return " && ".join([*setup_steps, pipeline_step])
 
 
-def build_edp_workflow(
-    *,
-    run_id: uuid.UUID,
-    command: str,
-    cpu: int,
-    memory: int,
-) -> dict[str, Any]:
-    return {
-        "id": str(run_id),
-        "name": f"agent-edp-{str(run_id)[:8]}",
-        "nodes": [
-            {
-                "id": "1",
-                "type": "default",
-                "position": {"x": 0, "y": 0},
-                "data": {
-                    "display_name": "Env Validation Batch",
-                    "nodeType": DATAFLOW_NODE_TYPE,
-                    "config": {"command": command, "cpu": cpu, "memory": memory},
-                },
-            }
-        ],
-        "edges": [],
-        "viewport": {"x": 0, "y": 0, "zoom": 1},
-        "timestamp": datetime.now(UTC).isoformat(),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
 
 
-class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
+class EdpSubmitRunner:
     """Stage runner/profile/manifest and submit one batch task."""
 
     def __init__(
@@ -490,6 +464,37 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
         self._storage_headers = storage_headers or {}
         self._storage_secret_headers = storage_secret_headers or {}
         self._timeout = timeout
+
+    @classmethod
+    def from_options(cls, **params: Any) -> Self:
+        env_value = params.pop("env", None)
+        env = str(env_value) if env_value is not None else None
+        cluster_value = params.pop("cluster", None)
+        cluster = str(cluster_value) if cluster_value is not None else None
+        params.pop("current_user", None)
+        headers = params.pop("headers", None) or {}
+        runtime_dir_value = params.pop("runtime_dir", None)
+        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
+        storage_base_url_value = params.pop("storage_base_url", None)
+        storage_base_url = (
+            str(storage_base_url_value) if storage_base_url_value is not None else None
+        )
+        storage_headers = params.pop("storage_headers", None) or None
+        storage_secret_headers = params.pop("storage_secret_headers", None) or None
+        timeout = int(params.pop("timeout", 30))
+        if params:
+            names = ", ".join(sorted(params))
+            raise ValueError(f"EdpSubmitTool got unknown params: {names}")
+        return cls(
+            env=env,
+            cluster=cluster,
+            headers=headers,
+            runtime_dir=runtime_dir,
+            storage_base_url=storage_base_url,
+            storage_headers=storage_headers,
+            storage_secret_headers=storage_secret_headers,
+            timeout=timeout,
+        )
 
     # -- staging -----------------------------------------------------------
 
@@ -654,7 +659,7 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
 
     # -- submission --------------------------------------------------------
 
-    def __call__(
+    def run(
         self,
         action: EdpSubmitAction,
         conversation: ToolConversation | None = None,
@@ -735,6 +740,7 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
                     name=str(workflow["name"]),
                     conversation_id=str(conversation.id),
                     task_kind="environment_processing",
+                    retry_create=False,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Stop the batch at the first failing shard: partially
@@ -790,6 +796,21 @@ class EdpSubmitExecutor(ToolExecutor[EdpSubmitAction, EdpSubmitObservation]):
 # ---------------------------------------------------------------------------
 
 
+class EdpSubmitExecutor(
+    EdpSubmitRunner, ToolExecutor[EdpSubmitAction, EdpSubmitObservation]
+):
+    def __call__(
+        self,
+        action: EdpSubmitAction,
+        conversation: ToolConversation | None = None,
+    ) -> EdpSubmitObservation:
+        return self.run(action, conversation)
+
+
+def create_edp_submit_runner(**params: Any) -> EdpSubmitRunner:
+    return EdpSubmitRunner.from_options(**params)
+
+
 class EdpSubmitTool(ToolDefinition[EdpSubmitAction, EdpSubmitObservation]):
     """Submit environment-processing shard manifests as Studio tasks."""
 
@@ -799,39 +820,12 @@ class EdpSubmitTool(ToolDefinition[EdpSubmitAction, EdpSubmitObservation]):
         conv_state: Any = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        env_value = params.pop("env", None)
-        env = str(env_value) if env_value is not None else None
-        cluster_value = params.pop("cluster", None)
-        cluster = str(cluster_value) if cluster_value is not None else None
-        params.pop("current_user", None)
-        headers = params.pop("headers", None) or {}
-        runtime_dir_value = params.pop("runtime_dir", None)
-        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
-        storage_base_url_value = params.pop("storage_base_url", None)
-        storage_base_url = (
-            str(storage_base_url_value) if storage_base_url_value is not None else None
-        )
-        storage_headers = params.pop("storage_headers", None) or None
-        storage_secret_headers = params.pop("storage_secret_headers", None) or None
-        timeout = int(params.pop("timeout", 30))
-        if params:
-            names = ", ".join(sorted(params))
-            raise ValueError(f"EdpSubmitTool got unknown params: {names}")
         return [
             cls(
                 description=TOOL_DESCRIPTION,
                 action_type=EdpSubmitAction,
                 observation_type=EdpSubmitObservation,
-                executor=EdpSubmitExecutor(
-                    env=env,
-                    cluster=cluster,
-                    headers=headers,
-                    runtime_dir=runtime_dir,
-                    storage_base_url=storage_base_url,
-                    storage_headers=storage_headers,
-                    storage_secret_headers=storage_secret_headers,
-                    timeout=timeout,
-                ),
+                executor=EdpSubmitExecutor.from_options(**params),
                 annotations=ToolAnnotations(
                     title="edp_submit",
                     readOnlyHint=False,

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import Field
 from pyromind_sdk import PyroMindAPIClient
 
+from pyromind_common.platform.workflows import (
+    WORKFLOW_ATTEMPT_STATE_KEY as WORKFLOW_ATTEMPT_STATE_KEY,
+    prepare_debug_workflow,
+)
 from pyromind_common.sdk.logger import get_logger
 from pyromind_common.sdk.tool.tool import (
     Action,
@@ -15,9 +20,7 @@ from pyromind_common.sdk.tool.tool import (
     ToolExecutor,
 )
 from pyromind_common.tools.workflow.dsl_to_xyflow import (
-    DslToXyflowAction,
-    DslToXyflowExecutor,
-    DslToXyflowObservation,
+    convert_dsl_to_xyflow,
 )
 from pyromind_common.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
@@ -31,7 +34,6 @@ if TYPE_CHECKING:
     from pyromind_common.sdk.conversation.base import ToolConversation
     from pyromind_common.sdk.conversation.state import ToolState
 DEFAULT_MAX_ATTEMPTS = 10
-WORKFLOW_ATTEMPT_STATE_KEY = "pyromind_workflow_attempts"
 
 
 class WorkflowDebugSubmissionAction(Action):
@@ -87,9 +89,7 @@ class WorkflowDebugSubmissionObservation(Observation):
     max_attempts: int = Field(description="The maximum number of run attempts allowed.")
 
 
-class WorkflowDebugSubmissionExecutor(
-    ToolExecutor[WorkflowDebugSubmissionAction, WorkflowDebugSubmissionObservation]
-):
+class WorkflowDebugSubmissionRunner:
     def __init__(
         self,
         *,
@@ -106,6 +106,13 @@ class WorkflowDebugSubmissionExecutor(
         self.submission_handler = None
 
     def __call__(
+        self,
+        action: WorkflowDebugSubmissionAction,
+        conversation: ToolConversation | None = None,
+    ) -> WorkflowDebugSubmissionObservation:
+        return self.run(action, conversation)
+
+    def run(
         self,
         action: WorkflowDebugSubmissionAction,
         conversation: ToolConversation | None = None,
@@ -244,6 +251,7 @@ class WorkflowDebugSubmissionExecutor(
                 name=_workflow_name,
                 conversation_id=conversation_id,
                 test_mode=True,
+                retry_create=False,
                 submission_handler=self.submission_handler,
                 source_code=source_code,
             )
@@ -272,20 +280,10 @@ class WorkflowDebugSubmissionExecutor(
                 error_log=str(exc),
             )
 
-    def _convert_dsl_to_xyflow(self, *, dsl: str, name: str) -> DslToXyflowObservation:
-        return DslToXyflowExecutor(converter_factory=None)(
-            DslToXyflowAction(dsl=dsl, name=name)
-        )
-
     def _resolve_add_test_mode(self, workflow_json: dict) -> dict:
         if not isinstance(workflow_json, dict):
             raise ValueError("Workflow JSON must be a JSON object.")
-        execution_argos = workflow_json.get("execution_argos")
-        if not isinstance(execution_argos, list):
-            execution_argos = []
-        execution_argos.append({"execution_mode": "test"})
-        workflow_json["execution_argos"] = execution_argos
-        return workflow_json
+        return prepare_debug_workflow(workflow_json)
 
     def _resolve_workflow_dsl_source(
         self, action: WorkflowDebugSubmissionAction
@@ -302,11 +300,30 @@ class WorkflowDebugSubmissionExecutor(
 
     def _resolve_dsl(self, action: WorkflowDebugSubmissionAction) -> dict:
         dsl_source = self._resolve_workflow_dsl_source(action)
-        conversion = self._convert_dsl_to_xyflow(dsl=dsl_source, name=action.name)
-        if conversion.is_error:
+        if not action.name.strip():
+            raise ValueError("Workflow name must be a non-empty string.")
+        try:
+            workflow = convert_dsl_to_xyflow(dsl_source, name=action.name)
+        except Exception as exc:
             raise ValueError(
-                conversion.text or "Failed to convert workflow DSL to xyflow."
-            )
-        if conversion.xyflow is None:
-            raise ValueError("Workflow DSL conversion did not return xyflow JSON.")
-        return conversion.xyflow
+                f"Failed to convert workflow DSL to xyflow: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            json.dumps(workflow)
+        except TypeError as exc:
+            raise ValueError(
+                f"Workflow DSL converter returned non-JSON data: {exc}"
+            ) from exc
+        return workflow
+
+
+class WorkflowDebugSubmissionExecutor(
+    WorkflowDebugSubmissionRunner,
+    ToolExecutor[WorkflowDebugSubmissionAction, WorkflowDebugSubmissionObservation],
+):
+    def __call__(
+        self,
+        action: WorkflowDebugSubmissionAction,
+        conversation: ToolConversation | None = None,
+    ) -> WorkflowDebugSubmissionObservation:
+        return self.run(action, conversation)

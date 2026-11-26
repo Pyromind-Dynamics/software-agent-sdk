@@ -18,6 +18,7 @@ from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.project_storage import StorageProxyConfig
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure import file_product_store
@@ -53,6 +54,36 @@ async def test_workspace_read_does_not_attach_an_idle_conversation(tmp_path) -> 
         )
         == "readable/public_data/project_request.json"
     )
+    assert adapter.attached == []
+
+
+async def test_development_proxy_is_scoped_and_does_not_attach(tmp_path, monkeypatch):
+    directory = tmp_path / "readable"
+    directory.mkdir()
+    FileProductStore(directory).create(
+        ConversationSnapshot(
+            conversation_id="readable", capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+    )
+    adapter = FakeAdapter()
+    runtime = ConversationRuntime(tmp_path, adapter)
+    owner = RequestContext(user_id="42")
+    assert await runtime.development_storage_proxy("readable", owner) is None
+    config = StorageProxyConfig(sandbox_id="sb-demo")
+    calls = []
+
+    async def registered(conversation_id):
+        calls.append(conversation_id)
+        return config
+
+    monkeypatch.setattr(adapter, "development_storage_proxy", registered, raising=False)
+    with pytest.raises(PermissionError):
+        await runtime.development_storage_proxy(
+            "readable", RequestContext(user_id="43")
+        )
+    assert await runtime.development_storage_proxy("readable", owner) == config
+    assert calls == ["readable"]
     assert adapter.attached == []
 
 
@@ -1089,7 +1120,7 @@ async def test_parked_history_run_notifies_the_live_conversation(tmp_path) -> No
     notice = adapter.external_task_notifications[0][1]
     assert notice.trigger_turn is True
     assert "review.out" in notice.hidden_text
-    assert "genome_resume" in notice.hidden_text
+    assert "历史经验功能已停用" in notice.hidden_text
     assert "open_url" in notice.hidden_text
     assert "artifact 路径只是回执位置" in notice.hidden_text
     assert "不要自己执行或重放 graph" in notice.hidden_text
@@ -1125,7 +1156,7 @@ async def test_a_failed_history_replay_offers_the_requeue_path(tmp_path) -> None
     )
     notice = adapter.external_task_notifications[0][1]
     assert notice.trigger_turn is True
-    assert "genome_replay_requeue" in notice.hidden_text
+    assert "历史经验功能已停用" in notice.hidden_text
     assert "不要重新沉淀" in notice.hidden_text
     assert "已发布的资产不能重排" in notice.hidden_text
     await runtime.close()
@@ -1161,7 +1192,7 @@ async def test_parked_history_run_survives_without_a_live_conversation(
     notice = adapter.external_task_notifications[0][1]
     assert notice.trigger_turn is True
     assert "review.out" in notice.hidden_text
-    assert "genome_resume" in notice.hidden_text
+    assert "历史经验功能已停用" in notice.hidden_text
     assert not store.load_snapshot().external_tasks[0].resume_pending
     await runtime.close()
 

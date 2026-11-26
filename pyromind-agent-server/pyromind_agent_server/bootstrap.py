@@ -15,7 +15,9 @@ from harness_adapter.artifact_snapshots import PlatformArtifactSnapshots
 from harness_adapter.pi_adapter import PiAdapter, resolve_pi_terminal_backend
 from harness_adapter.task_status_query import PlatformTaskStatusQuery
 from harness_adapter.workflow_submission import PlatformWorkflowSubmission
-from pyromind_agent_server.config import WORKSPACE_DIR_ENV, WORKSPACE_DIR_ENV_UPPER
+from pyromind_agent_server.config import (
+    Config,
+)
 from pyromind_agent_server.echomind_acquisition_tasks import (
     EchoMindAcquisitionTaskManager,
 )
@@ -37,6 +39,7 @@ from pyromind_agent_server.echomind_runtime_factory import (
 from pyromind_agent_server.echomind_runtime_scheduler import (
     RuntimeGraphPoller,
 )
+from pyromind_agent_server.echomind_tracer_admin import build_tracer_admin_cipher
 from pyromind_agent_server.evaluation_storage import (
     build_evaluation_storage,
     build_observation_evaluation_storage,
@@ -48,6 +51,7 @@ from pyromind_agent_server.external_task_registry import WorkflowExternalTaskReg
 from pyromind_agent_server.observability import build_execution_observer
 from pyromind_agent_server.plan_database import build_experiment_plan_store
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
+from pyromind_agent_server.project_flywheel import ProjectFlywheelServices
 from pyromind_agent_server.resource_inspector import StorageResourceInspector
 from pyromind_agent_server.storage_quota import ensure_conversation_quota
 from pyromind_agent_server.task_monitor_worker import TOKEN_ENV
@@ -65,6 +69,7 @@ from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.domain.workflow_execution import DatasetRecipeReceipt
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.infrastructure.sql_experiment_index import SQLExperimentIndex
 from pyromind_runtime.infrastructure.sqlite_task_monitor_store import (
@@ -75,53 +80,6 @@ from pyromind_runtime.ports.harness import HarnessAdapter
 
 
 logger = logging.getLogger(__name__)
-
-AGENTGENOME_HOME_ENV = "AGENTGENOME_HOME"
-# Agent workspaces live under this directory inside the mounted user Storage, so
-# the sandbox sees the same tree at ``/target-workspace/.pyromind-agent``.
-AGENTGENOME_STORAGE_DIRNAME = ".pyromind-agent"
-AGENTGENOME_DIRNAME = "agentgenome"
-
-
-def _move_legacy_agentgenome_home(home: Path, legacy: Path) -> None:
-    """Adopt a registry written before the Storage-root layout."""
-    if home.exists() or not legacy.is_dir():
-        return
-    try:
-        home.parent.mkdir(parents=True, exist_ok=True)
-        legacy.rename(home)
-    except OSError:
-        logger.warning(
-            "AgentGenome registry at %s could not move to %s; set %s to keep using it",
-            legacy,
-            home,
-            AGENTGENOME_HOME_ENV,
-            exc_info=True,
-        )
-        return
-    logger.info("Moved AgentGenome registry %s -> %s", legacy, home)
-
-
-def agentgenome_home(conversations_dir: Path) -> Path:
-    """Registry root shared by every conversation of one user.
-
-    The default sits beside the conversation workspaces inside the mounted
-    Storage, which is also what the sandbox mounts, so a frozen package is
-    readable from both sides. ``AGENTGENOME_HOME`` still wins when set.
-    """
-    configured = os.getenv(AGENTGENOME_HOME_ENV)
-    if configured:
-        return Path(configured)
-    root = _workspace_root(conversations_dir)
-    home = root / AGENTGENOME_STORAGE_DIRNAME / AGENTGENOME_DIRNAME
-    _move_legacy_agentgenome_home(home, root / AGENTGENOME_DIRNAME)
-    return home
-
-
-def _workspace_root(conversations_dir: Path) -> Path:
-    """Mounted Storage root, which stays fixed when conversations move."""
-    configured = os.getenv(WORKSPACE_DIR_ENV) or os.getenv(WORKSPACE_DIR_ENV_UPPER)
-    return Path(configured) if configured else conversations_dir.parent
 
 
 def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
@@ -163,6 +121,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         graph_run_id: str | None,
         correlation: TaskCorrelation | None = None,
         continue_after_completion: bool = False,
+        dataset_recipe: DatasetRecipeReceipt | None = None,
     ):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.submit_versioned_workflow(
@@ -174,6 +133,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             graph_run_id=graph_run_id,
             correlation=correlation,
             continue_after_completion=continue_after_completion,
+            dataset_recipe=dataset_recipe,
         )
 
     external_tasks = WorkflowExternalTaskRegistry(service.conversations_dir)
@@ -187,9 +147,13 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         )
 
     terminal_backend = resolve_pi_terminal_backend()
+    config = getattr(app.state, "config", None)
     pi_adapter = PiAdapter(
         service.conversations_dir,
         terminal_backend=terminal_backend,
+        platform_sdk_enabled=(
+            config.platform_sdk_enabled if isinstance(config, Config) else True
+        ),
         apply_workspace_quota=ensure_conversation_quota,
         pipeline_runs=pipeline_runs,
     )
@@ -229,6 +193,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             idle_eviction_seconds,
         )
     preparation_store = build_experiment_plan_store()
+    projects_root = Path(service.conversations_dir).parent / "projects"
     runtime = ConversationRuntime(
         service.conversations_dir,
         adapters,
@@ -258,6 +223,12 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         train_observer=TrainObserver(
             PlatformTrainingMetricSource(), ObservationCursor(secrets.token_bytes(32))
         ),
+        project_flywheel=ProjectFlywheelServices(
+            projects_root=projects_root,
+            conversations_dir=service.conversations_dir,
+            credential_store=build_runtime_credential_store(projects_root, config),
+            cipher=build_tracer_admin_cipher(config),
+        ),
     )
     if os.getenv("PYROMIND_TASK_MONITOR_ENABLED", "1") == "1":
         runtime.task_monitor = TaskMonitor(
@@ -270,6 +241,8 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         runtime.task_monitor.recover(service.conversations_dir)
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     pi_adapter.set_plan_submission_handler(runtime.bind_plan_submission)
+    pi_adapter.set_external_wait_provider(runtime.pending_external_tasks)
+    pi_adapter.set_sdk_context_provider(runtime.platform_sdk_context)
     pi_adapter.set_echo_chat_handler(
         runtime.echomind_chat.call, runtime.echomind_chat.model_history
     )
@@ -383,6 +356,9 @@ def resource_limits_from_environment() -> ResourceLimits:
 
 def install_product_api(app: FastAPI) -> FastAPI:
     """Install the product API and own its runtime lifecycle."""
+    from pyromind_agent_server.api.demo_collection import (
+        router as demo_collection_router,
+    )
     from pyromind_agent_server.api.echomind_chat import router as echomind_chat_router
     from pyromind_agent_server.api.echomind_observations import (
         router as observations_router,
@@ -393,6 +369,7 @@ def install_product_api(app: FastAPI) -> FastAPI:
     from pyromind_agent_server.api.evaluation_runs import (
         create_evaluation_runs_router,
     )
+    from pyromind_agent_server.api.project_flywheel import router as flywheel_router
     from pyromind_agent_server.api.router import create_product_router
 
     app.state.product_runtime = None
@@ -423,10 +400,28 @@ def install_product_api(app: FastAPI) -> FastAPI:
     app.include_router(create_product_router())
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
     app.include_router(echomind_projects_router)
+    app.include_router(demo_collection_router)
+    app.include_router(flywheel_router)
     app.include_router(echomind_chat_router)
     app.include_router(observations_router)
     app.include_router(create_evaluation_runs_router())
     return app
+
+
+async def _poll_project_flywheels(
+    runtime: ConversationRuntime, stop: asyncio.Event
+) -> None:
+    while not stop.is_set():
+        try:
+            await runtime.project_flywheel_poll()
+        except Exception as exc:
+            logger.warning("Project flywheel recovery paused (%s)", type(exc).__name__)
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=_echomind_runtime_poll_seconds()
+            )
+        except TimeoutError:
+            pass
 
 
 def _echomind_runtime_poll_seconds() -> float:
@@ -467,6 +462,11 @@ async def start_product_runtime(app: FastAPI) -> None:
     if runtime is not None:
         await runtime.recover_version_metadata()
         await runtime.start_execution_events()
+        stop = asyncio.Event()
+        app.state.echomind_flywheel_stop = stop
+        app.state.echomind_flywheel_task = asyncio.create_task(
+            _poll_project_flywheels(runtime, stop)
+        )
         conversation_service = getattr(
             app.state,
             "conversation_service",
@@ -504,6 +504,12 @@ async def stop_product_runtime(app: FastAPI) -> None:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
         app.state.task_monitor_worker = None
+    flywheel_stop = getattr(app.state, "echomind_flywheel_stop", None)
+    if flywheel_stop is not None:
+        flywheel_stop.set()
+        await app.state.echomind_flywheel_task
+        app.state.echomind_flywheel_stop = None
+        app.state.echomind_flywheel_task = None
     graph_poller = getattr(app.state, "echomind_graph_poller", None)
     if graph_poller is not None:
         await graph_poller.stop()

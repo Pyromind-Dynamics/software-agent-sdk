@@ -38,7 +38,7 @@ from pyromind_agent_server.echomind_publication import (
 )
 from pyromind_agent_server.echomind_runtime_contracts import (
     ArtifactReplayRuntimeExecutor,
-    BaselineRetainingFinalizer,
+    CandidateRecordingFinalizer,
     ContractProbeRuntimeExecutor,
     ExternalTaskIntent,
     RuntimeArtifact,
@@ -57,6 +57,8 @@ from pyromind_agent_server.echomind_storage import (
     ProjectLeaseTimeout,
     canonical_sha256,
 )
+from pyromind_runtime.domain.echomind_deployments import TERMINAL_DEPLOYMENT_STATUSES
+from pyromind_runtime.infrastructure.file_deployment_store import FileDeploymentStore
 
 
 logger = logging.getLogger(__name__)
@@ -144,7 +146,7 @@ class RuntimeGraphScheduler:
         self.publication_store = PublicationStore(self.projects_root)
         self.runtime_slot_store = RuntimeSlotStore(self.projects_root)
         self.executor_registry = RuntimeExecutorRegistry(executors)
-        self.finalizer = finalizer or BaselineRetainingFinalizer()
+        self.finalizer = finalizer or CandidateRecordingFinalizer()
         self.lease_timeout_seconds = lease_timeout_seconds
 
     def start(
@@ -951,6 +953,11 @@ class RuntimeGraphScheduler:
         execution_mode: GraphRunExecutionMode,
         require_runtime_slot: bool,
     ) -> None:
+        deployments = FileDeploymentStore(self.projects_root).list(
+            project.project.project_id
+        )
+        if any(item.status not in TERMINAL_DEPLOYMENT_STATUSES for item in deployments):
+            raise RuntimeSchedulerError("A model deployment is still in progress")
         if published.project_id != project.project.project_id:
             raise RuntimeSchedulerError("PublishedGraph belongs to another Project")
         if execution_mode == "debug":

@@ -9,21 +9,25 @@
 
 ## 打标模型（先问用户）
 
-开始预打标前，先在对话里问用户要**打标模型的 LLM 网关**，让用户书面给出三个值：
+开始预打标前，先确认**打标模型的 LLM 网关**及可用凭据来源：
 
 - `api_url`：OpenAI 兼容的 chat-completions 完整地址，例如
   `https://inference-cn-east-1.pyromind-asia.cn/inference/inf-xxxx/v1/chat/completions`；
 - `model`：该网关上的模型名，例如 `pcb_avi_sft_merge_v10`；
-- `api_key`：网关的 Bearer key。
+- `api_key_env`：当前执行环境中已授权的网关密钥变量名；不把密钥值写进对话配置。
 
-CLI 的 `gateway` 配置只写 endpoint、model 和宿主密钥环境变量名，不能写密钥。平台提交使用 `labeling_gateway` 传给
-`df_submit_pipeline`（配 `model_profile="vision"`），本次预打标用用户的模型。
-用户说没有、或明确用平台默认时**不要**传 `labeling_gateway`，直接走平台的
-`DF_API_URL` / `DF_MODEL_NAME` / `DF_API_KEY` / `DF_API_BASE_URL`。
+CLI 的 `gateway` 配置只写 endpoint、model 和宿主密钥环境变量名，不能写密钥。
+平台按 [playbook](../../playbook.md)准备并提交 DataFlow 全量任务：设置
+`model_profile="vision"`，在准备和提交 Python 进程的内存中整体替换
+`PYROMIND_DATAFLOW_PROFILES` 的 `vision` 项；端点、模型及密钥都来自同一用户网关。
+密钥只从该已授权变量取值，不写入脚本、冻结图或落盘配置。经校验 Tool 后的新进程须
+重新构造相同配置，公开配置指纹不一致时停止提交。
+用户说没有、或明确用平台默认时不替换 profile，沿用执行环境的视觉模型配置。
 
-`labeling_gateway` 整体替换视觉模型配置，不与平台配置混用：用户网关没给 key
-时不会把平台 key 发过去。本地试跑和平台全量必须用同一个网关；换了网关或模型
-会得到新的 run，不会复用旧结果。这块暂由用户书面提供，规范化入口后续再补。
+用户网关与平台配置不混用，缺少网关密钥时不能拿平台 key 顶替。
+本地试跑和平台全量必须用同一个网关；换了网关或模型先重做小样，按复用评估决定
+兼容续跑或新 run，不自动复用旧结果。带环境声明的图通过普通 `submit_workflow`
+提交，最终 Studio 请求可能保存 command 环境；不保存或打印绑定后的图。
 
 ## 完成标准
 
@@ -97,6 +101,53 @@ Label Studio 与训练格式转换在后续按需进行。
 平台全量提交时 Manifest 必须与图片处于同一 Storage 目录树，经
 `/workspace/<同一目录>/` 落位（见 playbook 的「平台全量输入」）。按源标识及
 图片路径关联结果，不按行号拼接，失败记录可能被跳过。
+
+## EchoMind Dataset 节点的三图输入
+
+已核实为「每个样本目录一组图」，且 `defect.jpg`、`diff.jpg`、`gt.jpg` 分别代表待检实拍图、
+差分图、同位置参考图时，可使用下列确定性转换。先在图片根目录上层生成清单，再把清单提交给
+已有的 PCB 预打标 Pipeline。应保存经确认的业务规则和训练提示词，供同一版本的执行图复用。
+
+```sh
+python3 .agents/skills/data-processing/scripts/preparation/pcb_dataset_inputs.py manifest \
+  /workspace/dataset/images /workspace/dataset/source.jsonl \
+  --inspection-rules-file /workspace/dataset/inspection_rules.txt
+```
+
+生成执行轮次的独立清单时，先创建该轮的 `incoming` 目录，再给 `manifest` 加上 `--stage-images`，
+例如把 `/workspace/dataset/images` 转为 `/workspace/run/incoming/source.jsonl`。脚本会复制已核实的图片
+到清单旁的 `images/`，预打标输出应引用这份清单的图。`messages` 使用同一清单完成匹配，产物审计记录
+原始 Storage 路径。清单与旁边的 `images/` 均不能已存在。实际挂载为 `/target-workspace` 时，两个命令
+都使用该挂载下的路径和 `--storage-root /target-workspace`。
+
+将已复核的 structured JSONL 与原清单按 ID 和三个角色下的原图路径精确匹配。每条已复核行应附
+`confirmed: true`，可通过 `gt` 提供已确认的完整答案。只有用户明确批准本版本使用预标注预测
+作为训练标签时，才在发布配置加入 `--allow-pseudo-labels`。此时脚本仍校验分类、置信度和区域框，
+且在审计清单区分预测标签与人工确认标签。
+
+```sh
+python3 .agents/skills/data-processing/scripts/preparation/pcb_dataset_inputs.py messages \
+  /workspace/run/reviewed.jsonl /workspace/run/dataset \
+  --source-manifest /workspace/dataset/source.jsonl \
+  --system-prompt-file /workspace/dataset/training_system_prompt.txt \
+  --user-prompt-file /workspace/dataset/training_user_prompt.txt --val-size 2
+```
+
+已封批并带有确认标签的 Tracer 输入可直接传入批次目录。脚本只读取 `train.jsonl`，从本批数据
+里抽取 Train 节点内部验证样本。固定业务 Eval 数据单独绑定到 Eval 节点。若批次中省略
+`system_prompt`，使用同一份版本化训练提示词文件。
+
+```sh
+python3 .agents/skills/data-processing/scripts/preparation/pcb_dataset_inputs.py messages \
+  /workspace/project-batches/tracer/batch-1 /workspace/run/dataset \
+  --system-prompt-file /workspace/dataset/training_system_prompt.txt --val-size 2
+```
+
+输出目录须是新目录。`train_messages.jsonl` 和 `val_messages.jsonl` 的所有角色均使用同一形状的
+`type/value` 内容块，图像引用相对于输出目录。脚本保留三图顺序，复制原图字节到输出目录，
+并在 `source_manifest.jsonl` 记录原始 ID、图片角色、路径、标签来源与切分。
+平台任务通过冻结脚本的 Storage 路径执行该命令；实际挂载为 `/target-workspace` 时，输入及输出参数
+应使用该挂载下的路径，并加 `--storage-root /target-workspace`。不依赖宿主 Python 或临时安装依赖。
 
 配置示例的 Prompt 和 Schema 应按任务调整，不将上述案例固化成通用协议。
 类别按任务或领域参考确定。任务文本使用

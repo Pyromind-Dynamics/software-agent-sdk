@@ -5,9 +5,11 @@ import io
 import json
 import logging
 import re
+import subprocess
 import tarfile
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from pyromind_sdk.client.models import (
@@ -19,7 +21,11 @@ from pyromind_sdk.client.models import (
 )
 
 from harness_adapter.pi_adapter.adapter import PiAdapter, _PiSession
-from harness_adapter.pi_adapter.business_tool_host import ToolExecutionContext
+from harness_adapter.pi_adapter.business_tool_host import (
+    DEBUG_STATE_RELATIVE_PATH,
+    PyromindBusinessToolHost,
+    ToolExecutionContext,
+)
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.sandbox_runtime import (
     _WORKSPACE_LAYOUT_VERSION,
@@ -33,8 +39,11 @@ from harness_adapter.pi_adapter.sandbox_runtime import (
     SandboxExecutionManager,
     SandboxSettings,
     _sandbox_client,
+    _SandboxState,
 )
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
+from harness_adapter.pi_adapter.sdk_environment import SANDBOX_SDK_PYTHON
+from pyromind_common.platform.workflows import DebugBudget
 from pyromind_runtime.domain.context import RequestContext
 
 
@@ -156,6 +165,139 @@ def _context(
 def test_default_sandbox_client_requires_platform_credentials(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="auth_token cookie or Bearer"):
         _sandbox_client(_context(tmp_path))
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_platform_sdk_is_prepared_in_the_execution_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    files: PiSessionFiles,
+    exit_code: int,
+) -> None:
+    client = _FakeSandboxClient()
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+    preparation = []
+
+    def run(**kwargs):
+        script = _uploaded_script(client)
+        if "PYROMIND_SDK_BOOTSTRAP" in script:
+            preparation.append((script, kwargs))
+            return "", exit_code, False
+        return _run_sandbox_command(client, kwargs["command"])
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command", run
+    )
+    if exit_code:
+        with pytest.raises(RuntimeError, match="PI_PLATFORM_SDK_SETUP_FAILED"):
+            await manager.sdk_python(_context(tmp_path), files)
+    else:
+        assert await manager.sdk_python(_context(tmp_path), files) == SANDBOX_SDK_PYTHON
+
+    assert len(preparation) == 1
+    script, request = preparation[0]
+    assert client.api_key not in script
+    assert request["sandbox_id"] == "sbx-1"
+    assert request["timeout_seconds"] == 300
+    wheels = [path for path in client.files if "/.sdk-helpers/" in path]
+    assert len(wheels) == 1
+    filename = Path(wheels[0]).name.split(".partial-", 1)[0]
+    assert filename in script
+    assert "version('pyromind-platform-helpers')" in script
+    if not exit_code:
+        before = [call for call in client.calls if "/.sdk-helpers/" in call]
+        await manager.sdk_python(_context(tmp_path), files)
+        assert [call for call in client.calls if "/.sdk-helpers/" in call] == before
+
+
+async def test_remote_debug_budget_is_shared_and_resettable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: PiSessionFiles
+) -> None:
+    key = "pyromind_workflow_attempts"
+    files.save_business_state({key: 2, "private_host_state": "not copied"})
+    context = _context(tmp_path)
+    client = _FakeSandboxClient()
+    remote_root = tmp_path / "remote-workspace"
+    state = _SandboxState(
+        client=client,
+        endpoint={
+            "workspace_path": str(remote_root),
+            "sandbox_id": "sbx-1",
+            "ws_base_url": "wss://sandbox.example",
+        },
+        credential_fingerprint="test",
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+    monkeypatch.setattr(manager, "_ensure_state", AsyncMock(return_value=state))
+
+    def run(**kwargs):
+        result = subprocess.run(
+            ["sh"],
+            input=_uploaded_script(client),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return result.stdout + result.stderr, result.returncode, False
+
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command", run
+    )
+    remote = Path(await manager.debug_state_path(context, files))
+    assert remote == remote_root / DEBUG_STATE_RELATIVE_PATH
+    assert json.loads(remote.read_text()) == {key: 2}
+    budget = DebugBudget.load(remote)
+    budget.accepted = 3
+    budget.save()
+    await manager.debug_state_path(context, files)
+    local = context.workspace_root / DEBUG_STATE_RELATIVE_PATH
+    assert json.loads(local.read_text())[key] == 3
+    assert files.load_business_state()[key] == 3
+
+    budget.accepted = 0
+    budget.save()
+    await manager.debug_state_path(context, files)
+    assert files.load_business_state()[key] == 0
+    local.write_text(json.dumps({key: 4}))
+    await manager.push_debug_budget(context, files)
+    assert DebugBudget.load(remote).accepted == 4
+
+    PyromindBusinessToolHost.reset_attempt_budget(context.workspace_root)
+    await manager.push_debug_budget(context, files)
+    assert DebugBudget.load(remote).accepted == 0
+    assert files.load_business_state()[key] == 0
+    remote.write_text("[]")
+    with pytest.raises(RuntimeError, match="PI_DEBUG_STATE_SYNC_FAILED"):
+        await manager.debug_state_path(context, files)
+    assert files.load_business_state()[key] == 0
+
+
+@pytest.mark.parametrize(
+    "result", [("rejected", 1, False), ("", None, True), ("missing marker", 0, False)]
+)
+async def test_remote_debug_state_sync_errors_are_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    files: PiSessionFiles,
+    result: tuple[str, int | None, bool],
+) -> None:
+    client = _FakeSandboxClient()
+    state = _SandboxState(
+        client=client,
+        endpoint={
+            "workspace_path": "/remote-workspace",
+            "sandbox_id": "sbx-1",
+            "ws_base_url": "wss://sandbox.example",
+        },
+        credential_fingerprint="test",
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+    monkeypatch.setattr(manager, "_ensure_state", AsyncMock(return_value=state))
+    monkeypatch.setattr(manager, "_run_script", AsyncMock(return_value=result))
+    files.save_business_state({"pyromind_workflow_attempts": 2})
+    with pytest.raises(RuntimeError, match="PI_DEBUG_STATE_SYNC_FAILED"):
+        await manager.debug_state_path(_context(tmp_path), files)
+    assert files.load_business_state()["pyromind_workflow_attempts"] == 2
 
 
 def _uploaded_scripts(client: _FakeSandboxClient) -> list[str]:
@@ -775,6 +917,46 @@ def test_ensure_recreates_a_sandbox_recorded_without_the_storage_mount(
     ]
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+def test_v6_sandbox_reuse_checks_the_actual_prepared_mount(
+    tmp_path: Path, files: PiSessionFiles, monkeypatch, read_only: bool
+) -> None:
+    files.save_sandbox(
+        {
+            "sandbox_id": "sbx-1",
+            "workspace_version": 6,
+            "mount_path": DEFAULT_MOUNT_PATH,
+            "storage_host_path": STORAGE_HOST_PATH,
+        }
+    )
+    prepared_dir = f"{PYROMIND_AGENT_STORAGE_ROOT}/conv-1/prepared"
+    sandbox = SandboxResponse(
+        id="sbx-1",
+        name="pi-conv-1",
+        type=SandboxType.CUSTOM,
+        status="running",
+        volume_mounts=[
+            VolumeMount(
+                host_path=STORAGE_HOST_PATH + prepared_dir,
+                mount_path=DEFAULT_MOUNT_PATH + prepared_dir,
+                read_only=read_only,
+            )
+        ],
+    )
+    client = _FakeSandboxClient(existing=sandbox)
+    monkeypatch.setattr(
+        "harness_adapter.pi_adapter.sandbox_runtime.run_terminal_command",
+        lambda **kwargs: ("", 0, False),
+    )
+    manager = SandboxExecutionManager(client_factory=lambda context: client)
+    asyncio.run(manager.ensure(_context(tmp_path), files))
+    assert ("delete:sbx-1" in client.lifecycle_calls) == (not read_only)
+    record = files.load_sandbox()
+    assert (
+        record is not None and record["workspace_version"] == _WORKSPACE_LAYOUT_VERSION
+    )
+
+
 def test_ensure_fails_fast_when_storage_is_not_mounted(
     tmp_path: Path, files: PiSessionFiles, monkeypatch
 ) -> None:
@@ -993,8 +1175,9 @@ def test_prewarm_can_be_switched_off(
     assert files.load_sandbox() is None
 
 
+@pytest.mark.parametrize("cluster", ["us-west-1", "cn-east-1#pre"])
 def test_ensure_warms_the_dataflow_runtime_after_resources(
-    tmp_path: Path, files: PiSessionFiles, monkeypatch
+    tmp_path: Path, files: PiSessionFiles, monkeypatch, cluster: str
 ) -> None:
     # The sandbox image ships without open-dataflow, so preparing the cached
     # venv at sandbox start keeps the first data-processing run from paying for
@@ -1002,7 +1185,9 @@ def test_ensure_warms_the_dataflow_runtime_after_resources(
     monkeypatch.setenv("PYROMIND_SANDBOX_SYSTEM_PYTHON", "python3.12")
     monkeypatch.setenv("PYROMIND_SANDBOX_DATAFLOW_VENV", "/tmp/dataflow-venv")
     monkeypatch.delenv("PYROMIND_SANDBOX_DATAFLOW_PYTHON", raising=False)
+    monkeypatch.delenv("PYROMIND_SANDBOX_DATAFLOW_PIP_INDEX_URL", raising=False)
     client = _FakeSandboxClient()
+    client.cluster = cluster
     commands: list[str] = []
 
     def run_terminal_command(**kwargs: object) -> tuple[str, int, bool]:
@@ -1038,6 +1223,9 @@ def test_ensure_warms_the_dataflow_runtime_after_resources(
     ) in command
     assert "env PYROMIND_SANDBOX_DATAFLOW_VENV=/tmp/dataflow-venv" in command
     assert "PYROMIND_SANDBOX_SYSTEM_PYTHON=python3.12" in command
+    assert (
+        "PYROMIND_SANDBOX_DATAFLOW_PIP_INDEX_URL=" in command
+    ) == cluster.startswith("cn-east-1")
     # The install yields CPU and disk to the interactive session instead of
     # competing with the first command.
     assert "nice -n 19" in command

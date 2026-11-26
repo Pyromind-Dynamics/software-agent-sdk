@@ -16,7 +16,7 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
   modelRuntime: ModelRuntime;
   model: Model<Api>;
 }> {
-  const outputLimit = maxOutputTokens();
+  const outputLimit = configuredOutputLimit();
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(config.provider, async () => ({ type: "api_key", key: config.apiKey }));
   const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false });
@@ -39,7 +39,6 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
           const reasoning = guardedOptions.reasoning
             ? clampThinkingLevel(requestModel, guardedOptions.reasoning)
             : undefined;
-          // 保留单次输出上限，不从上下文使用量推导输出预算。
           return streamModel(requestModel, context, {
             ...guardedOptions,
             reasoningEffort: reasoning === "off" ? undefined : reasoning,
@@ -53,17 +52,19 @@ export async function createPiModelRuntime(config: PiModelConfig): Promise<{
     model = modelRuntime.getModel(config.provider, config.modelId) ?? model;
   }
   await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
-  if (outputLimit === undefined) return { modelRuntime, model };
   const stream = modelRuntime.streamSimple.bind(modelRuntime);
-  modelRuntime.streamSimple = (requestModel, context, options) =>
-    stream(requestModel, context, {
+  modelRuntime.streamSimple = (requestModel, context, options) => {
+    const requested = options?.maxTokens ?? outputLimit;
+    if (requested === undefined) return stream(requestModel, context, options);
+    return stream(requestModel, context, {
       ...options,
-      maxTokens: Math.min(outputLimit, requestModel.maxTokens, options?.maxTokens ?? outputLimit),
+      maxTokens: Math.min(requested, requestModel.maxTokens, outputLimit ?? requested),
     });
+  };
   return { modelRuntime, model };
 }
 
-function maxOutputTokens(): number | undefined {
+function configuredOutputLimit(): number | undefined {
   const raw = process.env.PYROMIND_PI_MAX_OUTPUT_TOKENS?.trim();
   if (!raw) return undefined;
   const value = Number(raw);

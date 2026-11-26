@@ -74,6 +74,7 @@ class AcquisitionSimulation(BaseModel):
     completed_rounds: int = Field(default=0, ge=0)
     splits: list[AcquisitionSplit] = Field(min_length=1)
     auto_start_graph_run: bool = True
+    manual_start: bool = False
     tracer_resource_id: str | None = Field(default=None, max_length=128)
     batch_ids: list[str] = Field(default_factory=list)
     batches: dict[str, AcquisitionBatch] = Field(
@@ -171,6 +172,7 @@ class AcquisitionSimulationStore:
         splits: list[AcquisitionSplit],
         auto_start_graph_run: bool,
         model: str | None = None,
+        manual_start: bool = False,
     ) -> AcquisitionSimulation:
         existing = self.find_by_request_id(project_id, request_id)
         if existing is not None:
@@ -184,6 +186,7 @@ class AcquisitionSimulationStore:
             requested_rounds=requested_rounds,
             splits=splits,
             auto_start_graph_run=auto_start_graph_run,
+            manual_start=manual_start,
             model=model,
         )
         return self.save(simulation)

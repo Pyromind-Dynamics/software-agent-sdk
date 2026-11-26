@@ -1,4 +1,5 @@
 import pytest
+
 from pyromind_runtime.application import SnapshotProjector
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.events import ProductEvent
@@ -262,6 +263,125 @@ def test_late_completion_preserves_new_run_and_message_command_id():
     )
     assert snapshot.status == "idle"
     assert snapshot.active_run_id is None
+
+
+@pytest.fixture
+def external_wait_snapshot():
+    task = ExternalTaskState.model_validate(
+        {
+            "task_id": "task-1",
+            "kind": "data_preparation",
+            "run_id": "run-1",
+            "status": "running",
+            "correlation": {
+                "conversation_id": "conversation-1",
+                "task_kind": "data_preparation",
+            },
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    return _snapshot().model_copy(
+        update={
+            "status": "running",
+            "active_run_id": "run-1",
+            "external_tasks": (task,),
+        }
+    )
+
+
+@pytest.mark.parametrize("status", ["idle", "finished"])
+@pytest.mark.parametrize("task_status", ["pending", "running"])
+def test_main_completion_yields_until_external_task_callback(
+    external_wait_snapshot, status, task_status
+):
+    projector = SnapshotProjector()
+    task = external_wait_snapshot.external_tasks[0].model_copy(
+        update={"status": task_status}
+    )
+    snapshot = external_wait_snapshot.model_copy(update={"external_tasks": (task,)})
+    waiting = projector.reduce(
+        snapshot,
+        _event(1, "status.changed", {"status": status}).model_copy(
+            update={"run_id": "run-1"}
+        ),
+    )
+    assert waiting.status == "waiting_for_external_task"
+    assert waiting.active_run_id is None
+    completed = projector.reduce(
+        waiting,
+        _event(
+            2,
+            "external_task.completed",
+            {"task_id": task.task_id, "status": "succeeded"},
+        ),
+    )
+    assert completed.status == "idle"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"run_id": "old-run"},
+        {"status": "succeeded"},
+        {"kind": "historical_experience"},
+        {"kind": "graph_await"},
+        {"graph_run_id": "graph-run"},
+        {
+            "correlation": {
+                "type": "subagent",
+                "subagent_id": "child",
+                "conversation_id": "conversation-1",
+                "task_kind": "data_preparation",
+            }
+        },
+    ],
+)
+def test_main_completion_does_not_wait_for_background_tasks(
+    external_wait_snapshot, changes
+):
+    task = external_wait_snapshot.external_tasks[0]
+    task = ExternalTaskState.model_validate({**task.model_dump(), **changes})
+    snapshot = external_wait_snapshot.model_copy(update={"external_tasks": (task,)})
+    completed = SnapshotProjector().reduce(
+        snapshot,
+        _event(1, "status.changed", {"status": "idle"}).model_copy(
+            update={"run_id": "run-1"}
+        ),
+    )
+    assert completed.status == "idle"
+    assert completed.active_run_id is None
+
+
+@pytest.mark.parametrize("protection", ["paused", "error", "input", "permission"])
+def test_external_wait_preserves_human_and_settled_states(
+    external_wait_snapshot, protection
+):
+    projector = SnapshotProjector()
+    if protection in {"paused", "error"}:
+        snapshot = external_wait_snapshot.model_copy(update={"status": protection})
+    else:
+        payload = (
+            {
+                "request_id": "input-1",
+                "questions": [{"id": "decision", "prompt": "Continue?"}],
+            }
+            if protection == "input"
+            else {"permission_id": "permission-1"}
+        )
+        snapshot = projector.reduce(
+            external_wait_snapshot,
+            _event(1, f"{protection}.requested", payload).model_copy(
+                update={"run_id": "run-1"}
+            ),
+        )
+    completed = projector.reduce(
+        snapshot,
+        _event(
+            snapshot.through_seq + 1, "status.changed", {"status": "idle"}
+        ).model_copy(update={"run_id": "run-1"}),
+    )
+    assert completed.status == snapshot.status
 
 
 @pytest.mark.parametrize("outcome", ["cancelled", "interrupted"])

@@ -4,8 +4,9 @@ import asyncio
 from pathlib import Path
 from typing import Any, ClassVar
 
-import harness_adapter.pi_adapter.adapter as pi_adapter_module
 import pytest
+
+import harness_adapter.pi_adapter.adapter as pi_adapter_module
 from harness_adapter.pi_adapter import PiAdapter
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from harness_adapter.pi_adapter.runner import PiRunnerExit, PlannedPiRunnerExitReason
@@ -602,6 +603,67 @@ async def test_realtime_input_rejection_precedes_workflow_sync(
             )
         assert error.value.code == "input_pending"
         assert synced == []
+    finally:
+        await adapter.close(handle)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_prompt_busy_uses_runner_admission_and_reports_conflict(
+    tmp_path, monkeypatch, legacy
+) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle, session = await _new_session(adapter, conversations)
+    session.running = True
+    requests = []
+
+    async def request(method, _params):
+        requests.append(method)
+        if method == "prompt":
+            code = "request_failed" if legacy else "conversation_busy"
+            raise pi_adapter_module.PiRunnerError(
+                f"{code}: Pi agent is already running", code=code
+            )
+        return {}
+
+    monkeypatch.setattr(session.runner, "request", request)
+    try:
+        with pytest.raises(ProductRuntimeError) as error:
+            await adapter.send(
+                handle,
+                UserMessageCommand(
+                    command_id="message", content=(TextContent(text="hi"),)
+                ),
+                session.context,
+            )
+        assert error.value.code == "conversation_busy"
+        assert requests == ["prompt.prepare", "prompt", "prompt.cancel"]
+    finally:
+        await adapter.close(handle)
+
+
+async def test_usage_event_is_not_an_inflight_turn(tmp_path) -> None:
+    conversations = tmp_path / "conversations"
+    conversations.mkdir()
+    adapter = PiAdapter(conversations, terminal_backend="os-sandbox")
+    handle, session = await _new_session(adapter, conversations)
+    try:
+        await adapter._runner_event(
+            session,
+            {
+                "kind": "usage.updated",
+                "eventId": "usage-event",
+                "runId": "usage:telemetry",
+                "sessionId": handle.session_id,
+                "payload": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )
+        assert session.files.load_inflight() is None
+        session.files.save_inflight({"run_id": "usage:legacy"})
+        await adapter._recover_inflight(session)
+        assert session.files.load_inflight() is None
+        assert any(event.type == "usage.updated" for event in await _drain(session))
     finally:
         await adapter.close(handle)
 

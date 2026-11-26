@@ -619,3 +619,24 @@ def test_read_execution_evidence_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError):
         store.read_execution_evidence(digest)
+
+
+def test_retired_business_attempt_metadata_remains_readable_without_aliasing_commands(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    command = UserMessageCommand(
+        command_id="business-plan:historic", content=(TextContent(text="hello"),)
+    )
+    receipt, _ = store.claim_command(command)
+    record = json.loads(store.commands_path.read_text())
+    record["business_attempt"] = {"task_id": "first", "attempt": 1}
+    store.commands_path.write_text(json.dumps(record) + "\n")
+    recovered = FileProductStore(store.conversation_dir)
+    assert recovered.command_receipts("business-plan:") == (receipt,)
+    assert recovered.claim_command(command) == (receipt, False)
+    new = command.model_copy(update={"command_id": "business-plan:new"})
+    assert recovered.claim_command(new)[1]
+    assert "business_attempt" not in json.loads(
+        store.commands_path.read_text().splitlines()[-1]
+    )

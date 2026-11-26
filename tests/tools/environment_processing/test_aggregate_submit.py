@@ -10,11 +10,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from pyromind_common.sdk.tool import ToolExecutor
 from pyromind_common.tools.environment_processing.aggregate_submit import (
     AGGREGATE_TASK_KIND,
     EdpAggregateAction,
     EdpAggregateTool,
     build_aggregate_command,
+    create_edp_aggregate_runner,
 )
 
 
@@ -25,7 +27,7 @@ from pyromind_common.tools.environment_processing.aggregate_submit import (
 
 def test_build_aggregate_command_pod_paths_and_args() -> None:
     command = build_aggregate_command(
-        out_dir="edp/out",
+        out_dir="/edp/out",
         run_dirs=["edp/batch-001/run-1", "edp/batch-002/run-2"],
         protocol="tmax",
         min_reward=1.0,
@@ -55,7 +57,7 @@ def test_build_aggregate_command_pod_paths_and_args() -> None:
 
 def test_build_aggregate_command_omits_optional_args() -> None:
     command = build_aggregate_command(
-        out_dir="edp/out",
+        out_dir="/edp/out",
         run_dirs=["edp/batch-001/run-1"],
         protocol="tmax",
         min_reward=0.5,
@@ -124,16 +126,22 @@ def _patch_submission(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return SimpleNamespace(upload=upload, submit=submit, client=client)
 
 
-def test_executor_submits_aggregate_task(
+def test_runner_submits_aggregate_task_without_tool_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mocks = _patch_submission(monkeypatch)
     conversation = _conversation_with_secrets({"auth_token": "platform-tok"})
-    executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
-    observation = executor(
+    runner = create_edp_aggregate_runner(
+        env="pre",
+        cluster="us-west-1",
+        headers={"x-cluster": "us-west-1#pre"},
+        runtime_dir=str(_runtime_tmp(tmp_path)),
+    )
+    assert not isinstance(runner, ToolExecutor)
+    observation = runner.run(
         EdpAggregateAction(
             run_dirs=["/edp/batch-001/run-1", "/edp/batch-002/run-2"],
-            out_dir="edp/out",
+            out_dir="/edp/out",
             min_reward=0.8,
         ),
         conversation,
@@ -155,6 +163,7 @@ def test_executor_submits_aggregate_task(
     )
     # one CustomCommandCPUNode workflow; the command carries no credentials
     workflow = mocks.submit.call_args.kwargs["workflow"]
+    assert mocks.submit.call_args.kwargs["retry_create"] is False
     node = workflow["nodes"][0]
     assert node["data"]["nodeType"] == "CustomCommandCPUNode"
     command = node["data"]["config"]["command"]
@@ -174,7 +183,7 @@ def test_executor_missing_auth_token_fails(
     conversation = _conversation_with_secrets({})
     executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
     observation = executor(
-        EdpAggregateAction(run_dirs=["/edp/batch-001/run-1"], out_dir="edp/out"),
+        EdpAggregateAction(run_dirs=["/edp/batch-001/run-1"], out_dir="/edp/out"),
         conversation,
     )
     assert observation.status == "Failed"
@@ -191,7 +200,7 @@ def test_executor_missing_scripts_fails(
     empty.mkdir()
     executor = _executor(runtime_dir=str(empty))
     observation = executor(
-        EdpAggregateAction(run_dirs=["/edp/batch-001/run-1"], out_dir="edp/out"),
+        EdpAggregateAction(run_dirs=["/edp/batch-001/run-1"], out_dir="/edp/out"),
         conversation,
     )
     assert observation.status == "Failed"
@@ -200,7 +209,7 @@ def test_executor_missing_scripts_fails(
 
 def test_edp_aggregate_action_requires_run_dirs() -> None:
     with pytest.raises(ValueError):
-        EdpAggregateAction(run_dirs=[], out_dir="edp/out")
+        EdpAggregateAction(run_dirs=[], out_dir="/edp/out")
 
 
 def test_edp_aggregate_tool_rejects_unknown_params() -> None:

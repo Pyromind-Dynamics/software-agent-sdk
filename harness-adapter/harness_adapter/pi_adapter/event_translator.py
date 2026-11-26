@@ -148,6 +148,7 @@ def translate_runner_event(frame: dict[str, Any]) -> tuple[HarnessEvent, ...]:
     if not isinstance(kind, str):
         return ()
     event_type = {
+        "context_compaction.updated": "context_compaction.updated",
         "message.started": "message.started",
         "message.delta": "message.delta",
         "message.completed": "message.completed",

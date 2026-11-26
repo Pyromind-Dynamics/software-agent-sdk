@@ -4,7 +4,12 @@ import { dirname, posix } from "node:path";
 import { bounded, TerminalChannel } from "./terminal-channel.js";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { describeErrorChain } from "./sandbox-operations.js";
-import type { SandboxEndpoint, SandboxEndpointSession } from "./sandbox-operations.js";
+import type { PlatformEndpoint, SandboxEndpoint, SandboxEndpointSession } from "./sandbox-operations.js";
+import { runActorCommand } from "./sandbox-actor.js";
+import {
+  SandboxTerminalExecutionError, type TerminalExecOptions, type TerminalExecResult, type TerminalExecutionEvidence,
+} from "./terminal-execution.js";
+export { SandboxTerminalExecutionError, type TerminalExecutionEvidence } from "./terminal-execution.js";
 
 /** Raised when the TTY bridge cannot stay connected for a whole command. */
 export class SandboxTerminalConnectionError extends Error {
@@ -92,35 +97,6 @@ const ACK_MARKER = "__PM_ACK__";
  * domain, which only pays off once the payload would need many bursts.
  */
 const TERMINAL_STAGING_MAX_BATCHES = 4;
-
-export interface TerminalExecutionEvidence {
-  execution_id: string;
-  remote_run_dir: string;
-  phase: "preparing" | "connecting" | "environment" | "starting" | "observing" | "finished";
-  started: boolean;
-  stopped: boolean;
-  /** How the per-command script reached the sandbox, decided before the launch. */
-  staging?: "file" | "terminal" | "batch" | "batch-fallback";
-  /** Acknowledged exchanges spent on this command, for latency diagnosis. */
-  round_trips?: number;
-  /** Milliseconds per preparation phase, for latency diagnosis. */
-  timings_ms?: Record<string, number>;
-  error_code?: string;
-}
-
-export class SandboxTerminalExecutionError extends Error {
-  constructor(
-    message: string,
-    readonly execution: TerminalExecutionEvidence,
-    options?: ErrorOptions,
-  ) {
-    super(
-      `${message} (phase=${execution.phase}, started=${execution.started}, stopped=${execution.stopped})`,
-      options,
-    );
-    this.name = "SandboxTerminalExecutionError";
-  }
-}
 
 export interface SandboxTerminalSocket {
   send(data: string): void;
@@ -265,18 +241,6 @@ function positiveNumber(
     throw new Error(`${name} must be a positive number of ${unit}`);
   }
   return value;
-}
-
-interface TerminalExecOptions {
-  onData: (data: Buffer) => void;
-  signal?: AbortSignal;
-  timeout?: number;
-  env?: NodeJS.ProcessEnv;
-}
-
-interface TerminalExecResult {
-  exitCode: number | null;
-  execution: TerminalExecutionEvidence;
 }
 
 interface TerminalQueueOptions {
@@ -866,7 +830,7 @@ export function buildCancelLine(runDir: string, token: string): string {
     `else ${acknowledgement(token, "stop", "yes")}; fi ;; esac\n`;
 }
 
-export function sandboxTerminalUrl(endpoint: SandboxEndpoint): string {
+export function sandboxTerminalUrl(endpoint: PlatformEndpoint): string {
   const base = endpoint.wsBaseUrl
     .replace(/^https:\/\//, "wss://")
     .replace(/^http:\/\//, "ws://")
@@ -892,7 +856,7 @@ export class SandboxTerminalOperations implements BashOperations {
   private tail: Promise<unknown> = Promise.resolve();
 
   constructor(
-    private endpoint: SandboxEndpoint,
+    private endpoint: PlatformEndpoint,
     options: SandboxTerminalOptions = {},
   ) {
     this.settings = options;
@@ -932,7 +896,7 @@ export class SandboxTerminalOperations implements BashOperations {
   }>();
   get terminationUnconfirmed(): boolean { return this.unconfirmed.size > 0; }
 
-  updateEndpoint(endpoint: SandboxEndpoint): boolean {
+  updateEndpoint(endpoint: PlatformEndpoint): boolean {
     if (this.endpoint.sandboxId !== endpoint.sandboxId ||
         this.endpoint.workspacePath !== endpoint.workspacePath) return false;
     if (this.endpoint.wsBaseUrl !== endpoint.wsBaseUrl ||
@@ -1567,7 +1531,17 @@ export class LazySandboxTerminalOperations implements BashOperations {
     };
     const run = async (): Promise<TerminalExecResult> => {
       for (let attempt = 0; ; attempt += 1) {
-        const operations = await this.resolveOperations(options);
+        const endpoint = await this.resolveEndpoint(options);
+        if ("actorTarget" in endpoint) {
+          return runActorCommand(
+            endpoint, ["/bin/bash", "-c", command], resolveCwd(endpoint.workspacePath, cwd), options,
+          );
+        }
+        if (!this.operations?.updateEndpoint(endpoint)) {
+          this.operations?.dispose();
+          this.operations = new SandboxTerminalOperations(endpoint, this.options);
+        }
+        const operations = this.operations;
         try {
           const result = await operations.exec(command, cwd, options);
           if (operations.terminationUnconfirmed) {
@@ -1616,7 +1590,7 @@ export class LazySandboxTerminalOperations implements BashOperations {
     await this.disconnect();
   }
 
-  private async resolveOperations(options: TerminalExecOptions): Promise<SandboxTerminalOperations> {
+  private async resolveEndpoint(options: TerminalExecOptions): Promise<SandboxEndpoint> {
     const resolveDeadline =
       Date.now() + (this.options.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
     let lastError: unknown;
@@ -1625,11 +1599,7 @@ export class LazySandboxTerminalOperations implements BashOperations {
       try {
         const endpoint = await bounded(request, resolveDeadline, options.signal);
         this.endpointRequest = request;
-        if (!this.operations?.updateEndpoint(endpoint)) {
-          this.operations?.dispose();
-          this.operations = new SandboxTerminalOperations(endpoint, this.options);
-        }
-        return this.operations;
+        return endpoint;
       } catch (error) {
         if (!isRetryableResolve(error, options.signal)) throw this.resolveFailure(error, lastError);
         lastError = error;
@@ -1663,9 +1633,8 @@ export class LazySandboxTerminalOperations implements BashOperations {
       {
         execution_id: randomUUID().replace(/-/g, ""), remote_run_dir: "",
         phase: "connecting", started: false, stopped: true,
-        error_code: needsSandboxAuthorization(error) ? "sandbox_authorization_required"
-          : isTimeout(error) ? "startup_timeout"
-          : isAborted(error) ? "aborted" : "connection_lost",
+        error_code: endpointFailureCode(error) ??
+          (isTimeout(error) ? "startup_timeout" : isAborted(error) ? "aborted" : "connection_lost"),
       },
       { cause: error },
     );
@@ -1679,8 +1648,7 @@ export class LazySandboxTerminalOperations implements BashOperations {
    * the session keeps both on one bundle.
    */
   async endpoint(): Promise<SandboxEndpoint> {
-    await this.resolveOperations({ onData: () => undefined });
-    return (await this.endpoints.resolve());
+    return this.resolveEndpoint({ onData: () => undefined });
   }
 }
 
@@ -1718,13 +1686,17 @@ function isAborted(error: unknown): boolean {
   return error instanceof Error && error.message === "aborted";
 }
 
-function needsSandboxAuthorization(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "sandbox_authorization_required";
+function endpointFailureCode(error: unknown): string | undefined {
+  if (error instanceof Error && "code" in error &&
+      (error.code === "sandbox_authorization_required" || error.code === "fixed_actor_unavailable")) {
+    return error.code;
+  }
+  return undefined;
 }
 
 /** Transient failures during sandbox preparation can be retried on this call. */
 function isRetryableResolve(error: unknown, signal: AbortSignal | undefined): boolean {
-  if (isTimeout(error) || isAborted(error) || needsSandboxAuthorization(error)) return false;
+  if (isTimeout(error) || isAborted(error) || endpointFailureCode(error)) return false;
   return !(signal?.aborted ?? false);
 }
 

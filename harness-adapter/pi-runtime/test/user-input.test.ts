@@ -349,6 +349,26 @@ test(`notifications survive suspension ${suspendFirst ? "before" : "after"} sche
 });
 }
 
+test("a preparing turn reports a busy conflict for another prompt", async () => {
+  const runtime = new PiAgentRuntime({ emit: () => {} } as unknown as JsonlRpcPeer);
+  const state = runtime as unknown as { session: AgentSession; sessionId: string };
+  state.sessionId = "session";
+  state.session = {
+    isStreaming: false,
+    sessionManager: SessionManager.inMemory(),
+    messages: [],
+    prompt: async () => {},
+  } as unknown as AgentSession;
+  const content = [{ type: "text", text: "Prepare a draft." }];
+  assert.deepEqual(await runtime.handle("prompt", { run_id: "first", content }), {
+    accepted: true, steered: false,
+  });
+  await assert.rejects(runtime.handle("prompt.prepare", { run_id: "second", content }), {
+    code: "conversation_busy",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+});
+
 test("a rejected steer does not lift execution suspension", async () => {
   const runtime = new PiAgentRuntime({ emit: () => {} } as unknown as JsonlRpcPeer);
   const state = runtime as unknown as { session: AgentSession; executionSuspended: boolean };

@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from pyromind_common.sdk.marketplace.registration import MarketplaceRegistration
-from pyromind_common.sdk.utils.cipher import Cipher
 
 from pyromind_agent_server.env_parser import (
     MISSING,
@@ -15,6 +13,8 @@ from pyromind_agent_server.env_parser import (
     get_env_parser,
     merge,
 )
+from pyromind_common.sdk.marketplace.registration import MarketplaceRegistration
+from pyromind_common.sdk.utils.cipher import Cipher
 
 
 DEFAULT_LEASE_TTL_SECONDS = 45.0
@@ -170,6 +170,13 @@ class Config(BaseModel):
             "auth_token cookie. The JWT secret is resolved exactly like the portal: "
             "APP_ENV=dev uses the dev secret; other environments read "
             "/etc/secrets/web_secret_key."
+        ),
+    )
+    platform_sdk_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable direct platform SDK access for eligible main agents and "
+            "omit SDK-covered atomic tools. Disable to restore legacy tools."
         ),
     )
     allow_cors_origins: list[str] = Field(

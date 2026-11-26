@@ -1,0 +1,386 @@
+"""Keep SDK evaluation evidence and its originating chat turn after merging."""
+
+import json
+from copy import deepcopy
+from unittest.mock import AsyncMock
+
+import pytest
+
+from pyromind_runtime.application.model_evaluation_plan import (
+    check_inference_receipt,
+    sdk_inference_paths,
+)
+from pyromind_runtime.application.plan_execution import (
+    completed_callback_task,
+    plan_executions,
+)
+from pyromind_runtime.application.sdk_execution_metadata import (
+    verified_sdk_inference_paths,
+)
+from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.preparation import SetPreparationPlan
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
+from pyromind_runtime.domain.versions import VersionToolRequest
+
+from . import test_preparation
+from .test_sdk_task_callbacks import sdk_project_runtime as sdk_project_runtime
+from .test_version_integration import version_runtime as version_runtime
+from .test_workflow_execution import _runtime
+
+
+standard_preparation_setup = test_preparation.preparation_setup
+standard_ready_request = test_preparation.ready_request
+
+
+@pytest.fixture
+def preparation_setup(standard_preparation_setup):
+    preparations, owner, policy = standard_preparation_setup
+    return (
+        preparations,
+        owner,
+        policy.model_copy(
+            update={
+                "workflow_nodes": tuple(
+                    node.model_copy(
+                        update={
+                            "tasks": tuple(
+                                task.model_copy(update={"evaluation_target": "model"})
+                                for task in node.tasks
+                            )
+                        }
+                    )
+                    for node in policy.workflow_nodes
+                )
+            }
+        ),
+    )
+
+
+@pytest.fixture
+def dataset_input_name():
+    return "dataset"
+
+
+@pytest.fixture
+def ready_request(standard_ready_request, dataset_input_name):
+    document = standard_ready_request.model_dump(mode="json")
+    document["plan"]["tasks"][0]["inputs"][0]["name"] = dataset_input_name
+    document["plan"]["resources"].append(
+        {"id": "model", "name": "Candidate", "storage_path": "/workspace/models/merged"}
+    )
+    document["plan"]["tasks"][0]["inputs"].append(
+        {"name": "model", "resource_id": "model"}
+    )
+    return SetPreparationPlan.model_validate(document)
+
+
+@pytest.fixture
+def inference_graph():
+    return {
+        "name": "SDK inference",
+        "nodes": [
+            {
+                "id": "1",
+                "data": {
+                    "nodeType": "VLLMInference",
+                    "config": {"model_path": "/workspace/models/merged"},
+                },
+            },
+            {
+                "id": "2",
+                "data": {
+                    "nodeType": "CustomCommandCPUNode",
+                    "config": {
+                        "command": "python3 /workspace/eval/evaluate_inference.py "
+                        '--endpoint "$param" --model-reference /models/merged '
+                        "--dataset-path /workspace/val.jsonl"
+                    },
+                },
+            },
+        ],
+        "edges": [
+            {
+                "source": "1",
+                "sourceHandle": "endpoint",
+                "target": "2",
+                "targetHandle": "param",
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("source", ["storage", "lora", "clone", "download"])
+def test_sdk_inference_paths_follow_the_served_model(inference_graph, source):
+    graph = inference_graph
+    if source != "storage":
+        graph["nodes"][0]["data"]["config"] = {}
+        kind, config = {
+            "lora": ("ModelMergeLoraNode", {"lora_path": "/workspace/models/merged"}),
+            "clone": ("CloneAndCacheModel", {"model": "/models/merged"}),
+            "download": ("DownloadAndCacheModel", {"modelname": "/models/merged"}),
+        }[source]
+        graph["nodes"].append({"id": "3", "data": {"nodeType": kind, "config": config}})
+        graph["edges"].append(
+            {
+                "source": "3",
+                "sourceHandle": "merged_model_path"
+                if source == "lora"
+                else "model_path",
+                "target": "1",
+                "targetHandle": "model_path",
+            }
+        )
+    assert sdk_inference_paths(graph) == ("/models/merged", "/workspace/val.jsonl")
+
+
+@pytest.mark.parametrize("change", ["model", "connection", "scoring", "command"])
+def test_sdk_inference_paths_reject_unmatched_or_scoring_only_graphs(
+    inference_graph, change
+):
+    graph = inference_graph
+    if change == "model":
+        graph["nodes"][0]["data"]["config"]["model_path"] = "/workspace/models/base"
+    elif change == "connection":
+        graph["edges"] = []
+    elif change == "scoring":
+        graph["nodes"][0]["data"]["nodeType"] = "InputNode"
+    else:
+        graph["nodes"][1]["data"]["config"]["command"] += " && echo other"
+    assert sdk_inference_paths(graph) is None
+
+
+async def test_sdk_frozen_inference_is_accepted_without_a_legacy_pipeline(
+    sdk_project_runtime, version_runtime, inference_graph
+):
+    runtime, context, project = sdk_project_runtime
+    runtime.versions = version_runtime[0].versions
+    scope = project.conversation_id
+    environment = await runtime.platform_sdk_context(scope, context)
+    entry = json.loads(environment["PYROMIND_PROJECT_EXECUTIONS"])[0]
+    address = TaskCorrelation.model_validate_json(entry["out_ids"]["evaluation"])
+    await runtime.deliver_external_task_status(
+        scope,
+        task_id="sdk-evaluation",
+        status="Succeeded",
+        correlation=address,
+        trusted_platform=True,
+        auto_run=False,
+    )
+    request = VersionToolRequest(
+        action="bind_execution_metadata",
+        arguments={"task_id": "sdk-evaluation", "workflow": inference_graph},
+    )
+    await runtime.version_call(scope, request, "metadata", context)
+    store = runtime._store(scope)
+    paths = verified_sdk_inference_paths(store)
+    assert paths == {"sdk-evaluation": ("/models/merged", "/workspace/val.jsonl")}
+    assert store.load_pipeline_runs() == {}
+    runs = store.load_snapshot().experiment_executions
+    assert runs
+    run = runs[0].model_copy(update={"state": "succeeded"})
+    assert check_inference_receipt(run, {}).state == "needs_input"
+    assert check_inference_receipt(run, {}, sdk_receipts=paths).state == "succeeded"
+    metadata = deepcopy(request.arguments)
+    changed_graph = deepcopy(inference_graph)
+    changed_graph["nodes"][0]["data"]["config"]["model_path"] = "/other"
+    metadata["workflow"] = changed_graph
+    with pytest.raises(ValueError, match="already frozen"):
+        await runtime.version_call(
+            scope,
+            VersionToolRequest(action="bind_execution_metadata", arguments=metadata),
+            "rewrite-metadata",
+            context,
+        )
+
+
+async def test_late_sdk_callback_keeps_the_signed_originating_chat_turn(tmp_path):
+    runtime, _, _, context = await _runtime(tmp_path)
+    scope = "workflow-conversation"
+    store = runtime._store(scope)
+    try:
+        original = None
+        for task, run, turn in (
+            ("requirement:first", "run-first", "chat-turn-first"),
+            ("requirement:second", "run-second", "chat-turn-second"),
+        ):
+            store.append(
+                ProductEvent(
+                    conversation_id=scope,
+                    type="task.queued",
+                    payload={
+                        "task_id": task,
+                        "kind": "requirement",
+                        "instruction": "Review the task",
+                        "origin_turn_id": turn,
+                    },
+                )
+            )
+            store.append(
+                ProductEvent(
+                    conversation_id=scope,
+                    type="status.changed",
+                    run_id=run,
+                    task_id=task,
+                    payload={"status": "running"},
+                )
+            )
+            environment = await runtime.platform_sdk_context(scope, context)
+            correlation = TaskCorrelation.model_validate_json(
+                json.loads(environment["PYROMIND_TASK_CONTEXTS"])["workflow_run"]
+            )
+            assert correlation.origin_run_id == run
+            if run == "run-first":
+                original = correlation
+        assert original is not None
+        with pytest.raises(PermissionError, match="signature"):
+            await runtime.deliver_external_task_status(
+                scope,
+                task_id="forged",
+                status="Succeeded",
+                correlation=original.model_copy(update={"origin_run_id": "run-second"}),
+                trusted_platform=True,
+                auto_run=False,
+            )
+        await runtime.deliver_external_task_status(
+            scope,
+            task_id="late-sdk-task",
+            status="Succeeded",
+            correlation=original,
+            trusted_platform=True,
+            auto_run=False,
+        )
+        snapshot = store.load_snapshot()
+        task = next(
+            task for task in snapshot.external_tasks if task.task_id == "late-sdk-task"
+        )
+        assert task.run_id == "run-first"
+        assert snapshot.task_runs is not None
+        origin = snapshot.task_runs[task.run_id]
+        assert snapshot.task_origins[origin.task_id] == "chat-turn-first"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("change", [None, "model", "dataset"])
+@pytest.mark.parametrize(
+    "dataset_input_name", ["dataset", "eval_data", "evaluation_dataset"]
+)
+async def test_sdk_evaluation_plan_capture_checks_frozen_paths(
+    sdk_project_runtime,
+    version_runtime,
+    inference_graph,
+    monkeypatch,
+    change,
+    dataset_input_name,
+):
+    runtime, context, project = sdk_project_runtime
+    runtime.versions = version_runtime[0].versions
+    scope = project.conversation_id
+    model = "/models/base" if change == "model" else "/models/merged"
+    dataset = (
+        "/workspace/train.jsonl" if change == "dataset" else "/workspace/eval.jsonl"
+    )
+    inference_graph["nodes"][0]["data"]["config"]["model_path"] = model
+    inference_graph["nodes"][1]["data"]["config"]["command"] = (
+        "python3 /workspace/eval/evaluate_inference.py --endpoint '$param' "
+        f"--model-reference {model} --dataset-path {dataset}"
+    )
+    environment = await runtime.platform_sdk_context(scope, context)
+    entry = json.loads(environment["PYROMIND_PROJECT_EXECUTIONS"])[0]
+    address = TaskCorrelation.model_validate_json(entry["out_ids"]["evaluation"])
+    await runtime.deliver_external_task_status(
+        scope,
+        task_id="sdk-evaluation",
+        status="Succeeded",
+        correlation=address,
+        trusted_platform=True,
+        auto_run=False,
+    )
+    await runtime.version_call(
+        scope,
+        VersionToolRequest(
+            action="bind_execution_metadata",
+            arguments={"task_id": "sdk-evaluation", "workflow": inference_graph},
+        ),
+        "metadata",
+        context,
+    )
+    rows = [
+        {
+            "id": project.plan.tasks[0].id,
+            "stage_id": project.plan.tasks[0].stage_id,
+            "plan_attempt": 1,
+            "platform_task_id": "sdk-evaluation",
+            "business_status": "completed",
+        }
+    ]
+    active = runtime._active[scope]
+    monkeypatch.setattr(
+        active.adapter,
+        "read_workspace_text",
+        AsyncMock(return_value=json.dumps({"tasks": rows})),
+    )
+    assert await runtime._capture_plan_progress(active, runtime._store(scope)) == rows
+    snapshot = await runtime.get_snapshot(scope, context)
+    assert snapshot.experiment_executions
+    run = snapshot.experiment_executions[0]
+    assert run.platform_task_id == "sdk-evaluation"
+    if change:
+        assert run.state == "needs_input"
+        assert run.waiting_reason and "requires" in run.waiting_reason
+        assert not run.artifacts and run.report_uri is None
+    else:
+        assert run.state == "succeeded"
+        assert run.waiting_reason is None
+
+
+async def test_sdk_second_shard_matches_its_registered_plan_attempt(
+    sdk_project_runtime,
+):
+    runtime, context, project = sdk_project_runtime
+    scope = project.conversation_id
+    environment = await runtime.platform_sdk_context(scope, context)
+    entry = json.loads(environment["PYROMIND_PROJECT_EXECUTIONS"])[0]
+    address = TaskCorrelation.model_validate_json(entry["out_ids"]["evaluation"])
+    for identity in ("shard-first", "shard-second"):
+        await runtime.deliver_external_task_status(
+            scope,
+            task_id=identity,
+            status="Succeeded",
+            correlation=address,
+            trusted_platform=True,
+            auto_run=True,
+        )
+    store = runtime._store(scope)
+    snapshot = store.load_snapshot()
+    registered = snapshot.experiment_executions
+    assert registered and registered[0].platform_task_ids == (
+        "shard-first",
+        "shard-second",
+    )
+    task = project.plan.tasks[0]
+    (run,) = tuple(
+        plan_executions(
+            project,
+            [
+                {
+                    "id": task.id,
+                    "stage_id": task.stage_id,
+                    "plan_attempt": 1,
+                    "platform_task_id": "shard-second",
+                    "business_status": "completed",
+                }
+            ],
+            registered=registered,
+        )
+    )
+    assert run.run_id == registered[0].run_id and run.plan_attempt == 1
+    assert (
+        completed_callback_task(
+            store.load_snapshot(),
+            "shard-second",
+            project.project_id,
+            allow_pending_analysis=True,
+        )
+        == task.id
+    )

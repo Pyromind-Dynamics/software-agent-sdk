@@ -79,8 +79,9 @@ export class JsonlRpcPeer {
       response = { protocolVersion: PROTOCOL_VERSION, type: "response", requestId: request.requestId,
         result: await this.handler(request.method, request.params) };
     } catch (error) {
-      const code = error instanceof Error && "code" in error && error.code === "input_pending"
-        ? "input_pending" : "request_failed";
+      const code = error instanceof Error && "code" in error &&
+        (error.code === "input_pending" || error.code === "conversation_busy")
+        ? error.code : "request_failed";
       response = { protocolVersion: PROTOCOL_VERSION, type: "response", requestId: request.requestId,
         error: { code, message: error instanceof Error ? error.message : "request failed" } };
     }

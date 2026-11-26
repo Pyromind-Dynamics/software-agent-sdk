@@ -129,4 +129,5 @@ from dataflow.operators.text_sft import AlpagasusFilter
 ```
 
 先用 DataFlow CLI（配置 `output_schema: "dpo"`、`model_profile: "text"`，见 [terminal-cli](../../../terminal-cli.md)） 跑小样验证；用户确认
-后再 `df_submit_pipeline(output_schema="dpo", model_profile="text")`。
+后按 [playbook 的提交入口](../playbook.md)准备并提交 DataFlow 全量任务，
+业务参数设置 `output_schema="dpo"`、`model_profile="text"`。

@@ -92,7 +92,7 @@ def test_extract_archive_submits_zip_workflow(monkeypatch):
         timeout=5,
     )(
         ExtractArchiveAction(
-            archive_path="datasets/data.zip",
+            archive_path="/workspace/datasets/data.zip",
             format="zip",
         ),
         cast(Any, conversation),
@@ -147,7 +147,7 @@ def test_extract_archive_auto_detects_tar_gz(monkeypatch):
         headers={"x-cluster": "us-west-1#pre"},
         timeout=5,
     )(
-        ExtractArchiveAction(archive_path="datasets/data.tar.gz"),
+        ExtractArchiveAction(archive_path="/workspace/datasets/data.tar.gz"),
         cast(Any, conversation),
     )
 
@@ -162,7 +162,7 @@ def test_extract_archive_auto_detects_tar_gz(monkeypatch):
 
 def test_extract_archive_requires_conversation():
     observation = ExtractArchiveExecutor()(
-        ExtractArchiveAction(archive_path="datasets/data.zip"),
+        ExtractArchiveAction(archive_path="/workspace/datasets/data.zip"),
         conversation=None,
     )
     assert observation.is_error
@@ -171,7 +171,7 @@ def test_extract_archive_requires_conversation():
 
 def test_extract_archive_unknown_format():
     observation = ExtractArchiveExecutor()(
-        ExtractArchiveAction(archive_path="datasets/data.xyz"),
+        ExtractArchiveAction(archive_path="/workspace/datasets/data.xyz"),
         conversation=cast(Any, _fake_conversation()),
     )
     assert observation.is_error
@@ -222,9 +222,9 @@ def test_extract_archive_custom_output_dir(monkeypatch):
         timeout=5,
     )(
         ExtractArchiveAction(
-            archive_path="datasets/data.zip",
+            archive_path="/workspace/datasets/data.zip",
             format="zip",
-            output_dir="my/custom/output",
+            output_dir="/workspace/my/custom/output",
         ),
         cast(Any, conversation),
     )
@@ -294,7 +294,7 @@ def test_extract_archive_file_not_found(monkeypatch):
         timeout=5,
     )(
         ExtractArchiveAction(
-            archive_path="datasets/data.zip",
+            archive_path="/workspace/datasets/data.zip",
             format="zip",
         ),
         cast(Any, conversation),
@@ -355,7 +355,7 @@ def test_extract_archive_appends_suffix_when_default_dir_exists(monkeypatch):
         timeout=5,
     )(
         ExtractArchiveAction(
-            archive_path="datasets/data.zip",
+            archive_path="/workspace/datasets/data.zip",
             format="zip",
         ),
         cast(Any, conversation),
@@ -390,7 +390,7 @@ def test_extract_archive_skips_existing_suffixed_dirs(monkeypatch):
         timeout=5,
     )(
         ExtractArchiveAction(
-            archive_path="datasets/data.tar.gz",
+            archive_path="/workspace/datasets/data.tar.gz",
             format="tar.gz",
         ),
         cast(Any, conversation),
@@ -412,9 +412,9 @@ def test_extract_archive_explicit_output_dir_exists_errors(monkeypatch):
         timeout=5,
     )(
         ExtractArchiveAction(
-            archive_path="datasets/data.zip",
+            archive_path="/workspace/datasets/data.zip",
             format="zip",
-            output_dir="my/custom/output",
+            output_dir="/workspace/my/custom/output",
         ),
         cast(Any, conversation),
     )

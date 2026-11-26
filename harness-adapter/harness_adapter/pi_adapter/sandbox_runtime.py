@@ -10,19 +10,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import secrets
 import shlex
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
+from filelock import FileLock
 from pyromind_sdk.client.models import (
     ResourceConfig,
     SandboxRequest,
@@ -32,14 +34,26 @@ from pyromind_sdk.client.models import (
 )
 
 from harness_adapter.pi_adapter.business_tool_host import (
+    DEBUG_STATE_RELATIVE_PATH,
+    PyromindBusinessToolHost,
     ToolExecutionContext,
     _auth_token,
+    _debug_attempts,
     _execution_target,
     _forward_headers,
+    sandbox_dataflow_environment,
 )
-from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from harness_adapter.pi_adapter.persistence import PiSessionFiles, _atomic_json
+from harness_adapter.pi_adapter.platform_helper_bundle import (
+    build_platform_helper_wheel,
+)
 from harness_adapter.pi_adapter.protocol import SandboxAuthorizationRequired
 from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
+from harness_adapter.pi_adapter.sdk_environment import (
+    SANDBOX_SDK_PYTHON,
+    PlatformSDKSetupError,
+    sandbox_sdk_bootstrap_command,
+)
 from pyromind_common.tools.sandbox import (
     create_sandbox_api_client,
     default_sandbox_image,
@@ -47,6 +61,7 @@ from pyromind_common.tools.sandbox import (
     terminal_base_url,
     write_sandbox_file,
 )
+from pyromind_common.tools.workflow_debug.execution import WORKFLOW_ATTEMPT_STATE_KEY
 
 
 logger = logging.getLogger(__name__)
@@ -65,11 +80,8 @@ PYROMIND_AGENT_RESOURCES_ROOT = "/.pyromind-agent-resources"
 # relative name. Storage is addressed by its mount path now, so the link is only
 # remembered here to clear it out of workspaces laid out by an older runtime.
 LEGACY_STORAGE_ALIAS = "storage"
-# Bumped when the workspace layout changes, so an existing sandbox re-runs the
-# prepare script. 5: Pi mounts Storage at the same /workspace path exposed to
-# users and platform tasks.
-_WORKSPACE_LAYOUT_VERSION = 6
-_READONLY_PREPARED_MOUNT_VERSION = 6
+# Version 6 was used both with and without the read-only prepared volume.
+_WORKSPACE_LAYOUT_VERSION = 7
 # The platform rejects a create request without memory; mirror the sandbox
 # tool's own fallback (platform minimum 4 vCPU, 1:2 vCPU:memory ratio).
 DEFAULT_CPU = "4"
@@ -118,11 +130,6 @@ _DATAFLOW_WARMUP_SWITCH = "PYROMIND_SANDBOX_DATAFLOW_WARMUP"
 # the background instead of making its first tool call pay for it. Set to 0 to
 # create the sandbox on first touch only.
 _PREWARM_SWITCH = "PYROMIND_SANDBOX_PREWARM"
-_DATAFLOW_WARMUP_ENV = (
-    "PYROMIND_SANDBOX_DATAFLOW_PYTHON",
-    "PYROMIND_SANDBOX_DATAFLOW_VENV",
-    "PYROMIND_SANDBOX_SYSTEM_PYTHON",
-)
 _DEFAULT_SANDBOX_SYSTEM_PYTHON = "python3"
 
 
@@ -142,6 +149,14 @@ class SandboxSettings:
     gpu_card: str | None = None
     mount_path: str = DEFAULT_MOUNT_PATH
     host_path: str = STORAGE_HOST_PATH
+
+    def prepared_mount(self, conversation_id: str) -> VolumeMount:
+        prepared = f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation_id}/prepared"
+        return VolumeMount(
+            host_path=self.host_path + prepared,
+            mount_path=self.mount_path + prepared,
+            read_only=True,
+        )
 
     @classmethod
     def from_extra(cls, extra: dict[str, Any]) -> SandboxSettings:
@@ -223,6 +238,7 @@ class _SandboxState:
     client: SandboxClientLike
     endpoint: dict[str, Any]
     credential_fingerprint: str
+    sdk_helper_version: str | None = None
 
 
 def _credential_fingerprint(context: ToolExecutionContext) -> str:
@@ -256,23 +272,81 @@ def _failure_detail(output: str, exit_code: int | None, timed_out: bool) -> str:
     return " (" + ", ".join(detail) + ")"
 
 
-def _dataflow_warmup_env() -> dict[str, str]:
-    """Operator overrides the DataFlow runner would read, when they are set.
-
-    The runner resolves the same values from the run spec, so forwarding them
-    keeps the warm-up on the interpreter and venv path a run would pick.
-    """
-    values: dict[str, str] = {}
-    for name in _DATAFLOW_WARMUP_ENV:
-        value = os.environ.get(name, "").strip()
-        if value:
-            values[name] = value
-    return values
-
-
 def _resource_arcname(destination: str, workspace_path: str) -> str:
     """Sandbox path of one resource file, relative to the workspace root."""
     return PurePosixPath(destination).relative_to(workspace_path).as_posix()
+
+
+def _debug_state_script(path: str, attempts: int, *, push: bool) -> str:
+    return f"""python3 - <<'PYROMIND_DEBUG_STATE'
+import fcntl
+import json
+import os
+import tempfile
+from pathlib import Path
+
+path = Path({path!r})
+key = {WORKFLOW_ATTEMPT_STATE_KEY!r}
+path.parent.mkdir(parents=True, exist_ok=True)
+with open(str(path) + '.lock', 'a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    exists = path.is_file()
+    state = (
+        json.loads(path.read_text(encoding='utf-8')) if exists else {{key: {attempts}}}
+    )
+    if not isinstance(state, dict):
+        raise ValueError('Debug state must be a JSON object')
+    count = state.get(key, 0)
+    if type(count) is not int or count < 0:
+        raise ValueError('Debug submission count must be a nonnegative integer')
+    if {push!r} or not exists:
+        state[key] = {attempts}
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=path.parent, delete=False
+            ) as destination:
+                temporary = Path(destination.name)
+                json.dump(state, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    print('PYROMIND_DEBUG_ATTEMPTS:' + str(state.get(key, 0)))
+PYROMIND_DEBUG_STATE
+"""
+
+
+async def sync_debug_budget(
+    context: ToolExecutionContext,
+    files: PiSessionFiles,
+    workspace_path: str,
+    run: Callable[[str], Awaitable[str]],
+    *,
+    push: bool,
+) -> str:
+    local = await asyncio.to_thread(
+        PyromindBusinessToolHost.prepare_debug_budget, context.workspace_root
+    )
+    attempts = _debug_attempts(json.loads(local.read_text(encoding="utf-8")))
+    remote = str(PurePosixPath(workspace_path) / DEBUG_STATE_RELATIVE_PATH)
+    output = await run(_debug_state_script(remote, attempts, push=push))
+    marker = "PYROMIND_DEBUG_ATTEMPTS:"
+    values = [line.strip() for line in output.splitlines() if line.startswith(marker)]
+    if len(values) != 1:
+        raise RuntimeError("PI_DEBUG_STATE_SYNC_FAILED: missing submission count")
+    count = _debug_attempts({WORKFLOW_ATTEMPT_STATE_KEY: int(values[0][len(marker) :])})
+
+    def mirror() -> None:
+        with FileLock(str(local) + ".lock"):
+            budget_state = {WORKFLOW_ATTEMPT_STATE_KEY: count}
+            _atomic_json(local, budget_state)
+            files.save_business_state(budget_state)
+
+    await asyncio.to_thread(mirror)
+    return remote
 
 
 @contextmanager
@@ -325,6 +399,7 @@ class SandboxExecutionManager:
         self._resource_roots = list(resource_roots or [])
         self._states: dict[str, _SandboxState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._sdk_locks: dict[str, asyncio.Lock] = {}
         self._warmups: dict[str, asyncio.Task[None]] = {}
         self._prewarms: dict[str, asyncio.Task[None]] = {}
 
@@ -352,6 +427,98 @@ class SandboxExecutionManager:
             sandbox_id=endpoint["sandbox_id"],
             ws_base_url=endpoint["ws_base_url"],
             client=state.client,
+        )
+
+    async def sdk_python(
+        self, context: ToolExecutionContext, files: PiSessionFiles
+    ) -> str:
+        lock = self._sdk_locks.setdefault(context.conversation_id, asyncio.Lock())
+        async with lock:
+            state = await self._ensure_state(context, files)
+            endpoint = state.endpoint
+            with tempfile.TemporaryDirectory(
+                prefix="pi-platform-helpers-"
+            ) as directory:
+                bundle = await asyncio.to_thread(
+                    build_platform_helper_wheel, Path(directory)
+                )
+                if state.sdk_helper_version == bundle.version:
+                    return SANDBOX_SDK_PYTHON
+                remote = f"{endpoint['workspace_path']}/.sdk-helpers/{bundle.path.name}"
+                staging = remote + ".partial-" + secrets.token_hex(4)
+                await asyncio.to_thread(
+                    write_sandbox_file,
+                    state.client,
+                    ws_base_url=endpoint["ws_base_url"],
+                    sandbox_id=endpoint["sandbox_id"],
+                    path=staging,
+                    source=bundle.path,
+                )
+                command = f"set -e\nmv {shlex.quote(staging)} {shlex.quote(remote)}\n"
+                values = sandbox_dataflow_environment(state.client.cluster)
+                pip_index = values.get(
+                    "PYROMIND_SANDBOX_DATAFLOW_PIP_INDEX_URL"
+                ) or os.environ.get("PIP_INDEX_URL")
+                command += sandbox_sdk_bootstrap_command(
+                    helper_wheel=remote,
+                    helper_version=bundle.version,
+                    system_python=values.get("PYROMIND_SANDBOX_SYSTEM_PYTHON"),
+                    pip_index_url=pip_index,
+                )
+                output, exit_code, timed_out = await self._run_script(
+                    state.client,
+                    endpoint["sandbox_id"],
+                    endpoint["ws_base_url"],
+                    command,
+                    timeout_seconds=300,
+                )
+            if exit_code != 0 or timed_out:
+                stage = "transport"
+                for line in output.splitlines():
+                    if line.startswith("PYROMIND_SDK_SETUP_ERROR:"):
+                        reported, _, outcome = line.partition(":")[2].partition(":")
+                        if reported in {"lock", "python", "venv", "install", "verify"}:
+                            stage = reported
+                            timed_out = timed_out or outcome == "timeout"
+                raise PlatformSDKSetupError(stage, exit_code, timed_out)
+            state.sdk_helper_version = bundle.version
+            return SANDBOX_SDK_PYTHON
+
+    async def debug_state_path(
+        self, context: ToolExecutionContext, files: PiSessionFiles
+    ) -> str:
+        """Initialize the remote count once, then mirror its current value locally."""
+        return await self._sync_debug_budget(context, files, push=False)
+
+    async def push_debug_budget(
+        self, context: ToolExecutionContext, files: PiSessionFiles
+    ) -> None:
+        """Publish the legacy count, including an explicit reset to zero."""
+        await self._sync_debug_budget(context, files, push=True)
+
+    async def _sync_debug_budget(
+        self, context: ToolExecutionContext, files: PiSessionFiles, *, push: bool
+    ) -> str:
+        state = await self._ensure_state(context, files)
+        endpoint = state.endpoint
+
+        async def run(script: str) -> str:
+            output, exit_code, timed_out = await self._run_script(
+                state.client,
+                endpoint["sandbox_id"],
+                endpoint["ws_base_url"],
+                script,
+                timeout_seconds=60,
+            )
+            if exit_code != 0 or timed_out:
+                raise RuntimeError(
+                    "PI_DEBUG_STATE_SYNC_FAILED"
+                    + _failure_detail(output, exit_code, timed_out)
+                )
+            return output
+
+        return await sync_debug_budget(
+            context, files, endpoint["workspace_path"], run, push=push
         )
 
     def prewarm(self, context: ToolExecutionContext, files: PiSessionFiles) -> None:
@@ -523,17 +690,28 @@ class SandboxExecutionManager:
         # The Storage mount is fixed when the container is created, so a
         # container recorded under a different mount layout cannot be repaired
         # in place.
+        sandbox = await self._lookup(
+            client, recorded_id if isinstance(recorded_id, str) else None
+        )
         record_version = record.get("workspace_version")
+        prepared = settings.prepared_mount(context.conversation_id)
         record_layout_matches = (
             record.get("mount_path") == mount_path
             and record.get("storage_host_path") == settings.host_path
             and (
                 not isinstance(record_version, int)
-                or record_version >= _READONLY_PREPARED_MOUNT_VERSION
+                or record_version >= _WORKSPACE_LAYOUT_VERSION
+                or (
+                    record_version == 6
+                    and sandbox is not None
+                    and any(
+                        mount.read_only
+                        and mount.mount_path == prepared.mount_path
+                        and mount.host_path == prepared.host_path
+                        for mount in sandbox.volume_mounts or ()
+                    )
+                )
             )
-        )
-        sandbox = await self._lookup(
-            client, recorded_id if isinstance(recorded_id, str) else None
         )
         prepare = False
         if sandbox is None:
@@ -721,7 +899,6 @@ class SandboxExecutionManager:
     async def _create(
         self, client: SandboxClientLike, settings: SandboxSettings, conversation_id: str
     ) -> SandboxResponse:
-        prepared = f"{PYROMIND_AGENT_STORAGE_ROOT}/{conversation_id}/prepared"
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
             image=settings.image or default_sandbox_image(client.cluster),
@@ -738,11 +915,7 @@ class SandboxExecutionManager:
                     mount_path=settings.mount_path,
                     read_only=False,
                 ),
-                VolumeMount(
-                    host_path=settings.host_path + prepared,
-                    mount_path=settings.mount_path + prepared,
-                    read_only=True,
-                ),
+                settings.prepared_mount(conversation_id),
             ],
         )
         try:
@@ -961,7 +1134,7 @@ class SandboxExecutionManager:
         mount_path: str,
         workspace_path: str,
     ) -> None:
-        files = self._resource_files(workspace_path)
+        files = resource_files(self._resource_roots, workspace_path)
         total = len(files)
         if not total:
             return
@@ -1096,7 +1269,7 @@ class SandboxExecutionManager:
         running = self._warmups.get(conversation_id)
         if running is not None and not running.done():
             return
-        command = self._dataflow_warmup_command(workspace_path)
+        command = self._dataflow_warmup_command(workspace_path, client.cluster)
         if command is None:
             return
         task = asyncio.create_task(
@@ -1148,7 +1321,7 @@ class SandboxExecutionManager:
             output.strip()[-_FAILURE_OUTPUT_CHARS:],
         )
 
-    def _dataflow_warmup_command(self, workspace_path: str) -> str | None:
+    def _dataflow_warmup_command(self, workspace_path: str, cluster: str) -> str | None:
         """One-line command preparing the DataFlow venv, when the skill is staged."""
         for destination, source in self._resource_roots:
             if destination != _SKILLS_ALIAS:
@@ -1160,7 +1333,7 @@ class SandboxExecutionManager:
                 f"{workspace_path}/{_SKILLS_ALIAS}/{_DATAFLOW_SKILL}/"
                 f"{_DATAFLOW_PREPARE_SCRIPT}"
             )
-            values = _dataflow_warmup_env()
+            values = sandbox_dataflow_environment(cluster)
             system_python = (
                 values.get("PYROMIND_SANDBOX_SYSTEM_PYTHON")
                 or _DEFAULT_SANDBOX_SYSTEM_PYTHON
@@ -1236,33 +1409,36 @@ class SandboxExecutionManager:
         if self._prewarms.get(conversation_id) is task:
             self._prewarms.pop(conversation_id, None)
 
-    def _resource_files(self, workspace_path: str) -> list[tuple[str, str]]:
-        """Local resource files paired with the sandbox path each one targets."""
-        files: list[tuple[str, str]] = []
-        for destination_root, source_root in self._resource_roots:
-            source = os.fspath(source_root)
-            if os.path.isfile(source) and not os.path.islink(source):
-                files.append((f"{workspace_path}/{destination_root}", source))
-                continue
-            if not os.path.isdir(source):
-                continue
-            for directory, directories, names in os.walk(source):
-                directories[:] = [
-                    name for name in directories if name not in _SKIPPED_DIRECTORIES
-                ]
-                for name in names:
-                    local_path = os.path.join(directory, name)
-                    if os.path.islink(local_path) or not os.path.isfile(local_path):
-                        continue
-                    relative = os.path.relpath(local_path, source)
-                    files.append(
-                        (
-                            f"{workspace_path}/{destination_root}/"
-                            f"{relative.replace(os.sep, '/')}",
-                            local_path,
-                        )
+
+def resource_files(
+    resource_roots: Sequence[tuple[str, os.PathLike[str]]], workspace_path: str
+) -> list[tuple[str, str]]:
+    """Local resource files paired with the sandbox path each one targets."""
+    files: list[tuple[str, str]] = []
+    for destination_root, source_root in resource_roots:
+        source = os.fspath(source_root)
+        if os.path.isfile(source) and not os.path.islink(source):
+            files.append((f"{workspace_path}/{destination_root}", source))
+            continue
+        if not os.path.isdir(source):
+            continue
+        for directory, directories, names in os.walk(source):
+            directories[:] = [
+                name for name in directories if name not in _SKIPPED_DIRECTORIES
+            ]
+            for name in names:
+                local_path = os.path.join(directory, name)
+                if os.path.islink(local_path) or not os.path.isfile(local_path):
+                    continue
+                relative = os.path.relpath(local_path, source)
+                files.append(
+                    (
+                        f"{workspace_path}/{destination_root}/"
+                        f"{relative.replace(os.sep, '/')}",
+                        local_path,
                     )
-        return files
+                )
+    return files
 
 
 def _sandbox_client(context: ToolExecutionContext) -> SandboxClientLike:

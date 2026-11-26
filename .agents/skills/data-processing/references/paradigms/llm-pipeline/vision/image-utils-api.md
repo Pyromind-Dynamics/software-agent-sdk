@@ -1,6 +1,6 @@
 # image_utils API
 
-CLI 会把技能的运行库目录加入 Python 路径，`df_submit_pipeline` 会自动投递 `image_utils.py`。Pipeline
+CLI 会把技能的运行库目录加入 Python 路径，平台准备步骤必须随冻结运行时投递 `image_utils.py`。Pipeline
 只能显式导入以下 API：
 
 ```python
@@ -67,11 +67,20 @@ JSON fence 解析、响应修复或日志逻辑。
 - `timeout=1800`
 
 模型配置统一来自 `DF_API_KEY`、`DF_API_BASE_URL` 和 `DF_MODEL_NAME`，不得写入
-Pipeline。这三个值有两个来源：用户自己提供的打标网关（工具参数
-`labeling_gateway`，整体替换平台配置），或平台默认的 `DF_*`。Pipeline 只读
-`DF_*`，不关心来源；本地试跑和平台全量用同一个网关。
+Pipeline。来源为执行环境的视觉 profile，或用户指定的打标网关。
+自定义网关在小样使用 `gateway`；全量准备与提交脚本在内存中整体替换
+`PYROMIND_DATAFLOW_PROFILES` 的 `vision` 项，密钥只取同一网关的已授权环境变量，
+不与平台 key 混用。跨校验 Tool 后的新进程须按相同公开配置重建；指纹变化会拒绝提交。
+Pipeline 只读 `DF_*`，不关心来源；本地试跑和平台全量用同一个网关。
+具体步骤见上层 playbook 及其 SDK 提交参考，含环境声明的图通过普通提交函数调用 SDK。
 
 ## 执行入口
+
+输入清单中的相对图片引用按清单所在目录解析。清单另存到其他目录时，可使用同一用户
+Storage 内的 `/workspace/...` 绝对图片路径，平台任务会适配 `/target-workspace` 挂载。
+相对引用、非 Storage 的本地绝对引用仍限制在清单目录内；禁止 `..` 和符号链接越界。
+运行时统一冻结本轮图片根到 `runtime_metadata.json.image_root`，vision 输出仍是相对该根
+的图片引用，structured 的 `source_images` 使用可访问的原图绝对路径。
 
 标准脚本结尾：
 

@@ -1,52 +1,140 @@
 ---
 title: 执行训练工作流
-description: 使用 pyromind-sdk 创建、运行并等待训练 workflow 任务完成。
+description: 使用 pyromind-sdk 0.1.17 提交真实工作流定义，查询任务和节点日志。
 ---
 
 ## 前置条件
 
-- 已完成 [SDK 安装与配置](/zh/docs/sdk/installation)
+- 已完成 [SDK 安装与配置](installation.mdx)，明确配置 API Key 和目标集群。
+- 已准备真实的标准工作流 JSON 文件 `workflow.json`，含完整节点、边与配置。
+
+本页用于独立 SDK 脚本。平台 SDK 负责创建任务；工作台按需维护会话关联，
+EchoMind 按 Project 业务 run 维护数据、模型、报告和恢复信息。
+Agent terminal 启用 SDK 后，异步提交使用执行环境提供的会话或 Project task/attempt
+关联，保留实际校验图和产物验收；未迁移的准备能力继续使用当前已启用入口。
+Agent 的保留校验 Tool 在 content 返回 `validated_workflow_path` 与摘要；直接从该路径
+读取已保存的实际图，不从内部 `raw_response` 搬写 JSON。缺少路径或
+`artifact_unavailable` 时停止 SDK 提交，即使校验的 `valid=true`。
+职责与迁移状态见 [Agent 操作索引](agent-operations.mdx)。
 
 ## 创建训练任务
 
 ```python
+import json
+import os
+from pathlib import Path
+
 from pyromind_sdk import PyroMindAPIClient
-from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
+from pyromind_sdk.client import validate_workflow
+from pyromind_sdk.client.models import TrainingTaskCreateRequest
 
-client = PyroMindAPIClient(api_key="your-api-key")
-
-task = client.studio.create(
-    TrainingTaskCreateRequest(
-        name="my-workflow",
-        workflow={"nodes": [...]}
+workflow = json.loads(Path("workflow.json").read_text(encoding="utf-8"))
+with PyroMindAPIClient(
+    api_key=os.environ["PYROMIND_API_KEY"],
+    cluster=os.environ["PYROMIND_CLUSTER"],
+    max_retries=0,
+) as client:
+    valid, errors = validate_workflow(workflow, client=client)
+    if not valid:
+        raise ValueError("\n".join(errors))
+    task = client.studio.create(
+        TrainingTaskCreateRequest(
+            name="my-workflow",
+            workflow=workflow,
+            out_id="my-external-run-id",
+        )
     )
-)
-print(f"Task ID: {task.task_id}")
+    print(f"Task ID: {task.task_id}")
 ```
 
-## 列出任务并注入参数运行
+独立调用方将 `out_id` 替换为真实外部关联标识。Agent 会话从 `PYROMIND_TASK_CONTEXTS`
+按场景取值；Project 场景从 `PYROMIND_PROJECT_EXECUTIONS` 选择任务及 attempt 的 `out_ids`。
+不要自行拼造归属。`out_id` 是必填字段，不承诺服务端幂等或重复提交去重。
+示例关闭 SDK 自动重试；超时或连接中断后先核对平台是否已经创建任务，避免重复提交。
+
+`validate_workflow` 默认返回 `(valid, errors)`，使用 `client` 可获取节点定义。
+它不替代服务端 DSL 校验、集群资源检查或对应场景的业务约束。
+
+## 查询任务和等待结果
 
 ```python
-tasks = client.studio.list()
-
-result = client.studio.run_with_params(
-    WorkflowRunRequest(workflow_name="my-workflow", primitive_node_map={"key": "value"})
-)
-
-status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
-print(f"Final status: {status}")
+with PyroMindAPIClient(
+    api_key=os.environ["PYROMIND_API_KEY"],
+    cluster=os.environ["PYROMIND_CLUSTER"],
+    max_retries=0,
+) as client:
+    details = client.studio.get_task(task.task_id)
+    print(details.status)
+    status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
+    print(f"Wait result: {status}")
 ```
 
-## 提交前校验 workflow
+此例接续上例的 `task`；恢复独立脚本时使用已经保存的真实 `task_id`，不要重新创建任务。
+等待结果可能为 `success`、失败终态或 `timeout`。`timeout` 仅表示等待期限已到，不能据此认定平台任务已终止。
+场景采用状态回调和异步恢复时，仍需维护任务关联与业务运行记录，单次轮询不会自动补齐这些信息。
+
+## 查询节点状态与日志
+
+原生 SDK 提供 `client.studio.get_node_logs(task_id, node_id)` 和
+`scroll_node_logs(task_id, node_id, timestamp=..., expect_count=500)`。
+节点 ID 使用任务响应中的实际 ID；不要把 DSL 节点的排列位置当作平台数据库 ID。
+滚动接口向前读取分段，不提供“最后若干行”的语义。
+
+Agent SDK 解释器还安装了普通查询函数，覆盖原 `inspect_workflow_task` Tool 的任务状态、
+节点筛选和日志尾部输出。SDK Main 不再注入该 Tool：
 
 ```python
-from pyromind_sdk.client import validate_workflow, ValidationError
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_common.platform.inspection import inspect_workflow_task
 
-try:
-    validate_workflow(workflow_dict)
-    print("Workflow is valid")
-except ValidationError as e:
-    print(f"Invalid workflow: {e}")
+with PyroMindAPIClient(max_retries=0) as client:
+    result = inspect_workflow_task(client, task_id)
+    print(result.model_dump_json())
+    if result.failed_nodes:
+        detail = inspect_workflow_task(
+            client,
+            task_id,
+            node_id=result.failed_nodes[0].node_id,
+            include_log=True,
+            tail_lines=100,
+            max_log_chars=20000,
+        )
+        print(detail.model_dump_json())
+```
+
+此例使用已有真实 `task_id`。该函数由执行环境的 `pyromind-platform-helpers` wheel 提供；
+只安装 `pyromind-sdk` 的独立脚本没有此模块，仍可使用上述原生 SDK 方法。
+SDK 0.1.17 的 `get_task()` 将节点解析成 `TrainingTaskNodeInfo`，未声明的 `status` 会丢失。
+普通查询函数通过 `client.studio.get()` 读取原始任务响应，保留实际节点状态。
+平台未返回的状态仍为 `unknown`，`node_status_available=false` 表示信息不完整；
+不按时间戳、整体任务状态或退出码补造节点结论。
+
+指定 `node_id` 才能读取日志。默认返回最后 100 行、最多 20000 字符，上限分别是
+1000 行、100000 字符；这限制返回文本，不代表 SDK 的整份日志响应只下载这些行。
+日志读取失败时保留已取得的状态，通过 `log_error` 报告；任务查询失败抛出
+`WorkflowInspectionError`。按需查询后返回用户，使用终态回调跟进，不在 Agent terminal
+循环等待。SDK 关闭的部署仍可按实际清单使用保留的旧 Tool。
+
+## 按已存储的工作流名称运行
+
+仅在确有可按名称运行的工作流时使用此入口；这是另一次任务创建。
+
+```python
+from pyromind_sdk.client.models import WorkflowRunRequest
+
+with PyroMindAPIClient(
+    api_key=os.environ["PYROMIND_API_KEY"],
+    cluster=os.environ["PYROMIND_CLUSTER"],
+    max_retries=0,
+) as client:
+    result = client.studio.run_with_params(
+        WorkflowRunRequest(
+            workflow_name="my-workflow",
+            primitive_node_map={},
+            execution_argos=None,
+        )
+    )
+    print(result.task_id)
 ```
 
 ## 请求参数
@@ -57,6 +145,7 @@ except ValidationError as e:
 |------|------|------|------|
 | `name` | 是 | `str` | 任务名称 |
 | `workflow` | 是 | `Dict[str, Any]` | 包含节点定义的 workflow JSON |
+| `out_id` | 是 | `str` | 外部系统关联标识；不承诺幂等 |
 
 ### `WorkflowRunRequest`
 
@@ -64,6 +153,7 @@ except ValidationError as e:
 |------|------|------|------|
 | `workflow_name` | 是 | `str` | 已存储的 workflow 名称 |
 | `primitive_node_map` | 否 | `Dict[str, Any]` | 注入的原始节点值（默认 `{}`） |
+| `execution_argos` | 是 | `Optional[list]` | 0.1.17 模型要求显式提供；无需额外参数时传 `None` |
 
 ## API 速查
 
@@ -75,6 +165,9 @@ except ValidationError as e:
 | `delete(task_id, force=False)` | 删除任务 |
 | `stop(task_id)` | 停止运行中的任务 |
 | `get_node_output(task_id, node_id)` | 获取节点级输出 |
+| `get_node_info(names=None)` | 查询节点定义 |
+| `get_node_logs(task_id, node_id)` | 获取节点日志 |
+| `scroll_node_logs(task_id, node_id, ...)` | 按时间滚动读取节点日志 |
 | `run_with_params(request)` | 以参数运行已存储的 workflow |
 | `wait_for_task_completion(task_id, ...)` | 轮询直至终态 |
 | `create_and_wait(request, ...)` | 创建 + 轮询 + 可选导出输出 |
@@ -86,10 +179,13 @@ except ValidationError as e:
 | `task_id` | `str` | 任务唯一 ID |
 | `name` | `str` | 任务名称 |
 | `status` | `str` | 当前状态（`running`、`completed`、`failed` 等） |
-| `workflow` | `Dict` | Workflow 配置 |
-| `nodes` | `List[TrainingTaskNodeInfo]` | 节点执行详情 |
+| `metrics` | `Optional[Dict[str, Any]]` | 平台返回的任务指标 |
+| `nodes` | `Optional[List[TrainingTaskNodeInfo]]` | 节点信息，可能为 `None`；0.1.17 节点模型没有 `status` 字段 |
 | `error_message` | `Optional[str]` | 失败时的错误信息 |
-| `created_at` | `datetime` | 创建时间 |
+| `created_at` | `str \| datetime \| None` | 创建时间 |
+| `started_at` / `completed_at` / `expires_at` | `str \| datetime \| None` | 启动、完成与过期时间 |
+
+`TrainingTaskResponse` 没有 `workflow` 字段；需要工作流图时保留提交时的真实定义。
 
 ## 下一步
 

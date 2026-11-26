@@ -98,6 +98,7 @@ class TaskMonitor:
                         status=task.status,
                         error_summary=task.error_summary,
                         auto_run=task.resume_auto_run,
+                        trusted_platform=True,
                     )
                     if task.resume_auto_run:
                         await self.host.resume_monitored_task(claimed.conversation_id)
@@ -122,6 +123,7 @@ class TaskMonitor:
                         status=result.status,
                         error_summary=result.error_summary,
                         auto_run=task.resume_auto_run,
+                        trusted_platform=True,
                     )
                 if result.status in _TERMINAL:
                     if task.resume_auto_run:

@@ -20,6 +20,7 @@ from pyromind_common.sdk.tool import (
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.domain.workflow_execution import DatasetRecipeReceipt
 
 
 type VersionCall = Callable[
@@ -33,6 +34,10 @@ summary; for Project task outputs include plan_task_id and plan_attempt inside
 arguments alongside logical_key); compare (left_version_id, right_version_id);
 select (slot, version_id, expected_revision, optional reason);
 new_iteration (goal, expected_revision); recover (retry unfinished snapshots).
+bind_execution_metadata (task_id, workflow, optional code, output_dir and
+dataset_recipe): record an SDK task's versions after a trusted callback confirms
+ownership. Supply the safe validated graph, never the graph containing worker
+credentials. A binding failure only requires retrying metadata, never SDK create.
 Use the revision returned by list for selections and new iterations. Reuse the
 same command_id when retrying the same operation. A reference_only record is not
 a restorable snapshot. Selection affects future executions, not running tasks.
@@ -42,7 +47,14 @@ Use version://<slot> in workflow path fields to consume a selected version.
 
 class ProductVersionsAction(Action):
     action: Literal[
-        "save", "list", "read", "compare", "select", "new_iteration", "recover"
+        "save",
+        "list",
+        "read",
+        "compare",
+        "select",
+        "new_iteration",
+        "recover",
+        "bind_execution_metadata",
     ]
     command_id: str = Field(
         min_length=1, description="Stable unique operation ID; reuse on retries."
@@ -134,6 +146,7 @@ class ExecutionCall(Protocol):
         graph_run_id: str | None,
         correlation: TaskCorrelation | None = None,
         continue_after_completion: bool = False,
+        dataset_recipe: DatasetRecipeReceipt | None = None,
     ) -> Coroutine[Any, Any, dict[str, Any]]: ...
 
 
@@ -149,7 +162,10 @@ def submission_bridge(
 ):
     from pyromind_sdk.client.models import TrainingTaskCreateResponse
 
-    from pyromind_common.tools.workflow.task_submission import current_task_correlation
+    from pyromind_common.tools.workflow.task_submission import (
+        current_dataset_recipe,
+        current_task_correlation,
+    )
 
     def submit(workflow: dict, name: str, code: str | None):
         effective = {**workflow, "name": name}
@@ -162,7 +178,12 @@ def submission_bridge(
                 context,
                 graph_run_id,
                 current_task_correlation(),
-                continue_after_completion,
+                continue_after_completion=continue_after_completion,
+                **(
+                    {"dataset_recipe": recipe}
+                    if (recipe := current_dataset_recipe())
+                    else {}
+                ),
             ),
             loop,
         ).result()

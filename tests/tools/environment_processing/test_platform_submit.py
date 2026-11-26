@@ -12,11 +12,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from pyromind_common.sdk.tool import ToolExecutor
 from pyromind_common.tools.environment_processing.platform_submit import (
     EdpSubmitAction,
+    EdpSubmitExecutor,
     EdpSubmitTool,
     build_edp_command,
     build_edp_workflow,
+    create_edp_submit_runner,
     resolve_llm_env,
 )
 
@@ -230,12 +233,9 @@ def test_build_edp_workflow_uses_custom_command_cpu_node() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _executor(runtime_dir: str | None = None) -> Any:
-    from pyromind_common.tools.environment_processing.platform_submit import (
-        EdpSubmitExecutor,
-    )
-
-    return EdpSubmitExecutor(
+def _executor(runtime_dir: str | None = None, *, plain_runner: bool = False) -> Any:
+    factory = create_edp_submit_runner if plain_runner else EdpSubmitExecutor
+    return factory(
         env="pre",
         cluster="us-west-1",
         headers={"x-cluster": "us-west-1#pre"},
@@ -295,7 +295,7 @@ def _patch_submission(
     return SimpleNamespace(upload=upload, submit=submit, client=client)
 
 
-def test_executor_submits_single_manifest(
+def test_runner_submits_single_manifest_without_tool_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mocks = _patch_submission(monkeypatch)
@@ -307,9 +307,10 @@ def test_executor_submits_single_manifest(
             "LLM_MODEL": "model-x",
         }
     )
-    executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
-    observation = executor(
-        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+    runner = _executor(runtime_dir=str(_runtime_tmp(tmp_path)), plain_runner=True)
+    assert not isinstance(runner, ToolExecutor)
+    observation = runner.run(
+        EdpSubmitAction(manifest="/edp/batch-001/manifest.jsonl"), conversation
     )
 
     assert observation.status == "Pending"
@@ -326,6 +327,7 @@ def test_executor_submits_single_manifest(
     assert "manifest.jsonl" not in uploaded_names
     # one task created with the CustomCommandCPUNode workflow
     workflow = mocks.submit.call_args.kwargs["workflow"]
+    assert mocks.submit.call_args.kwargs["retry_create"] is False
     assert workflow["nodes"][0]["data"]["nodeType"] == "CustomCommandCPUNode"
     # the runner reads the manifest straight from the Storage mount
     command = workflow["nodes"][0]["data"]["config"]["command"]
@@ -350,7 +352,7 @@ def test_executor_resume_reuses_run_id(
     run_id = "3f9a6c1d-4f5e-4a6b-8c7d-9e0f1a2b3c4d"
     executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
     observation = executor(
-        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl", run_id=run_id),
+        EdpSubmitAction(manifest="/edp/batch-001/manifest.jsonl", run_id=run_id),
         conversation,
     )
 
@@ -387,7 +389,7 @@ def test_executor_missing_llm_env_fails(
     conversation = _conversation_with_secrets({"auth_token": "tok"})
     executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
     observation = executor(
-        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+        EdpSubmitAction(manifest="/edp/batch-001/manifest.jsonl"), conversation
     )
     assert observation.status == "Failed"
     assert "LLM_BASE_URL" in observation.text
@@ -413,7 +415,7 @@ def test_executor_missing_profile_fails(
     (scripts / "sandbox_runner.py").write_text("print('runner')\n")
     executor = _executor(runtime_dir=str(scripts))
     observation = executor(
-        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+        EdpSubmitAction(manifest="/edp/batch-001/manifest.jsonl"), conversation
     )
     assert observation.status == "Failed"
     assert "tmax-validation" in observation.text
@@ -428,7 +430,7 @@ def test_edp_submit_action_requires_exactly_one_manifest_source() -> None:
     with pytest.raises(ValueError, match="exactly one of manifest"):
         EdpSubmitAction()
     with pytest.raises(ValueError, match="exactly one of manifest"):
-        EdpSubmitAction(manifest="edp/b/manifest.jsonl", shards="/edp/shards.json")
+        EdpSubmitAction(manifest="/edp/b/manifest.jsonl", shards="/edp/shards.json")
 
 
 def test_edp_submit_action_defaults_to_serial_shard_submission() -> None:
@@ -520,7 +522,7 @@ def test_executor_shard_batch_resume_shares_run_id(
     assert observation.output_dirs == [f"/workspace/edp/batch-001/{run_id}"]
 
 
-def test_executor_shard_batch_stops_on_first_failure(
+def test_runner_shard_batch_stops_on_first_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mocks = _patch_submission(monkeypatch)
@@ -530,8 +532,8 @@ def test_executor_shard_batch_stops_on_first_failure(
     ]
     _patch_shards_index(monkeypatch, _SHARDS)
     conversation = _full_conversation()
-    executor = _executor(runtime_dir=str(_runtime_tmp(tmp_path)))
-    observation = executor(
+    runner = _executor(runtime_dir=str(_runtime_tmp(tmp_path)), plain_runner=True)
+    observation = runner.run(
         EdpSubmitAction(shards="/edp/shards.json", shard_count=2),
         conversation,
     )
@@ -600,7 +602,7 @@ def test_executor_stages_runtime_wheel_and_rewrites_profile(
 
     executor = _executor(runtime_dir=str(scripts))
     observation = executor(
-        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+        EdpSubmitAction(manifest="/edp/batch-001/manifest.jsonl"), conversation
     )
 
     assert observation.status == "Pending"
@@ -643,7 +645,7 @@ def test_executor_missing_wheel_bundle_fails(
     )
     executor = _executor(runtime_dir=str(scripts))
     observation = executor(
-        EdpSubmitAction(manifest="edp/batch-001/manifest.jsonl"), conversation
+        EdpSubmitAction(manifest="/edp/batch-001/manifest.jsonl"), conversation
     )
     assert observation.status == "Failed"
     assert "wheel bundle is missing" in observation.text

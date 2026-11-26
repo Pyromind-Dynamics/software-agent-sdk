@@ -1,6 +1,7 @@
 """Completed reports remain readable after the Sandbox record is reclaimed."""
 
 import pytest
+
 from harness_adapter.pi_adapter import PiAdapter, adapter as adapter_module
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
 from pyromind_runtime.domain.context import RequestContext
@@ -56,6 +57,26 @@ async def test_archived_report_reads_storage_with_current_request_credentials(
     assert not adapter._sessions
     assert files.load_sandbox() is None
     assert "auth_token" not in files.session_path.read_text()
+
+
+async def test_development_storage_uses_only_registered_mount(archived):
+    adapter, handle, files = archived
+    assert await adapter.development_storage_proxy(handle.session_id) is None
+    record = {
+        "sandbox_id": "sb-owner",
+        "mount_path": "/data",
+        "storage_host_path": "/other",
+        "workspace_path": "/data/private",
+    }
+    files.save_sandbox(record)
+    assert await adapter.development_storage_proxy(handle.session_id) is None
+    files.save_sandbox({**record, "storage_host_path": "/workspace", "mount_path": "/"})
+    assert await adapter.development_storage_proxy(handle.session_id) is None
+    files.save_sandbox({**record, "storage_host_path": "/workspace"})
+    result = await adapter.development_storage_proxy(handle.session_id)
+    assert result is not None
+    assert result.model_dump() == {"sandbox_id": "sb-owner", "mount_root": "/data"}
+    assert not adapter._sessions
 
 
 async def test_persisted_workspace_read_skips_recorded_sandbox(archived, monkeypatch):

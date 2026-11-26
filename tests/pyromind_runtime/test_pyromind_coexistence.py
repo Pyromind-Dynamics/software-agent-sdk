@@ -60,7 +60,6 @@ async def test_deferred_product_service_initializes_pi_and_closes(
 ):
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv("PYROMIND_PI_TERMINAL_BACKEND", "os-sandbox")
-    monkeypatch.setenv("PYROMIND_AGENTGENOME_ENABLED", "0")
     monkeypatch.setattr(bootstrap, "build_experiment_plan_store", lambda: None)
     app = create_app(
         Config(conversations_path=tmp_path / "dormant", deferred_init=True)

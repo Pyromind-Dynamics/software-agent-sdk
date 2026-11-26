@@ -13,6 +13,12 @@ EXPERIMENT_PLANNING_SKILL = "experiment-planning"
 EXPERIMENT_GRAPH_TEMPLATE = "experiment-planning/v1"
 
 ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
+_CATALOG_NODE_TYPES: dict[str, ProjectNodeType] = {
+    "dataset": "dataset",
+    "train": "train",
+    "eval": "evaluator",
+    "inference": "inference",
+}
 
 
 def build_graph_payload(
@@ -52,15 +58,27 @@ def build_graph_payload(
                 config=config,
             )
         )
+    stage_links = [(edge.source, edge.target) for edge in plan.edges]
+    if not stage_links:
+        task_stages = {task.id: task.stage_id for task in plan.tasks}
+        stage_links = [
+            (task_stages[item.task_id], task.stage_id)
+            for task in plan.tasks
+            for item in task.inputs
+            if item.task_id is not None and task_stages[item.task_id] != task.stage_id
+        ]
     edges = [
-        {"source": edge.source, "target": edge.target}
-        for edge in plan.edges
-        if edge.source in node_types and edge.target in node_types
+        {"source": source, "target": target}
+        for source, target in dict.fromkeys(stage_links)
+        if source in node_types and target in node_types
     ]
     return nodes, edges
 
 
 def _stage_node_type(stage: ExperimentStage) -> ProjectNodeType | None:
+    catalog_type = _CATALOG_NODE_TYPES.get(stage.kind or "")
+    if catalog_type is not None:
+        return catalog_type
     value = f"{stage.id} {stage.name}".lower()
     if "dataset" in value or value.startswith("data"):
         return "dataset"

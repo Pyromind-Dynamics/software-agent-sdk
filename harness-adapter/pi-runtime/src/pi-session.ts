@@ -32,7 +32,7 @@ import { createNoSpinExtension } from "./no-spin-extension.js";
 import { createToolResultExtension } from "./tool-results.js";
 import { isRecord, type JsonObject, type JsonValue } from "./protocol.js";
 import type { JsonlRpcPeer } from "./rpc-peer.js";
-import type { SandboxEndpoint, SandboxEndpointProvider } from "./sandbox-operations.js";
+import type { SandboxEndpointProvider } from "./sandbox-operations.js";
 import {
   applySandboxPathAliases,
   SandboxReadMirror,
@@ -43,6 +43,7 @@ import {
   type SandboxTerminalConnector,
 } from "./sandbox-terminal.js";
 import { inside } from "./workspace-policy.js";
+import { platformSdkEnvironment } from "./sdk-environment.js";
 import {
   createTools,
   businessTool,
@@ -62,6 +63,7 @@ interface PiSessionConfig extends PiModelConfig {
   thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   workspaceRoot: string;
   terminalBackend: PiTerminalBackend;
+  platformSdkEnabled: boolean;
   sessionPath: string;
   skillRoots: SkillRootConfig[];
   skillsDirectory?: string;
@@ -214,6 +216,13 @@ export async function createPiSession(
   if (nativeDelivery) subagentLiveness();
   let executionAccess: ExecutionAccess | undefined;
   let sandboxTools: SandboxTools | undefined;
+  let childTerminalTool: AgentTool | undefined;
+  const secrets = [
+    config.apiKey,
+    ...Object.entries(process.env)
+      .filter(([key]) => /KEY|TOKEN|SECRET|PASSWORD|COOKIE/.test(key))
+      .map(([, value]) => value ?? ""),
+  ];
   const recorder = new ObservationRecorder({
     conversationId: config.sessionId,
     directory: join(config.workspaceRoot, ".observability"),
@@ -222,12 +231,7 @@ export async function createPiSession(
       const resolved = await executionAccess.resolvePath(path, "read");
       return executionAccess.readFile(resolved, limit);
     },
-    secrets: [
-      config.apiKey,
-      ...Object.entries(process.env)
-        .filter(([key]) => /KEY|TOKEN|SECRET|PASSWORD|COOKIE/.test(key))
-        .map(([, value]) => value ?? ""),
-    ],
+    secrets,
     snapshot: {
       harness: "pi",
       pi_version: JSON.parse(readFileSync(new URL("../package.json", import.meta.resolve("@earendil-works/pi-coding-agent")), "utf8")).version,
@@ -282,10 +286,20 @@ export async function createPiSession(
       };
     },
     terminalEnvironment: terminalEnvironment as Record<string, string>,
+    ...(config.platformSdkEnabled ? {
+      platformSdkEnvironment: async (signal?: AbortSignal) => {
+        const environment = await platformSdkEnvironment(peer, signal);
+        if (environment.PYROMIND_API_KEY && !secrets.includes(environment.PYROMIND_API_KEY)) {
+          secrets.push(environment.PYROMIND_API_KEY);
+        }
+        return environment;
+      },
+    } : {}),
     terminalTimeouts: sandboxTerminalTimeouts(),
     scriptChunkChars: sandboxTerminalScriptChunkChars(),
     onExecutionReady: (access) => { executionAccess = access; },
     onSandboxToolsReady: (tools) => { sandboxTools = tools; },
+    onChildTerminalReady: (tool) => { childTerminalTool = tool; },
     skillsDirectory: config.skillsDirectory,
     ...(config.terminalBackend === "sandbox"
       ? {
@@ -362,10 +376,17 @@ export async function createPiSession(
       ? terminal.wrap(guarded, peer, role?.name, true)
       : coordinator.wrap(guarded, peer, role?.name);
   };
-  const tools = observedTools.map((tool) =>
-    guard(tool, allowedSkillRoots, mainTerminal),
+  const tools = observedTools.map((tool) => {
+    const guarded = guard(tool, allowedSkillRoots, mainTerminal);
+    return params.await_external_tasks === true && tool.name === "terminal"
+      ? { ...guarded, executionMode: "sequential" as const }
+      : guarded;
+  });
+  const childRawTools = observedTools.map((tool) =>
+    tool.name === "terminal" && childTerminalTool ? observe(childTerminalTool) : tool,
   );
-  const childTools = tools.filter((tool) => usesAgentTerminal(tool.name));
+  const childTools = childRawTools.filter((tool) => usesAgentTerminal(tool.name))
+    .map((tool) => guard(tool, allowedSkillRoots, mainTerminal));
   const childInstructions = "Use read-only knowledge/ and .agents/skills/ resources and public_data/ conversation files. The user Storage mount is addressed by its absolute path. Write only public_data/. " +
     "Tool paths refer to the conversation execution environment, never the host's directories. Available skills:\n" + skillPaths.map((path) => applySandboxPathAliases(path, sandboxPathAliases)).join("\n");
   const roleToolSets = config.delegatedRoles ? Object.fromEntries(config.delegatedRoles.map(role => {
@@ -382,7 +403,7 @@ export async function createPiSession(
     const business = roleSpecs.map(spec => businessTool(peer, spec, role.name));
     const scoped = childTools.filter(tool => role.tools.includes(tool.name)).map(tool => {
       const raw =
-        observedTools.find(candidate => candidate.name === tool.name) ?? tool;
+        childRawTools.find(candidate => candidate.name === tool.name) ?? tool;
       return guard(raw, roots, mainTerminal, role);
     });
     const askUser = sessionOptions.askUserTool && role.tools.includes("ask_user")
@@ -604,6 +625,9 @@ export function parsePromptContent(value: JsonValue | undefined): ParsedPrompt {
 }
 
 function parseConfig(value: JsonObject): PiSessionConfig {
+  if (value.platform_sdk_enabled !== undefined && typeof value.platform_sdk_enabled !== "boolean") {
+    throw new Error("invalid platform_sdk_enabled");
+  }
   const model = record(value, "model");
   const thinking = typeof model.thinking_level === "string" ? model.thinking_level : "off";
   if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) {
@@ -625,6 +649,7 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     thinkingLevel: thinking as PiSessionConfig["thinkingLevel"],
     workspaceRoot: requiredString(value, "workspace_root"),
     terminalBackend: terminalBackend(value),
+    platformSdkEnabled: value.platform_sdk_enabled === true,
     sessionPath: requiredString(value, "session_path"),
     skillRoots: parseSkillRoots(value),
     skillsDirectory: optionalString(value, "skills_directory"),
@@ -683,17 +708,20 @@ function sandboxEndpointProvider(peer: JsonlRpcPeer): SandboxEndpointProvider {
       ...(replace === true ? { replace: true } : {}),
     });
     if (!isRecord(result)) throw new Error("invalid sandbox.ensure response");
-    const endpoint: SandboxEndpoint = {
+    const endpoint = {
       baseUrl: requiredString(result, "base_url"),
-      wsBaseUrl: requiredString(result, "ws_base_url"),
       sandboxId: requiredString(result, "sandbox_id"),
-      apiKey: requiredString(result, "api_key"),
       workspacePath: requiredString(result, "workspace_path"),
       storagePath: requiredString(result, "storage_path"),
     };
-    const cluster = result.cluster;
-    if (typeof cluster === "string" && cluster) endpoint.cluster = cluster;
-    return endpoint;
+    const actorTarget = optionalString(result, "actor_target");
+    if (actorTarget) return { ...endpoint, actorTarget };
+    return {
+      ...endpoint,
+      wsBaseUrl: requiredString(result, "ws_base_url"),
+      apiKey: requiredString(result, "api_key"),
+      ...(typeof result.cluster === "string" && result.cluster ? { cluster: result.cluster } : {}),
+    };
   };
 }
 

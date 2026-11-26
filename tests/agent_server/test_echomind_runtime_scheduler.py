@@ -55,6 +55,12 @@ from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeExecutor,
     TrainTaskState,
 )
+from pyromind_runtime.domain.echomind_deployments import (
+    DeploymentRecord,
+    DeploymentRequest,
+    DeploymentTarget,
+)
+from pyromind_runtime.infrastructure.file_deployment_store import FileDeploymentStore
 
 
 def test_tracer_batch_requires_ready_runtime_slot(tmp_path):
@@ -162,7 +168,8 @@ def test_train_runtime_waits_recovers_and_resumes_graph(tmp_path):
 
     assert completed is not None
     assert completed.status == "succeeded"
-    assert completed.outcome == "baseline_retained"
+    assert completed.outcome == "candidate_recorded"
+    assert completed.promotion_result["decision"] == "awaiting_user_selection"
     assert backend.submit_count == 1
     stages = scheduler.stage_run_store.list_for_graph_run(
         project_id=project.project.project_id,
@@ -1002,7 +1009,8 @@ def test_evaluator_runtime_waits_recovers_and_finishes_graph(tmp_path):
 
     assert completed is not None
     assert completed.status == "succeeded"
-    assert completed.outcome == "baseline_retained"
+    assert completed.outcome == "candidate_recorded"
+    assert completed.promotion_result["decision"] == "awaiting_user_selection"
     assert backend.submit_count == 1
     stages = scheduler.stage_run_store.list_for_graph_run(
         project_id=project.project.project_id,
@@ -1477,3 +1485,35 @@ def _stage_for_node(
         )
         if stage.node_id == node_id
     )
+
+
+def test_graph_start_waits_for_manual_deployment_under_project_lease(tmp_path):
+    root = tmp_path / "projects"
+    project, published = _published_project(root, with_runtime_slot=True)
+    project_id = project.project.project_id
+    store = FileDeploymentStore(root)
+    with store.lease(project_id):
+        store.save(
+            DeploymentRecord(
+                deployment_id=uuid4().hex,
+                project_id=project_id,
+                request=DeploymentRequest(
+                    request_id="deploy", candidate_id="candidate"
+                ),
+                candidate_id="candidate",
+                model_uri="/workspace/new",
+                previous=DeploymentTarget(
+                    resource_id="inf-old", model_uri="/workspace/old"
+                ),
+                status="waiting_inference",
+            )
+        )
+    scheduler = RuntimeGraphScheduler(projects_root=root)
+    with pytest.raises(RuntimeSchedulerError, match="deployment is still in progress"):
+        scheduler.start(
+            project=project,
+            published=published,
+            request_id="batch",
+            inputs=_run_inputs("batch"),
+        )
+    assert scheduler.graph_run_store.list(project_id) == []

@@ -64,6 +64,7 @@ async def test_terminal_notification_uses_generic_workflow_callback(
         "correlation": TaskCorrelation(
             conversation_id="550e8400e29b41d4a716446655440000", task_kind="workflow_run"
         ),
+        "trusted_platform": True,
     }
 
 
@@ -115,6 +116,7 @@ async def test_debug_out_id_passes_from_workflow_debug(
             conversation_id="550e8400e29b41d4a716446655440000",
             task_kind="workflow_debug",
         ),
+        "trusted_platform": True,
     }
 
 
@@ -213,22 +215,28 @@ async def test_compressed_error_msg_is_decoded(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_kind", "status", "expected"),
+    ("task_kind", "status", "signature", "expected"),
     [
-        ("workflow_run", "Running", None),
-        ("echomind_dataset", "running", "Running"),
-        ("echomind_dataset", "new", "Pending"),
+        ("workflow_run", "Running", None, None),
+        ("workflow_run", "Pending", None, None),
+        ("workflow_run", "Running", "a" * 64, "Running"),
+        ("workflow_run", "Pending", "a" * 64, "Pending"),
+        ("workflow_run", "new", "a" * 64, "Pending"),
+        ("echomind_dataset", "running", None, "Running"),
+        ("echomind_dataset", "new", None, "Pending"),
     ],
 )
-async def test_non_terminal_notifications_only_dispatch_for_published_graphs(
+async def test_non_terminal_notifications_dispatch_for_signed_sdk_or_published_graphs(
     monkeypatch: pytest.MonkeyPatch,
     task_kind: str,
     status: str,
+    signature: str | None,
     expected: str | None,
 ) -> None:
     statuses: list[str] = []
 
     async def fake_deliver(**kwargs: Any) -> WorkflowCallbackResult:
+        assert kwargs["trusted_platform"] is True
         statuses.append(kwargs["status"])
         return WorkflowCallbackResult(
             outcome="delivered_async",
@@ -252,6 +260,7 @@ async def test_non_terminal_notifications_only_dispatch_for_published_graphs(
                 "out_id": TaskCorrelation(
                     conversation_id="conversation-1",
                     task_kind=task_kind,
+                    signature=signature,
                 ).to_out_id(),
             },
         )

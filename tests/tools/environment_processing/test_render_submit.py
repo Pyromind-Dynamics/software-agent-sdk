@@ -13,18 +13,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from pyromind_common.sdk.tool import ToolExecutor
 from pyromind_common.tools.environment_processing.render_submit import (
     EdpRenderAction,
     EdpRenderExecutor as RenderExecutor,
     EdpRenderTool,
     build_render_command,
+    create_edp_render_runner,
 )
 
 
 def test_build_render_command_paths_and_args() -> None:
     cmd = build_render_command(
         output_dir="/edp/render/r1",
-        data_source="datasets/tmax/data/train-1.parquet",
+        data_source="/datasets/tmax/data/train-1.parquet",
         shard_size=500,
         limit=10,
     )
@@ -42,7 +44,7 @@ def test_build_render_command_paths_and_args() -> None:
 def test_build_render_command_without_limit() -> None:
     cmd = build_render_command(
         output_dir="/edp/render/r1",
-        data_source="datasets/tmax/data/train-1.parquet",
+        data_source="/datasets/tmax/data/train-1.parquet",
         shard_size=500,
         limit=None,
     )
@@ -107,7 +109,7 @@ def _executor(runtime_dir: str | None = None) -> Any:
     )
 
 
-def test_executor_submits_render(
+def test_runner_submits_render_without_tool_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mocks = _patch_submission(monkeypatch)
@@ -115,10 +117,16 @@ def test_executor_submits_render(
     template.write_text(json.dumps({"fields": {"task_id": "task_id"}}))
     conversation = _conversation_with_secrets({"auth_token": "tok"})
 
-    obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
+    runner = create_edp_render_runner(
+        env="pre",
+        cluster="us-west-1",
+        runtime_dir=str(_render_runtime(tmp_path)),
+    )
+    assert not isinstance(runner, ToolExecutor)
+    obs = runner.run(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
             shard_size=100,
         ),
         conversation,
@@ -138,6 +146,7 @@ def test_executor_submits_render(
         "render_requirements.txt",
     } == names
     workflow = mocks.submit.call_args.kwargs["workflow"]
+    assert mocks.submit.call_args.kwargs["retry_create"] is False
     assert workflow["nodes"][0]["data"]["nodeType"] == "CustomCommandCPUNode"
     command = workflow["nodes"][0]["data"]["config"]["command"]
     assert "render_manifest.py" in command
@@ -154,7 +163,7 @@ def test_executor_missing_template_fails(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(tmp_path / "nope.json"),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -182,7 +191,7 @@ def test_executor_resolves_workspace_relative_template(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path="public_data/render_template.json",
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -222,7 +231,7 @@ def test_executor_stages_template_from_remote_workspace(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path="public_data/render_template.json",
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -257,7 +266,7 @@ def test_executor_missing_env_uses_production(
     obs = executor(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
             shard_size=100,
         ),
         conversation,
@@ -290,7 +299,7 @@ def test_executor_missing_cluster_uses_default(
     obs = executor(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
             shard_size=100,
         ),
         conversation,
@@ -348,7 +357,7 @@ def test_preflight_rejects_missing_column(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -373,7 +382,7 @@ def test_preflight_rejects_missing_nested_field(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -405,7 +414,7 @@ def test_preflight_accepts_valid_template(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -429,7 +438,7 @@ def test_preflight_skips_glob_source(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train-*.parquet",
+            data_source="/datasets/tmax/data/train-*.parquet",
         ),
         conversation,
     )
@@ -453,7 +462,7 @@ def test_preflight_fails_open_on_storage_error(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(template),
-            data_source="datasets/tmax/data/train.parquet",
+            data_source="/datasets/tmax/data/train.parquet",
         ),
         conversation,
     )
@@ -486,7 +495,7 @@ def test_preflight_parses_schema_through_sparse_gap(
     assert (
         _preflight_template(
             {"fields": {"task_id": "task_id", "prompt": "description"}},
-            "datasets/tmax/data/train.parquet",
+            "/datasets/tmax/data/train.parquet",
             storage_base_url="http://storage",
             headers={},
             timeout=5.0,
@@ -495,7 +504,7 @@ def test_preflight_parses_schema_through_sparse_gap(
     )
     message = _preflight_template(
         {"fields": {"prompt": "nope"}},
-        "datasets/tmax/data/train.parquet",
+        "/datasets/tmax/data/train.parquet",
         storage_base_url="http://storage",
         headers={},
         timeout=5.0,
@@ -520,7 +529,7 @@ def test_preflight_rejects_non_parquet_source(
     obs = _executor(runtime_dir=str(_render_runtime(tmp_path)))(
         EdpRenderAction(
             template_path=str(template),
-            data_source="test_data/pick_and_place_data/meta/episodes.jsonl",
+            data_source="/test_data/pick_and_place_data/meta/episodes.jsonl",
         ),
         conversation,
     )
@@ -559,7 +568,7 @@ def test_preflight_par1_check_survives_missing_pyarrow(
     assert (
         _preflight_template(
             {"fields": {"task_id": "task_id", "prompt": "description"}},
-            "datasets/tmax/data/train.parquet",
+            "/datasets/tmax/data/train.parquet",
             storage_base_url="http://storage",
             headers={},
             timeout=5.0,

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ssl
 import subprocess
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from requests.adapters import HTTPAdapter
 
 from pyromind_common.tools.workflow import task_submission
 from pyromind_common.tools.workflow.task_submission import (
@@ -39,6 +41,9 @@ def test_workflow_sdk_client_uses_request_route(monkeypatch, headers, route, hos
     assert exchange.call_args.kwargs["origin_headers"] == {"x-cluster": route}
     assert client.sandboxes.session.headers["X-Cluster"] == route
     assert client.sandboxes.base_url == f"https://{host}/api/v1"
+    retry_adapter = client.studio.session.get_adapter("https://")
+    assert isinstance(retry_adapter, HTTPAdapter)
+    assert retry_adapter.max_retries.total == 0
 
 
 class _FakeSSLError(OSError):
@@ -105,8 +110,9 @@ def test_retry_transient_covers_httpx_request_errors(
     assert len(calls) == 3
 
 
-def test_submit_workflow_task_retries_ssl_create(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("retry_create", [False, True])
+def test_submit_workflow_task_retries_only_when_explicitly_requested(
+    monkeypatch: pytest.MonkeyPatch, retry_create: bool
 ) -> None:
     monkeypatch.setattr(
         "pyromind_common.tools.workflow.task_submission.time.sleep", MagicMock()
@@ -118,15 +124,23 @@ def test_submit_workflow_task_retries_ssl_create(
         response,
     ]
 
-    result = submit_workflow_task(
+    submit = partial(
+        submit_workflow_task,
         client=client,
         workflow={"id": "w"},
         name="agent-edp",
         conversation_id="conv-1",
     )
 
-    assert result.task_id == "task-1"
-    assert client.studio.create.call_count == 2
+    if retry_create:
+        assert submit(retry_create=True).task_id == "task-1"
+        assert client.studio.create.call_count == 2
+    else:
+        with workflow_submission_scope(TaskOrigin()) as scope:
+            with pytest.raises(_FakeSSLError):
+                submit()
+            assert scope.outcome_uncertain
+        assert client.studio.create.call_count == 1
 
 
 @pytest.mark.parametrize("test_mode", [False, True])
@@ -149,8 +163,26 @@ def test_resource_rejection_prevents_platform_create_and_scope_registration(test
                 test_mode=test_mode,
             )
         assert scope.submissions == {} and scope.direct_tasks == set()
+        assert not scope.outcome_uncertain
     assert checked == [workflow]
     client.studio.create.assert_not_called()
+
+
+def test_accepted_task_is_recorded_before_observer_failure():
+    client = MagicMock()
+    client.studio.create.return_value = SimpleNamespace(task_id="task-1")
+    observer = MagicMock(side_effect=RuntimeError("registration failed"))
+
+    with workflow_submission_scope(TaskOrigin(), on_submitted=observer) as scope:
+        with pytest.raises(RuntimeError, match="registration failed"):
+            submit_workflow_task(
+                client=client, workflow={}, name="scene", conversation_id="c"
+            )
+        assert "task-1" in scope.submissions
+        assert scope.direct_tasks == {"task-1"}
+        assert scope.outcome_uncertain
+    observer.assert_called_once_with("task-1", scope.submissions["task-1"])
+    client.studio.create.assert_called_once()
 
 
 def test_each_direct_task_checks_resources_before_create():

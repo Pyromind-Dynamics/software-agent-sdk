@@ -1,6 +1,13 @@
-from pyromind_agent_server.__main__ import RELOAD_DIRS
+import os
+import ssl
+from unittest.mock import Mock
+
+import certifi
 from uvicorn.config import Config
 from uvicorn.supervisors.watchfilesreload import FileFilter
+
+from pyromind_agent_server import _configure_platform_ca_bundle
+from pyromind_agent_server.__main__ import RELOAD_DIRS
 
 
 def _file_filter(tmp_path):
@@ -60,3 +67,33 @@ def test_uvicorn_reload_filter_only_includes_python_files(tmp_path) -> None:
 
     assert file_filter(python_source)
     assert not file_filter(text_file)
+
+
+def test_sdk_tls_preserves_configured_trust_and_recovers_an_empty_store(
+    monkeypatch, tmp_path
+) -> None:
+    for key in (
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    defaults = ssl.get_default_verify_paths()._replace(
+        cafile=None, capath=str(tmp_path)
+    )
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: defaults)
+    context = Mock()
+    context.cert_store_stats.return_value = {"x509_ca": 0}
+    monkeypatch.setattr(ssl, "create_default_context", lambda: context)
+
+    anchor = tmp_path / "12345678.0"
+    anchor.touch()
+    _configure_platform_ca_bundle()
+    assert "SSL_CERT_FILE" not in os.environ
+    anchor.unlink()
+    _configure_platform_ca_bundle()
+    assert os.environ["SSL_CERT_FILE"] == certifi.where()
+    monkeypatch.setenv("SSL_CERT_FILE", "/private/company/ca.pem")
+    _configure_platform_ca_bundle()
+    assert os.environ["SSL_CERT_FILE"] == "/private/company/ca.pem"

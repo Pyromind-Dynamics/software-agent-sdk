@@ -100,7 +100,8 @@ python <skill目录>/scripts/preparation/bundle_template_pipeline.py \
 ```
 
 生成仍使用 sandbox_sample.py（`--model-profile none --output-schema artifacts`）
-或 df_submit_pipeline。平台仅上传单个 Pipeline 和固定 runtime；素材与计划
+或按 [llm-pipeline 提交入口](llm-pipeline/playbook.md)准备并提交 DataFlow 全量任务。
+平台仅上传单个 Pipeline 和固定 runtime；素材与计划
 必须在执行环境可访问。
 
 每次运行使用新目录，阶段输出分别放置：

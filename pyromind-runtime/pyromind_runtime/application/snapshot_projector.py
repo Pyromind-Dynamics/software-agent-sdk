@@ -320,6 +320,28 @@ class SnapshotProjector:
             return snapshot
         execution = ExperimentExecutionView.model_validate(value)
         runs = {run.run_id: run for run in snapshot.experiment_executions or ()}
+        previous = runs.get(execution.run_id)
+        if event.payload.get("binding_only") is True and previous is not None:
+            identities = tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            (previous.platform_task_id,)
+                            if previous.platform_task_id
+                            else ()
+                        ),
+                        *previous.platform_task_ids,
+                        *execution.platform_task_ids,
+                    )
+                )
+            )
+            execution = previous.model_copy(
+                update={
+                    "platform_task_id": previous.platform_task_id
+                    or execution.platform_task_id,
+                    "platform_task_ids": identities,
+                }
+            )
         runs[execution.run_id] = execution
         return snapshot.model_copy(
             update={"experiment_executions": tuple(runs.values())}
@@ -361,6 +383,8 @@ class SnapshotProjector:
             and event.run_id != snapshot.active_run_id
         ):
             return snapshot
+        if status in {"idle", "finished"} and snapshot.status in _SETTLED_STATUSES:
+            return snapshot
         if snapshot.foreground_inputs:
             waiting_run = snapshot.active_run_id or snapshot.foreground_inputs[0].run_id
             if event.run_id is not None and event.run_id != waiting_run:
@@ -369,6 +393,19 @@ class SnapshotProjector:
                 status = "waiting_for_input"
         if snapshot.pending_permissions and status in {"idle", "finished"}:
             status = "waiting_for_confirmation"
+        if (
+            status in {"idle", "finished"}
+            and event.run_id is not None
+            and any(
+                task.run_id == event.run_id
+                and task.status in {"pending", "running"}
+                and task.kind not in {"historical_experience", "graph_await"}
+                and task.graph_run_id is None
+                and (task.correlation is None or task.correlation.type == "main")
+                for task in snapshot.external_tasks
+            )
+        ):
+            status = "waiting_for_external_task"
         return snapshot.model_copy(
             update={
                 "status": status,

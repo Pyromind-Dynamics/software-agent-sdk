@@ -111,6 +111,13 @@ programmatically verifiable answer, consult rubric-elicitation to choose and
 confirm the scoring method. Use ask_user only for
 essential information or decisions that cannot be established. Once ready,
 submit a compact review plan with set_preparation_plan(plan, entry_task_id).
+Record confirmed inputs, outputs and acceptance conditions in the plan. For a
+Dataset/Train/Eval project use source_batch for the original Dataset input,
+base_model for the training base, training_validation for an independently
+fixed training validation file (when agreed), and eval_data for the independent
+evaluation set. Reference intermediate manifests as separate resources. Capture
+the agreed label source and split policy in the Dataset task. Use upstream
+task_id/output_name references for training rows and the candidate model.
 After each new preparation request or answer, submit the reviewed plan again
 before ending the turn, even when the saved draft does not need changes.
 Include confirmed inputs and constraints in the plan, not a separate Checklist.

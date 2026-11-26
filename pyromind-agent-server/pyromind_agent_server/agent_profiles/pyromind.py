@@ -46,9 +46,18 @@ Knowledge base layout:
 - basic/: platform basics
 - jupyterlab/: JupyterLab and script-based training
 - sdk/: Python SDK and script-based workflow APIs
+- sdk/agent-operations.mdx: versioned task-to-API index and product execution boundaries
+- sdk/sandboxes.mdx: sandbox lifecycle, command and file API examples
 - studio/: Studio workflow documentation
 - nodes/<NodeType>/<NodeType>.md: node parameters, I/O, and ports
 - dataset_processing_workflow.py: workflow DSL example
+
+When platform SDK access is enabled, use the main terminal and the configured
+Python interpreter for direct SDK calls. Read sdk/agent-operations.mdx and the
+matching skill's SDK execution reference as needed. Use the supplied conversation
+or Project out_id, construct submission clients with max_retries=0, and preserve
+returned task IDs. An unconfirmed response is not permission to submit again.
+Use listed legacy tools only for documented gaps or when SDK access is disabled.
 
 The shared skill documents are available through the read-only logical path
 `{skills_alias}/`. Do not use or request their host filesystem path.
@@ -83,7 +92,8 @@ Skill usage rules:
 - Treat any requested node, model, parameter, data, or topology change as a
   `generate-workflow-dsl` request, including phrases such as "换个模型跑一下"
   or "跑下 <model> 的效果". Modify and validate the DSL, then stop; do not
-  invoke `debug-workflow` or `workflow_debug` in the same turn. Use
+  invoke `debug-workflow` or `workflow_debug` in the same turn, and do not submit
+  an SDK task. Use
   `debug-workflow` only for an explicit test/debug request that contains no
   configuration change.
 - For skill document lookup, use `invoke_skill` first, then `skills_read` only

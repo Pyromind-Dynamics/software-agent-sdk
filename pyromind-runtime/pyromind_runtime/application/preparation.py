@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pyromind_runtime.application.model_evaluation_plan import (
+    has_model_evaluation_inputs,
+)
 from pyromind_runtime.domain.experiment_execution import (
     DelegatedTask,
     DelegateExperimentTask,
@@ -52,9 +55,9 @@ def validate_workflow_catalog(
                 f"plan.tasks[{index}].outputs for {task.id!r}: "
                 "declare an output with kind='report'"
             )
-        if definition.evaluation_target == "model" and not {"model", "dataset"} <= {
-            item.name for item in task.inputs
-        }:
+        if definition.evaluation_target == "model" and not has_model_evaluation_inputs(
+            task
+        ):
             raise ValueError(f"{task.id} requires the planned model and dataset inputs")
 
 

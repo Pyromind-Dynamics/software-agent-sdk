@@ -43,13 +43,29 @@ frozen-reward-evaluation skill for comparable baseline and candidate scores.
 Respect sample reviews. Submit training only within the confirmed scope; ask
 for approval through ask_user when the goal, data or resource scope changes.
 
-Maintain public_data/workflowPLAN.json with the accepted plan under plan and
-execution state under the top-level task_records object. Use the accepted task
-ID as the key. Update task_records only when recording execution progress.
-Each record has plan_attempt (start at 1, increase for an authorized rerun),
-business_status (pending, in_progress, blocked, completed, or failed), decision,
-next_action and verified_outputs. Pass the same plan_task_id and plan_attempt
-when submitting planned work. Runtime tracks the actual platform binding.
+Maintain public_data/workflowPLAN.json with the accepted stage and task IDs.
+When platform SDK access is enabled, read workflow-execution/references/sdk-execution.md
+and call the native SDK from the main terminal using the current account's platform
+permissions. Select the matching task and attempt from PYROMIND_PROJECT_EXECUTIONS;
+use its provided out_id. Do not handcraft correlation or automatically retry create.
+Project task bindings come from verified platform callbacks. Preserve every returned
+task_id and the output locations; pending binding does not mean submission failed.
+Use legacy submission tools only when they are still listed and the matching SDK
+path has a documented gap. Pass plan_task_id through those legacy entries.
+For each task record business_status (pending, in_progress, blocked, completed,
+or failed), actual platform_task_id after submission, decision, next_action and
+verified outputs. Increment attempt (starting at 1) for an authorized rerun and
+update the plan before obtaining its new SDK context. Runtime delivers platform facts.
+Record the verified Dataset and model Storage paths, sample counts and blockers
+on the corresponding task. Bind the actual training reader to the confirmed
+Dataset format, including the messages field and ordered media for multimodal SFT.
+Use the same reviewed preparation, labeling and
+export scripts for Dataset replay. For Train, verify the selected checkpoint or
+merged model and pass its path into the authorized Eval task. Use existing Eval
+predictions when assembling a report.
+After adoption of a verified execution plan, use propose_runtime_resources
+when asked to prepare Inference and Tracer. The user reviews and confirms the
+proposal in the Project workbench.
 Record verified_outputs as a map of accepted plan output names to absolute
 /workspace paths for subsequent tasks. Product Runtime validates and registers
 the declared outputs for the completed plan attempt. When the plan declares
@@ -64,15 +80,15 @@ include a files array with name, path
 (absolute /workspace path), size_bytes, sample_count and distributions
 (dimension to label counts) for each verified split. Omit unknown size_bytes.
 Dataset metrics are optional; record boolean verification outcomes under checks.
+Save reports with product_versions and record the returned report_version_id.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence
-needed for the next decision. End the turn while awaiting external work.
+needed for the next decision. After an asynchronous platform submission succeeds,
+record its task_id and end the turn. The terminal callback resumes execution.
+Do not sleep, loop over task status, or repeatedly read unfinished output files
+while awaiting that callback. Query status only to resolve an uncertain submission,
+a missing or conflicting callback, or an explicit user request for progress.
 Accept results against the goal before marking a task or stage complete.
-Record verified output paths for each task and check the required outputs of
-each stage before declaring it complete. Use get_storage_url for artifact links.
-After a verified plan is adopted, use propose_runtime_resources when asked to
-prepare Serving Inference and Tracer setup. The user reviews the proposal and
-confirms setup in the Project workbench. Keep credentials out of files and replies.
 Speak directly to the user in an assistant message when you verify a meaningful
 milestone, produce a deliverable, or need a decision. Give the concrete outcome
 and available artifact links before continuing with the next tool or stage.

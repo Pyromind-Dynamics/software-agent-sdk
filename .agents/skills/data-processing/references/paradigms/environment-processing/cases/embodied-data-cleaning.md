@@ -3,34 +3,37 @@
 本 case 处理 S2 自采集录制或挂载的 Hugging Face LeRobot v2.1 数据，执行
 多模态时间对齐、静止帧清理、动作与标签关联、批量转换和 LeRobot v2.1 校验。
 
-执行形态与 [tmax 批量验证](tmax.md) 同构：**EDP 平台编排**（`edp_render` 渲染
-分片 → `edp_submit` 逐 episode 执行 → 聚合发布 merge 记录），复用平台
+执行形态与 [tmax 批量验证](tmax.md) 同构：**EDP 平台编排**（EDP 渲染任务 渲染
+分片 → EDP 分片任务 逐 episode 执行 → 聚合发布 merge 记录），复用平台
 runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任务。
 
 ## 执行入口
 
+按 [environment playbook](../playbook.md) 保留准备、冻结与 SDK 提交步骤；本页为业务参数。
+渲染阶段生成分片，分片阶段执行 episode 或 merge profile。准备能力未迁移时使用仍列出的 EDP Tool。
+
 - 确定性 runtime：`pyromind-embodied-runtime==0.1.0`。交付方式：wheel 随
-  `edp_submit` 冻结包自动分发（skill bundle `edp/wheels/` 随包暂存进 run 目录，
+  EDP 分片任务 冻结包自动分发（skill bundle `edp/wheels/` 随包暂存进 run 目录，
   exec 经 Storage 挂载安装，第三方依赖由公网 PyPI 解析）。agent 无需任何
-  wheel 预置动作；skill bundle 缺 wheel 时 edp_submit 直接报错。若安装仍失败，
+  wheel 预置动作；skill bundle 缺 wheel 时 EDP 分片 直接报错。若安装仍失败，
   属部署配置错误，停止并上报。
 - ProcessingProfile：`scripts/edp/profiles/embodied-cleaning.json`
   （逐 episode 执行）与 `scripts/edp/profiles/embodied-cleaning-merge.json`
   （聚合发布）。
-- 数据契约、质量门和执行顺序见 `../../../../../embodied-data-cleaning/SKILL.md`。
+- 数据契约、质量门和执行顺序见本页的渲染模板、verdict 语义与[门禁流程](#门禁与流程)。
 
 ## 架构边界
 
 - `data-processing` 负责统一路由和用户确认门禁。
-- `embodied-data-cleaning` 描述本 case 的数据契约、质量门和执行顺序。
-- `edp_render` / `edp_submit` 是唯一的平台执行通道；**禁止**
-  sandbox_create/sandbox_terminal 手工编排、禁止 Studio 工作流、禁止已弃用
+- 本 case 描述具身数据契约、质量门和执行顺序。
+- EDP 渲染和分片准备函数保留冻结运行时；**禁止**
+  sandbox_create/sandbox_terminal 手工逐条编排、手工搭建替代画布、使用已弃用
   的 `run_embodied_cleaning_sandbox` 专用工具。
 - `pyromind-embodied-runtime` 在平台沙箱内完成确定性处理；plan/full 与
   episode/merge 共用同一套 CLI（`--mode episode` 单条、`--mode merge` 聚合，
   均支持 `--config <json>` 读挂载配置，避免 shell 引号转义）。
 - rejected episode 只输出结构化错误报告（`rejection_diagnostics`），不自动
-  repair；重跑由 `edp_submit` 的 shards 断点续跑承载，只重跑 failed。
+  repair；重跑由 EDP 分片任务 的 shards 断点续跑承载，只重跑 failed。
 
 ## 状态与 verdict 语义
 
@@ -103,7 +106,7 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
   拼接+校验，episode 数过大时需先分批或推动平台放宽上限——部署侧已有
   filing）。**绝不**提交 timeout > 600 的 profile，会被
   `SandboxExecRequest` 校验直接拒绝，全部记录 exec_failed。
-- `edp_submit` **必须显式传 `profile_name`**；不传会默认冻结
+- EDP 分片任务 **必须显式传 `profile_name`**；不传会默认冻结
   `tmax-validation` profile，probe 语义完全不同，整批 probe_failed。
 
 ## 门禁与流程
@@ -111,16 +114,18 @@ runner 的硬截止、心跳、账本与 verdicts 契约；agent 不持有长任
 1. 预览探查（直读 `/workspace`）→ 确认源形态
    （LeRobot v2.1 / S2 自采集）；
    自采集源先构建并上传 episode 索引（见上）。
-0. **无需 wheel 预置**：runtime wheel 已内置于 skill bundle，由 edp_submit
+0. **无需 wheel 预置**：runtime wheel 已内置于 skill bundle，由 EDP 分片
    随冻结包自动暂存；提交报"wheel bundle is missing"才是部署配置错误。
-2. `edp_render` 渲染 episode 分片（shard_size 与用户确认）。
+2. EDP 渲染任务 渲染 episode 分片（shard_size 与用户确认）。
 3. **plan 阶段**：对代表 episode 先小样跑 `--mode plan`（或以 smoke 片代替），
    向用户展示 representative plan + inspection 摘要。
 4. 用户一次性确认：task text、子任务区间约定、next-state 动作约定、阈值、
    target path。
-5. `edp_submit(manifest=..., limit=3, profile_name="embodied-cleaning")`
+5. EDP 分片业务参数显式填写 `manifest`、`limit=3`、
+   `profile_name="embodied-cleaning"`
    smoke → verdicts 分诊（镜像缺件类 error 单独分桶，可修镜像回收）。
 6. 用户确认后默认串行全量提交（每次一片，终态后再提交下一片）；仅当
-   用户明确要求时才并发 2-5 片。`df_check_progress` 观察进度。
+   用户明确要求时才并发 2-5 片。按[挂载进度参考](../../../storage-progress.md)
+   从实际分片输出目录读取进度；任务终态仍等待平台回调。
 7. 全部 episode 终态后提交 merge 记录（`embodied-cleaning-merge`），
    Kafka 回调后校验 target 发布物与聚合 report（直读 `/workspace`）。

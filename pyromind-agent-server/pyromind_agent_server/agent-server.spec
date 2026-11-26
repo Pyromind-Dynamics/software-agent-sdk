@@ -1,7 +1,9 @@
 from pathlib import Path
+from importlib.resources import files
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
+from harness_adapter.pi_adapter.platform_helper_bundle import HELPER_SOURCE_FILES
 project_root = Path.cwd()
-packages = ["pyromind_common", "pyromind_agent_server", "pyromind_runtime", "harness_adapter", "agentgenome", "pyromind_sdk", "litellm", "tiktoken"]
+packages = ["pyromind_common", "pyromind_agent_server", "pyromind_runtime", "harness_adapter", "pyromind_sdk", "litellm", "tiktoken"]
 def get_pi_skill_datas():
     data_files = []
     skills_dir = project_root / ".agents" / "skills"
@@ -22,7 +24,18 @@ def get_pi_skill_datas():
                 data_files.append((str(path), f".agents/skills/{rel}"))
     return data_files
 
-datas = get_pi_skill_datas()
+def get_platform_helper_datas():
+    root = files("pyromind_common")
+    result = []
+    for relative in HELPER_SOURCE_FILES:
+        source = root.joinpath(relative)
+        if not source.is_file():
+            raise FileNotFoundError(f"Platform helper source is missing: {relative}")
+        destination = (Path("pyromind_common") / relative).parent.as_posix()
+        result.append((str(source), destination))
+    return result
+
+datas = get_pi_skill_datas() + get_platform_helper_datas()
 
 binaries = []
 hiddenimports = []

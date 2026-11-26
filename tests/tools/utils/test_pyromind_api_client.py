@@ -1,5 +1,6 @@
 import time
 
+import httpx
 import jwt
 import pytest
 
@@ -179,3 +180,26 @@ def test_get_api_key_posts_sensitive_data_request_key(
     request_body = captured["json"]
     assert isinstance(request_body, dict)
     assert isinstance(request_body.get("request_key"), str)
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "reason"),
+    [
+        (403, {"message": "private-value"}, "HTTP 403"),
+        (200, {"success": False, "message": "private-value"}, "rejected"),
+        (200, {"success": True, "data": {"accessKey": {}}}, "missing accessKey"),
+    ],
+)
+def test_access_key_exchange_errors_are_safe_to_report(
+    monkeypatch, status, payload, reason
+):
+    monkeypatch.setattr(pyromind_api_client, "_find_secret_key", lambda: TEST_SECRET)
+    response = httpx.Response(status, json=payload)
+    monkeypatch.setattr(pyromind_api_client.httpx, "post", lambda *a, **kw: response)
+    token = jwt.encode({"user_id": 42}, TEST_SECRET, algorithm="HS256")
+    with pytest.raises(
+        pyromind_api_client.AccessKeyExchangeError, match=reason
+    ) as error:
+        pyromind_api_client.get_api_key(env="prod", auth_token=token, origin_headers={})
+    assert "private-value" not in str(error.value)
+    assert token not in str(error.value)

@@ -96,7 +96,7 @@ test("invalid output caps fail before a model request", async (context) => {
   }
 });
 
-test("insufficient credits remain a model error after capping output", async () => {
+test("insufficient credits remain a model error without an explicit output cap", async () => {
   const { modelRuntime, model } = await createPiModelRuntime({
     provider: "openrouter", modelId: "z-ai/glm-5.3-flash", apiKey: "test-key",
     baseUrl: "https://openrouter.ai/api/v1",

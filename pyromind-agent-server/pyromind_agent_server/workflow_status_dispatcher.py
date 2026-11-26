@@ -45,6 +45,7 @@ class WorkflowStatusDispatcher:
         auto_run: bool = True,
         from_workflow_debug: bool = False,  # noqa: ARG002
         correlation: TaskCorrelation | None = None,
+        trusted_platform: bool = False,
     ) -> WorkflowCallbackResult:
         if correlation is not None:
             if (
@@ -136,6 +137,7 @@ class WorkflowStatusDispatcher:
             error_summary=error_log,
             auto_run=auto_run,
             correlation=correlation,
+            trusted_platform=trusted_platform,
         )
         return WorkflowCallbackResult(
             outcome="delivered_async",

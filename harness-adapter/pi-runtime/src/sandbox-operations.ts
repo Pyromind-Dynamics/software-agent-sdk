@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import type {
@@ -8,22 +9,31 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import type { SandboxReadMirror } from "./sandbox-paths.js";
+import { ActorRequestError, actorFileUrl, actorRequest, runActorCommand } from "./sandbox-actor.js";
 import { bounded } from "./terminal-channel.js";
 
 /** Endpoint bundle handed to the runner by the control plane on demand. */
-export interface SandboxEndpoint {
-  /** REST base URL (portal domain is fine for the file API). */
+interface EndpointBase {
   baseUrl: string;
-  /** Cluster-direct base URL; the portal domain does not proxy WebSocket. */
-  wsBaseUrl: string;
   sandboxId: string;
-  apiKey: string;
-  cluster?: string;
   /** Sandbox-side conversation root. */
   workspacePath: string;
   /** Sandbox-side Storage mount root, addressed by its absolute path. */
   storagePath: string;
 }
+
+export interface ActorEndpoint extends EndpointBase {
+  actorTarget: string;
+}
+
+export interface PlatformEndpoint extends EndpointBase {
+  /** Cluster-direct base URL; the portal domain does not proxy WebSocket. */
+  wsBaseUrl: string;
+  apiKey: string;
+  cluster?: string;
+}
+
+export type SandboxEndpoint = ActorEndpoint | PlatformEndpoint;
 
 export interface SandboxEndpointRequest {
   /** Re-read the sandbox instead of returning the control plane's cached one. */
@@ -129,6 +139,11 @@ export class SandboxFileClient {
 
   async read(path: string, limit = SANDBOX_FILE_MAX_BYTES, signal?: AbortSignal): Promise<Buffer> {
     return this.withEndpoint(async (endpoint) => {
+      if ("actorTarget" in endpoint) {
+        const url = actorFileUrl(endpoint, path);
+        const response = await actorRequest(endpoint, url, { signal });
+        return this.bytes("GET", url, response, limit);
+      }
       const url = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/read`);
       url.searchParams.set("path", path);
       return this.bytes("GET", url, await this.fetch(endpoint, url, { signal }), limit);
@@ -150,6 +165,21 @@ export class SandboxFileClient {
     body: Buffer,
     signal?: AbortSignal,
   ): Promise<void> {
+    if ("actorTarget" in endpoint) {
+      const url = actorFileUrl(endpoint, path);
+      const put = () => actorRequest(endpoint, url, { method: "PUT", body: new Uint8Array(body), signal });
+      try {
+        await put();
+      } catch (error) {
+        if (!(error instanceof ActorRequestError) || error.status !== 404) throw error;
+        const result = await runActorCommand(endpoint, ["mkdir", "-p", "--", posix.dirname(path)], endpoint.workspacePath, {
+          signal, onData: () => undefined,
+        });
+        if (result.exitCode !== 0) throw new Error("could not create sandbox file directory");
+        await put();
+      }
+      return;
+    }
     const base = this.url(endpoint, `/sandboxes/${endpoint.sandboxId}/files/chunks`);
     const totalChunks = Math.max(1, Math.ceil(body.byteLength / UPLOAD_CHUNK_BYTES));
     const init = new URL(`${base}/init`);
@@ -261,7 +291,7 @@ export class SandboxFileClient {
   }
 
   private async fetch(
-    endpoint: SandboxEndpoint,
+    endpoint: PlatformEndpoint,
     url: URL,
     init: RequestInit = {},
   ): Promise<Response> {
@@ -326,6 +356,7 @@ const FILE_API_RETRY_MS = 30_000;
 export interface FallbackSandboxFileClientOptions {
   /** See {@link FILE_API_RETRY_MS}. */
   retryFileApiMs?: number;
+  endpoints?: SandboxEndpointSession;
 }
 
 function isWorkflowPlan(path: string): boolean {
@@ -348,62 +379,40 @@ export class FallbackSandboxFileClient implements SandboxFileClientLike {
   constructor(
     private readonly fileApi: SandboxFileClientLike,
     private readonly terminal: SandboxFileClientLike,
-    options: FallbackSandboxFileClientOptions = {},
+    private readonly options: FallbackSandboxFileClientOptions = {},
   ) {
     this.retryFileApiMs = options.retryFileApiMs ?? FILE_API_RETRY_MS;
   }
 
-  async read(path: string, limit?: number, signal?: AbortSignal): Promise<Buffer> {
+  read(path: string, limit?: number, signal?: AbortSignal): Promise<Buffer> {
+    return this.use(path, signal, (client) => client.read(path, limit, signal));
+  }
+
+  access(path: string, signal?: AbortSignal): Promise<void> {
+    return this.use(path, signal, (client) => client.access(path, signal));
+  }
+
+  write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
+    return this.use(path, signal, (client) => client.write(path, content, signal));
+  }
+
+  private async use<T>(
+    path: string, signal: AbortSignal | undefined, run: (client: SandboxFileClientLike) => Promise<T>,
+  ): Promise<T> {
     signal?.throwIfAborted();
-    if (this.terminalOnly || isWorkflowPlan(path)) return this.terminal.read(path, limit, signal);
-    try {
-      const content = await this.fileApi.read(path, limit, signal);
-      this.recovered();
-      return content;
-    } catch (error) {
-      signal?.throwIfAborted();
-      return this.fallback(error, () => this.terminal.read(path, limit, signal));
+    if (this.options.endpoints && "actorTarget" in await bounded(this.options.endpoints.resolve(), Infinity, signal)) {
+      return run(this.fileApi);
     }
-  }
-
-  async access(path: string, signal?: AbortSignal): Promise<void> {
-    signal?.throwIfAborted();
-    if (this.terminalOnly || isWorkflowPlan(path)) return this.terminal.access(path, signal);
+    if (this.terminalOnlyUntil > Date.now() || isWorkflowPlan(path)) return run(this.terminal);
     try {
-      await this.fileApi.access(path, signal);
-      this.recovered();
+      const result = await run(this.fileApi);
+      this.terminalOnlyUntil = 0;
+      return result;
     } catch (error) {
-      signal?.throwIfAborted();
-      return this.fallback(error, () => this.terminal.access(path, signal));
+      if (signal?.aborted || !isFileApiUnavailable(error)) throw error;
+      this.terminalOnlyUntil = Date.now() + this.retryFileApiMs;
+      return run(this.terminal);
     }
-  }
-
-  async write(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void> {
-    if (this.terminalOnly || isWorkflowPlan(path)) return this.terminal.write(path, content, signal);
-    try {
-      await this.fileApi.write(path, content, signal);
-      this.recovered();
-    } catch (error) {
-      // A caller which aborted is not a portal failure: the file API reports
-      // the abort as a transport error, and the terminal must not run instead.
-      if (signal?.aborted) throw error;
-      return this.fallback(error, () => this.terminal.write(path, content, signal));
-    }
-  }
-
-  /** Whether the file API is inside the cooldown one failure bought it. */
-  private get terminalOnly(): boolean {
-    return this.terminalOnlyUntil > Date.now();
-  }
-
-  private recovered(): void {
-    this.terminalOnlyUntil = 0;
-  }
-
-  private async fallback<T>(error: unknown, run: () => Promise<T>): Promise<T> {
-    if (!isFileApiUnavailable(error)) throw error;
-    this.terminalOnlyUntil = Date.now() + this.retryFileApiMs;
-    return run();
   }
 }
 

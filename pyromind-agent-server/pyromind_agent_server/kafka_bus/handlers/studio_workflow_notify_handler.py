@@ -114,7 +114,11 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             )
             return
         if status not in _TERMINAL_STUDIO_STATUSES and not (
-            correlation.type == "main" and correlation.task_kind.startswith("echomind_")
+            correlation.signature is not None
+            or (
+                correlation.type == "main"
+                and correlation.task_kind.startswith("echomind_")
+            )
         ):
             return
 
@@ -133,6 +137,7 @@ class StudioWorkflowNotifyHandler(MessageHandler):
             auto_run=True,
             from_workflow_debug=correlation.task_kind == "workflow_debug",
             correlation=correlation,
+            trusted_platform=True,
         )
 
         # Broadcast: other pods normally hit unknown_conversation — that is OK.

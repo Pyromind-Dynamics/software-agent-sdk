@@ -48,6 +48,10 @@ from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeError,
     render_workflow_template,
 )
+from pyromind_runtime.domain.storage_paths import (
+    StoragePathError,
+    normalize_workspace_path,
+)
 
 
 ExecutionProfile = Literal["echomind.flywheel/v1"]
@@ -1286,7 +1290,7 @@ _REQUIRED_INPUTS: dict[
         ),
         "validation_dataset": (
             "val_messages",
-            frozenset({"node_output"}),
+            frozenset({"node_output", "literal"}),
             "dataset",
             "val_messages",
         ),
@@ -1357,18 +1361,23 @@ def build_runtime_contract_draft(
                     node_id=node.id,
                 )
             )
-        inputs = {
-            **node.inputs,
-            **_derive_node_inputs(
-                node=node,
-                tasks=tasks,
-                task_to_stage=task_to_stage,
-                resources=resources,
-                assumptions=assumptions,
-                issues=issues,
-            ),
-        }
-        outputs = _derive_node_outputs(node=node, tasks=tasks, issues=issues)
+        inputs, outputs = node.inputs, node.outputs
+        if "development_evidence" not in node.config:
+            inputs = {
+                **_derive_node_inputs(
+                    node=node,
+                    tasks=tasks,
+                    task_to_stage=task_to_stage,
+                    resources=resources,
+                    assumptions=assumptions,
+                    issues=issues,
+                ),
+                **inputs,
+            }
+            outputs = {
+                **_derive_node_outputs(node=node, tasks=tasks, issues=issues),
+                **outputs,
+            }
         implementation_ref, implementation_digest = _implementation_binding(
             node=node,
             assumptions=assumptions,
@@ -1815,6 +1824,8 @@ def _derive_node_inputs(
                 and output_name
             ):
                 source_node_id = task_to_stage.get(source_task_id)
+                if source_node_id == node.id:
+                    continue
                 if source_node_id is None:
                     issues.append(
                         PublicationIssue(
@@ -2297,6 +2308,19 @@ def _validate_ports(project: ProjectInfo, issues: list[PublicationIssue]) -> Non
                 continue
             if expected_source_type is None:
                 continue
+            if binding.kind == "literal":
+                if not _is_fixed_validation_dataset(node_input):
+                    issues.append(
+                        PublicationIssue(
+                            code="input_binding_source_invalid",
+                            message=(
+                                f"Node input {node.id}.{input_name} must bind "
+                                "a fixed validation JSONL file under /workspace/."
+                            ),
+                            node_id=node.id,
+                        )
+                    )
+                continue
             source = nodes_by_id.get(binding.node_id or "")
             if (
                 source is None
@@ -2353,6 +2377,23 @@ def _validate_ports(project: ProjectInfo, issues: list[PublicationIssue]) -> Non
                     node_id=node.id,
                 )
             )
+
+
+def _is_fixed_validation_dataset(port: ProjectNodeInput) -> bool:
+    value = port.binding.value
+    if not isinstance(value, str) or not value.endswith(".jsonl"):
+        return False
+    try:
+        return (
+            normalize_workspace_path(value) == value
+            and (
+                port.artifact_type,
+                port.schema_ref,
+            )
+            == _OUTPUT_CONTRACTS["val_messages"]
+        )
+    except StoragePathError:
+        return False
 
 
 def _validate_profile_topology(

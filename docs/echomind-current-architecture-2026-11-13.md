@@ -21,12 +21,11 @@ EchoMind 当前是一个**以 Manager 为业务决策中心、以 pi 原生子 A
   -> Manager 判断是否继续、调整方向或结束
 ```
 
-需要避免四种误读：
+需要避免三种误读：
 
 1. **不是两个产品 Agent 串联。** EchoMind 与 Pyromind 是独立 Profile，共享基础设施，不通过互相调用完成任务。
 2. **不是 Runtime 自动遍历 DAG。** 当前 Manager 自行决定下一步，阶段依赖不等于后台自动调度规则。
-3. **不是 AgentGenome 驱动所有委派。** 当前 EchoMind 阶段开发依赖原生 `subagent`；经验图复用是另一个可选通用能力。
-4. **不是已完成的线上数据飞轮。** Init、Dataset、Train、Eval 已有执行角色；Inference、Tracer 是未实现占位，RawData 也没有独立执行角色。
+3. **不是已完成的线上数据飞轮。** Init、Dataset、Train、Eval 已有执行角色；Inference、Tracer 是未实现占位，RawData 也没有独立执行角色。
 
 最重要的状态分工是：
 
@@ -62,7 +61,6 @@ flowchart TB
     RT --> FILE["Product 文件存储"]
     RT --> SQL["Preparation / Project SQL"]
     RT --> VER["版本 SQLite + 产物快照"]
-    RT -.可选.-> GENOME["AgentGenome 经验复用"]
     NODE -.可选.-> OBS["Langfuse / 本地观测"]
 ```
 
@@ -112,7 +110,7 @@ pi / pi-subagents / 通用 Python 平台工具
 - Pyromind：`/api/v2/pyromind/conversations`。
 - Project 列表和兼容节点 API：`/api/echomind/projects`。
 
-`bootstrap.py` 装配 Adapter、Product Store、Preparation Store、版本服务、平台任务查询、Storage、可选 AgentGenome 和观测组件。
+`bootstrap.py` 装配 Adapter、Product Store、Preparation Store、版本服务、平台任务查询、Storage 和观测组件。
 
 ### 3.2 Product Runtime
 
@@ -234,15 +232,14 @@ Adapter 内部再把稳定接收地址映射回 native run：仍运行则 steer�
 
 依据：[Preparation 用例](../pyromind-runtime/pyromind_runtime/application/preparation.py)、[关联模型](../pyromind-runtime/pyromind_runtime/domain/task_correlation.py)、[状态 Dispatcher](../pyromind-agent-server/pyromind_agent_server/workflow_status_dispatcher.py)、[子会话接收者](../harness-adapter/pi-runtime/src/subagent-recipients.ts)。
 
-## 6. 工作流、评测与经验复用
+## 6. 工作流与评测
 
-### 6.1 三种“工作流”不能混为一谈
+### 6.1 两种工作流
 
 | 名称 | 当前作用 | 是否直接执行 |
 | --- | --- | --- |
 | workflowPLAN / preparation plan | 业务目标、阶段、任务和依赖；创建后 Manager 记录判断 | 文件修改本身不启动任务 |
 | Python DSL `workflow.py` | Studio 计算工作流，Train 等角色生成并验证 | 通过提交工具执行 |
-| AgentGenome graph / script | 历史经验沉淀、复用和通用工作流运行 | 在对应能力启用和调用时执行 |
 
 主工作台不是画布编辑器。Train 在 task workspace 写入 `workflow_canvas/workflow.py`，验证与提交必须使用该实际文件路径。
 
@@ -268,15 +265,7 @@ Runtime 另有评测 case、媒体、annotation、review task 和导出用例；
 
 `reference_only` 产物是引用，不是完整不可变快照；运行归档也受 `PYROMIND_RUN_ARCHIVES_ENABLED` 控制，默认不启用。当前前端没有看到实验目录和指标趋势的完整消费界面，因此应区分“后端查询已实现”和“工作台已产品化展示”。
 
-### 6.4 AgentGenome 的实际位置
-
-`PYROMIND_AGENTGENOME_ENABLED` 控制通用经验能力；bootstrap 在默认 backend 为 pi 时装配 AgentGenomeBackend，通过 Adapter 的执行宿主访问 pi。
-
-当前启动脚本启用它，但 EchoMind Manager 的开发工具白名单没有经验管理工具。因此“服务具备经验能力”不等于“EchoMind 阶段已自动经验沉淀和复用”。
-
-用户级 registry 默认位于挂载 Storage 的 `.pyromind-agent/agentgenome`，可由 `AGENTGENOME_HOME` 覆盖。它不应被误认为会话产品状态或阶段调度数据库。
-
-依据：[版本模型](../pyromind-runtime/pyromind_runtime/domain/versions.py)、[训练评测](../pyromind-runtime/pyromind_runtime/application/training_evaluations.py)、[Checkpoint 选择](../pyromind-runtime/pyromind_runtime/application/checkpoint_selection.py)、[实验投影](../pyromind-runtime/pyromind_runtime/application/experiments.py)、[经验桥接](../harness-adapter/harness_adapter/agentgenome_bridge.py)。
+依据：[版本模型](../pyromind-runtime/pyromind_runtime/domain/versions.py)、[训练评测](../pyromind-runtime/pyromind_runtime/application/training_evaluations.py)、[Checkpoint 选择](../pyromind-runtime/pyromind_runtime/application/checkpoint_selection.py)、[实验投影](../pyromind-runtime/pyromind_runtime/application/experiments.py)。
 
 ## 7. 持久化与恢复
 

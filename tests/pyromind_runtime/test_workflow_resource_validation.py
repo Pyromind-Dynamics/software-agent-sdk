@@ -1,5 +1,6 @@
 import httpx
 import pytest
+
 from harness_adapter.workflow_validation import (
     ResourceValidatedWorkflowDslExecutor,
     WorkflowResourceValidationObservation,
@@ -7,7 +8,6 @@ from harness_adapter.workflow_validation import (
 from pyromind_common.tools.workflow.validate_workflow_dsl import (
     ValidateWorkflowDslAction,
 )
-
 from tests.tools.workflow.test_validate_workflow_dsl import (
     _Response,
     _valid_response as _structure_valid_response,
@@ -264,3 +264,31 @@ def test_missing_validated_workflow_fails_without_resource_request(
     assert result.valid is False and result.is_error
     assert result.retryable is False
     assert len(calls) == 1 and calls[0].endswith("/dsl/validate")
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_sdk_preparation_returns_the_actual_resource_checked_graph(
+    monkeypatch, test_mode
+):
+    checked = []
+
+    def post(url, **kwargs):
+        if url.endswith("/dsl/validate"):
+            return _valid_response()
+        checked.append(kwargs["json"]["workflow"])
+        return _resource_response(valid=True)
+
+    monkeypatch.setattr(httpx, "post", post)
+    result = ResourceValidatedWorkflowDslExecutor()(
+        ValidateWorkflowDslAction(dsl="workflow = server_graph()", test_mode=test_mode)
+    )
+    assert result.valid and not result.is_error
+    assert result.raw_response is not None
+    actual = result.raw_response["data"]["workflow"]
+    assert checked == [actual]
+    assert actual["name"] == "normalized-by-server"
+    assert (
+        {"execution_mode": "test"} in actual.get("execution_argos", [])
+    ) is test_mode
+    assert "execution_argos" not in VALIDATED_WORKFLOW
+    assert result.raw_response["data"]["valid"] is True

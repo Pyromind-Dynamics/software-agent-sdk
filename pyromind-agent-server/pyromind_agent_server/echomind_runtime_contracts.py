@@ -297,6 +297,27 @@ class RuntimeFinalizer(Protocol):
     ) -> RuntimeFinalization: ...
 
 
+class CandidateRecordingFinalizer:
+    def finalize(
+        self,
+        *,
+        project_id: str,
+        graph_run: GraphRun,
+        stages: list[StageRun],
+    ) -> RuntimeFinalization:
+        return RuntimeFinalization(
+            outcome="candidate_recorded",
+            promotion_result={
+                "decision": "awaiting_user_selection",
+                "reason": "manual_deployment",
+                "candidate_id": graph_run.run_id,
+                "project_id": project_id,
+                "round_no": graph_run.round_no,
+                "stage_count": len(stages),
+            },
+        )
+
+
 class BaselineRetainingFinalizer:
     def finalize(
         self,

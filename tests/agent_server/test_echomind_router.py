@@ -16,6 +16,7 @@ from pyromind_agent_server.echomind_projects import (
     ProjectNotFoundError,
     ProjectStore,
 )
+from pyromind_agent_server.echomind_publication import build_runtime_contract_draft
 from pyromind_agent_server.experiment_plan_projects import (
     EchoMindExperimentPlanProjectBinder,
 )
@@ -185,6 +186,82 @@ def test_plan_binding_creates_and_updates_one_project_with_revision_id(tmp_path)
     assert second.graph.graph_id == first.graph.graph_id
     assert second.project.name == "Revised AVI experiment"
     assert len(list((tmp_path / "projects").iterdir())) == 1
+
+
+def test_preparation_graph_uses_catalog_types_and_task_dependencies(tmp_path):
+    plan = ExperimentContext.model_validate(
+        {
+            "stages": [
+                {"id": "prepare", "kind": "dataset", "name": "预打标"},
+                {"id": "fit", "kind": "train", "name": "微调"},
+                {"id": "score", "kind": "eval", "name": "评测"},
+            ],
+            "tasks": [
+                {
+                    "id": "label",
+                    "stage_id": "prepare",
+                    "name": "预打标",
+                    "outputs": [{"name": "train_data"}, {"name": "val_data"}],
+                },
+                {
+                    "id": "sft",
+                    "stage_id": "fit",
+                    "name": "微调",
+                    "inputs": [
+                        {"name": name, "task_id": "label", "output_name": name}
+                        for name in ("train_data", "val_data")
+                    ],
+                    "outputs": [{"name": "model"}],
+                },
+                {
+                    "id": "evaluate",
+                    "stage_id": "score",
+                    "name": "评测",
+                    "inputs": [
+                        {"name": "candidate", "task_id": "sft", "output_name": "model"}
+                    ],
+                    "outputs": [{"name": "metrics"}],
+                },
+                {
+                    "id": "analyze",
+                    "stage_id": "score",
+                    "name": "分析",
+                    "inputs": [
+                        {
+                            "name": "metrics",
+                            "task_id": "evaluate",
+                            "output_name": "metrics",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    project = ProjectStore(tmp_path).bind_preparation(
+        ProjectView(
+            project_id=uuid4().hex,
+            conversation_id="conversation-1",
+            plan_sequence=1,
+            plan=plan,
+            creation_command_id="create-project",
+        ),
+        cluster="cn-east-1",
+        owner_user_id="42",
+    )
+
+    assert [(node.id, node.type) for node in project.graph.nodes] == [
+        ("prepare", "dataset"),
+        ("fit", "train"),
+        ("score", "evaluator"),
+    ]
+    assert [(edge.source, edge.target) for edge in project.graph.edges] == [
+        ("prepare", "fit"),
+        ("fit", "score"),
+    ]
+    draft = build_runtime_contract_draft(project)
+    assert draft.issues == []
+    assert draft.nodes[-1].inputs["candidate"].binding.node_id == "fit"
+    assert "metrics" not in draft.nodes[-1].inputs
 
 
 def test_project_graph_follows_plan_topology_instead_of_skill_name(tmp_path):

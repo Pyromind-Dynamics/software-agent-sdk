@@ -52,4 +52,5 @@ class TaskMonitorHost(Protocol):
         status: str,
         error_summary: str | None = None,
         auto_run: bool = True,
+        trusted_platform: bool = False,
     ) -> object: ...

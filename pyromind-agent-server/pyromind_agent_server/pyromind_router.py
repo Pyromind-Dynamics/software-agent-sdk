@@ -8,6 +8,11 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
+
+from pyromind_agent_server.workflow_status import (
+    WorkflowCallbackResult,
+    dispatch_workflow_status as deliver_workflow_status,
+)
 from pyromind_common.platform.auth import (
     CurrentLoginUser,
     get_debug_current_login_user_by_conversation,
@@ -18,11 +23,6 @@ from pyromind_common.tools.data_preparation import (
 )
 from pyromind_common.tools.data_preparation.progress import DfCheckProgressExecutor
 from pyromind_common.tools.pyromind_debug import get_debug_result_broker
-
-from pyromind_agent_server.workflow_status import (
-    WorkflowCallbackResult,
-    dispatch_workflow_status as deliver_workflow_status,
-)
 
 
 class Success(BaseModel):
@@ -77,7 +77,7 @@ class PyromindWorkflowCallbackRequest(BaseModel):
         default=False,
         description=(
             "True when simulating a workflow_debug (test) terminal callback. "
-            "Kafka derives this from out_id agent1#debug#..."
+            "Kafka derives this from the out_id task_kind=workflow_debug."
         ),
     )
 
@@ -268,17 +268,23 @@ async def pyromind_workflow_callback(
     """将工作流状态分发给 Product Runtime。
 
     调用 :func:`deliver_workflow_status`，便于手动 HTTP 请求在没有 Kafka
-    消费者时测试异步恢复。与 ``/debug/callback`` 共用无需鉴权的 Webhook
-    路由，仅供内部可信网络调用。
+    消费者时测试已有任务的异步恢复。与 ``/debug/callback`` 共用无需鉴权的
+    Webhook 路由，不提供平台来源证明，也不登记未知 SDK 任务。
     """
-    result: WorkflowCallbackResult = await deliver_workflow_status(
-        task_id=request.task_id,
-        status=request.status,
-        error_log=request.error_log,
-        conversation_id=request.conversation_id,
-        auto_run=request.auto_run,
-        from_workflow_debug=request.from_workflow_debug,
-    )
+    try:
+        result: WorkflowCallbackResult = await deliver_workflow_status(
+            task_id=request.task_id,
+            status=request.status,
+            error_log=request.error_log,
+            conversation_id=request.conversation_id,
+            auto_run=request.auto_run,
+            from_workflow_debug=request.from_workflow_debug,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Callback source or task ownership is not authorized.",
+        ) from exc
     if result.outcome in {"unknown_task", "unknown_conversation"}:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+from abc import abstractmethod
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
@@ -50,7 +51,75 @@ def _workspace_path(workspace: str, path: str | Path) -> str:
     return str(PurePosixPath(to_posix_path(workspace)) / candidate)
 
 
-class SandboxWorkspace(BaseWorkspace):
+class RemoteSandboxWorkspace(BaseWorkspace):
+    """SDK file operations shared by remote sandbox transports."""
+
+    @abstractmethod
+    def _upload_file(self, source: Path, destination: str) -> None: ...
+
+    @abstractmethod
+    def _read_file(self, source: str) -> bytes: ...
+
+    def file_upload(
+        self,
+        source_path: str | Path,
+        destination_path: str | Path,
+    ) -> FileOperationResult:
+        source = Path(source_path)
+        destination = _workspace_path(self.working_dir, destination_path)
+        try:
+            self._upload_file(source, destination)
+            return FileOperationResult(
+                success=True,
+                source_path=str(source),
+                destination_path=destination,
+                file_size=source.stat().st_size,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return FileOperationResult(
+                success=False,
+                source_path=str(source),
+                destination_path=destination,
+                error=str(exc),
+            )
+
+    def file_download(
+        self,
+        source_path: str | Path,
+        destination_path: str | Path,
+    ) -> FileOperationResult:
+        source = _workspace_path(self.working_dir, source_path)
+        destination = Path(destination_path)
+        try:
+            content = self._read_file(source)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            return FileOperationResult(
+                success=True,
+                source_path=source,
+                destination_path=str(destination),
+                file_size=len(content),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return FileOperationResult(
+                success=False,
+                source_path=source,
+                destination_path=str(destination),
+                error=str(exc),
+            )
+
+    def git_changes(self, path: str | Path) -> list[GitChange]:
+        raise NotImplementedError(
+            "SandboxWorkspace does not expose git workspace operations"
+        )
+
+    def git_diff(self, path: str | Path) -> GitDiff:
+        raise NotImplementedError(
+            "SandboxWorkspace does not expose git workspace operations"
+        )
+
+
+class SandboxWorkspace(RemoteSandboxWorkspace):
     """Expose a platform Sandbox through the SDK workspace port."""
 
     _sandbox_id: str = PrivateAttr()
@@ -107,69 +176,17 @@ class SandboxWorkspace(BaseWorkspace):
             timeout_occurred=timed_out,
         )
 
-    def file_upload(
-        self,
-        source_path: str | Path,
-        destination_path: str | Path,
-    ) -> FileOperationResult:
-        source = Path(source_path)
-        destination = _workspace_path(self.working_dir, destination_path)
-        try:
-            write_sandbox_file(
-                self._client,
-                ws_base_url=self._ws_base_url,
-                sandbox_id=self._sandbox_id,
-                path=destination,
-                source=source,
-            )
-            return FileOperationResult(
-                success=True,
-                source_path=str(source),
-                destination_path=destination,
-                file_size=source.stat().st_size,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return FileOperationResult(
-                success=False,
-                source_path=str(source),
-                destination_path=destination,
-                error=str(exc),
-            )
-
-    def file_download(
-        self,
-        source_path: str | Path,
-        destination_path: str | Path,
-    ) -> FileOperationResult:
-        source = _workspace_path(self.working_dir, source_path)
-        destination = Path(destination_path)
-        try:
-            content = self._client.read_file(self._sandbox_id, source)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-            return FileOperationResult(
-                success=True,
-                source_path=source,
-                destination_path=str(destination),
-                file_size=len(content),
-            )
-        except Exception as exc:  # noqa: BLE001
-            return FileOperationResult(
-                success=False,
-                source_path=source,
-                destination_path=str(destination),
-                error=str(exc),
-            )
-
-    def git_changes(self, path: str | Path) -> list[GitChange]:
-        raise NotImplementedError(
-            "SandboxWorkspace does not expose git workspace operations"
+    def _upload_file(self, source: Path, destination: str) -> None:
+        write_sandbox_file(
+            self._client,
+            ws_base_url=self._ws_base_url,
+            sandbox_id=self._sandbox_id,
+            path=destination,
+            source=source,
         )
 
-    def git_diff(self, path: str | Path) -> GitDiff:
-        raise NotImplementedError(
-            "SandboxWorkspace does not expose git workspace operations"
-        )
+    def _read_file(self, source: str) -> bytes:
+        return self._client.read_file(self._sandbox_id, source)
 
     def pause(self) -> None:
         self._client.pause(self._sandbox_id)

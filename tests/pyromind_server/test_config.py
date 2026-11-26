@@ -30,3 +30,14 @@ def test_load_config_reads_registered_marketplaces_from_env(monkeypatch, tmp_pat
     assert registration.ref == "main"
     assert registration.repo_path == "marketplace"
     assert registration.auto_load is True
+
+
+def test_platform_sdk_rollback_can_override_config_file(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"platform_sdk_enabled": True}))
+    monkeypatch.setenv("OH_PLATFORM_SDK_ENABLED", "false")
+
+    assert load_config(config_path).platform_sdk_enabled is False
+
+    monkeypatch.delenv("OH_PLATFORM_SDK_ENABLED")
+    assert load_config(config_path).platform_sdk_enabled is True

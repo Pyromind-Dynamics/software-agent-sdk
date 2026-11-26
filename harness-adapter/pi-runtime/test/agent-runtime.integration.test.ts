@@ -287,96 +287,101 @@ test("AgentSession resolves an uncovered workflow node through the knowledge ind
   }
 });
 
-test("native skill commands load sandbox resources", async (context) => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-native-skill-")));
-  const workspace = join(root, "conversation");
-  const skillsDirectory = join(root, "skills");
-  const skill = join(skillsDirectory, "custom-workflow");
-  await mkdir(join(workspace, "public_data"), { recursive: true });
-  await mkdir(join(skill, "references"), { recursive: true });
-  await writeFile(join(skill, "SKILL.md"), [
-    "---",
-    "name: custom-workflow",
-    "description: Generate a workflow using its node contracts.",
-    "---",
-    "Read references/workflow-contracts.md before generating the workflow.",
-  ].join("\n"));
-  await writeFile(join(skill, "references", "workflow-contracts.md"), "Native skill reference loaded.\n");
+for (const workflowsEnabled of [false, true]) {
+  test(`native skill commands load sandbox resources with legacy workflow flag ${workflowsEnabled}`, async (context) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-native-skill-")));
+    const workspace = join(root, "conversation");
+    const skillsDirectory = join(root, "skills");
+    const skill = join(skillsDirectory, "custom-workflow");
+    await mkdir(join(workspace, "public_data"), { recursive: true });
+    await mkdir(join(skill, "references"), { recursive: true });
+    await writeFile(join(skill, "SKILL.md"), [
+      "---",
+      "name: custom-workflow",
+      "description: Generate a workflow using its node contracts.",
+      "---",
+      "Read references/workflow-contracts.md before generating the workflow.",
+    ].join("\n"));
+    await writeFile(join(skill, "references", "workflow-contracts.md"), "Native skill reference loaded.\n");
 
-  const requests: JsonObject[] = [];
-  const server = createServer(async (request, response) => {
-    requests.push(await readJson(request));
-    if (requests.length === 1) {
-      sendToolCall(response, "read", {
-        path: ".agents/skills/custom-workflow/references/workflow-contracts.md",
-      }, "call-native-reference");
-    } else {
-      sendText(response, "Skill and reference loaded.");
-    }
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  context.after(() => server.close());
-  const address = server.address() as AddressInfo;
-  const events: RunnerEvent[] = [];
-  let finish!: () => void;
-  const finished = new Promise<void>((resolve) => { finish = resolve; });
-  const peer = {
-    request: async (): Promise<JsonValue> => {
-      throw new Error("Skill reads must not create a sandbox or invoke a business tool");
-    },
-    emit: (event: RunnerEvent): void => {
-      events.push(event);
-      if (event.kind === "run.finished") finish();
-    },
-  } as unknown as JsonlRpcPeer;
-  const runtime = new PiAgentRuntime(peer);
-  await runtime.handle("start", {
-    session_id: "native-skill-session",
-    workspace_root: workspace,
-    terminal_backend: "sandbox",
-    session_path: join(workspace, "pi", "session.jsonl"),
-    skills_directory: skillsDirectory,
-    skill_roots: [],
-    system_prompt: "Follow the selected skill.",
-    model: {
-      provider: "openai",
-      id: "custom-chat-model",
-      api_key: "test-key",
-      base_url: `http://127.0.0.1:${address.port}/v1`,
-    },
-    tools: [],
-  });
-  await runtime.handle("prompt", {
-    run_id: "native-skill-run",
-    content: [{ type: "text", text: "/skill:custom-workflow Generate the requested workflow." }],
-  });
-  let timeout: NodeJS.Timeout | undefined;
-  await Promise.race([
-    finished,
-    new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => reject(new Error("native skill turn timed out")), 5_000);
-      timeout.unref();
-    }),
-  ]).finally(() => clearTimeout(timeout));
+    const requests: JsonObject[] = [];
+    const server = createServer(async (request, response) => {
+      requests.push(await readJson(request));
+      if (requests.length === 1) {
+        sendToolCall(response, "read", {
+          path: ".agents/skills/custom-workflow/references/workflow-contracts.md",
+        }, "call-native-reference");
+      } else {
+        sendText(response, "Skill and reference loaded.");
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    context.after(() => server.close());
+    const address = server.address() as AddressInfo;
+    const events: RunnerEvent[] = [];
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => { finish = resolve; });
+    const peer = {
+      request: async (): Promise<JsonValue> => {
+        throw new Error("Skill reads must not create a sandbox or invoke a business tool");
+      },
+      emit: (event: RunnerEvent): void => {
+        events.push(event);
+        if (event.kind === "run.finished") finish();
+      },
+    } as unknown as JsonlRpcPeer;
+    const runtime = new PiAgentRuntime(peer);
+    await runtime.handle("start", {
+      session_id: "native-skill-session",
+      workspace_root: workspace,
+      terminal_backend: "sandbox",
+      session_path: join(workspace, "pi", "session.jsonl"),
+      skills_directory: skillsDirectory,
+      skill_roots: [],
+      workflows_enabled: workflowsEnabled,
+      system_prompt: "Follow the selected skill.",
+      model: {
+        provider: "openai",
+        id: "custom-chat-model",
+        api_key: "test-key",
+        base_url: `http://127.0.0.1:${address.port}/v1`,
+      },
+      tools: [],
+    });
+    await runtime.handle("prompt", {
+      run_id: "native-skill-run",
+      content: [{ type: "text", text: "/skill:custom-workflow Generate the requested workflow." }],
+    });
+    let timeout: NodeJS.Timeout | undefined;
+    await Promise.race([
+      finished,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("native skill turn timed out")), 5_000);
+        timeout.unref();
+      }),
+    ]).finally(() => clearTimeout(timeout));
 
-  assert.equal(requests.length, 2);
-  const messages = requests[0]!.messages as Array<{ role: string; content: string }>;
-  const system = messages.filter((message) => message.role === "system" || message.role === "developer")
-    .map((message) => message.content).join("\n");
-  const user = JSON.stringify(messages.filter((message) => message.role === "user"));
-  assert.match(system, /<location>\.agents\/skills\/custom-workflow\/SKILL\.md<\/location>/);
-  assert.match(system, /<cwd>\n\.\n<\/cwd>/);
-  assert.match(system, /When a skill file references a relative path, resolve it against the skill directory/);
-  assert.equal(JSON.stringify(messages).includes(root), false);
-  assert.ok(user.includes('<skill name=\\"custom-workflow\\"'));
-  assert.ok(user.includes("References are relative to .agents/skills/custom-workflow."));
-  assert.ok(user.includes("Read references/workflow-contracts.md before generating the workflow."));
-  assert.ok(user.includes("Generate the requested workflow."));
-  assert.ok(!user.includes("/skill:custom-workflow"));
-  assert.ok(JSON.stringify(requests[1]!.messages).includes("Native skill reference loaded."));
-  assert.equal(events.some((event) => event.kind === "tool.failed"), false);
-  assert.ok(!system.includes("genome_list"));
-});
+    assert.equal(requests.length, 2);
+    const messages = requests[0]!.messages as Array<{ role: string; content: string }>;
+    const system = messages.filter((message) => message.role === "system" || message.role === "developer")
+      .map((message) => message.content).join("\n");
+    const user = JSON.stringify(messages.filter((message) => message.role === "user"));
+    assert.match(system, /<location>\.agents\/skills\/custom-workflow\/SKILL\.md<\/location>/);
+    assert.match(system, /<cwd>\n\.\n<\/cwd>/);
+    assert.match(system, /When a skill file references a relative path, resolve it against the skill directory/);
+    assert.equal(JSON.stringify(messages).includes(root), false);
+    assert.ok(user.includes('<skill name=\\"custom-workflow\\"'));
+    assert.ok(user.includes("References are relative to .agents/skills/custom-workflow."));
+    assert.ok(user.includes("Read references/workflow-contracts.md before generating the workflow."));
+    assert.ok(user.includes("Generate the requested workflow."));
+    assert.ok(!user.includes("/skill:custom-workflow"));
+    assert.ok(JSON.stringify(requests[1]!.messages).includes("Native skill reference loaded."));
+    assert.equal(events.some((event) => event.kind === "tool.failed"), false);
+    const tools = requests[0]!.tools as Array<{ function: { name: string } }>;
+    assert.equal(tools.some((tool) => tool.function.name.startsWith("genome_")), false);
+    assert.equal(system.includes("genome_"), false);
+  });
+}
 
 test("a persistent length stop finishes as output_truncated, never completed", async (context) => {
   const server = createServer(async (request, response) => {

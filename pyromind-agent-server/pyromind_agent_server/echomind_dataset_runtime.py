@@ -33,6 +33,9 @@ from pyromind_agent_server.echomind_train_runtime import (
 )
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.storage_paths import normalize_workspace_path
+from pyromind_runtime.domain.workflow_execution import (
+    DATASET_COMMAND_TEMPLATE_MAX_LENGTH,
+)
 
 
 class DatasetRuntimeError(RuntimeError):
@@ -52,6 +55,9 @@ _WORKFLOW_RUNTIME_IDS = (
 class DatasetWorkflowConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    dataflow_credential_task_id: str | None = Field(
+        default=None, pattern=r"^[0-9]+$", max_length=64, exclude_if=lambda v: v is None
+    )
     workflow: dict[str, Any] = Field(min_length=1)
     workflow_bindings: dict[str, str] = Field(default_factory=dict)
     workflow_templates: dict[str, str] = Field(default_factory=dict)
@@ -60,7 +66,9 @@ class DatasetWorkflowConfig(BaseModel):
     output_parameter: str = Field(default="output_path", min_length=1, max_length=128)
     train_filename: str = "train_messages.jsonl"
     val_filename: str = "val_messages.jsonl"
-    command_template: str | None = Field(default=None, min_length=1, max_length=20000)
+    command_template: str | None = Field(
+        default=None, min_length=1, max_length=DATASET_COMMAND_TEMPLATE_MAX_LENGTH
+    )
     command_binding_path: str | None = Field(
         default=None, min_length=1, max_length=4000
     )
@@ -166,6 +174,7 @@ def _template_fields(template: str) -> set[str]:
 
 
 class DatasetWorkflowSpec(TrainWorkflowSpec):
+    dataflow_credential_task_id: str | None = None
     train_filename: str
     val_filename: str
 
@@ -355,8 +364,10 @@ class PlatformDatasetRuntimeExecutor:
             output_uri=output_uri,
             output_node_id=config.output_node_id,
             output_parameter=config.output_parameter,
+            dataflow_credential_task_id=config.dataflow_credential_task_id,
             train_filename=config.train_filename,
             val_filename=config.val_filename,
+            template_values={"project_id": context.project_id},
         )
 
 

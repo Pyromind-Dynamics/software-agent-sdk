@@ -11,6 +11,8 @@ from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
 
 class ProductStore(Protocol):
+    def authorize(self, user_id: str, profile_id: str | None = None) -> None: ...
+
     def read_execution_evidence(self, digest: str) -> bytes: ...
 
     def load_workflow_execution_requests(

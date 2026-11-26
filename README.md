@@ -30,6 +30,41 @@ export PYROMIND_PI_TERMINAL_BACKEND=os-sandbox
 existing environment restriction. Linux `os-sandbox` execution requires the
 platform sandbox dependencies checked by the Pi runner.
 
+### Run each developer's Agent on a dedicated Actor
+
+Place `start_actor_dev.sh` beside your personal `start_inference.sh` and export
+the three sandbox connection settings.
+
+```bash
+export KUBECONFIG="$(cat <<'YAML'
+# Paste your complete kubeconfig YAML here.
+YAML
+)"
+export PYROMIND_SANDBOX_ACTOR_URL=http://127.0.0.1:8081
+export PYROMIND_SANDBOX_ACTOR_TARGET=your-atespace/your-actor
+./start_actor_dev.sh
+```
+
+The wrapper connects to the Actor, then runs your `start_inference.sh` with
+the sandbox terminal backend. Run `./start_actor_dev.sh` for the complete
+startup. Your existing script manages the model, credentials, database, Kafka,
+dependencies and other service settings.
+
+For the localhost 8081 URL the wrapper manages a router forward using
+`KUBECONFIG`. Multiline YAML is
+written to a temporary file readable only by the current user, passed to
+`kubectl`, and removed on exit. File paths are also accepted, with
+`$HOME/.kube/config` as the default. An existing connection is reused.
+A directly reachable router URL also works.
+Use embedded certificate data or absolute certificate paths in pasted YAML.
+
+Operations should provision one Actor and the corresponding JuiceFS user disk
+per developer, with an egress policy for the required services. Pin the same
+image digest in every template. The tested `amd64-v3` digest is
+`sha256:ad1e8070460cec98cf0ca4eb8f7945a39e64ffff5bcd202a5246111c45ee025f`.
+
+### Run checks
+
 ```bash
 uv run pytest tests
 npm test --prefix harness-adapter/pi-runtime

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
+import hmac
+import json
 import os
 import threading
 from collections.abc import Iterator
@@ -21,10 +23,12 @@ from pyromind_runtime.domain.commands import (
 )
 from pyromind_runtime.domain.evaluation import EvaluationCommitState
 from pyromind_runtime.domain.events import ProductEvent, WorkflowRunState
+from pyromind_runtime.domain.experiment_plans import PlanOwner
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.snapshot import ConversationSnapshot
+from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.domain.user_input import UserInputResolution
 from pyromind_runtime.domain.workflow_execution import WorkflowExecutionRequest
 
@@ -88,12 +92,17 @@ class _Metadata(ContractModel):
 class CommandIntent(ContractModel):
     """Recoverable description of a claimed command.
 
-    The ledger records fingerprints and receipts only; the intent carries the
-    minimum needed to reconcile input-response receipts after a crash.
+    The intent carries the minimum needed to reconcile input-response receipts
+    after a crash.
     """
 
     type: str = Field(min_length=1)
     request_id: str | None = None
+
+
+class _BusinessAttempt(ContractModel):
+    task_id: str = Field(min_length=1)
+    attempt: int = Field(ge=1)
 
 
 class _StoredCommand(ContractModel):
@@ -101,12 +110,15 @@ class _StoredCommand(ContractModel):
     fingerprint: str
     receipt: CommandReceipt
     intent: CommandIntent | None = None
+    business_attempt: _BusinessAttempt | None = None
 
     @model_serializer(mode="wrap")
     def _omit_empty_intent(self, handler):
         data = handler(self)
         if self.intent is None:
             data.pop("intent", None)
+        if self.business_attempt is None:
+            data.pop("business_attempt", None)
         return data
 
 
@@ -219,6 +231,58 @@ class FileProductStore:
         metadata = self._load_metadata()
         if metadata.user_id != user_id or metadata.profile_id != profile_id:
             raise PermissionError("conversation does not belong to current user")
+
+    def plan_owner(self) -> PlanOwner:
+        metadata = self._load_metadata()
+        return PlanOwner(
+            user_id=metadata.user_id,
+            conversation_id=metadata.conversation_id,
+            profile_id=metadata.profile_id,
+        )
+
+    def issue_task_correlation(self, correlation: TaskCorrelation) -> TaskCorrelation:
+        metadata = self._load_metadata()
+        if correlation.conversation_id != metadata.conversation_id:
+            raise PermissionError("task correlation belongs to another conversation")
+        key_path = self._task_correlation_key_path()
+        with self._lock():
+            key_path.parent.mkdir(mode=_DIR_MODE, exist_ok=True)
+            if not key_path.exists():
+                self._atomic_write(key_path, os.urandom(32).hex())
+            signature = self._task_signature(correlation, key_path.read_text())
+        return correlation.model_copy(update={"signature": signature})
+
+    def verify_task_correlation(self, correlation: TaskCorrelation) -> bool:
+        if correlation.signature is None:
+            return False
+        key_path = self._task_correlation_key_path()
+        if not key_path.is_file():
+            return False
+        expected = self._task_signature(correlation, key_path.read_text())
+        return hmac.compare_digest(correlation.signature, expected)
+
+    def _task_correlation_key_path(self) -> Path:
+        identity = hashlib.sha256(
+            self._load_metadata().conversation_id.encode()
+        ).hexdigest()
+        return self.conversation_dir.parent / ".task-correlation-keys" / identity
+
+    def _task_signature(self, correlation: TaskCorrelation, key: str) -> str:
+        metadata = self._load_metadata()
+        payload = json.dumps(
+            {
+                "user_id": metadata.user_id,
+                "profile_id": metadata.profile_id,
+                "correlation": correlation.model_dump(
+                    mode="json", exclude={"signature"}, exclude_none=True
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hmac.new(
+            bytes.fromhex(key), payload.encode(), hashlib.sha256
+        ).hexdigest()
 
     def permits_tool(self, name: str) -> bool:
         allowed = self._load_metadata().tool_allowlist
@@ -713,6 +777,14 @@ class FileProductStore:
                 ).model_dump_json(),
             )
             return receipt, True
+
+    def command_receipts(self, prefix: str) -> tuple[CommandReceipt, ...]:
+        with self._lock():
+            return tuple(
+                entry.receipt
+                for key, entry in self._load_commands(repair_tail=True).items()
+                if key.startswith(prefix)
+            )
 
     def load_input_command_receipts(
         self,

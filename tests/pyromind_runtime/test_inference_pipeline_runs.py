@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_runtime.application.pipeline_runs import PipelineRuns
 from pyromind_runtime.domain.capabilities import HarnessCapabilities
@@ -40,6 +41,27 @@ def test_pipeline_run_survives_restart_and_requires_terminal_status(pipeline_run
     assert resumed["revision"] > run["revision"]
     with pytest.raises(ValueError, match="in progress"):
         restarted.reserve(run["definition"], run["run_id"])
+
+
+def test_sdk_task_associations_exclude_other_conversations_and_unsubmitted_runs(
+    pipeline_runs,
+):
+    service, store, registry = pipeline_runs
+    run = service.reserve({"model_path": "/models/v1"}, None)
+    service.finish_submission(run["run_id"], run["revision"], "task-1", "submitted")
+    service.reserve({"model_path": "/models/v2"}, None)
+    restarted = PipelineRuns(service.conversation_id, store, registry)
+
+    assert restarted.task_associations() == [
+        {
+            "task_id": "task-1",
+            "run_id": run["run_id"],
+            "output_dir": run["output_dir"],
+        }
+    ]
+    assert (
+        PipelineRuns("another-conversation", store, registry).task_associations() == []
+    )
 
 
 def test_changed_config_and_cross_conversation_resume_rejected(pipeline_runs, tmp_path):

@@ -5,6 +5,7 @@ Tests the check_session_api_key dependency with multiple session API keys suppor
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
+
 from pyromind_agent_server import dependencies as dependencies_module
 from pyromind_agent_server.config import Config
 from pyromind_agent_server.dependencies import (
@@ -123,7 +124,7 @@ def test_check_session_api_key_accepts_dev_pyromind_headers(monkeypatch):
     }
 
 
-def test_check_session_api_key_accepts_dev_pyromind_query_params(monkeypatch):
+def test_check_session_api_key_rejects_dev_identity_from_query_params(monkeypatch):
     monkeypatch.setenv("APP_ENV", "dev")
     client = TestClient(_make_user_app(["test-key"]), raise_server_exceptions=False)
 
@@ -139,14 +140,7 @@ def test_check_session_api_key_accepts_dev_pyromind_query_params(monkeypatch):
         },
     )
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "auth_method": "pyromind_dev",
-        "user_id": "42",
-        "username": "debug-user-42",
-        "cookie": "auth_token=session-token; other=value",
-        "x_cluster": "us-west-1#pre",
-    }
+    assert response.status_code == 401
 
 
 def test_check_session_api_key_prefers_dev_pyromind_headers_over_query(monkeypatch):

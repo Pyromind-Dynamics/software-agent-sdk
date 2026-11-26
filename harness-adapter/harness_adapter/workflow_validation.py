@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
+
 from pyromind_common.tools.utils.platform_env import (
     platform_headers,
     platform_portal_url,
@@ -116,13 +117,18 @@ class ResourceValidatedWorkflowDslExecutor(StructureValidationExecutor):
                 is_error=True,
             )
         structure = super().__call__(
-            ValidateWorkflowDslAction(dsl=dsl, name=action.name), conversation
+            ValidateWorkflowDslAction(
+                dsl=dsl, name=action.name, test_mode=action.test_mode
+            ),
+            conversation,
         )
         if structure.is_error or structure.valid is not True:
             return structure
         payload = structure.raw_response or {}
         data = payload.get("data")
-        workflow = data.get("workflow") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return _resource_check_failed(retryable=False)
+        workflow = data.get("workflow")
         if (
             not isinstance(workflow, dict)
             or not isinstance(workflow.get("nodes"), list)
@@ -139,7 +145,25 @@ class ResourceValidatedWorkflowDslExecutor(StructureValidationExecutor):
             )
         return WorkflowResourceValidationObservation.from_text(
             text=summary,
-            **resources.model_dump(exclude={"content", "workflow_id", "warnings"}),
+            **resources.model_dump(
+                exclude={"content", "workflow_id", "warnings", "raw_response"}
+            ),
+            raw_response={
+                **payload,
+                "data": {
+                    **data,
+                    "workflow": workflow,
+                    "valid": resources.valid,
+                    "errors": [
+                        issue.model_dump(mode="json") for issue in resources.errors
+                    ],
+                    "warnings": [issue.model_dump(mode="json") for issue in warnings],
+                    "available_resources": [
+                        item.model_dump(mode="json")
+                        for item in resources.available_resources
+                    ],
+                },
+            },
             workflow_id=structure.workflow_id,
             warnings=warnings,
             validated_workflow=workflow,

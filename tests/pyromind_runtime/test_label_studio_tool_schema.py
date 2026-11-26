@@ -32,8 +32,8 @@ def test_pi_label_studio_operation_schemas_require_the_right_arguments(host):
         for item in host.specs(sandbox=True)
         if item["name"].startswith("label_studio_")
     }
-    assert "label_studio_project" not in specs
     assert set(specs) == {
+        "label_studio_project",
         "label_studio_create_project",
         "label_studio_get_project",
         "label_studio_project_status",
@@ -54,6 +54,10 @@ import { makeStrictJsonSchema } from "@earendil-works/pi-ai/api/constrained-samp
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 const specs = JSON.parse(readFileSync(0, "utf8"));
 const valid = {
+  label_studio_project: {
+    operation: "create", dataset_path: "/datasets/pcb/badcase_step320_ls.jsonl",
+    label_config_path: "public_data/label_config_badcase.xml", adapter: "jsonl",
+  },
   label_studio_create_project: {
   dataset_path: "/datasets/pcb/badcase_step320_ls.jsonl",
   label_config_path: "public_data/label_config_badcase.xml",
@@ -71,6 +75,7 @@ const valid = {
   label_studio_refresh_media: { project_ref: "existing-project" },
 };
 const required = {
+  label_studio_project: ["operation"],
   label_studio_create_project: ["dataset_path", "label_config_path"],
   label_studio_get_project: ["project_ref"],
   label_studio_project_status: ["project_ref"],
@@ -90,13 +95,19 @@ for (const spec of Object.values(specs)) {
   const nullable = Object.fromEntries(Object.keys(strict.properties).map(
     field => [field, valid[spec.name][field] ?? null]));
   assert.deepEqual(
-    validateToolArguments(tool, call(nullable)), nullable);
+    validateToolArguments(tool, call(nullable)),
+    spec.name === "label_studio_project" ? valid[spec.name] : nullable);
   for (const field of required[spec.name]) {
     const incomplete = { ...valid[spec.name] };
     delete incomplete[field];
     assert.throws(() => validateToolArguments(tool, call(incomplete)));
   }
 }
+assert.throws(() => validateToolArguments(
+  { name: specs.label_studio_project.name,
+    parameters: specs.label_studio_project.input_schema },
+  { type: "toolCall", id: "test", name: "label_studio_project",
+    arguments: { operation: "unsupported" } }));
 assert.throws(() => validateToolArguments(
   { name: specs.label_studio_create_project.name,
     parameters: specs.label_studio_create_project.input_schema },

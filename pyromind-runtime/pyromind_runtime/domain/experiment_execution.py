@@ -44,6 +44,9 @@ class ExperimentExecutionView(ContractModel):
     stage_snapshot: JsonObject | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    plan_attempt: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
     task_id: str
     stage_id: str | None = None
     task_name: str
@@ -63,6 +66,9 @@ class ExperimentExecutionView(ContractModel):
     proposal: JsonObject | None = None
     metrics: JsonObject | None = None
     platform_task_id: str | None = None
+    platform_task_ids: tuple[str, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     artifacts: tuple[JsonObject, ...] = ()
     intent: str = "prepare"
     summary: str | None = None

@@ -69,7 +69,7 @@ class TrainWorkflowSpec(BaseModel):
     output_uri: str | None = Field(default=None, max_length=4000)
     artifact_uri: str | None = Field(default=None, max_length=4000)
     artifact_selection: (
-        Literal["latest_lora_checkpoint", "evaluation_report"] | None
+        Literal["latest_lora_checkpoint", "merged_model", "evaluation_report"] | None
     ) = None
     output_node_id: str | None = Field(default=None, max_length=128)
     output_parameter: str = Field(default="output_path", min_length=1, max_length=128)
@@ -355,6 +355,7 @@ class TrainRuntimeExecutor:
         if artifact_selection not in (
             None,
             "latest_lora_checkpoint",
+            "merged_model",
             "evaluation_report",
         ):
             raise TrainRuntimeError(f"Unknown artifact selection: {artifact_selection}")

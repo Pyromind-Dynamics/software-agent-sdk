@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -60,20 +60,6 @@ dev = [
     { name = "streamlit", specifier = ">=1.49.1" },
     { name = "tabulate", specifier = ">=0.9.0" },
 ]
-
-[[package]]
-name = "agentgenome"
-version = "0.6.60"
-source = { path = "vendor/agentgenome-0.6.60-py3-none-any.whl" }
-dependencies = [
-    { name = "pyyaml" },
-]
-wheels = [
-    { filename = "agentgenome-0.6.60-py3-none-any.whl", hash = "sha256:6451643f729bf7fcd40adc3e5bb8fb53617c9d4d4dc09df3c5f504aa442988a5" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pyyaml" }]
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -1082,16 +1068,16 @@ name = "harness-adapter"
 version = "0.1.0"
 source = { editable = "harness-adapter" }
 dependencies = [
-    { name = "agentgenome" },
     { name = "pyromind-common" },
     { name = "pyromind-runtime" },
+    { name = "wheel" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "agentgenome", path = "vendor/agentgenome-0.6.60-py3-none-any.whl" },
     { name = "pyromind-common", editable = "pyromind-common" },
     { name = "pyromind-runtime", editable = "pyromind-runtime" },
+    { name = "wheel", specifier = ">=0.45" },
 ]
 
 [[package]]

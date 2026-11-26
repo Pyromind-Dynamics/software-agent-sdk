@@ -20,8 +20,8 @@ from pyromind_common.tools.workflow.constants import WORKFLOW_RELATIVE_PATH
 from pyromind_common.tools.workflow_debug.execution import (
     DEFAULT_MAX_ATTEMPTS,
     WorkflowDebugSubmissionAction,
-    WorkflowDebugSubmissionExecutor,
     WorkflowDebugSubmissionObservation,
+    WorkflowDebugSubmissionRunner,
 )
 
 
@@ -161,10 +161,8 @@ def _to_debug_observation(
     )
 
 
-class WorkflowDebugExecutor(
-    ToolExecutor[WorkflowDebugAction, WorkflowDebugObservation]
-):
-    """委托仅供调试的提交执行器完成提交。
+class WorkflowDebugRunner:
+    """Read a workspace DSL file and submit a bounded test run.
 
     异步提交成功后始终返回 ``keep_ui_lock=True``，以便前端锁定界面，
     直到平台回调完成。
@@ -177,9 +175,9 @@ class WorkflowDebugExecutor(
         env: str | None = None,
         current_user: object | None = None,
         headers: dict[str, str] | None = None,
-        run_executor: WorkflowDebugSubmissionExecutor | None = None,
+        submission_runner: WorkflowDebugSubmissionRunner | None = None,
     ) -> None:
-        self._run_executor = run_executor or WorkflowDebugSubmissionExecutor(
+        self._run_executor = submission_runner or WorkflowDebugSubmissionRunner(
             cluster=cluster,
             env=env,
             current_user=current_user,
@@ -208,7 +206,7 @@ class WorkflowDebugExecutor(
             )
         return read_workspace_text(cast(Any, conversation).workspace, dsl_path)
 
-    def __call__(
+    def run(
         self,
         action: WorkflowDebugAction,
         conversation: ToolConversation | None = None,
@@ -234,6 +232,51 @@ class WorkflowDebugExecutor(
             conversation,
         )
         return _to_debug_observation(observation)
+
+
+def create_workflow_debug_runner(
+    *,
+    cluster: str | None = None,
+    env: str | None = None,
+    current_user: object | None = None,
+    headers: dict[str, str] | None = None,
+    submission_runner: WorkflowDebugSubmissionRunner | None = None,
+) -> WorkflowDebugRunner:
+    return WorkflowDebugRunner(
+        cluster=cluster,
+        env=env,
+        current_user=current_user,
+        headers=headers,
+        submission_runner=submission_runner,
+    )
+
+
+class WorkflowDebugExecutor(
+    WorkflowDebugRunner, ToolExecutor[WorkflowDebugAction, WorkflowDebugObservation]
+):
+    def __init__(
+        self,
+        *,
+        cluster: str | None = None,
+        env: str | None = None,
+        current_user: object | None = None,
+        headers: dict[str, str] | None = None,
+        run_executor: WorkflowDebugSubmissionRunner | None = None,
+    ) -> None:
+        super().__init__(
+            cluster=cluster,
+            env=env,
+            current_user=current_user,
+            headers=headers,
+            submission_runner=run_executor,
+        )
+
+    def __call__(
+        self,
+        action: WorkflowDebugAction,
+        conversation: ToolConversation | None = None,
+    ) -> WorkflowDebugObservation:
+        return self.run(action, conversation)
 
 
 class WorkflowDebugTool(ToolDefinition[WorkflowDebugAction, WorkflowDebugObservation]):

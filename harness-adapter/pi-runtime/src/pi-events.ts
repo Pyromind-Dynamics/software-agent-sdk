@@ -29,6 +29,12 @@ export class PiEventNormalizer {
       case "agent_end": return [];
       case "turn_end": return [];
       case "turn_start": return [];
+      case "compaction_start":
+        return [this.make("context_compaction.updated", { status: "started" })];
+      case "compaction_end":
+        return [this.make("context_compaction.updated", {
+          status: event.errorMessage ? "failed" : event.result ? "completed" : "skipped",
+        })];
       case "message_start": return this.startMessage(event.message);
       case "message_update": {
         const update = event.assistantMessageEvent;

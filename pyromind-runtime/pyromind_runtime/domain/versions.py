@@ -222,6 +222,13 @@ class SnapshotResult(ContractModel):
 
 class VersionToolRequest(ContractModel):
     action: Literal[
-        "save", "list", "read", "compare", "select", "new_iteration", "recover"
+        "save",
+        "list",
+        "read",
+        "compare",
+        "select",
+        "new_iteration",
+        "recover",
+        "bind_execution_metadata",
     ]
     arguments: JsonObject = Field(default_factory=dict)

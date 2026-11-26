@@ -316,9 +316,8 @@ class SandboxSampleExecutor:
         self._run_id = run_id
         run_dir = self._run_dir_path(run_id)
         marker = uuid.uuid4().hex
-        system_python = (
-            os.environ.get(ENV_SANDBOX_SYSTEM_PYTHON) or DEFAULT_SANDBOX_SYSTEM_PYTHON
-        )
+        system_python = os.environ.get(ENV_SANDBOX_SYSTEM_PYTHON) or None
+        launcher_python = system_python or DEFAULT_SANDBOX_SYSTEM_PYTHON
         payload = {
             **spec,
             "runtime_dir": runtime_dir,
@@ -343,7 +342,7 @@ class SandboxSampleExecutor:
                 sandbox_upload(self._workspace, spec_path, destination)
             command = (
                 f"chmod 600 {shlex.quote(destination)}; "
-                f"{shlex.quote(system_python)} "
+                f"{shlex.quote(launcher_python)} "
                 f"{shlex.quote(runtime_dir + '/' + SANDBOX_RUNNER_FILENAME)} "
                 f"--spec {shlex.quote(destination)}; rc=$?; "
                 f"rm -rf {shlex.quote(run_dir)}; (exit $rc)"

@@ -3,9 +3,161 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 
 import pytest
 from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp.test_utils import TestServer
+
+from harness_adapter.pi_adapter import PiAdapter
+from harness_adapter.pi_adapter.adapter import _PiSession
+from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from pyromind_common.tools.utils import pyromind_api_client
+from pyromind_common.tools.workflow import task_submission
+from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.ports.harness import SessionSpec
+
+from .test_native_preparation import stream
+
+
+@pytest.fixture
+def pi_stop_session(tmp_path):
+    adapter = PiAdapter(tmp_path, terminal_backend="os-sandbox")
+    session = _PiSession(
+        "stop-conversation",
+        tmp_path,
+        PiSessionFiles(tmp_path),
+        {},
+        RequestContext(user_id="42"),
+    )
+    return adapter, session
+
+
+@pytest.fixture
+def sdk_terminal_run(tmp_path, monkeypatch):
+    async def run(app: web.Application, script: str) -> str:
+        key = "atomic-sdk-access-key"
+        cluster = "cn-east-1#pre2"
+        model_requests = []
+        platform_requests = []
+
+        @web.middleware
+        async def capture(request, handler):
+            if request.path.startswith("/api/v1/"):
+                platform_requests.append(
+                    (
+                        request.headers.get("authorization"),
+                        request.headers.get("x-cluster"),
+                        request.headers.get("cookie"),
+                    )
+                )
+            return await handler(request)
+
+        async def model(request):
+            model_requests.append(await request.json())
+            return (
+                stream(
+                    "terminal",
+                    {
+                        "command": '"$PYROMIND_SDK_PYTHON" -c ' + shlex.quote(script),
+                        "timeout": 30,
+                    },
+                )
+                if len(model_requests) == 1
+                else stream()
+            )
+
+        app.middlewares.append(capture)
+        app.router.add_post("/v1/chat/completions", model)
+        monkeypatch.setenv("LLM_API_KEY", "atomic-local-model-key")
+        monkeypatch.setattr(task_submission, "get_api_key", lambda **kwargs: key)
+        root = tmp_path / "sdk-conversations"
+        runtime = ConversationRuntime(
+            root,
+            PiAdapter(root, terminal_backend="os-sandbox"),
+            default_harness_id="pi",
+        )
+        context = RequestContext(
+            user_id="42", cookie="auth_token=atomic-request-token", x_cluster=cluster
+        )
+        try:
+            async with TestServer(app) as server:
+                monkeypatch.setattr(
+                    pyromind_api_client,
+                    "_api_url",
+                    lambda env: str(server.make_url("/api/v1")),
+                )
+                await runtime.create_conversation(
+                    SessionSpec(
+                        conversation_id="sdk-operations",
+                        user_id="42",
+                        workspace_root=str(root / "sdk-operations"),
+                        model_configuration={
+                            "model": "atomic-local-model",
+                            "base_url": str(server.make_url("/v1")),
+                            "api_key": "atomic-local-model-key",
+                        },
+                        extra={"sandbox_default_image": "registry.example/sdk-test:v1"},
+                    ),
+                    context,
+                )
+                await runtime.submit_command(
+                    "sdk-operations",
+                    UserMessageCommand(
+                        command_id="sdk-operations",
+                        content=(TextContent(text="Run the platform operations."),),
+                    ),
+                    context,
+                )
+                async with asyncio.timeout(40):
+                    while True:
+                        snapshot = await runtime.get_snapshot("sdk-operations", context)
+                        if len(model_requests) >= 2 and snapshot.status != "running":
+                            break
+                        await asyncio.sleep(0.02)
+                assert snapshot.external_tasks == ()
+                assert platform_requests
+                assert all(
+                    headers == (f"Bearer {key}", cluster, None)
+                    for headers in platform_requests
+                )
+                removed = {
+                    "sandbox_create",
+                    "sandbox_delete",
+                    "sandbox_read_file",
+                    "sandbox_write_file",
+                    "sandbox_delete_file",
+                    "df_stop_task",
+                    "inspect_workflow_task",
+                }
+                for body in model_requests:
+                    names = {tool["function"]["name"] for tool in body["tools"]}
+                    assert not names & removed
+                    assert "sandbox_terminal" in names
+                assert key not in json.dumps(model_requests)
+                assert "atomic-request-token" not in json.dumps(model_requests)
+                result = json.dumps(
+                    [
+                        message
+                        for message in model_requests[-1]["messages"]
+                        if message["role"] == "tool"
+                    ],
+                    ensure_ascii=False,
+                )
+                assert "Command exited with code" not in result, result
+        finally:
+            await runtime.close()
+        for path in root.rglob("*"):
+            if path.is_file():
+                persisted = path.read_bytes()
+                assert key.encode() not in persisted, str(path)
+                assert b"atomic-request-token" not in persisted, str(path)
+        return result
+
+    return run
 
 
 @pytest.fixture

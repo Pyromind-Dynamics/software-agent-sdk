@@ -27,7 +27,6 @@ constraint-dependencies = [
 
 # Workspace sources for intra-repo dependencies
 [tool.uv.sources]
-agentgenome = { path = "vendor/agentgenome-0.6.60-py3-none-any.whl" }
 pyromind-embodied-runtime = { workspace = true }
 pyromind-common = { workspace = true }
 pyromind-runtime = { workspace = true }

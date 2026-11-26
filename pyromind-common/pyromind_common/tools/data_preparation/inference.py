@@ -2,17 +2,32 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
-import shlex
-import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
-from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-
+from pyromind_common.platform.evaluation_core import (
+    INFERENCE_RUNTIME_FILENAMES as INFERENCE_RUNTIME_FILENAMES,
+    CheckpointModelSource as CheckpointModelSource,
+    CloneModelSource as CloneModelSource,
+    DatasetMapping as DatasetMapping,
+    DownloadModelSource as DownloadModelSource,
+    EvaluationConfig as EvaluationConfig,
+    EvaluationConfigurationError as EvaluationConfigurationError,
+    GenerationOptions as GenerationOptions,
+    InferenceOptions as InferenceOptions,
+    ModelSource as ModelSource,
+    Rubric as Rubric,
+    RubricEvaluator as RubricEvaluator,
+    StorageModelSource as StorageModelSource,
+    _validate_report_ui_bundle as _validate_report_ui_bundle,
+    build_inference_dsl as build_inference_dsl,
+    lora_merge_model_type as lora_merge_model_type,
+    model_reference as model_reference,
+    read_evaluation_config as read_evaluation_config,
+    storage_path as storage_path,
+)
 from pyromind_common.sdk.logger import get_logger
 from pyromind_common.tools.data_preparation.runner import runtime_bundle_fingerprint
 from pyromind_common.tools.utils.workspace_staging import publish_workspace_path
@@ -52,188 +67,10 @@ from pyromind_common.tools.data_preparation.submission import (
 )
 from pyromind_common.tools.utils.storage_paths import (
     to_agent_storage_path,
-    to_storage_api_path,
 )
 
 
 logger = get_logger(__name__)
-
-
-INFERENCE_RUNTIME_FILENAMES = (
-    "evaluate_inference.py",
-    "evaluation_report.css",
-    "evaluation_report.js",
-)
-
-
-def _validate_report_ui_bundle(runtime_dir: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, str(runtime_dir / "build_report_ui.py"), "--check"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise ValueError(
-            "evaluation report UI bundle is stale or its build check failed; run "
-            ".agents/skills/inference-evaluation/scripts/build_report_ui.py"
-        )
-
-
-class InferenceOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    model_path: str = Field(
-        min_length=1,
-        description=(
-            "Model reference interpreted by model_source in the evaluation config "
-            "JSON: a user Storage path such as '/workspace/models/model' for "
-            "storage (default), a central "
-            "catalog model identifier for clone (exact enum value, including its "
-            "namespace), or a repository name for download."
-        ),
-    )
-    source_checkpoint_version_id: str | None = Field(
-        default=None,
-        min_length=1,
-        description="Version ID of the checkpoint used as model_path.",
-    )
-    selection_run_id: str | None = Field(
-        default=None,
-        description="Validation selection batch authorizing this independent test run.",
-    )
-    dataset_config_path: str = Field(min_length=1)
-    evaluation_config_path: str = Field(min_length=1)
-    report_spec_path: str | None = Field(default=None, min_length=1)
-    served_model_name: str = Field(default="default", min_length=1)
-    gpu_product: str = "NVIDIA-L40S"
-    gpu_count: int = Field(default=1, ge=1)
-    port: int = Field(default=3000, ge=1, le=65535)
-    max_model_len: int | None = Field(default=None, ge=1)
-
-
-class DatasetMapping(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    reference_field: str | None = Field(default=None, min_length=1)
-    user_prompt_field: str | None = Field(default=None, min_length=1)
-    messages_field: str | None = Field(default=None, min_length=1)
-    system_prompt_field: str | None = Field(default=None, min_length=1)
-    id_field: str = Field(default="id", min_length=1)
-    media_field: str | None = Field(default=None, min_length=1)
-    media_base_dir: str | None = Field(default=None, min_length=1)
-    image_order: list[str] | None = None
-
-    @model_validator(mode="after")
-    def has_input(self) -> DatasetMapping:
-        if not (self.user_prompt_field or self.messages_field):
-            raise ValueError("user_prompt_field or messages_field is required")
-        return self
-
-
-class RubricEvaluator(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    type: Literal[
-        "exact_match",
-        "json_valid",
-        "required_fields",
-        "field_equals",
-        "non_empty",
-        "number_range",
-        "list_count_match",
-        "bbox_iou",
-    ]
-    prediction_path: str = ""
-    reference_path: str = ""
-    prediction_paths: list[str] = Field(default_factory=list)
-    case_sensitive: bool = False
-    min: float | None = None
-    max: float | None = None
-    iou_threshold: float = Field(default=0.5, ge=0, le=1)
-
-    @model_validator(mode="after")
-    def valid_bounds(self) -> RubricEvaluator:
-        if self.type == "required_fields" and not all(self.prediction_paths):
-            raise ValueError("required_fields paths must be nonempty")
-        if self.type == "required_fields" and not self.prediction_paths:
-            raise ValueError("required_fields requires prediction_paths")
-        if self.min is not None and self.max is not None and self.min > self.max:
-            raise ValueError("number_range min exceeds max")
-        return self
-
-
-class Rubric(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    name: str = Field(min_length=1)
-    criterion: str = Field(min_length=1)
-    weight: float = Field(gt=0)
-    required: bool = False
-    evaluator: RubricEvaluator
-
-
-class GenerationOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    workers: int = Field(default=4, ge=1, le=64)
-    max_tokens: int = Field(default=1024, ge=1)
-    temperature: float = Field(default=0, ge=0, le=2)
-    timeout_seconds: int = Field(default=240, ge=1)
-    max_retries: int = Field(default=3, ge=0, le=10)
-    limit: int = Field(default=0, ge=0)
-
-
-class StorageModelSource(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["storage"] = "storage"
-
-
-class CloneModelSource(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["clone"]
-
-
-class DownloadModelSource(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["download"]
-    download_source: Literal["huggingface", "modelscope"] = "huggingface"
-
-
-class CheckpointModelSource(BaseModel):
-    """Explicit saved checkpoint; its reference must never be rebound to latest."""
-
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["checkpoint"]
-    kind: Literal["full", "lora"]
-    base_model: str | None = None
-
-    @model_validator(mode="after")
-    def lora_base(self):
-        if self.kind == "lora":
-            if not self.base_model:
-                raise ValueError("LoRA requires its resolved base_model Storage path")
-            storage_path(self.base_model, "model_source.base_model")
-        return self
-
-
-ModelSource = Annotated[
-    StorageModelSource | CloneModelSource | DownloadModelSource | CheckpointModelSource,
-    Field(discriminator="type"),
-]
-
-
-class EvaluationConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    mode: Literal["agent_rubric"]
-    rubrics: list[Rubric] = Field(default_factory=list, max_length=20)
-    pass_threshold: float = Field(default=0.7, ge=0, le=1)
-    rubric_pass_threshold: float = Field(default=0.7, ge=0, le=1)
-    generation: GenerationOptions = Field(default_factory=GenerationOptions)
-    model_source: ModelSource = Field(default_factory=StorageModelSource)
-
-    @model_validator(mode="after")
-    def unique_names(self) -> EvaluationConfig:
-        names = [rubric.name.strip() for rubric in self.rubrics]
-        if not all(names) or len(set(names)) != len(names):
-            raise ValueError("rubric names must be nonempty and unique")
-        return self
 
 
 class PipelineRunBackend(Protocol):
@@ -254,198 +91,6 @@ class PipelineRunBackend(Protocol):
     def prepare_execution(
         self, run_id: str, workflow: dict[str, Any], dsl: str, script: str
     ) -> tuple[dict[str, Any], str]: ...
-
-
-def storage_path(value: str, field: str = "Storage path") -> str:
-    return to_storage_api_path(value, field=field)
-
-
-def model_reference(value: str, source: ModelSource) -> str:
-    if source.type == "checkpoint":
-        reference = storage_path(value, "inference.model_path")
-        if not re.fullmatch(r"checkpoint-\d+", PurePosixPath(reference).name):
-            raise ValueError("selected model must reference an exact checkpoint-n")
-        return reference
-    if source.type == "storage":
-        return storage_path(value, "inference.model_path (model_source.type=storage)")
-    path = PurePosixPath(value)
-    if (
-        value != value.strip()
-        or not value
-        or path.is_absolute()
-        or ".." in path.parts
-        or "\\" in value
-        or any(ord(character) < 32 for character in value)
-        or str(path) in {".", "/"}
-    ):
-        raise ValueError(
-            f"inference.model_path (model_source.type={source.type}): "
-            f"expected a model identifier, received {value!r}"
-        )
-    return value
-
-
-def build_inference_dsl(
-    definition: dict[str, Any], output_dir: str, run_id: str, files: SubmissionFiles
-) -> str:
-    options = definition["inference"]
-    source = EvaluationConfig.model_validate(
-        definition["evaluation_config"]
-    ).model_source
-    reference = model_reference(options["model_path"], source)
-    output = to_agent_storage_path(output_dir, field="output_dir")
-    dataset_path = to_agent_storage_path(definition["input_path"], field="input_path")
-    command = " ".join(
-        [
-            "python3",
-            shlex.quote(output + "/evaluate_inference.py"),
-            "--run-id",
-            shlex.quote(run_id),
-            '--endpoint "$param"',
-            "--model",
-            shlex.quote(options["served_model_name"]),
-            "--model-reference",
-            shlex.quote(options["model_path"]),
-            "--dataset-path",
-            shlex.quote(dataset_path),
-            "--dataset-config",
-            shlex.quote(output + "/dataset_config.json"),
-            "--evaluation-config",
-            shlex.quote(output + "/evaluation_config.json"),
-            *(
-                ["--report-spec", shlex.quote(output + "/report_spec.json")]
-                if definition.get("report_spec")
-                else []
-            ),
-            "--output-dir",
-            shlex.quote(output),
-            "--report-assets-dir",
-            shlex.quote(output),
-            *(
-                ["--frozen-reward", shlex.quote(output + "/frozen_reward.json")]
-                if definition.get("frozen_reward")
-                else []
-            ),
-            *(
-                ["--business-scoring", shlex.quote(output + "/business_scoring.json")]
-                if definition.get("business_scoring")
-                else []
-            ),
-        ]
-    )
-    node_config = {
-        key: options[key]
-        for key in ("port", "gpu_count", "gpu_product", "max_model_len")
-        if options.get(key) is not None
-    }
-    preparation = ""
-    if source.type == "checkpoint" and source.kind == "lora":
-        base = to_agent_storage_path(
-            source.base_model or "", field="model_source.base_model"
-        )
-        lora = to_agent_storage_path(reference, field="inference.model_path")
-        merged = output + "/merged-model"
-        model_type = lora_merge_model_type(files, base)
-        preparation = (
-            f"model = ModelMergeLoraNode(id=3, lora_path={lora!r}, "
-            f"model_path={base!r}, output_path={merged!r}, "
-            f"gpu_count=1, gpu_product={options['gpu_product']!r}, "
-            f"model_type={model_type!r})\n\n"
-        )
-        model_input = "model.merged_model_path"
-    elif source.type in {"storage", "checkpoint"}:
-        model_input = repr(
-            to_agent_storage_path(reference, field="inference.model_path")
-        )
-    elif source.type == "clone":
-        preparation = (
-            f"model = CloneAndCacheModel(id=3, model={reference!r}, "
-            "target_path='/workspace/models/')\n\n"
-        )
-        model_input = "model.model_path"
-    else:
-        assert isinstance(source, DownloadModelSource)
-        cache_dir = "/workspace/models/" + reference
-        preparation = (
-            f"model = DownloadAndCacheModel(id=3, modelname={reference!r}, "
-            f"cache_dir={cache_dir!r}, "
-            f"download_source={source.download_source!r})\n\n"
-        )
-        model_input = "model.model_path"
-    args = ", ".join(f"{key}={value!r}" for key, value in node_config.items())
-    return (
-        preparation
-        + f"inference = VLLMInference(id=1, model_path={model_input}, {args})\n\n"
-        f"evaluation = CustomCommandCPUNode(id=2, command={command!r}, "
-        f"cpu={definition['cpu']}, memory={definition['memory']}, "
-        "param=inference.endpoint)\n"
-    )
-
-
-def lora_merge_model_type(files: SubmissionFiles, base_model: str) -> str:
-    """Pick the platform loader from the base model's config, including aliases."""
-    try:
-        config = json.loads(files.read_text(f"{base_model}/config.json"))
-    except (OSError, ValueError):
-        return "auto"
-    model_type = config.get("model_type") if isinstance(config, dict) else None
-    if model_type == "qwen3_vl":
-        return "qwen3vl"
-    if model_type == "qwen3_5":
-        return "qwen3.5"
-    return "auto"
-
-
-class EvaluationConfigurationError(ValueError):
-    pass
-
-
-def read_evaluation_config(
-    files, path: str, *, frozen_reward: bool = False
-) -> EvaluationConfig:
-    try:
-        raw = json.loads(files.read_text(path))
-    except json.JSONDecodeError as exc:
-        raise EvaluationConfigurationError(
-            f"{path}: JSON line {exc.lineno}, column {exc.colno}: {exc.msg}"
-        ) from exc
-    allowed = {
-        "exact_match": {"type", "prediction_path", "reference_path", "case_sensitive"},
-        "json_valid": {"type", "prediction_path"},
-        "required_fields": {"type", "prediction_paths"},
-        "field_equals": {"type", "prediction_path", "reference_path", "case_sensitive"},
-        "non_empty": {"type", "prediction_path"},
-        "number_range": {"type", "prediction_path", "min", "max"},
-        "list_count_match": {"type", "prediction_path", "reference_path"},
-        "bbox_iou": {"type", "prediction_path", "reference_path", "iou_threshold"},
-    }
-    for index, rubric in enumerate(
-        raw.get("rubrics", []) if isinstance(raw, dict) else []
-    ):
-        evaluator = rubric.get("evaluator", {}) if isinstance(rubric, dict) else {}
-        kind = evaluator.get("type") if isinstance(evaluator, dict) else None
-        if kind in allowed and set(evaluator) - allowed[kind]:
-            extra = sorted(set(evaluator) - allowed[kind])
-            raise EvaluationConfigurationError(
-                f"{path}: rubrics.{index}.evaluator rubric={rubric.get('name')!r}: "
-                f"unsupported fields {extra}; {kind} accepts: "
-                f"{', '.join(sorted(allowed[kind]))}"
-            )
-    try:
-        config = EvaluationConfig.model_validate(raw)
-        if frozen_reward and config.rubrics:
-            raise EvaluationConfigurationError(
-                "omit rubrics for the Project's frozen Reward"
-            )
-        if not frozen_reward and not config.rubrics:
-            raise EvaluationConfigurationError(
-                "agent_rubric requires a nonempty rubrics list"
-            )
-        return config
-    except ValidationError as exc:
-        raise EvaluationConfigurationError(
-            f"{path}: {exc.errors(include_url=False)}"
-        ) from exc
 
 
 class _WorkflowValidationError(ValueError):

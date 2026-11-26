@@ -802,11 +802,22 @@ def _load_source_records(
     if not records:
         raise ValueError("image input contains no records")
 
+    output_root = image_root
+    if any(
+        PurePosixPath(path).is_absolute()
+        for record in records
+        for path in _record_image_paths(record, config)
+    ):
+        for mount in (WORKSPACE_ROOT, PLATFORM_STORAGE_MOUNT):
+            if image_root.is_relative_to(mount):
+                output_root = Path(mount)
+                break
     normalized = [
         _normalize_source_record(
             record,
             source_index=index,
             image_root=image_root,
+            output_root=output_root,
             config=config,
         )
         for index, record in enumerate(records)
@@ -815,7 +826,7 @@ def _load_source_records(
         ids = [record["id"] for record in normalized]
         if len(set(ids)) != len(ids):
             raise ValueError("structured input contains duplicate source id values")
-    return normalized, image_root
+    return normalized, output_root
 
 
 def _read_jsonl(path: Path, limit: int | None) -> list[dict[str, Any]]:
@@ -865,6 +876,7 @@ def _load_record_metadata(
     image_root: Path,
     raw_images: list[Any],
     config: ImagePipelineConfig,
+    absolute_root: Path,
 ) -> dict[str, Any]:
     embedded = record.get("metadata")
     if embedded is not None and not isinstance(embedded, dict):
@@ -895,13 +907,10 @@ def _load_record_metadata(
             )
         if unique_candidates:
             relative = unique_candidates[0]
-            if relative.is_absolute() or ".." in relative.parts:
-                raise ValueError(
-                    "metadata sidecar path must remain inside the input root"
-                )
-            local = (image_root / Path(*relative.parts)).resolve()
             try:
-                local.relative_to(image_root.resolve())
+                local = _resolve_source_path(
+                    relative.as_posix(), image_root, absolute_root
+                )
             except ValueError as exc:
                 raise ValueError("metadata sidecar escapes the input root") from exc
             if not local.is_file():
@@ -941,45 +950,63 @@ def _reference_map_key(value: Any) -> str:
     return str(value).strip()
 
 
+def _record_image_paths(
+    record: dict[str, Any], config: ImagePipelineConfig
+) -> list[str]:
+    images = (
+        record.get(config.images_key)
+        or record.get("images")
+        or record.get("image_paths")
+    )
+    if images is None and record.get("image_path"):
+        images = [record["image_path"]]
+    if not isinstance(images, list) or not images:
+        raise ValueError("images must be a non-empty list")
+    if any(not isinstance(path, str) or not path.strip() for path in images):
+        raise ValueError("images must contain only non-empty strings")
+    return images
+
+
+def _resolve_source_path(raw_path: str, root: Path, absolute_root: Path) -> Path:
+    path = PurePosixPath(raw_path)
+    if ".." in path.parts or raw_path != path.as_posix():
+        raise ValueError("paths must be canonical POSIX paths without '..'")
+    allowed = root
+    if path.is_absolute():
+        allowed = absolute_root
+        if str(absolute_root) in {WORKSPACE_ROOT, PLATFORM_STORAGE_MOUNT}:
+            for mount in (WORKSPACE_ROOT, PLATFORM_STORAGE_MOUNT):
+                if path.is_relative_to(mount):
+                    path = PurePosixPath(absolute_root) / path.relative_to(mount)
+                    break
+    local = (root / Path(*path.parts)).resolve()
+    if not local.is_relative_to(allowed.resolve()):
+        raise ValueError("path escapes input root")
+    return local
+
+
 def _normalize_source_record(
     record: dict[str, Any],
     *,
     source_index: int,
     image_root: Path,
     config: ImagePipelineConfig,
+    output_root: Path,
 ) -> dict[str, Any]:
     normalized = copy.deepcopy(record)
     record_id = record.get(config.id_key) or record.get("id") or record.get("sample_id")
     if not isinstance(record_id, (str, int)) or not str(record_id).strip():
         raise ValueError(f"record {source_index}: id must be non-empty")
-    raw_images = (
-        record.get(config.images_key)
-        or record.get("images")
-        or record.get("image_paths")
-    )
-    if raw_images is None and record.get("image_path"):
-        raw_images = [record["image_path"]]
-    if not isinstance(raw_images, list) or not raw_images:
-        raise ValueError(f"record {source_index}: images must be a non-empty list")
+    raw_images = _record_image_paths(record, config)
 
     output_images: list[str] = []
     local_images: list[str] = []
     for raw_path in raw_images:
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            raise ValueError(
-                f"record {source_index}: every image path must be non-empty"
-            )
-        posix = PurePosixPath(raw_path)
-        if posix.is_absolute() or ".." in posix.parts or raw_path != posix.as_posix():
-            raise ValueError(
-                f"record {source_index}: image paths must be relative POSIX paths"
-            )
-        local = (image_root / Path(*posix.parts)).resolve()
         try:
-            local.relative_to(image_root.resolve())
+            local = _resolve_source_path(raw_path, image_root, output_root)
         except ValueError as exc:
             raise ValueError(
-                f"record {source_index}: image escapes input root"
+                f"record {source_index}: invalid image path: {exc}"
             ) from exc
         if not local.is_file():
             raise ValueError(f"record {source_index}: missing image {raw_path}")
@@ -987,7 +1014,11 @@ def _normalize_source_record(
             raise ValueError(
                 f"record {source_index}: unsupported image format {local.suffix}"
             )
-        output_images.append(posix.as_posix())
+        output_images.append(
+            raw_path
+            if image_root == output_root and not PurePosixPath(raw_path).is_absolute()
+            else local.relative_to(output_root.resolve()).as_posix()
+        )
         local_images.append(str(local))
 
     normalized["id"] = (
@@ -1001,6 +1032,7 @@ def _normalize_source_record(
         image_root=image_root,
         raw_images=raw_images,
         config=config,
+        absolute_root=output_root,
     )
     if metadata:
         normalized["metadata"] = metadata

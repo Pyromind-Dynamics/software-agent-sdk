@@ -11,16 +11,19 @@ credentials).
 
 from __future__ import annotations
 
-import shlex
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic import Field, field_validator
 from rich.text import Text
 
+from pyromind_common.platform.scene_core import (
+    build_aggregate_command as build_aggregate_command,
+)
+from pyromind_common.platform.scene_options import AggregateOptions
 from pyromind_common.sdk.conversation.state import ActiveLongTask
 from pyromind_common.sdk.tool import (
     Action,
@@ -82,53 +85,7 @@ conversion step remains.
 """
 
 
-class EdpAggregateAction(Action):
-    """Submit the merge + training-format conversion task to Studio."""
-
-    run_dirs: list[str] = Field(
-        min_length=1,
-        description=(
-            "Per-shard output_dir values returned by edp_submit "
-            "('/workspace/...'). Each must contain "
-            "run/verdicts.jsonl next to its shard manifest."
-        ),
-    )
-    out_dir: str = Field(
-        description=(
-            "User Storage output directory for the merged dataset + training "
-            "files, e.g. '/workspace/datasets/merged'. "
-            "It contains verdicts.jsonl / slime.jsonl / sft.jsonl / report.json. "
-            "Reuse it to resume: already-aggregated task_ids are skipped."
-        ),
-    )
-    protocol: str = Field(
-        default="tmax",
-        description="Protocol tag embedded in slime record metadata.",
-    )
-    min_reward: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Minimum reward for the SFT set (default 1.0: solved "
-            "trajectories only; slime keeps every usable record regardless)."
-        ),
-    )
-    system_prompt: str | None = Field(
-        default=None,
-        description=(
-            "Optional system message prepended to every SFT sample "
-            "(coding-agent persona)."
-        ),
-    )
-    limit: int | None = Field(
-        default=None,
-        ge=1,
-        description="Optional cap on new records this pass (smoke runs).",
-    )
-    cpu: int = Field(default=4, ge=1, le=64)
-    memory: int = Field(default=16, ge=1, le=256)
-
+class EdpAggregateAction(AggregateOptions, Action):
     @property
     def visualize(self) -> Text:
         content = Text()
@@ -167,50 +124,7 @@ def _pod_path(storage_path: str) -> str:
     return f"/target-workspace{storage_path}"
 
 
-def build_aggregate_command(
-    *,
-    out_dir: str,
-    run_dirs: Sequence[str],
-    protocol: str,
-    min_reward: float,
-    system_prompt: str | None,
-    limit: int | None,
-) -> str:
-    """Assemble the aggregation command: node python3, stdlib only."""
-    pod_out = _pod_path(str(PurePosixPath("/" + out_dir.lstrip("/"))))
-    pod_run_dirs = [
-        _pod_path(str(PurePosixPath("/" + str(d).lstrip("/")))) for d in run_dirs
-    ]
-    script = f"{pod_out}/{AGGREGATE_FILENAME}"
-    args = [
-        "--run-dirs",
-        *[shlex.quote(d) for d in pod_run_dirs],
-        "--out-dir",
-        shlex.quote(pod_out),
-        "--protocol",
-        shlex.quote(protocol),
-        "--min-reward",
-        str(float(min_reward)),
-    ]
-    if system_prompt is not None:
-        args += ["--system-prompt", shlex.quote(system_prompt)]
-    if limit is not None:
-        args += ["--limit", str(int(limit))]
-    steps = [
-        # Leading no-op: the pod executor can drop the first command segment.
-        "true",
-        f"test -f {script}",
-        f"test -f {pod_out}/{SLIME_CONVERTER_FILENAME}",
-        f"test -f {pod_out}/{SFT_CONVERTER_FILENAME}",
-        # Pure standard library: run with the node python directly. The
-        # script's own directory is sys.path[0], so its sibling converter
-        # imports resolve from the same staged directory.
-        f"python3 {script} " + " ".join(args),
-    ]
-    return " && ".join(steps)
-
-
-class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservation]):
+class EdpAggregateRunner:
     """Stage the aggregation scripts and submit the task."""
 
     def __init__(
@@ -233,6 +147,37 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
         self._storage_headers = storage_headers or {}
         self._storage_secret_headers = storage_secret_headers or {}
         self._timeout = timeout
+
+    @classmethod
+    def from_options(cls, **params: Any) -> Self:
+        env_value = params.pop("env", None)
+        env = str(env_value) if env_value is not None else None
+        cluster_value = params.pop("cluster", None)
+        cluster = str(cluster_value) if cluster_value is not None else None
+        params.pop("current_user", None)
+        headers = params.pop("headers", None) or {}
+        runtime_dir_value = params.pop("runtime_dir", None)
+        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
+        storage_base_url_value = params.pop("storage_base_url", None)
+        storage_base_url = (
+            str(storage_base_url_value) if storage_base_url_value is not None else None
+        )
+        storage_headers = params.pop("storage_headers", None) or None
+        storage_secret_headers = params.pop("storage_secret_headers", None) or None
+        timeout = int(params.pop("timeout", 30))
+        if params:
+            names = ", ".join(sorted(params))
+            raise ValueError(f"EdpAggregateTool got unknown params: {names}")
+        return cls(
+            env=env,
+            cluster=cluster,
+            headers=headers,
+            runtime_dir=runtime_dir,
+            storage_base_url=storage_base_url,
+            storage_headers=storage_headers,
+            storage_secret_headers=storage_secret_headers,
+            timeout=timeout,
+        )
 
     def _storage_headers_for(self, conversation: ToolConversation) -> dict[str, str]:
         headers = {**self._storage_headers}
@@ -273,7 +218,7 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
         for script in scripts:
             self._stage(conversation, script, output_dir)
 
-    def __call__(
+    def run(
         self,
         action: EdpAggregateAction,
         conversation: ToolConversation | None = None,
@@ -351,6 +296,7 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
                 name=str(workflow["name"]),
                 conversation_id=str(conversation.id),
                 task_kind="environment_processing_aggregate",
+                retry_create=False,
             )
             task_id = response.task_id
         except Exception as exc:  # noqa: BLE001
@@ -389,6 +335,21 @@ class EdpAggregateExecutor(ToolExecutor[EdpAggregateAction, EdpAggregateObservat
         )
 
 
+class EdpAggregateExecutor(
+    EdpAggregateRunner, ToolExecutor[EdpAggregateAction, EdpAggregateObservation]
+):
+    def __call__(
+        self,
+        action: EdpAggregateAction,
+        conversation: ToolConversation | None = None,
+    ) -> EdpAggregateObservation:
+        return self.run(action, conversation)
+
+
+def create_edp_aggregate_runner(**params: Any) -> EdpAggregateRunner:
+    return EdpAggregateRunner.from_options(**params)
+
+
 class EdpAggregateTool(ToolDefinition[EdpAggregateAction, EdpAggregateObservation]):
     """Submit the shard-result aggregation task to Pyromind Studio."""
 
@@ -398,39 +359,12 @@ class EdpAggregateTool(ToolDefinition[EdpAggregateAction, EdpAggregateObservatio
         conv_state: Any = None,  # noqa: ARG003
         **params: Any,
     ) -> Sequence[Self]:
-        env_value = params.pop("env", None)
-        env = str(env_value) if env_value is not None else None
-        cluster_value = params.pop("cluster", None)
-        cluster = str(cluster_value) if cluster_value is not None else None
-        params.pop("current_user", None)
-        headers = params.pop("headers", None) or {}
-        runtime_dir_value = params.pop("runtime_dir", None)
-        runtime_dir = str(runtime_dir_value) if runtime_dir_value is not None else None
-        storage_base_url_value = params.pop("storage_base_url", None)
-        storage_base_url = (
-            str(storage_base_url_value) if storage_base_url_value is not None else None
-        )
-        storage_headers = params.pop("storage_headers", None) or None
-        storage_secret_headers = params.pop("storage_secret_headers", None) or None
-        timeout = int(params.pop("timeout", 30))
-        if params:
-            names = ", ".join(sorted(params))
-            raise ValueError(f"EdpAggregateTool got unknown params: {names}")
         return [
             cls(
                 description=TOOL_DESCRIPTION,
                 action_type=EdpAggregateAction,
                 observation_type=EdpAggregateObservation,
-                executor=EdpAggregateExecutor(
-                    env=env,
-                    cluster=cluster,
-                    headers=headers,
-                    runtime_dir=runtime_dir,
-                    storage_base_url=storage_base_url,
-                    storage_headers=storage_headers,
-                    storage_secret_headers=storage_secret_headers,
-                    timeout=timeout,
-                ),
+                executor=EdpAggregateExecutor.from_options(**params),
                 annotations=ToolAnnotations(
                     title="edp_aggregate",
                     readOnlyHint=False,

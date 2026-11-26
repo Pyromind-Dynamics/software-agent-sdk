@@ -72,6 +72,8 @@ IMAGE_DATAFLOW_PYTHONS = (
     "/opt/pyromind/dataflow-venv/bin/python",
     "/home/openhands/dataflow-venv/bin/python",
 )
+_BOOTSTRAP_PYTHONS = ("python3.12", "python3.11", "python3.10")
+_PIP_INDEX_OVERRIDE = "PYROMIND_SANDBOX_DATAFLOW_PIP_INDEX_URL"
 
 
 def _log(message: str) -> None:
@@ -106,6 +108,51 @@ def _system_python(spec: dict[str, Any]) -> str:
     if isinstance(configured, str) and configured:
         return configured
     return shutil.which("python3") or sys.executable
+
+
+def _venv_prerequisite_error(python: str) -> str | None:
+    # Pillow requires 3.10+, and NumPy 1.26 ships wheels through 3.12.
+    probe = (
+        "import sys\n"
+        "if not (3, 10) <= sys.version_info[:2] < (3, 13):\n"
+        "    print('found Python ' + sys.version.split()[0])\n"
+        "    sys.exit(1)\n"
+        "import importlib.util\n"
+        "for name in ('venv', 'ensurepip'):\n"
+        "    if importlib.util.find_spec(name) is None:\n"
+        "        print('missing ' + name)\n"
+        "        sys.exit(1)\n"
+    )
+    try:
+        result = subprocess.run(
+            [python, "-c", probe], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "interpreter could not be started"
+    if result.returncode != 0:
+        return result.stdout.strip() or "interpreter failed its venv check"
+    return None
+
+
+def _bootstrap_python(spec: dict[str, Any]) -> tuple[str | None, str]:
+    default = _system_python(spec)
+    candidates = [default]
+    if not spec.get("system_python"):
+        candidates.extend(
+            path for name in _BOOTSTRAP_PYTHONS if (path := shutil.which(name))
+        )
+        candidates.append("/usr/bin/python3")
+    failures: list[str] = []
+    for python in dict.fromkeys(candidates):
+        error = _venv_prerequisite_error(python)
+        if error is None:
+            return python, ""
+        failures.append(f"{python}: {error}")
+    return None, (
+        "DataFlow CPU runtime installation requires a sandbox-local Python "
+        "3.10–3.12 with venv and ensurepip. Set PYROMIND_SANDBOX_SYSTEM_PYTHON "
+        f"to a compatible interpreter. Checked: {', '.join(failures)}"
+    )
 
 
 def _interpreter_spec() -> dict[str, Any]:
@@ -193,7 +240,9 @@ def _bootstrap_venv(spec: dict[str, Any]) -> tuple[str | None, str]:
                 None,
                 f"could not read CPU runtime requirements {requirements}: {exc}",
             )
-        system_python = _system_python(spec)
+        system_python, detail = _bootstrap_python(spec)
+        if system_python is None:
+            return None, detail
         _log(f"installing open-dataflow=={expected} into {venv} (first use)")
         venv.parent.mkdir(parents=True, exist_ok=True)
         if venv.exists():
@@ -216,12 +265,17 @@ def _bootstrap_venv(spec: dict[str, Any]) -> tuple[str | None, str]:
             ("-r", str(requirements)),
             ("--no-deps", f"open-dataflow=={expected}"),
         )
+        pip_env = os.environ.copy()
+        pip_index = pip_env.get(_PIP_INDEX_OVERRIDE, "").strip()
+        if pip_index:
+            pip_env["PIP_INDEX_URL"] = pip_index
         for packages in installs:
             try:
                 installed = subprocess.run(
                     [str(python), "-m", "pip", "install", "--quiet", *packages],
                     capture_output=True,
                     text=True,
+                    env=pip_env,
                     timeout=float(spec.get("install_timeout", 3600)),
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
@@ -731,7 +785,7 @@ def _run(spec: dict[str, Any]) -> dict[str, Any]:
             str(Path(log_dir or spec["state_dir"], "validation.json")),
         ]
         if output_schema == "vision" and spec.get("image_root"):
-            validation_args.extend(["--image-root", str(spec["image_root"])])
+            validation_args.extend(["--image-root", _validation_image_root(spec)])
         validation_rc, out, err = _run_step(
             python,
             validation_args,
@@ -1148,6 +1202,26 @@ def cli_spec(config: dict[str, Any], workspace: Path) -> dict[str, Any]:
         "state_dir": str(state),
         "log_dir": str(log),
     }
+
+
+def _validation_image_root(spec: dict[str, Any]) -> str:
+    root = str(spec["image_root"])
+    metadata = Path(spec.get("log_dir") or spec["state_dir"]) / "runtime_metadata.json"
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return root
+    if (
+        isinstance(payload, dict)
+        and payload.get("output_format") == "vision"
+        and payload.get("source_path") == spec.get("input_path")
+        and isinstance(payload.get("image_root"), str)
+        and Path(payload["image_root"]).is_absolute()
+        and Path(root).is_relative_to(payload["image_root"])
+        and payload["image_root"] in {root, "/workspace", "/target-workspace"}
+    ):
+        return payload["image_root"]
+    return root
 
 
 def direct_config(args: argparse.Namespace) -> dict[str, Any]:

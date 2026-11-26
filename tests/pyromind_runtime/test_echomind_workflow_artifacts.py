@@ -203,6 +203,53 @@ def test_train_resolves_latest_complete_checkpoint(monkeypatch):
     client.studio.get_node_output.assert_not_called()
 
 
+@pytest.mark.parametrize("missing_shard", [False, True])
+def test_train_verifies_merged_model_weights(monkeypatch, missing_shard):
+    client = Mock()
+    client.studio.get_task.return_value.status = "Succeeded"
+    storage = Mock()
+    directory = "/models/run/merged"
+    storage.list.return_value = {
+        "config.json",
+        "model.safetensors.index.json",
+        "model-00001.safetensors",
+    }
+    if not missing_shard:
+        storage.list.return_value.add("model-00002.safetensors")
+    storage.read.side_effect = {
+        f"{directory}/config.json": b'{"model_type":"qwen3_vl"}',
+        f"{directory}/model.safetensors.index.json": (
+            b'{"weight_map":{"first":"model-00001.safetensors",'
+            b'"second":"model-00002.safetensors"}}'
+        ),
+    }.__getitem__
+    monkeypatch.setattr(echomind_train_backend, "_client", lambda **_: client)
+    monkeypatch.setattr(
+        echomind_train_backend, "build_runtime_storage", lambda **_: storage
+    )
+    spec = TrainWorkflowSpec(
+        task_name="train",
+        conversation_id="conversation",
+        cluster="us-west-1",
+        workflow={},
+        output_uri=f"/workspace{directory}",
+        artifact_selection="merged_model",
+    )
+
+    state = PlatformTrainWorkflowBackend().query_task(
+        task_id="42", spec=spec, request_context=None
+    )
+
+    if missing_shard:
+        assert state.status == "failed"
+        assert state.failure_category == "validation"
+        assert state.output_uri is None
+    else:
+        assert state.status == "succeeded"
+        assert state.output_uri == spec.output_uri
+    client.studio.get_node_output.assert_not_called()
+
+
 def test_evaluation_requires_successful_report_with_metrics(monkeypatch):
     client = Mock()
     client.studio.get_task.return_value.status = "Succeeded"

@@ -86,6 +86,8 @@ Loss 的数值或恰好为整数不能证明它是错误样本计数；未取得
 Gap，再进入 [合成范式](../data-processing/references/paradigms/gap-driven-synthesis.md)
 选择合成方法、试跑和复核。
 loss 只能提示问题，不能证明某个类别缺样，也不能直接据此决定扩增数量。
+主会话在 Train 成功回调后核验模型产物，将 task ID、模型和 checkpoint 的 Storage 路径记入计划。使用已确认的模型产物和评测集执行获批的 Eval。按需交付训练指标与报告，记录缺失的指标。
+
 执行训练的完成回调还需按原任务衔接 [inference-evaluation](../inference-evaluation/SKILL.md)：
 计划要求评测训练模型时，从该次训练已核验的输出取得模型路径，在指定数据集上执行推理。
 用户未排除评测时，先复用训练 eval 产物选择 checkpoint，已有基线按同口径复用评分。

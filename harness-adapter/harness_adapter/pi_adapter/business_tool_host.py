@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -11,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 
+from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from harness_adapter.pi_adapter.business_tools import (
@@ -18,8 +21,12 @@ from harness_adapter.pi_adapter.business_tools import (
     execute_validation_tool,
     validation_tool_spec,
 )
-from harness_adapter.pi_adapter.persistence import PiSessionFiles, SavedToolOutput
-from harness_adapter.pi_adapter.sandbox_workspace import SandboxWorkspace
+from harness_adapter.pi_adapter.persistence import (
+    PiSessionFiles,
+    SavedToolOutput,
+    _atomic_json,
+)
+from harness_adapter.pi_adapter.sandbox_workspace import RemoteSandboxWorkspace
 from harness_adapter.pi_adapter.tool_output import (
     ToolOutputPolicy,
     business_tool_output_id,
@@ -49,8 +56,14 @@ from pyromind_common.tools.data_preparation import (
     DfSubmitPipelineTool,
 )
 from pyromind_common.tools.data_preparation.inference import InferencePipelineHandler
+from pyromind_common.tools.data_preparation.platform_submit import (
+    TASK_ASSOCIATION_DIRNAME,
+    DataPreparationTaskAssociation,
+)
 from pyromind_common.tools.data_preparation.sandbox_execution import (
     ENV_SANDBOX_DATAFLOW_PYTHON,
+    ENV_SANDBOX_DATAFLOW_VENV,
+    ENV_SANDBOX_SYSTEM_PYTHON,
 )
 from pyromind_common.tools.environment_processing import (
     EdpAggregateTool,
@@ -79,15 +92,18 @@ from pyromind_common.tools.sandbox import (
     SandboxUploadTool,
     SandboxWriteFileTool,
 )
+from pyromind_common.tools.sandbox.definition import default_sandbox_image
 from pyromind_common.tools.training_analysis import TrainingAnalysisTool
 from pyromind_common.tools.update_plan import UpdatePlanTool
 from pyromind_common.tools.utils.platform_env import (
     platform_cluster_route,
     platform_cluster_target,
 )
+from pyromind_common.tools.utils.pyromind_api_client import AccessKeyExchangeError
 from pyromind_common.tools.workflow.inspect_workflow_task import InspectWorkflowTaskTool
 from pyromind_common.tools.workflow.task_submission import (
     PYROMIND_WORKFLOW_AUTH_TOKEN_SECRET,
+    create_workflow_api_client,
     workflow_submission_scope,
 )
 from pyromind_common.tools.workflow.validate_workflow_dsl import (
@@ -102,6 +118,7 @@ from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
 from pyromind_runtime.domain.errors import ProductRuntimeError
+from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.reward_bundle import GET_PROJECT_REWARD
 from pyromind_runtime.domain.storage_paths import resolve_conversation_storage_path
 from pyromind_runtime.domain.task_correlation import TaskOrigin
@@ -110,6 +127,33 @@ from pyromind_runtime.domain.versions import VersionToolRequest
 
 _STORAGE_COOKIE_SECRET = "PYROMIND_STORAGE_AUTH_COOKIE"
 _VALIDATE_AUTHORIZATION_SECRET = "PYROMIND_VALIDATE_AUTHORIZATION"
+DEBUG_STATE_RELATIVE_PATH = "public_data/.pyromind/workflow-debug-state.json"
+PLATFORM_SDK_TOOL_NAMES = frozenset(
+    {
+        "validate_workflow_dsl",
+        "submit_workflow",
+        GetStorageUrlTool.name,
+        UploadFileToPyromindTool.name,
+        RunDatasetCleaningTool.name,
+        DfSubmitPipelineTool.name,
+        DfSubmitEvaluationTool.name,
+        DfCheckProgressTool.name,
+        DfStopTaskTool.name,
+        EdpRenderTool.name,
+        EdpSubmitTool.name,
+        EdpAggregateTool.name,
+        SandboxCreateTool.name,
+        SandboxDeleteTool.name,
+        SandboxReadFileTool.name,
+        SandboxWriteFileTool.name,
+        SandboxDeleteFileTool.name,
+        SandboxTerminalTool.name,
+        SandboxUploadTool.name,
+        SandboxDownloadTool.name,
+        WorkflowDebugTool.name,
+        InspectWorkflowTaskTool.name,
+    }
+)
 _READ_ONLY_TOOLS = frozenset(
     {
         GetStorageUrlTool.name,
@@ -119,6 +163,15 @@ _READ_ONLY_TOOLS = frozenset(
     }
 )
 logger = logging.getLogger(__name__)
+
+
+def _debug_attempts(state: object) -> int:
+    if not isinstance(state, dict):
+        raise ValueError("Debug state must be a JSON object")
+    attempts = state.get(WORKFLOW_ATTEMPT_STATE_KEY, 0)
+    if type(attempts) is not int or attempts < 0:
+        raise ValueError("Debug submission count must be a nonnegative integer")
+    return attempts
 
 
 class _LabelStudioArgs(BaseModel):
@@ -193,6 +246,27 @@ _MAX_DETAILS_BYTES = 200_000
 _MAX_DETAIL_ITEMS = 50
 _MAX_DETAIL_TEXT_CHARS = 20_000
 
+_DATAFLOW_PIP_INDEX = "PYROMIND_SANDBOX_DATAFLOW_PIP_INDEX_URL"
+_DATAFLOW_ENV = (
+    ENV_SANDBOX_DATAFLOW_PYTHON,
+    ENV_SANDBOX_DATAFLOW_VENV,
+    ENV_SANDBOX_SYSTEM_PYTHON,
+    _DATAFLOW_PIP_INDEX,
+)
+
+
+def sandbox_dataflow_environment(cluster: str | None) -> dict[str, str]:
+    environment = {
+        name: value
+        for name in _DATAFLOW_ENV
+        if (value := os.environ.get(name, "").strip())
+    }
+    if platform_cluster_target(cluster)[1] == "cn-east-1":
+        environment.setdefault(
+            _DATAFLOW_PIP_INDEX, "https://mirrors.aliyun.com/pypi/simple/"
+        )
+    return environment
+
 
 def _encoded_len(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
@@ -241,6 +315,48 @@ class ToolExecutionContext:
     extra: dict[str, Any] = field(default_factory=dict)
     workspace: BaseWorkspace | None = None
     evaluation_reward: JsonObject | None = None
+    sdk_submissions_enabled: bool = False
+    sdk_secrets: SecretRegistry | None = None
+
+
+def _legacy_task_associations(context: ToolExecutionContext) -> list[dict[str, str]]:
+    root = context.workspace_root.parent / TASK_ASSOCIATION_DIRNAME
+    try:
+        paths = list(root.glob("*.json"))
+    except OSError:
+        return []
+    associations: list[DataPreparationTaskAssociation] = []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            association = DataPreparationTaskAssociation.from_dict(payload)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if association.conversation_id != context.conversation_id:
+            continue
+        if not association.task_id or not all(
+            isinstance(value, str)
+            for value in (
+                association.task_id,
+                association.run_id,
+                association.output_dir,
+                association.updated_at,
+            )
+        ):
+            continue
+        associations.append(association)
+    return [
+        {
+            "task_id": association.task_id,
+            "run_id": association.run_id,
+            "output_dir": association.output_dir,
+        }
+        for association in sorted(
+            associations, key=lambda item: item.updated_at, reverse=True
+        )
+    ]
 
 
 def _workflow_storage_path(context: ToolExecutionContext, workflow_path: str) -> str:
@@ -357,6 +473,40 @@ class _ToolConversationFacade:
 
     def send_agent_message(self, message: Any) -> None:
         self.signals.append({"type": "agent.message", "content": str(message)})
+
+
+def _validate_persisted_execution(
+    workflow: dict[str, Any],
+    context: ToolExecutionContext,
+    *,
+    metadata: dict[str, Any],
+) -> None:
+    for node in workflow["nodes"]:
+        validate_persisted_payload(node["data"].get("config", {}))
+    validate_persisted_payload(workflow.get("execution_argos", []))
+    validate_persisted_payload(metadata)
+    registry = _ToolConversationFacade(context).state.secret_registry
+    registry.update_secrets(
+        {
+            f"ENV_{name}": StaticSecret(value=SecretStr(value))
+            for name in (
+                "DF_API_KEY",
+                "LLM_AUTH_TOKEN",
+                "LLM_API_KEY",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+            )
+            if (value := os.environ.get(name))
+        }
+    )
+    registry.get_all_secrets_as_env_vars()
+    document = json.dumps({"workflow": workflow, **metadata}, ensure_ascii=False)
+    if registry.mask_secrets_in_output(document) != document or (
+        context.sdk_secrets is not None
+        and context.sdk_secrets.mask_secrets_in_output(document) != document
+    ):
+        raise ValueError("Request credentials cannot be persisted")
 
 
 ToolFactory = Callable[[ToolExecutionContext], ToolDefinition[Any, Any]]
@@ -504,10 +654,69 @@ class PyromindBusinessToolHost:
         environment = terminal_model_environment(
             _ToolConversationFacade(context).state.agent.llm
         )
-        interpreter = os.environ.get(ENV_SANDBOX_DATAFLOW_PYTHON, "").strip()
-        if interpreter:
-            environment[ENV_SANDBOX_DATAFLOW_PYTHON] = interpreter
+        environment.update(
+            sandbox_dataflow_environment(context.request_context.x_cluster)
+        )
         return environment
+
+    async def sdk_environment(self, context: ToolExecutionContext) -> dict[str, str]:
+        auth_token = _auth_token(context.request_context)
+        if auth_token is None:
+            return {}
+        env, cluster = _execution_target(context)
+
+        def resolve() -> dict[str, str]:
+            with create_workflow_api_client(
+                env=env,
+                cluster=cluster,
+                auth_token=auth_token,
+                headers=_forward_headers(context.request_context, include_cookie=True),
+            ) as client:
+                configured_image = context.extra.get("sandbox_default_image")
+                default_image = (
+                    configured_image.strip()
+                    if isinstance(configured_image, str) and configured_image.strip()
+                    else default_sandbox_image(client.studio.cluster)
+                )
+                task_associations = (
+                    self._pipeline_runs(context.conversation_id).task_associations()
+                    if self._pipeline_runs is not None
+                    else []
+                )
+                task_associations.extend(_legacy_task_associations(context))
+                environment = {
+                    "PYROMIND_API_KEY": client.studio.api_key,
+                    "PYROMIND_BASE_URL": client.studio.base_url,
+                    "PYROMIND_CLUSTER": client.studio.cluster,
+                    "PYROMIND_SANDBOX_DEFAULT_IMAGE": default_image,
+                    "PYROMIND_TASK_ASSOCIATIONS": json.dumps(task_associations),
+                }
+                for name, secret in _llm_credential_secrets(context).items():
+                    value = secret.get_value()
+                    if value is None or not value.strip():
+                        continue
+                    value = value.strip()
+                    if name == "LLM_BASE_URL":
+                        value = value.rstrip("/").removesuffix("/v1")
+                    environment[name] = value
+                return environment
+
+        try:
+            return await asyncio.to_thread(resolve)
+        except Exception as exc:
+            reason = (
+                str(exc)
+                if isinstance(exc, AccessKeyExchangeError)
+                else type(exc).__name__
+            )
+            logger.warning(
+                "platform_sdk.credentials_unavailable conversation_id=%s "
+                "cluster=%s reason=%s",
+                context.conversation_id,
+                cluster,
+                reason,
+            )
+            raise PermissionError("Platform SDK credentials are unavailable") from None
 
     def specs(self, *, sandbox: bool = False) -> list[dict[str, Any]]:
         """Tool specs this session exposes.
@@ -608,6 +817,7 @@ class PyromindBusinessToolHost:
             WorkflowDebugTool,
             InspectWorkflowTaskTool,
             TrainingAnalysisTool,
+            LabelStudioProjectTool,
         ):
             if sandbox and tool_type is UploadFileToPyromindTool:
                 continue
@@ -683,6 +893,25 @@ class PyromindBusinessToolHost:
                 raise ValueError("version management is unavailable")
             try:
                 action = ProductVersionsAction.model_validate(arguments)
+                if action.action == "bind_execution_metadata":
+                    try:
+                        workflow = action.arguments.get("workflow")
+                        if not isinstance(workflow, dict):
+                            raise ValueError("Invalid execution workflow")
+                        _validate_persisted_execution(
+                            workflow,
+                            context,
+                            metadata={
+                                key: value
+                                for key, value in action.arguments.items()
+                                if key != "workflow"
+                            },
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        raise ValueError(
+                            "Execution metadata cannot contain credentials "
+                            "or invalid workflow data"
+                        ) from None
                 result = await self.version_call(
                     context.conversation_id,
                     VersionToolRequest(
@@ -698,10 +927,17 @@ class PyromindBusinessToolHost:
                     ],
                     details=result,
                 ).as_dict()
-            except ValueError as exc:
+            except (ValueError, PermissionError) as exc:
                 return BusinessToolResult(
                     is_error=True,
-                    content=[{"type": "text", "text": str(exc)}],
+                    content=[
+                        {
+                            "type": "text",
+                            "text": "Invalid version operation arguments"
+                            if isinstance(exc, ValidationError)
+                            else str(exc),
+                        }
+                    ],
                     details={},
                 ).as_dict()
         if name == "submit_workflow":
@@ -726,14 +962,20 @@ class PyromindBusinessToolHost:
                     continue_after_completion=continue_after_completion,
                     **({"origin": origin} if origin.type == "subagent" else {}),
                 )
+                text = json.dumps(prepared, ensure_ascii=False)
+                if (
+                    origin.type == "subagent"
+                    and prepared["status"] == "submitted"
+                    and prepared.get("task_id")
+                ):
+                    text += (
+                        "\nEnd this turn after reporting the submitted task ID. "
+                        "The terminal callback resumes your task directly. "
+                        "Do not poll or wait in a terminal command."
+                    )
                 return BusinessToolResult(
                     is_error=False,
-                    content=[
-                        {
-                            "type": "text",
-                            "text": json.dumps(prepared, ensure_ascii=False),
-                        }
-                    ],
+                    content=[{"type": "text", "text": text}],
                     details=prepared,
                 ).as_dict()
             except ValueError as exc:
@@ -775,6 +1017,18 @@ class PyromindBusinessToolHost:
                 context.request_context,
                 **({"reward": reward} if reward is not None else {}),
             )
+            if (
+                context.sdk_submissions_enabled
+                and origin.type == "main"
+                and raw["details"].get("valid") is True
+            ):
+                artifact = await self._publish_validated_workflow(
+                    raw["details"], context
+                )
+                raw["details"].update(artifact)
+                raw["content"].append(
+                    {"type": "text", "text": "\n" + json.dumps(artifact)}
+                )
             response = await self._finalize_result(
                 BusinessToolResult(
                     is_error=bool(raw["is_error"]),
@@ -863,6 +1117,26 @@ class PyromindBusinessToolHost:
             files = PiSessionFiles(context.workspace_root)
             facade = _ToolConversationFacade(context, files.load_business_state())
             key = (context.conversation_id, tool_call_id or name)
+
+            def invoke_tool():
+                if name != WorkflowDebugTool.name:
+                    return tool(action, cast(Any, facade))
+                path = self.prepare_debug_budget(context.workspace_root)
+                with FileLock(str(path) + ".lock"):
+                    facade.state.agent_state[WORKFLOW_ATTEMPT_STATE_KEY] = (
+                        _debug_attempts(json.loads(path.read_text(encoding="utf-8")))
+                    )
+                    try:
+                        return tool(action, cast(Any, facade))
+                    finally:
+                        state = {
+                            WORKFLOW_ATTEMPT_STATE_KEY: _debug_attempts(
+                                facade.state.agent_state
+                            )
+                        }
+                        _atomic_json(path, state)
+                        files.save_business_state(state)
+
             if tool.executor is not None:
                 self._active_executors[key] = tool.executor
             try:
@@ -875,9 +1149,7 @@ class PyromindBusinessToolHost:
                         ),
                     ),
                 ) as submissions:
-                    observation = await asyncio.to_thread(
-                        tool, action, cast(Any, facade)
-                    )
+                    observation = await asyncio.to_thread(invoke_tool)
             finally:
                 self._active_executors.pop(key, None)
             if name == WorkflowDebugTool.name:
@@ -927,14 +1199,6 @@ class PyromindBusinessToolHost:
                         task["correlation"] = correlation.model_dump(
                             mode="json", exclude_none=True
                         )
-            attempts = facade.state.agent_state.get(WORKFLOW_ATTEMPT_STATE_KEY)
-            files.save_business_state(
-                {
-                    WORKFLOW_ATTEMPT_STATE_KEY: attempts
-                    if isinstance(attempts, int) and attempts >= 0
-                    else 0
-                }
-            )
             content = [
                 block.model_dump(mode="json") for block in observation.to_llm_content
             ]
@@ -1013,6 +1277,66 @@ class PyromindBusinessToolHost:
         )
         self._log_execution(name, context, started_at, response)
         return response
+
+    @staticmethod
+    async def _publish_validated_workflow(
+        details: dict[str, Any], context: ToolExecutionContext
+    ) -> dict[str, str]:
+        response = details.get("raw_response")
+        data = response.get("data") if isinstance(response, dict) else None
+        workflow = data.get("workflow") if isinstance(data, dict) else None
+        if not isinstance(workflow, dict) or not isinstance(
+            workflow.get("nodes"), list
+        ):
+            return {
+                "artifact_unavailable": "No validated graph is available; "
+                "SDK submission must stop."
+            }
+        document = json.dumps(
+            workflow, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        try:
+            _validate_persisted_execution(workflow, context, metadata={})
+        except (KeyError, TypeError, ValueError):
+            details.pop("raw_response", None)
+            return {
+                "artifact_unavailable": "The graph cannot be safely persisted; "
+                "SDK submission must stop and retain the legacy preparation path."
+            }
+        digest = hashlib.sha256(document.encode()).hexdigest()
+        relative = Path("public_data/workflow-validation") / f"{digest}.json"
+        workspace = context.workspace or LocalWorkspace(
+            working_dir=context.workspace_root
+        )
+
+        def publish() -> None:
+            destination = Path(workspace.working_dir) / relative
+            if isinstance(
+                workspace, LocalWorkspace
+            ) and not destination.resolve().is_relative_to(
+                (Path(workspace.working_dir) / "public_data").resolve()
+            ):
+                raise ValueError("Validated workflow must remain inside public_data")
+            with tempfile.TemporaryDirectory(
+                prefix="pi-validated-workflow-"
+            ) as directory:
+                source = Path(directory) / relative.name
+                source.write_text(document, encoding="utf-8")
+                result = workspace.file_upload(source, destination.as_posix())
+            if not result.success:
+                raise OSError("Cannot publish the validated workflow")
+
+        try:
+            await asyncio.to_thread(publish)
+        except (OSError, RuntimeError, ValueError):
+            return {
+                "artifact_unavailable": "Validation passed, but its graph could not "
+                "be published; SDK submission must stop."
+            }
+        return {
+            "validated_workflow_path": relative.as_posix(),
+            "sha256": digest,
+        }
 
     @staticmethod
     async def _finalize_result(
@@ -1160,10 +1484,30 @@ class PyromindBusinessToolHost:
         }
 
     @staticmethod
+    def prepare_debug_budget(workspace_root: Path) -> Path:
+        files = PiSessionFiles(workspace_root)
+        path = workspace_root / DEBUG_STATE_RELATIVE_PATH
+        if not path.resolve().is_relative_to(
+            (workspace_root / "public_data").resolve()
+        ):
+            raise ValueError("Debug state must remain inside public_data")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(path) + ".lock"):
+            if path.is_file():
+                attempts = _debug_attempts(json.loads(path.read_text(encoding="utf-8")))
+            else:
+                attempts = _debug_attempts(files.load_business_state())
+                _atomic_json(path, {WORKFLOW_ATTEMPT_STATE_KEY: attempts})
+            files.save_business_state({WORKFLOW_ATTEMPT_STATE_KEY: attempts})
+        return path
+
+    @staticmethod
     def reset_attempt_budget(workspace_root: Path) -> None:
-        PiSessionFiles(workspace_root).save_business_state(
-            {WORKFLOW_ATTEMPT_STATE_KEY: 0}
-        )
+        path = PyromindBusinessToolHost.prepare_debug_budget(workspace_root)
+        with FileLock(str(path) + ".lock"):
+            state = {WORKFLOW_ATTEMPT_STATE_KEY: 0}
+            _atomic_json(path, state)
+            PiSessionFiles(workspace_root).save_business_state(state)
 
     async def stop_platform_task(
         self, task_id: str, context: ToolExecutionContext
@@ -1297,8 +1641,11 @@ class PyromindBusinessToolHost:
         return params
 
     def _stop_params(self, context: ToolExecutionContext) -> dict[str, Any]:
+        env, cluster = _execution_target(context)
         params: dict[str, Any] = {
-            "headers": _forward_headers(context.request_context, include_cookie=False)
+            "env": env,
+            "cluster": cluster,
+            "headers": _forward_headers(context.request_context, include_cookie=False),
         }
         if self._pipeline_runs is not None:
             params["task_resolver"] = self._pipeline_runs(
@@ -1372,7 +1719,7 @@ async def _publish_tool_output_to_execution_workspace(
     the control-plane spill file alone would be unreachable for the model.
     """
     workspace = context.workspace
-    if not isinstance(workspace, SandboxWorkspace):
+    if not isinstance(workspace, RemoteSandboxWorkspace):
         return
     result = await asyncio.to_thread(
         workspace.file_upload, saved.path, saved.relative_path

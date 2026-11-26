@@ -1,10 +1,7 @@
 """Subagent lifecycle is a generic product operation, regardless of harness."""
 
-import json
-import tarfile
-from pathlib import Path
-
 import pytest
+
 from harness_adapter.pi_adapter.event_translator import translate_runner_event
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.context import RequestContext
@@ -98,28 +95,3 @@ async def test_initial_child_queue_state_is_retained_on_snapshot_reload(tmp_path
     assert operation.kind == "operation"
     assert operation.details == details
     await runtime.close()
-
-
-def test_pinned_genome_compatibility_package_preserves_implementation():
-    root = Path(__file__).resolve().parents[2] / "harness-adapter/pi-runtime"
-    with (
-        tarfile.open(root / "vendor/agentgenome-pi-extension-0.6.3.tgz") as old,
-        tarfile.open(root / "vendor/agentgenome-pi-extension-0.6.3-pi087.tgz") as new,
-    ):
-        assert old.getnames() == new.getnames()
-        for entry in old.getmembers():
-            if not entry.isfile():
-                continue
-            old_file = old.extractfile(entry)
-            new_file = new.extractfile(entry.name)
-            assert old_file is not None and new_file is not None
-            previous = old_file.read()
-            current = new_file.read()
-            if entry.name == "package/package.json":
-                previous, current = json.loads(previous), json.loads(current)
-                assert (
-                    current["peerDependencies"]["@earendil-works/pi-coding-agent"]
-                    == "0.84.2 || 0.87.0"
-                )
-                current["peerDependencies"] = previous["peerDependencies"]
-            assert previous == current

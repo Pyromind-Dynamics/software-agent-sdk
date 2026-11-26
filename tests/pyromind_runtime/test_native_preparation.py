@@ -69,9 +69,16 @@ def stream(tool=None, arguments=None, call="call"):
     )
 
 
-@pytest.mark.parametrize("concurrent_edit", [False, True])
+@pytest.mark.parametrize(
+    ("concurrent_edit", "encoded_plan"), [(False, False), (True, False), (False, True)]
+)
 async def test_single_plan_tool_after_question_and_stale_model_request(
-    preparation_setup, ready_request, tmp_path, monkeypatch, concurrent_edit
+    preparation_setup,
+    ready_request,
+    tmp_path,
+    monkeypatch,
+    concurrent_edit,
+    encoded_plan,
 ):
     store, owner, policy = preparation_setup
     context = RequestContext(user_id=owner.user_id, profile_id=owner.profile_id)
@@ -94,14 +101,10 @@ async def test_single_plan_tool_after_question_and_stale_model_request(
         if len(captured) == 2:
             request_started.set()
             await release.wait()
-            return stream(
-                "set_preparation_plan",
-                {
-                    **ready_request.model_dump(mode="json"),
-                    "plan": ready_request.plan.model_dump_json(),
-                },
-                "plan-first",
-            )
+            arguments = ready_request.model_dump(mode="json")
+            if encoded_plan:
+                arguments["plan"] = json.dumps(arguments["plan"])
+            return stream("set_preparation_plan", arguments, "plan-first")
         if concurrent_edit and len(captured) == 3:
             return stream(
                 "set_preparation_plan",
@@ -176,6 +179,7 @@ async def test_single_plan_tool_after_question_and_stale_model_request(
                 ).phase != "ready":
                     await asyncio.sleep(0.01)
             ready = store.get(owner)
+            assert ready.plan == ready_request.plan
             assert ready.revision == (4 if concurrent_edit else 3)
             assert store.project(owner) is None
             names = {tool["function"]["name"] for tool in captured[0]["tools"]}

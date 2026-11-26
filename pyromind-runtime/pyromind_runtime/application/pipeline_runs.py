@@ -572,6 +572,17 @@ class PipelineRuns:
                                 project.id, record.id, task_id
                             )
 
+    def task_associations(self) -> list[dict[str, str]]:
+        return [
+            {
+                "task_id": run.task_id,
+                "run_id": str(run.run_id),
+                "output_dir": run.output_dir,
+            }
+            for run in self._store.load_pipeline_runs().values()
+            if run.conversation_id == self.conversation_id and run.task_id
+        ]
+
     def task_for(
         self, task_id: str | None, run_id: str | None, output_dir: str | None
     ) -> str | None:

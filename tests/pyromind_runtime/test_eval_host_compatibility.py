@@ -154,5 +154,34 @@ async def test_main_host_creates_through_api_and_executes_tools_directly(
                     },
                 )
             assert execute.await_count == 4
+
+            bind = AsyncMock(return_value="1201")
+            adapter.set_plan_submission_handler(bind)
+            submission = {"plan_task_id": "prepare", "plan_attempt": 1}
+            tool_call = {"tool_name": "df_submit_pipeline", "arguments": submission}
+            duplicate = await adapter._runner_request(
+                session, "tool.execute", tool_call
+            )
+            assert duplicate["details"] == {
+                "task_id": "1201",
+                "already_submitted": True,
+            }
+            assert execute.await_count == 4
+
+            for number, batch in enumerate(["batch-a", "batch-b"], start=1202):
+                sample = {"replay_of_task_id": "1201", "input_path": batch}
+                execute.return_value = {
+                    "is_error": False,
+                    "content": [],
+                    "details": {"task_id": str(number)},
+                }
+                replay = await adapter._runner_request(
+                    session,
+                    "tool.execute",
+                    {**tool_call, "arguments": {**submission, **sample}},
+                )
+                assert replay["details"]["task_id"] == str(number)
+                assert execute.call_args.args[1] == sample
+            bind.assert_awaited_once()
     finally:
         await runtime.close()

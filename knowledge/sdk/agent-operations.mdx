@@ -1,0 +1,183 @@
+---
+title: Agent 操作索引
+description: 按平台任务定位 SDK 方法，区分平台原语、场景业务职责与迁移缺口。
+---
+
+适用版本：工程锁定的 `pyromind-sdk==0.1.17`。这里只索引能力；参数和示例按需打开参考页。
+
+## 当前执行入口
+
+SDK 负责平台原子操作；普通 Python 函数负责准备、构图、冻结和结果解析。
+Agent 使用当前 terminal 直接调用 SDK，不需要新的通用提交 Tool、代理或计划协议。
+按需读取 `workflow-execution` Skill 的 `references/sdk-execution.md`，其中区分原生 SDK、
+轻量 helper 的安装前提、关联上下文与仍保留的校验入口。
+执行层通过正常 wheel 安装提供 `pyromind-platform-helpers`，导入路径为
+`pyromind_common.platform`，不向执行环境暴露 Host 源码或安装完整 Runtime/Tool 依赖。
+
+系统消息明确启用平台 SDK 上下文的已登录 Workbench 或 EchoMind 单 Main，使用 terminal 和
+`"$PYROMIND_SDK_PYTHON"` 执行 SDK 脚本。身份、API 地址、集群、有效默认镜像和
+当前会话的任务关联快照由执行环境注入。
+原授权清单内已完成迁移的原子 Tool 停止注入；OS Main 保留 `sandbox_terminal`，
+远端路径单独验收。实现与注册保留，部署可配置回退。
+按 `sandbox` Skill 的操作表按需读取生命周期、读写、删除和命令参考；停止任务按
+`data-processing/references/sdk-stop-task.md` 执行，支持已有 run / 输出目录映射。
+
+SDK 身份使用已授权的当前账户平台权限，不受旧 Tool 名称枚举限制；Project 计划和用户
+确认仍约束本次业务执行范围。Tool 清单继续按原授权范围派生，不向 EchoMind 加入原先没有的
+Sandbox Tool。未登录、受限自定义角色和历史子 Agent 使用各自实际入口，不下放此身份。
+独立 SDK 脚本的客户端配置见 [安装](installation.mdx)。
+部署设置 `OH_PLATFORM_SDK_ENABLED=false` 并重启服务，可恢复原授权范围的旧 Tool，
+并关闭动态 SDK 环境；OS 的 `sandbox_terminal` 始终保留。
+旧会话在下一次 runner 初始化时应用该配置，不改写持久化授权策略。
+SDK Main 默认停止注入八个业务提交 schema：`df_submit_pipeline`、`df_submit_evaluation`、
+`submit_workflow`、`workflow_debug`、`run_dataset_cleaning`、`edp_render`、`edp_submit`、
+`edp_aggregate`。不按历史任务重新加入提交 Tool；当前迁移面向后续对话的完整执行路径。
+
+远端 SDK Main 的平台操作 Tool 暂时仅保留 `get_storage_url`、`validate_workflow_dsl`、
+`training_analysis`、`label_studio_project`。Storage 已挂载为 `/workspace`，文件和进度
+直接读写挂载目录，不再注入 `df_check_progress`、`upload_file_to_pyromind`、
+`sandbox_upload`、`sandbox_download`。实现、注册和导出继续保留；本机无挂载及关闭 SDK 的
+会话按实际目录使用旧入口。Project 版本、Reward、资源提案与原生工作区工具不属于这四项。
+
+## 按任务查方法
+
+| 任务 / 现有 Tool | SDK 方法或能力 | 覆盖与执行边界 | 按需参考 |
+|---|---|---|---|
+| 查询节点定义 | `client.studio.get_node_info(names=...)` | SDK 已覆盖；用于确定节点参数与端口 | [自定义节点](custom-nodes.mdx) |
+| DSL 本地预检 | `DslValidator().validate(code)` | SDK 已覆盖语法、引用及 DAG 检查，不能替代服务端节点与资源校验 | [校验边界](#工作流校验与提交) |
+| `validate_workflow_dsl` | 缺服务端 DSL、资源校验的专用 SDK 方法 | 当前保留产品校验入口；本地预检不能决定是否正式提交 | [校验边界](#工作流校验与提交) |
+| `submit_workflow` | `client.studio.create(request)` | 普通函数准备实际校验图；SDK 创建，Project 元数据与版本更新独立处理 | [训练工作流](training-workflow.mdx)、[提交边界](#工作流校验与提交) |
+| `df_submit_pipeline` | `prepare_pipeline` + SDK 创建 | 支持 none/text/vision、冻结修订与带复用评估的兼容续跑；模型环境在提交前绑定 | [提交边界](#工作流校验与提交) |
+| `run_dataset_cleaning` | `client.studio.create(request)` | 普通函数冻结脚本与输入；目标依赖和 Storage 文件发布需先就绪 | [提交边界](#工作流校验与提交) |
+| `df_submit_evaluation` | `client.studio.create(request)` | 普通函数准备推理/评分/报告；独立测试使用已授权 Project 的冻结 `ValidationSelection` | [提交边界](#工作流校验与提交) |
+| `edp_render`、`edp_aggregate` | `client.studio.create(request)` | 普通函数准备模板和聚合脚本；保留分片终态选择及部分成功规则 | [提交边界](#工作流校验与提交) |
+| `edp_submit` | `select_edp_manifests`、`prepare_edp_shard` + SDK 创建 | 冻结分片 runner/profile/runtime；Worker 使用 API key，按 profile 需要提供模型环境；保留每片任务 ID、run ID、输出目录 | [提交边界](#工作流校验与提交) |
+| `workflow_debug` | Studio 任务创建 | SDK 请求没有 `test_mode` 字段；调试 runner 固定测试语义并保留次数和回调 | [提交边界](#工作流校验与提交) |
+| `df_stop_task` | `client.studio.stop(task_id)` | SDK Main 不再注入；run / 输出目录映射来自当前会话只读快照，请求受理与终态分开确认 | [停止与状态](#任务停止与状态) |
+| `inspect_workflow_task` | 普通 `platform.inspection.inspect_workflow_task` + SDK 原始任务响应、节点日志 | SDK Main 不再注入；保留实际返回的节点状态，缺失为 unknown；按实际节点 ID 查日志并限制返回量 | [任务与节点检查](training-workflow.mdx#查询节点状态与日志) |
+| `df_check_progress` | 普通 `platform.progress.read_progress` 读取挂载文件 | 远端不再注入；有界读取 progress/report 和 JSONL 尾部，进度不替代平台终态 | [挂载进度](../../.agents/skills/data-processing/references/storage-progress.md) |
+| `get_storage_url` | 缺平台预览链接的 SDK 方法 | 当前保留产品入口；对象存储下载地址不能直接视为相同的浏览器预览契约 | [Storage 边界](#storage-客户端边界) |
+| `upload_file_to_pyromind` | 对挂载的 Storage 直接写入或复制文件 | 远端不注入；落位后核对大小及 SHA-256，本机无挂载时不能把本机 cp 当成发布 | [挂载文件](../../.agents/skills/data-processing/references/storage-progress.md#文件直接落位) |
+| `sandbox_read_file` | `client.sandboxes.read_file` | SDK Main 不再注入；文本/二进制与有界输出，无 Project 或业务 run | [沙箱文件](sandboxes.mdx#读取和写入文件) |
+| `sandbox_delete_file` | `client.sandboxes.delete_file` | SDK Main 不再注入；普通文件非递归，目录删除显式启用递归 | [沙箱文件](sandboxes.mdx#读取和写入文件) |
+| `sandbox_create`、`sandbox_delete` | `client.sandboxes.create`、`delete` | SDK Main 不再注入；保留部署镜像和资源默认值、等待 running、暂停后确认删除 | [沙箱](sandboxes.mdx) |
+| `sandbox_write_file` | `client.sandboxes.write_file` | SDK Main 不再注入；bytes / 本地文件、空文件和分片上传，写后核验 | [沙箱文件](sandboxes.mdx#读取和写入文件) |
+| `sandbox_terminal` | `client.sandboxes.exec_command_stream` | 远端 SDK Main 不再注入；OS 保留原 Tool，当前 SDK WS 缺少代理配置入口 | [沙箱命令](sandboxes.mdx#执行命令) |
+| `sandbox_upload`、`sandbox_download` | 共享 Storage 挂载直接读写；其他沙箱使用 SDK 文件原语 | 远端不再注入；先核实挂载与目标文件，未共享挂载时按 SDK read_file/write_file 传递所需内容并校验 | [沙箱文件](sandboxes.mdx#读取和写入文件)、[挂载文件](../../.agents/skills/data-processing/references/storage-progress.md#文件直接落位) |
+| 跨集群传输 | `client.storage.transfers.submit`、`list_page`、`cancel` | SDK 已覆盖传输任务；这是 `client.storage` 当前的用途 | [Storage 边界](#storage-客户端边界) |
+| `training_analysis` | Studio 任务信息和节点日志仅覆盖部分 | checkpoint 定位、W&B 指标和报告不属于已完成的 SDK 替代范围 | [训练工作流](training-workflow.mdx) |
+| `label_studio_project` | 当前 SDK 无对应客户端 | 标注项目业务集成继续使用现有入口 | 当前会话的 `label-studio` Skill |
+
+## 工作流校验与提交
+
+本地 DSL 预检入口：`from pyromind_sdk.client.workflow import DslValidator`。
+`DslValidator().validate(code)` 返回 `(valid, errors)`，不查询当前平台节点、账户配额或集群资源。
+SDK Main 的保留校验入口在成功后保存实际图，模型可见 content 返回
+`validated_workflow_path` 和 `sha256`；直接读取该文件并提交，不搬写 JSON。
+`raw_response.data.workflow` 仅是内部观测字段，不表示模型已经取得实际图。
+没有路径或出现 `artifact_unavailable` 时，SDK 提交必须停止，即使 `valid=true`。
+实际配置中的 secret、签名 URL、当前请求/SDK 凭据会使 artifact 保存被拒绝；
+不要删改图绕过检查。SDK 关闭时仍返回原校验摘要。
+
+SDK 的 `TrainingTaskCreateRequest` 要求 `name`、`workflow` 和 `out_id`。
+SDK 负责创建平台任务并返回 `task_id`，不认识 Project、业务阶段或报告版本。
+`out_id` 是调用方的外部关联标识，不提供平台幂等保证；由场景执行上下文生成，
+从 `PYROMIND_TASK_CONTEXTS` 选择会话任务类型，Project 从 `PYROMIND_PROJECT_EXECUTIONS`
+选择已授权 task/attempt 的 `out_ids`。不手工拼造归属；可信平台回调验证签名后补齐任务事实。
+
+平台操作和业务运行记录按使用场景分工：
+
+| 场景 | 应用用例维护的内容 |
+|---|---|
+| 工作台 | 按需关联会话与平台任务，维护该会话需要的执行版本、结果通知和恢复信息 |
+| EchoMind | 由单个主 Agent 按 Project 业务 run 维护数据、模型、报告、版本与 Reward 绑定，以及去重和恢复 |
+| 独立 SDK 脚本 | 按调用系统需求保存任务 ID、关联标识和输出，不自动创建 Agent 会话或 Project 业务记录 |
+
+场景直接调用 SDK 并保存真实任务 ID。平台回调可以先于 SDK 返回到达；可信平台入口结合
+签名关联补齐事实并投递，不以提前登记作为唯一条件。普通 HTTP 手工回调不认领未知任务。
+当前 SDK `get_task()` 不含 owner/out_id，查询到任务存在不构成跨会话归属证明。
+平台已受理但未取得响应时，等待回调或核对平台，不盲目重复创建。
+
+这些场景用例可以继续位于同一个 `pyromind_runtime.application` 中；共享 Runtime
+提供通用事件、持久化与恢复能力，不把每次平台 API 调用都变成 Project 任务，
+也不另建一套平行 Runtime。
+
+SDK create 不替代小样、Recipe、测试预算、预测复用、Project 绑定与业务验收。
+目标解释器依赖未就绪时先修复执行环境，不重新加入提交 Tool。创建客户端使用
+`max_retries=0`；响应不明确时
+核对回调或平台，不自动重投。平台已受理但 Project 绑定失败，只重试元数据更新。
+本地冻结图、脚本、报告与 Project 记录不保存密钥。含 `{{pyromind.runtime:...}}`
+声明的实际校验图必须交给普通 `submit_workflow` 或 `submit_workflow_batch`，不能直接
+调用 `studio.create` 绕过环境绑定。这些函数在 SDK POST 前复制图并在内存填入必要环境值；
+最终请求沿用现有平台 command 环境，Studio 可能保存任务定义。这不是新的 Secret 服务，
+不要保存、打印或回传绑定后的请求图。
+
+评测准备使用 `pyromind_common.platform.evaluation_core.EvaluationOptions`，默认调用
+`pyromind_common.platform.evaluation.stage_evaluation` 无 HTTP 地冻结文件和 DSL。
+以返回的 `workflow_path` 工作区相对路径和 `name` 调用保留的
+`validate_workflow_dsl`，再从 content 提供的 `validated_workflow_path` 文件读图交给 SDK。
+`prepare_evaluation(..., validator=...)` 仅供已有校验登录身份的调用方使用；
+SDK Access Key 不代表旧校验路由的 Cookie。
+独立测试再给 `stage_evaluation(..., selection=...)` 传同模块的
+`ValidationSelection`。其 train/validation/test 为包含路径与 SHA-256 的 `FrozenDataset`，
+模型为精确 checkpoint 的 `ValidationCheckpoint`，并携带验证时冻结的 Reward 或评分契约。
+调用方从已授权 Project 的版本、训练分析和报告取得这些证据，不能用自报 task ID
+代替归属核对。准备函数验证独立测试、选定模型和完整 test，冻结
+`validation-selection.json`；恢复时沿用该文件。
+
+清洗、EDP 和 Pipeline 准备结果为原始业务图，尚未检查集群资源。
+用 SDK 的 `pyromind_sdk.client.workflow.DslConverter().to_python(graph)` 保存 DSL，
+交给同一保留校验入口并读取其 `validated_workflow_path` 实际图文件，再提交 SDK。
+不能因为业务 builder 已构图
+而省略旧入口的资源预检；有额外顶层执行参数时也不能假定 DSL 转换会保留所有语义。
+
+`prepare_pipeline` 支持 `model_profile="none"`、`"text"`、`"vision"`。模型配置来自
+`PYROMIND_DATAFLOW_PROFILES`；准备时记录公开配置指纹，提交时配置发生变化会拒绝执行。
+用户指定视觉网关时，在准备和提交进程内从同一已授权环境整体构造 `vision` 配置，
+完整替换平台视觉 profile，不保留原平台 key；小样也使用同一网关。跨校验 Tool 后的新
+Python 进程需要重新构造相同配置，不会自动继承上次进程的内存修改。
+严格续跑复用冻结脚本/运行库；兼容续跑须给出覆盖实际变化维度的 `reuse_assessment`。
+Recipe 提交后的 task、输出和冻结配方元数据，在可信回调确认归属后用
+`product_versions(action="bind_execution_metadata", ...)` 单独登记，成功返回
+`metadata_bound`；失败只重试登记。实际参数示例见 SDK 提交参考，不能用 SDK 查到任务
+代替归属确认，也不能把同一任务改绑成另一份事实。
+
+EDP 使用 `pyromind_common.platform.environment.EdpSubmitOptions`，先调用
+`select_edp_manifests(options, shard_index=...)`，再逐片调用 `prepare_edp_shard`。
+每片目录保持在 manifest 旁，以 run UUID 命名；保存返回的 manifest、run ID、输出目录并与
+SDK 返回的真实任务 ID 对应。`submit_workflow_batch` 遇到首个失败立即停止，
+`WorkflowBatchSubmissionError.accepted` 保留已受理的响应，不整批重投。
+纯环境 profile 只需平台 SDK 身份；解题 profile 才需要相应 LLM 环境。
+
+调试预算由 `PYROMIND_DEBUG_STATE_PATH` 提供，位于实际执行工作区的
+`public_data/.pyromind/workflow-debug-state.json`。SDK helper 与旧入口沿用同一个
+`pyromind_workflow_attempts` 计数，文件锁保护多进程提交；切换入口或新 Python
+进程不会重置预算。用户授权新一轮时将同一记录归零，不取新旧计数的最大值。
+
+## 任务停止与状态
+
+SDK Main 使用 `pyromind_common.platform.inspection.inspect_workflow_task(client, task_id)`
+查询任务和节点，按需给 `node_id`、`include_log=True` 读取指定节点的日志尾部。
+这是随 helper wheel 安装的普通函数，通过 `client.studio.get()` 保留原始响应中的节点状态；
+SDK 0.1.17 的 `get_task()` 节点模型会丢弃未声明的 `status` 字段。
+平台未返回节点状态时，结果保持 `unknown`，`node_status_available=false`；
+不能从时间戳或任务整体状态推断节点成功，也不能将空的失败节点列表当作成功证明。
+日志使用响应中的实际节点 ID，任务读取错误和日志读取错误分别处理。
+
+`studio.stop(task_id)` 会发送停止请求并读取任务详情。
+应根据返回状态或后续状态通知区分“停止已请求”和“任务已终止”，不要把请求成功直接报告为终态。
+SDK 不认识业务 `run_id` 或输出目录；需要这些标识的场景先解析为平台 `task_id`，
+再按该场景核对会话或 Project 归属。
+
+## Storage 客户端边界
+
+- `PyroMindAPIClient.storage` 是 `StorageAPIClient`，当前提供跨集群 transfer，不能调用对象文件上传、下载或预览方法。
+- 顶层导出的独立 `StorageClient` 操作 MinIO/S3，要求相应 endpoint、bucket 和存储凭据；参阅 [Storage](storage.mdx)。
+- 当前 SDK 没有平台 Storage 预览链接、文件 stat 和范围读取的专用方法。不要把建议补充的方法当成已经存在的 API。
+
+远端的挂载提供文件大小、局部读取和直接落位，不需要为这些文件操作新增 SDK HTTP 方法
+或保留传输 Tool。普通 `read_progress` 随轻量 helper 安装，只读取已知运行目录。
+它不创建报告登记：只有已确认已登记的稳定入口才作为 `stable_report_url` 传入；否则将
+实际 `artifact_paths` 交给 `get_storage_url`，只交付其真实只读预览，不承诺页内标注保存。
+
+只有在相应执行上下文、业务语义和结果校验都已迁移后，才应从 Agent 工具清单移除对应入口。

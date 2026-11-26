@@ -437,6 +437,41 @@ async def test_failed_workflow_callback_routes_to_failure_analysis(tmp_path):
     await runtime.close()
 
 
+async def test_delegated_training_success_routes_model_handoff_to_owner(tmp_path):
+    runtime, adapter, submission, context = await _runtime(tmp_path)
+    origin = TaskOrigin(type="subagent", subagent_id="train-owner")
+    try:
+        await runtime.prepare_workflow_execution(
+            "workflow-conversation",
+            "/workspace/project/workflow.py",
+            context,
+            request_id="r",
+            origin=origin,
+            continue_after_completion=True,
+        )
+        correlation = submission.correlations[0]
+        assert correlation is not None
+        adapter.external_task_notifications.clear()
+        for _ in range(2):
+            await runtime.deliver_external_task_status(
+                "workflow-conversation",
+                task_id="task-123",
+                status="Succeeded",
+                correlation=correlation,
+            )
+
+        assert len(adapter.external_task_notifications) == 1
+        notification = adapter.external_task_notifications[0][1]
+        assert notification.correlation == correlation
+        assert notification.trigger_turn is True
+        assert "training_analysis(operation=artifacts)" in notification.hidden_text
+        assert "Manager delegates independent evaluation" in notification.hidden_text
+        assert "W&B availability does not block" in notification.hidden_text
+        assert "df_submit_pipeline" not in notification.hidden_text
+    finally:
+        await runtime.close()
+
+
 async def test_callback_arriving_during_create_waits_for_task_registration(tmp_path):
     runtime, adapter, submission, context = await _runtime(tmp_path)
     callback: asyncio.Task | None = None
@@ -494,12 +529,16 @@ async def test_default_workflow_callback_reports_without_starting_a_turn(tmp_pat
         await runtime.close()
 
 
-async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_pi_tool_exposes_direct_workflow_submission(tmp_path, delegated):
     skills = Path(__file__).parents[2] / ".agents" / "skills"
     host = PyromindBusinessToolHost(
         [skills / "data-processing", skills / "training-analysis"]
     )
-    calls: list[tuple[str, str, str, str | None]] = []
+    calls: list[tuple[str, str, str, str | None, TaskOrigin | None]] = []
+    task_origin = (
+        TaskOrigin(type="subagent", subagent_id="train-owner") if delegated else None
+    )
 
     async def prepare(
         conversation_id,
@@ -509,10 +548,11 @@ async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
         request_id,
         workflow_storage_path,
         continue_after_completion,
+        origin=None,
     ):
         assert continue_after_completion is False
         calls.append(
-            (conversation_id, workflow_path, workflow_storage_path, request_id)
+            (conversation_id, workflow_path, workflow_storage_path, request_id, origin)
         )
         return {"request_id": request_id, "status": "submitted", "task_id": "task-123"}
 
@@ -524,13 +564,15 @@ async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
         ToolExecutionContext(
             conversation_id="conversation-1",
             workspace_root=tmp_path,
-            request_context=RequestContext(user_id="42"),
+            request_context=RequestContext(user_id="42", task_origin=task_origin),
             model_configuration={},
         ),
         tool_call_id="call-1",
     )
     assert result["details"]["status"] == "submitted"
     assert result["details"]["task_id"] == "task-123"
+    receipt_text = result["content"][0]["text"]
+    assert ("The terminal callback resumes your task" in receipt_text) == delegated
     assert calls == [
         (
             "conversation-1",
@@ -538,6 +580,7 @@ async def test_pi_tool_exposes_direct_workflow_submission(tmp_path):
             "/workspace/.pyromind-agent/conversation-1/"
             "public_data/workflow_canvas/workflow.py",
             "call-1",
+            task_origin,
         )
     ]
 

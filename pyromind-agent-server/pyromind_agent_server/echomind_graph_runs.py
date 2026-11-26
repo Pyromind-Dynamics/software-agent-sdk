@@ -27,6 +27,7 @@ GraphRunStatus = Literal[
     "canceled",
 ]
 GraphRunOutcome = Literal[
+    "candidate_recorded",
     "promoted",
     "baseline_retained",
     "canceled",
@@ -207,10 +208,12 @@ class GraphRun(BaseModel):
             raise ValueError("non-terminal GraphRun must not have finished_at")
 
         if self.status == "succeeded":
-            if self.outcome not in {"promoted", "baseline_retained"}:
-                raise ValueError(
-                    "succeeded GraphRun requires a completed promotion outcome"
-                )
+            if self.outcome not in {
+                "promoted",
+                "baseline_retained",
+                "candidate_recorded",
+            }:
+                raise ValueError("succeeded GraphRun requires a completed outcome")
         elif self.status == "failed":
             if self.outcome != "failed" or self.failure is None:
                 raise ValueError("failed GraphRun requires failure details")
