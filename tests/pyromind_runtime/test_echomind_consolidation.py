@@ -227,7 +227,10 @@ def test_train_only_plan_compiles_without_training_validation(
     )
 
 
+@pytest.mark.parametrize("legacy_replay", [False, True])
 def test_reviews_and_applies_original_project(
+    legacy_replay,
+    train_reader_probe,
     tmp_path: Path,
     project: ProjectInfo,
     context: ConsolidationContext,
@@ -275,6 +278,9 @@ def test_reviews_and_applies_original_project(
             stages=(),
             blockers=(),
             dataset_replay=ConsolidationDatasetReplay(
+                train_reader_probes=None
+                if legacy_replay
+                else (train_reader_probe, train_reader_probe),
                 dataset_runtime_sha256=canonical_sha256(proposal.dataset_runtime),
                 task_ids=("112", "113"),
                 source_kinds=("jsonl", "jsonl"),
@@ -286,6 +292,17 @@ def test_reviews_and_applies_original_project(
         ),
         tmp_path,
     )
+    if legacy_replay:
+        with pytest.raises(ValueError, match="换批"):
+            apply_consolidation(
+                store,
+                project,
+                conversations_root=tmp_path,
+                task_ids={},
+                proposal=proposal,
+                expected_proposal_sha256=reviewed,
+            )
+        return
     updated = apply_consolidation(
         store,
         project,

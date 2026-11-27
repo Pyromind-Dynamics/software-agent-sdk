@@ -18,6 +18,7 @@ from pyromind_agent_server.echomind_consolidation import (
     ConsolidationBlocker,
     ConsolidationContext,
     ConsolidationDatasetReplay,
+    TrainReaderProbe,
 )
 from pyromind_agent_server.echomind_dataset_consolidation import _validated_runtime
 from pyromind_agent_server.echomind_sandbox_storage import (
@@ -34,6 +35,7 @@ from pyromind_common.platform.dataset_replay import (
 )
 from pyromind_common.platform.scene_core import DATAFLOW_RUNTIME_FILENAMES
 from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.sft_reader import train_reader_fields
 from pyromind_runtime.domain.storage_paths import (
     normalize_workspace_path,
     to_storage_api_path,
@@ -67,6 +69,7 @@ class _Verification(BaseModel):
 
 class _LiveVerification(_Verification):
     approved_source_member: bool
+    train_reader_probe: TrainReaderProbe
 
 
 @dataclass(frozen=True)
@@ -206,6 +209,30 @@ def recheck_dataset_replay(
     else:
         raise EvaluationStorageUnavailableError("换批复核需要已绑定的 Storage 工作区。")
     if code != 0:
+        diagnostics = (error or "") + "\n" + (output or "")
+        for marker, message in (
+            (
+                "reader_probe_environment_missing",
+                "沙箱没有可用的 datasets 与 PyArrow CPU 环境，请恢复该环境后重新验证。",
+            ),
+            (
+                "reader_probe_sample_too_large",
+                "训练或验证 JSONL 超过 8 MiB，请选用更小的独立小样。",
+            ),
+            (
+                "reader_probe_source_changed",
+                "读取时训练或验证 JSONL 已变化，请重新验证同一份导出。",
+            ),
+        ):
+            if marker in diagnostics:
+                raise _TrainReaderIssue(message)
+        for split in ("train", "val"):
+            if f"reader_probe_schema_{split}" in diagnostics:
+                raise _TrainReaderIssue(
+                    f"{split}_messages.jsonl 无法用 "
+                    "datasets.Dataset.from_list 整行建表。"
+                    "请统一各列及嵌套字段的数据类型，修正导出后重新验证。"
+                )
         if any(
             marker in (error or output)
             for marker in (
@@ -216,6 +243,10 @@ def recheck_dataset_replay(
             raise ValueError("换批图片小样超过回放上限，请选更小的样本批次")
         raise ValueError("复核失败，请检查小样、训练文件及验证集")
     return _finish_live_verification(output)
+
+
+class _TrainReaderIssue(ValueError):
+    """A bounded, safe diagnostic from the server-owned CPU probe."""
 
 
 def _summary(
@@ -242,7 +273,10 @@ def _summary(
             "Replay validation rows do not match the approved Train inputs"
         )
     live = _LiveVerification.model_validate_json(check(recipe))
-    if live.model_dump(exclude={"approved_source_member"}) != result.model_dump():
+    if (
+        live.model_dump(exclude={"approved_source_member", "train_reader_probe"})
+        != result.model_dump()
+    ):
         raise ValueError("Original source or exported data changed since verification")
     return live
 
@@ -378,6 +412,10 @@ def verify_dataset_replays(
                             f"请按 Train {context.evidence.train.task_id} 的字段修正 "
                             "Dataset 导出，并用修正后的配方复核两批小样。",
                         )
+        except _TrainReaderIssue as exc:
+            return _blocked(
+                "dataset_train_reader_failed", f"小样任务 {receipt.task_id}：{exc}"
+            )
         except EvaluationStorageUnavailableError:
             return _blocked(
                 "dataset_replay_storage_unavailable",
@@ -428,6 +466,10 @@ def verify_dataset_replays(
                     else "batch"
                 ),
                 fixed_validation_path=recipe.fixed_validation_path,
+                train_reader_probes=(
+                    proof.train_reader_probe,
+                    latest.summary.train_reader_probe,
+                ),
                 dataset_runtime_sha256=canonical_sha256(latest_runtime),
                 task_ids=(receipt.task_id, latest.task_id),
                 source_kinds=(proof.source_kind, latest.summary.source_kind),
@@ -447,69 +489,6 @@ def verify_dataset_replays(
         f"追溯到 Project 已确认的源数据。已核对平台任务 {latest.task_id}。"
     )
     return _blocked("dataset_replay_required", message)
-
-
-def train_reader_fields(runtime: Mapping[str, object]) -> dict[str, str]:
-    workflow = runtime.get("workflow")
-    if not isinstance(workflow, dict):
-        return {}
-    nodes, edges = workflow.get("nodes"), workflow.get("edges")
-    if not isinstance(nodes, list) or not isinstance(edges, list):
-        return {}
-    graph = {}
-    for node in nodes:
-        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
-            return {}
-        identity, data = node["id"], node.get("data")
-        if identity in graph or not isinstance(data, dict):
-            return {}
-        graph[identity] = data
-
-    def upstream(target: str, port: str) -> str | None:
-        incoming = [
-            edge
-            for edge in edges
-            if isinstance(edge, dict)
-            and edge.get("target") == target
-            and edge.get("targetHandle") == port
-        ]
-        if len(incoming) != 1 or incoming[0].get("sourceHandle") != port:
-            return None
-        source = incoming[0].get("source")
-        return source if isinstance(source, str) and source in graph else None
-
-    trainers = [
-        i for i, data in graph.items() if data.get("nodeType") == "ModelTrainSFTNode"
-    ]
-    if len(trainers) != 1:
-        return {}
-    dataset = upstream(trainers[0], "dataset_config")
-    if not dataset or graph[dataset].get("nodeType") != "DatasetConfigBuilderNode":
-        return {}
-    reader = upstream(dataset, "dataset_kind_config")
-    if not reader:
-        return {}
-    config = graph[reader].get("config")
-    kind = graph[reader].get("nodeType")
-    if not isinstance(config, dict):
-        return {}
-    if (
-        kind == "DatasetConfigBuilderMessageNode"
-        and config.get("messages_field") == "messages"
-    ):
-        return {"messages_field": "messages"}
-    if kind != "DatasetConfigBuilderVisionNode":
-        return {}
-    roles = ["image_field", "user_prompt_field", "assistant_response_field"]
-    if config.get("system_prompt_field"):
-        roles.append("system_prompt_field")
-    fields = {
-        key: config[key]
-        for key in roles
-        if isinstance(config.get(key), str)
-        and re.fullmatch(r"[\w.-]{1,128}", config[key])
-    }
-    return fields if len(set(fields.values())) == len(roles) else {}
 
 
 def compatible_train_reader(runtime: Mapping[str, object]) -> bool:

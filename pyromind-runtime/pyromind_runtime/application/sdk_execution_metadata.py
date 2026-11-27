@@ -25,6 +25,7 @@ from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.preparation import ProjectView
+from pyromind_runtime.domain.sft_reader import archived_sft_input
 from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
     to_storage_api_path,
@@ -480,6 +481,7 @@ def _bind_sdk_metadata(
             resolved_inputs={},
         )
         workflow_path = "version://" + run.id
+    train_input = archived_sft_input(request.workflow)
     receipt = WorkflowExecutionRequest(
         request_id=identity,
         conversation_id=snapshot.conversation_id,
@@ -489,6 +491,7 @@ def _bind_sdk_metadata(
         dataset_recipe=request.dataset_recipe,
         summary={
             "name": str(request.workflow.get("name", "workflow")),
+            **({"train_input": train_input} if train_input else {}),
             **(
                 {"metadata_source": "studio_task"}
                 if platform_archive or independently_verified

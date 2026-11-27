@@ -26,12 +26,18 @@ class DatasetReplayPaths:
         command = [
             "sh",
             "-c",
-            "for py in /opt/pyromind/dataflow-venv/bin/python "
+            'probe="$1"; output="$2"; shift 2; '
+            "for py in /workspace/.conda/bin/python "
+            "/opt/pyromind/dataflow-venv/bin/python "
             "/home/openhands/dataflow-venv/bin/python "
-            "/tmp/pyromind-dataflow-venv-1.0.13-cpu/bin/python "
-            'python3; do if "$py" -I -c "from PIL import Image" >/dev/null 2>&1; '
-            'then exec "$py" "$@"; fi; done; exec python3 "$@"',
+            "/tmp/pyromind-dataflow-venv-1.0.13-cpu/bin/python python3; do "
+            '"$py" -I -c "from datasets import Dataset" >/dev/null 2>&1 || continue; '
+            'receipt=$("$py" "$@") || exit $?; '
+            'printf %s "$receipt" | "$py" -I -c "$probe" "$output"; exit $?; '
+            "done; echo reader_probe_environment_missing >&2; exit 1",
             "verify-dataset",
+            VERIFIER.with_name("probe_sft_train_reader.py").read_text(),
+            mount_root + self.output_dir,
             "-I",
             "-c",
             VERIFIER.read_text(),

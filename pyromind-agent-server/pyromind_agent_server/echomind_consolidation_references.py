@@ -37,6 +37,7 @@ from pyromind_runtime.domain.content import JsonObject, JsonValue
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.preparation import ProjectView
+from pyromind_runtime.domain.sft_reader import archived_sft_input
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
     from_storage_api_path,
@@ -187,6 +188,14 @@ def consolidation_references(
         "workflow": workflow,
         "wandb_credential_task_id": train.task_id if has_wandb_reference else None,
     }
+    train_input = archived_sft_input(train.workflow)
+    if train_input:
+        train_reference["development_input"] = {
+            **train_input,
+            "task_id": evidence.train.task_id,
+            "workflow_path": _source_path(train.workflow_path),
+            "workflow_sha256": evidence.train.definition_sha256,
+        }
     if train.task_id and has_wandb_reference:
         candidate = _train_runtime_candidate(
             workflow, evidence.conversation_id, train.task_id

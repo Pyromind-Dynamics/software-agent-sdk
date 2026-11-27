@@ -29,6 +29,7 @@ from pyromind_agent_server.echomind_publication import (
     PublicationValidationError,
     RuntimeImplementationAdoptionError,
 )
+from pyromind_agent_server.echomind_repair_proposals import GraphRepairProposals
 from pyromind_agent_server.echomind_resource_proposals import (
     prepare_runtime_resources,
 )
@@ -204,6 +205,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         adapters,
         default_harness_id=backend,
         preparation_store=preparation_store,
+        graph_repair_submitter=GraphRepairProposals(projects_root),
         experiment_index=SQLExperimentIndex(preparation_store.engine)
         if preparation_store is not None
         else None,
@@ -248,6 +250,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
         runtime.task_monitor.recover(service.conversations_dir)
     pi_adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     pi_adapter.set_plan_submission_handler(runtime.bind_plan_submission)
+    pi_adapter.set_graph_repair_handler(runtime.graph_repair_proposal)
     pi_adapter.set_external_wait_provider(runtime.pending_external_tasks)
     pi_adapter.set_sdk_context_provider(runtime.platform_sdk_context)
     pi_adapter.set_echo_chat_handler(

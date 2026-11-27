@@ -106,6 +106,7 @@ from pyromind_agent_server.echomind_publication import (
     list_runtime_validation_candidates,
     load_runtime_validation_project,
 )
+from pyromind_agent_server.echomind_repair_proposals import GraphRepairProposals
 from pyromind_agent_server.echomind_resource_proposals import (
     RuntimeResourceProposal,
     read_runtime_resource_proposal,
@@ -934,6 +935,7 @@ async def generate_echomind_consolidation(
             },
             "assets": review.assets.get(stage),
             "train_input_fields": review.assets.get("train_input_fields"),
+            "train_development_input": review.assets.get("train_development_input"),
         }
         repair, command = plan_repair(
             stage=stage,
@@ -2133,7 +2135,7 @@ async def _read_graph_repair_proposal(
     if handoff is None or handoff.delivered_at is None:
         return None
     source = await _read_repair_proposal_text(
-        request, project, context, handoff.handoff_id
+        request, project, context, handoff.handoff_id, run.run_id, projects_root
     )
     if source is None:
         return None
@@ -2164,7 +2166,17 @@ async def _read_repair_proposal_text(
     project: ProjectInfo,
     context: RequestContext,
     handoff_id: str,
+    run_id: str,
+    projects_root: Path,
 ) -> str | None:
+    submitted = await asyncio.to_thread(
+        GraphRepairProposals(projects_root).load,
+        project.project.project_id,
+        run_id,
+        handoff_id,
+    )
+    if submitted is not None:
+        return submitted.model_dump_json()
     path = f"public_data/graph-repairs/{handoff_id}.json"
     try:
         async with asyncio.timeout(8):
@@ -2337,7 +2349,7 @@ async def request_echomind_debug_repair(
         notification_id = handoff.handoff_id
         if body is not None and body.revise_invalid_proposal:
             previous = await _read_repair_proposal_text(
-                request, project, context, handoff.handoff_id
+                request, project, context, handoff.handoff_id, run_id, store.root
             )
             if previous is None or handoff.delivered_at is None:
                 raise RuntimeSchedulerError("No Agent repair proposal to revise.")
@@ -2352,6 +2364,7 @@ async def request_echomind_debug_repair(
                 raise RuntimeSchedulerError("The repair proposal is already valid.")
             digest = sha256(previous.encode()).hexdigest()
             notification_id = f"{handoff.handoff_id}:{digest}"
+        await configure_session(request, conversation_id, ECHOMIND_PRODUCT_PROFILE)
         event = await get_product_runtime(request).request_echomind_debug_repair(
             conversation_id,
             handoff_id=notification_id,

@@ -17,6 +17,7 @@ from pyromind_agent_server.echomind_consolidation_replay import (
     train_reader_fields,
     verify_dataset_replays,
 )
+from pyromind_common.platform.dataset_replay import DatasetReplayPaths
 from pyromind_common.platform.recipe import (
     RECIPE_INPUT,
     RECIPE_OUTPUT,
@@ -94,7 +95,9 @@ def test_image_contract_decodes_media_and_links_to_approved_source(tmp_path: Pat
     assert "symlinks" in _run(source, output, *options).stderr
 
 
-def test_read_only_replay_decodes_bounded_media_without_remote_pillow(tmp_path: Path):
+def test_read_only_replay_decodes_bounded_media_without_remote_pillow(
+    tmp_path: Path, train_reader_probe
+):
     source = tmp_path / "batch"
     source.mkdir()
     output = tmp_path / "run"
@@ -132,9 +135,11 @@ def test_read_only_replay_decodes_bounded_media_without_remote_pillow(tmp_path: 
     remote = subprocess.run(command, capture_output=True, text=True, check=True)
     result = json.loads(remote.stdout)
     assert len(result["deferred_media"]) == 2
-    assert json.loads(_finish_live_verification(remote.stdout)) == json.loads(
-        local.stdout
-    )
+    result["train_reader_probe"] = train_reader_probe.model_dump()
+    assert json.loads(_finish_live_verification(json.dumps(result))) == {
+        **json.loads(local.stdout),
+        "train_reader_probe": train_reader_probe.model_dump(),
+    }
     entry = result["deferred_media"][hashlib.sha256(image.read_bytes()).hexdigest()]
     assert entry["path"] == "batch/sample.png"
     entry["data"] = base64.b64encode(b"invalid").decode()
@@ -163,7 +168,9 @@ def test_read_only_replay_decodes_bounded_media_without_remote_pillow(tmp_path: 
         "sdk_external_command_changed",
     ],
 )
-def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
+def test_text_replay_compiles_only_a_verified_pair(
+    tmp_path: Path, change: str, train_reader_probe
+):
     conversation = "a" * 32
     project = "b" * 32
     evidence = dict(
@@ -272,6 +279,7 @@ def test_text_replay_compiles_only_a_verified_pair(tmp_path: Path, change: str):
         result = _run(source, output, "--read-only", "--approved-source", str(approved))
         assert result.returncode == 0, result.stderr
         checked = json.loads(result.stdout)
+        checked["train_reader_probe"] = train_reader_probe.model_dump()
         if change == "tampered":
             checked["train_rows"] += 1
         if change == "unrelated":
@@ -425,3 +433,30 @@ def test_tracer_directory_reads_media_and_pins_fixed_validation(tmp_path: Path):
     assert "Fixed train-time validation has changed" in (
         _run(batch, output, "--fixed-validation", str(fixed)).stderr
     )
+
+
+@pytest.mark.parametrize("bad_split", ["train", "val", None])
+def test_cpu_reader_checks_every_column_of_both_splits(
+    tmp_path, bad_split, train_reader_probe
+):
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "replay"
+    output.mkdir()
+    _jsonl(source, [{"text": "train"}, {"text": "val"}])
+    for split in ("train", "val"):
+        row = _message(split)
+        if bad_split == split:
+            row["messages"][0]["content"] = [{"type": "text", "value": split}]
+        _jsonl(output / f"{split}_messages.jsonl", [row])
+    paths = DatasetReplayPaths("/source.jsonl", "/source.jsonl", "/replay")
+    result = subprocess.run(
+        paths.verification_command(str(tmp_path)), capture_output=True, text=True
+    )
+    if bad_split:
+        assert result.returncode != 0
+        assert f"reader_probe_schema_{bad_split}" in result.stderr
+    else:
+        result.check_returncode()
+        proof = json.loads(_finish_live_verification(result.stdout))
+        assert proof["train_reader_probe"] == train_reader_probe.model_dump()
+        assert proof["train_rows"] == proof["val_rows"] == 1

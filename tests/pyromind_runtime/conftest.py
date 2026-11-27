@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+from importlib.metadata import version
 
 import pytest
 from aiohttp import ClientSession, ClientTimeout, web
@@ -12,6 +13,7 @@ from aiohttp.test_utils import TestServer
 from harness_adapter.pi_adapter import PiAdapter
 from harness_adapter.pi_adapter.adapter import _PiSession
 from harness_adapter.pi_adapter.persistence import PiSessionFiles
+from pyromind_agent_server.echomind_consolidation import TrainReaderProbe
 from pyromind_common.tools.utils import pyromind_api_client
 from pyromind_common.tools.workflow import task_submission
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
@@ -288,3 +290,12 @@ async def live_user_input_model(monkeypatch):
             yield f"http://127.0.0.1:{port}/v1", requests, results
         finally:
             await runner.cleanup()
+
+
+@pytest.fixture
+def train_reader_probe() -> TrainReaderProbe:
+    return TrainReaderProbe(
+        method="datasets.Dataset.from_list",
+        datasets_version=version("datasets"),
+        pyarrow_version=version("pyarrow"),
+    )

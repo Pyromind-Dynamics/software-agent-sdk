@@ -105,6 +105,10 @@ from pyromind_runtime.domain.echomind_chat import (
 )
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import HarnessEvent
+from pyromind_runtime.domain.graph_repair import (
+    GRAPH_REPAIR_PROPOSAL,
+    GraphRepairRequest,
+)
 from pyromind_runtime.domain.preparation import (
     PREPARATION_REVIEW_TOOLS,
     PREPARATION_TOOLS,
@@ -349,6 +353,9 @@ class PiAdapter:
         self._chat_history: (
             Callable[[str, str, RequestContext], Awaitable[list[JsonObject]]] | None
         ) = None
+        self._graph_repair_handler: (
+            Callable[[str, JsonObject, RequestContext], Awaitable[JsonObject]] | None
+        ) = None
         self._preparation_call: Any = None
         self._preparation_revision: Any = None
         self._preparation_review: (
@@ -508,6 +515,12 @@ class PiAdapter:
         self._chat_history = history
         self._echo_chat_call = callback
 
+    def set_graph_repair_handler(
+        self,
+        callback: Callable[[str, JsonObject, RequestContext], Awaitable[JsonObject]],
+    ) -> None:
+        self._graph_repair_handler = callback
+
     def set_preparation_handler(
         self,
         callback: Any,
@@ -664,6 +677,16 @@ class PiAdapter:
             if self._sdk_context_provider is not None:
                 migrated_tools = migrated_tools | _SDK_DIRECT_SUBMISSION_TOOLS
             specs = [spec for spec in specs if spec["name"] not in migrated_tools]
+        if self._graph_repair_handler is not None and GRAPH_REPAIR_PROPOSAL in (
+            session.config.get("tool_allowlist") or ()
+        ):
+            specs.append(
+                {
+                    "name": GRAPH_REPAIR_PROPOSAL,
+                    "description": GraphRepairRequest.__doc__,
+                    "input_schema": GraphRepairRequest.model_json_schema(),
+                }
+            )
         if self._echo_chat_call is not None:
             specs += [
                 {
@@ -2400,6 +2423,21 @@ class PiAdapter:
             if not isinstance(tool_arguments, dict):
                 raise ValueError("tool arguments must be an object")
             arguments = dict(tool_arguments)
+            if tool_name == GRAPH_REPAIR_PROPOSAL:
+                if self._graph_repair_handler is None or tool_name not in (
+                    session.config.get("tool_allowlist") or ()
+                ):
+                    raise PermissionError("Graph repair is not enabled")
+                result = await self._graph_repair_handler(
+                    session.session_id, arguments, session.context
+                )
+                return {
+                    "content": [
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                    ],
+                    "details": result,
+                    "is_error": result.get("status") == "invalid",
+                }
             if tool_name in CHAT_TOOLS:
                 tool_call_id = params.get("tool_call_id")
                 if self._echo_chat_call is None or not isinstance(tool_call_id, str):

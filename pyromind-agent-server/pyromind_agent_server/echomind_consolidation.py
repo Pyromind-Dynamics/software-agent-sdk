@@ -47,6 +47,7 @@ from pyromind_runtime.application.model_evaluation_plan import (
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.preparation import ProjectView
+from pyromind_runtime.domain.sft_reader import sft_reader
 from pyromind_runtime.domain.storage_paths import normalize_workspace_path
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 
@@ -107,7 +108,16 @@ class ConsolidationStageStatus(BaseModel):
     verification_task_ids: tuple[str, ...] = ()
 
 
+class TrainReaderProbe(BaseModel):
+    method: Literal["datasets.Dataset.from_list"]
+    datasets_version: str = Field(min_length=1, max_length=64)
+    pyarrow_version: str = Field(min_length=1, max_length=64)
+
+
 class ConsolidationDatasetReplay(BaseModel):
+    train_reader_probes: tuple[TrainReaderProbe, TrainReaderProbe] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     batch_label_source: Literal["dataset", "collection"] | None = Field(
         default=None,
         exclude_if=lambda v: v is None,
@@ -617,6 +627,18 @@ def _validate_workflow_render(
         raise ValueError(
             f"Stage {node.id} could not render its workflow bindings."
         ) from exc
+    if (
+        node.type == "train"
+        and (reader := sft_reader(rendered))
+        and reader.field_mapping()
+    ):
+        expected = {"train_data_path": probes["train_dataset"]}
+        if "validation_dataset" in probes:
+            expected["val_data_path"] = probes["validation_dataset"]
+        if reader.paths != expected:
+            raise ValueError(
+                "Train 读取的训练或验证文件与 Dataset 已校验的输出端口不匹配。"
+            )
     rendered_nodes = json.dumps(rendered.get("nodes"))
     for port, uri in probes.items():
         if uri not in rendered_nodes:
@@ -675,6 +697,7 @@ def apply_consolidation(
             or recorded.evidence_sha256 != context.evidence_sha256
             or recorded.proposal != proposal
             or recorded.dataset_replay is None
+            or recorded.dataset_replay.train_reader_probes is None
             or recorded.dataset_replay.dataset_runtime_sha256
             != canonical_sha256(proposal.dataset_runtime)
         ):

@@ -61,11 +61,14 @@ class ConsolidationCompilation(BaseModel):
     ) -> ConsolidationReview:
         if self.evidence_sha256 != context.evidence_sha256:
             raise ValueError("执行方案的研发证据已改变，请重新生成。")
-        if self.proposal is not None and self.dataset_replay is None:
+        if self.proposal is not None and (
+            self.dataset_replay is None
+            or self.dataset_replay.train_reader_probes is None
+        ):
             return ConsolidationReview(
                 context=context,
                 proposal_path=context.proposal_path,
-                issue="历史方案已通过静态校验，请生成并验证换批结果后采用。",
+                issue="历史方案缺少 Train 整行读取验证，请重新生成执行方案后采用。",
                 assets=self.assets,
             )
         proposal = self.proposal
@@ -186,6 +189,9 @@ def build_script_compilation(
         "dataset": [asset.model_dump(mode="json") for asset in source.assets],
         "eval": evaluator.get("assets", {}),
         "train_input_fields": dict(train_fields),
+        "train_development_input": train.get("development_input")
+        if isinstance(train, dict)
+        else None,
     }
     problems = {
         "dataset": "缺少已验证的 Dataset 运行配方。",

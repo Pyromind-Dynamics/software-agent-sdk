@@ -1,12 +1,15 @@
 import pytest
 
+from pyromind_agent_server.echomind_consolidation import _validate_workflow_render
 from pyromind_agent_server.echomind_consolidation_references import (
     _train_runtime_candidate,
 )
+from pyromind_agent_server.echomind_projects import ProjectNode
 from pyromind_agent_server.echomind_train_runtime import (
     TrainWorkflowSpec,
     prepare_workflow_for_submission,
 )
+from pyromind_runtime.domain.sft_reader import archived_sft_input
 
 
 @pytest.fixture
@@ -117,3 +120,67 @@ def test_text_dataset_with_direct_train_path(vision_train):
         "nodes[3].data.config.model_path",
         "nodes[9].data.config.model_path",
     }
+
+
+def test_successful_reader_records_the_bound_file_and_fields(vision_train):
+    data, join, vision = vision_train["nodes"][:3]
+    data["data"]["config"] = {"val_data_path": "/workspace/固定验证/val.jsonl"}
+    join["data"]["config"]["subpath"] = "/train_sft_messages.jsonl"
+    mapping = {
+        "image_field": "images",
+        "user_prompt_field": "user_prompt",
+        "assistant_response_field": "gt",
+    }
+    vision["data"]["config"] = mapping
+    assert archived_sft_input(vision_train) == {
+        "reader": "DatasetConfigBuilderVisionNode",
+        "reader_version": None,
+        "paths": {
+            "train_data_path": "/workspace/old/train_sft_messages.jsonl",
+            "val_data_path": "/workspace/固定验证/val.jsonl",
+        },
+        "fields": mapping,
+    }
+    vision["data"]["version"] = "1.7.4"
+    reference = archived_sft_input(vision_train)
+    assert reference and reference["reader_version"] == "1.7.4"
+
+    vision_train["edges"].append(dict(vision_train["edges"][0]))
+    assert archived_sft_input(vision_train) is None
+
+
+def test_rendered_train_cannot_swap_verified_splits(vision_train):
+    data, _, vision = vision_train["nodes"][:3]
+    data["data"]["config"]["val_data_path"] = "/workspace/old/val"
+    vision["data"]["config"].update(
+        user_prompt_field="user_prompt", assistant_response_field="gt"
+    )
+    recipe = _train_runtime_candidate(vision_train, "a" * 32, "21")
+    assert recipe
+    node = ProjectNode.model_validate(
+        {
+            "id": "train",
+            "type": "train",
+            "title": "Train",
+            "inputs": {
+                key: {
+                    "artifact_type": "dataset",
+                    "schema_ref": "v1",
+                    "binding": {"kind": "run_input", "name": key},
+                }
+                for key in ("train_dataset", "validation_dataset", "base_model")
+            },
+        }
+    )
+    _validate_workflow_render(node, config=recipe, inputs=node.inputs)
+    bindings = recipe["workflow_bindings"]
+    assert isinstance(bindings, dict)
+    for key, role in list(bindings.items()):
+        if role in ("train_dataset", "validation_dataset"):
+            bindings[key] = (
+                "train_dataset"
+                if role == "validation_dataset"
+                else "validation_dataset"
+            )
+    with pytest.raises(ValueError, match="输出端口不匹配"):
+        _validate_workflow_render(node, config=recipe, inputs=node.inputs)

@@ -10,7 +10,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    JsonValue,
     ValidationError,
     model_validator,
 )
@@ -47,6 +46,10 @@ from pyromind_agent_server.echomind_storage import (
 from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeError,
     render_workflow_template,
+)
+from pyromind_runtime.domain.graph_repair import (
+    GraphRepairDraft,
+    RuntimeGraphRepairChanges,
 )
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
@@ -719,35 +722,30 @@ class ProjectPublicationService:
             source = self.publication_store.load(
                 project_id=project_id, release_id=release_id
             )
-            if (
-                project.project.lifecycle != "development"
-                or source.publication_mode != "debug"
-            ):
-                raise ProjectLifecycleError(
-                    "Graph repair requires a development debug run"
-                )
-            repaired = proposal.repaired_node(source)
-            working = ProjectInfo(
-                project=project.project,
-                graph=project.graph.model_copy(
-                    update={
-                        "nodes": [
-                            repaired if item.id == repaired.id else item
-                            for item in source.nodes
-                        ],
-                        "edges": source.edges,
-                    }
-                ),
-            )
-            draft = compile_working_graph(
-                working,
-                publication_mode="debug",
-                require_production_executors=True,
-                adopted_debug_run=source.adopted_debug_run,
-            )
+            draft = self.preview_repair_debug(project, source, proposal)
             return self.publication_store.save(
                 self._get_or_build_snapshot(draft, published_by=reviewed_by)
             )
+
+    def preview_repair_debug(
+        self,
+        project: ProjectInfo,
+        source: PublishedGraph,
+        proposal: RuntimeGraphRepairProposal,
+    ) -> PublishedGraphDraft:
+        if (
+            project.project.lifecycle != "development"
+            or source.publication_mode != "debug"
+        ):
+            raise ProjectLifecycleError("Graph repair requires a development debug run")
+        repaired = proposal.repaired_node(source)
+        return self._compile_execution(
+            project,
+            [repaired if node.id == repaired.id else node for node in source.nodes],
+            source.edges,
+            "debug",
+            source.adopted_debug_run,
+        )
 
     def publish(
         self,
@@ -988,25 +986,7 @@ class PublicationValidationError(ValueError):
         )
 
 
-class RuntimeGraphRepairChanges(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    command_template: str | None = Field(default=None, min_length=1, max_length=20000)
-    workflow_bindings: dict[str, str] | None = None
-    workflow_templates: dict[str, str] | None = None
-    workflow_parameter_updates: dict[str, dict[str, JsonValue]] = Field(
-        default_factory=dict
-    )
-
-
-class RuntimeGraphRepairProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    release_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    node_id: str = Field(min_length=1, max_length=128)
-    reason: str = Field(min_length=1, max_length=2000)
-    runtime_config: RuntimeGraphRepairChanges
-
+class RuntimeGraphRepairProposal(GraphRepairDraft):
     @property
     def content_sha256(self) -> str:
         return canonical_sha256(self.model_dump(mode="json"))

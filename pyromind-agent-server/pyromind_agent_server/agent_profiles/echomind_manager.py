@@ -9,6 +9,7 @@ ECHOMIND_MANAGER_DEVELOPMENT_TOOLS = (
     "ask_user",
     "get_storage_url",
     "propose_runtime_resources",
+    "graph_repair_proposal",
     "get_project_reward",
     "df_submit_evaluation",
     "df_submit_pipeline",
@@ -63,6 +64,13 @@ Use the same reviewed preparation, labeling and
 export scripts for Dataset replay. For Train, verify the selected checkpoint or
 merged model and pass its path into the authorized Eval task. Use existing Eval
 predictions when assembling a report.
+For Graph Debug repairs, including follow-up user requests, first use
+graph_repair_proposal(action="inspect") to recover the original failure handoff.
+Inspect the failed reader and its actual inputs. Verify a concrete repair,
+then submit it through graph_repair_proposal and address validation errors.
+Report the reviewable receipt or an evidence-backed blocker. A workspace file,
+Dataset receipt or diagnostic report alone does not register a proposal.
+Leave adoption and reruns to the user.
 After adoption of a verified execution plan, use propose_runtime_resources
 when asked to prepare Inference and Tracer. The user reviews and confirms the
 proposal in the Project workbench.

@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -17,6 +18,7 @@ from pyromind_agent_server.api.echomind_projects import router
 from pyromind_agent_server.config import Config
 from pyromind_agent_server.echomind_graph_runs import (
     ActiveGraphRunExistsError,
+    GraphRunRepairHandoff,
     GraphRunStore,
     RuntimeFailure,
     TaskRun,
@@ -49,6 +51,7 @@ from pyromind_agent_server.echomind_publication import (
     build_runtime_contract_draft,
     compile_working_graph,
 )
+from pyromind_agent_server.echomind_repair_proposals import GraphRepairProposals
 from pyromind_agent_server.echomind_resource_proposals import prepare_runtime_resources
 from pyromind_agent_server.echomind_runtime_contracts import (
     ContractProbeRuntimeExecutor,
@@ -72,6 +75,8 @@ from pyromind_agent_server.echomind_runtime_slots import (
 from pyromind_agent_server.echomind_stage_executors import StageArtifactPayload
 from pyromind_agent_server.echomind_storage import project_directory
 from pyromind_agent_server.service_context import ProductServiceContext
+from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
 from pyromind_runtime.domain.experiment_plans import PlanRevision, WorkflowPlan
 
@@ -468,6 +473,114 @@ def test_graph_repair_changes_only_the_selected_stage(tmp_path: Path) -> None:
         == previous
     )
     assert store.load(source.project.project_id, owner_user_id="42") == source
+
+
+async def test_graph_repair_submission_validates_against_the_original_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, project = _golden_shape_project(tmp_path)
+    recipe = store.save(_runtime_validation_project(project))
+    service = GraphRepairProposals(store.root)
+    draft = build_runtime_contract_draft(project, validation_project=recipe)
+    snapshot = service.publication.prepare_debug(
+        project=project,
+        reviewed_by="42",
+        expected_contract_sha256=draft.content_sha256,
+        validation_project_id=recipe.project.project_id,
+    )
+    project_id = project.project.project_id
+    context = RequestContext(user_id="42", x_cluster=project.project.cluster)
+    runs = GraphRunStore(store.root)
+    run = runs.create(
+        project_id=project_id,
+        release_id=snapshot.release_id,
+        release_digest=snapshot.content_sha256,
+        request_id="test-repair",
+        trigger="manual",
+        execution_mode="debug",
+        inputs={},
+    )
+    failure = RuntimeFailure(category="external", message="Downstream reader failed")
+    handoff = GraphRunRepairHandoff(
+        handoff_id=str(uuid4()),
+        project_id=project_id,
+        run_id=run.run_id,
+        release_id=run.release_id,
+        release_digest=run.release_digest,
+        stage_run_id=str(uuid4()),
+        node_id="train",
+        attempt=1,
+        failure=failure,
+        delivered_at=datetime.now(UTC),
+    )
+    paused = runs.save(
+        run.model_copy(
+            update={
+                "status": "paused",
+                "started_at": datetime.now(UTC),
+                "failure": failure,
+                "current_stage_ids": [handoff.stage_run_id],
+                "repair_handoffs": [handoff],
+            }
+        )
+    )
+    submit = partial(
+        service.submit,
+        conversation_id=project.project.conversation_id,
+        project_id=project_id,
+        handoff_id=handoff.handoff_id,
+        run_id=run.run_id,
+        context=context,
+    )
+    payload: JsonObject = {
+        "release_digest": run.release_digest,
+        "node_id": "eval",
+        "reason": "Verified asset directory",
+        "runtime_config": {
+            "workflow_parameter_updates": {"1": {"source": "/new-report-assets"}}
+        },
+    }
+    with pytest.raises(PermissionError):
+        submit(context=RequestContext(user_id="other"), proposal=payload)
+    with pytest.raises(PermissionError, match="original"):
+        submit(conversation_id="other", proposal=payload)
+    with pytest.raises(ProjectLifecycleError, match="handoff"):
+        submit(handoff_id=str(uuid4()), proposal=payload)
+    for rejected in (
+        {"facts": {}, "root_cause": "a report"},
+        {**payload, "reason": "Callback Authorization: Bearer test-session-token"},
+        {
+            **payload,
+            "reason": "Review https://storage.example/report?X-Amz-Signature=test",
+        },
+        {
+            **payload,
+            "runtime_config": {
+                "workflow_parameter_updates": {"1": {"Authorization": "sensitive"}}
+            },
+        },
+        {**payload, "release_digest": "sha256:" + "f" * 64},
+        {**payload, "runtime_config": {}},
+    ):
+        with pytest.raises(ValueError):
+            submit(proposal=rejected)
+    assert service.load(project_id, run.run_id, handoff.handoff_id) is None
+    expected = RuntimeGraphRepairProposal.model_validate(payload)
+    runtime = Mock(
+        read_persisted_workspace_text=AsyncMock(return_value=expected.model_dump_json())
+    )
+    monkeypatch.setattr(project_api, "get_product_runtime", lambda _: runtime)
+    read_args = (Mock(), project, paused, context, store.root)
+    assert await project_api._read_graph_repair_proposal(*read_args) == expected
+    assert runtime.read_persisted_workspace_text.await_count == 1
+    receipt = submit(proposal=payload)
+    assert submit(proposal=payload) == receipt
+    assert receipt["status"] == "reviewable"
+    assert receipt["proposal_sha256"] == expected.content_sha256
+    assert await project_api._read_graph_repair_proposal(*read_args) == expected
+    assert runtime.read_persisted_workspace_text.await_count == 1
+    assert runs.list(project_id) == [paused]
+    assert store.load(project_id, owner_user_id="42") == project
 
 
 def test_debug_draft_snapshots_do_not_activate_or_mutate_project(

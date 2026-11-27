@@ -106,7 +106,7 @@ def test_recorded_replay_restricts_paths_and_checks_file_identity(monkeypatch):
 
 @pytest.mark.parametrize("entry", ["compile", "generate"])
 async def test_replay_reader_reaches_each_workbench_compiler(
-    entry, tmp_path, monkeypatch
+    entry, tmp_path, monkeypatch, train_reader_probe
 ):
     ctx = RequestContext(user_id="a", x_cluster="east")
     reader = Mock(spec=DatasetReplayReader)
@@ -164,6 +164,7 @@ async def test_replay_reader_reaches_each_workbench_compiler(
             "train_rows": 2,
             "val_rows": 0,
             "approved_source_member": True,
+            "train_reader_probe": train_reader_probe.model_dump(),
         }
     )
     reader.verify_splits.return_value = (0, approved, "")

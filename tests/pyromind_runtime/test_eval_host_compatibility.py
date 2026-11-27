@@ -33,6 +33,7 @@ async def test_main_host_creates_through_api_and_executes_tools_directly(
     adapter.set_version_handler(runtime.version_call, AsyncMock())
     adapter.set_workflow_preparer(runtime.prepare_workflow_execution)
     adapter.set_runtime_resource_proposer(AsyncMock())
+    adapter.set_graph_repair_handler(runtime.graph_repair_proposal)
     adapter.set_project_reward_reader(runtime.project_reward)
     app = _app(tmp_path, runtime)
     app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))

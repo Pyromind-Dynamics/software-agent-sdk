@@ -580,6 +580,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "df_submit_evaluation",
         "request_experiment_task",
         "propose_runtime_resources",
+        "graph_repair_proposal",
     }.intersection(tools)
     assert set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()) == {
         "read",
@@ -589,6 +590,7 @@ def test_preparation_policy_is_trusted_profile_configuration():
         "ask_user",
         "get_storage_url",
         "propose_runtime_resources",
+        "graph_repair_proposal",
         "get_project_reward",
         "df_submit_evaluation",
         "df_submit_pipeline",
