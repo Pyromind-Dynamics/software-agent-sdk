@@ -368,7 +368,9 @@ class SnapshotProjector:
             and event.task_id
             and (
                 snapshot.task_origins
-                or event.task_id.startswith(("project-start:", "project-continue:"))
+                or event.task_id.startswith(
+                    ("project-start:", "project-continue:", "report-handoff:")
+                )
             )
         ):
             snapshot = snapshot.model_copy(

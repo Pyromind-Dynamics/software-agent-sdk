@@ -48,34 +48,13 @@ For workflows with several training stages, the current taskId-based analysis ma
 
 ## Project report delivery
 
-Use [export_plan_report.py](scripts/export_plan_report.py) to write the versioned
-primary report. Custom analysis scripts write intermediate JSON or JSONL results
-for the exporter. Create the mapping from the actual
-fields of the evaluated artifact. For example, a mapping can contain
-`{"metrics":[{"label":"result_accuracy","unit":"ratio","path":["metrics","accuracy"]}]}`.
-A path is a list of object keys and zero-based array indexes. For JSONL, the
-first index selects a row. Optional `summary`, `findings`, `badcases`, `files`,
-`checks` and `source` mappings point to matching source fields. For a platform
-report, pass one `--platform-task-id` for each verified task in the approved
-attempt. For Train with separate SFT and LoRA merge tasks, pass both IDs. The
-exporter writes `{"source":{"platform_task_ids":["1398","1400"]}}` for multiple
-tasks and `{"source":{"platform_task_id":"1398"}}` for one. It validates ID
-values and rejects source IDs outside the supplied set. An Init attribution
-report needs a summary or findings. Baseline, Train and Eval result reports
-need a metrics array with finite numeric values. Dataset reports need a
-nonempty files array and use boolean values for optional checks. Retain
-existing Markdown, HTML and per-sample outputs for detailed inspection.
-
-For a two-task report, run this from the skill directory with the actual
-result, mapping, target paths and verified IDs:
-
-```sh
-python3 scripts/export_plan_report.py result.json report_mapping.json \
-  --platform-task-id 1398 --platform-task-id 1400 > report.json
-```
-
-Check the verified Storage paths with `product_versions`, action
-`deliver_plan_outputs`, and `validate_only=true` before recording completion in
-`workflowPLAN.json` or submitting the same outputs for registration. Wait for
-`report_state=ready` and `report_version_id`
-before reporting a formal delivery.
+For EchoMind Projects, hand off the execution evidence in workflowPLAN.json.
+Record the exact plan task and attempt, platform task IDs, verified non-report
+output paths, and evidence_paths containing absolute /workspace paths to actual
+raw results. For training include the metrics and checkpoint, for evaluation
+include the scoring output and predictions. Mark local execution completed
+when evidence is available. Runtime starts the stage report agent to analyze,
+validate and deliver the declared report and artifacts. A ready report version
+is the delivery receipt. Continue approved execution using verified raw inputs while the
+report agent works. For analysis-only tasks, list existing files as evidence and leave
+completion to Runtime. Runtime requires the validated report receipt for that task and attempt.

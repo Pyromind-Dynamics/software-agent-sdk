@@ -9,13 +9,20 @@ from pyromind_runtime.application.echomind_chat import completed_chat_turns
 from pyromind_runtime.application.echomind_notices import (
     visible_chat_event,
 )
-from pyromind_runtime.application.plan_execution import PLAN_PATH, next_approved_task
+from pyromind_runtime.application.plan_execution import (
+    PLAN_PATH,
+    independent_plan_steps,
+    next_approved_task,
+    plan_executions,
+)
 from pyromind_runtime.application.preparation import Preparations
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.commands import CreateProjectCommand, UserMessageCommand
 from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.echomind_chat import CHAT_PROFILE
 from pyromind_runtime.domain.events import HarnessEvent, ProductEvent, ProductEventType
+from pyromind_runtime.domain.experiment_plans import ExperimentContext
 from pyromind_runtime.domain.preparation import ProjectView, SetPreparationPlan
 from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
@@ -83,6 +90,108 @@ def local_completion():
         "business_status": "completed",
         "verified_outputs": {"samples": "/workspace/prepared.jsonl"},
     }
+
+
+@pytest.mark.parametrize("delivery", ["registering", "registration_failed", "ready"])
+def test_independent_analysis_and_execution_use_declared_inputs(delivery):
+    definition = plan_request().plan.model_dump(mode="json")
+    first, next_task = definition["tasks"]
+    first["outputs"].append({"name": "report", "kind": "report"})
+    analysis = {
+        **next_task,
+        "inputs": [dict(item) for item in next_task["inputs"]],
+        "kind": "analysis",
+        "id": "diagnosis",
+        "outputs": [{"name": "diagnosis", "kind": "report"}],
+    }
+    definition["tasks"] = [first, analysis, next_task]
+    project = ProjectView(
+        project_id="project",
+        conversation_id="session",
+        plan_sequence=1,
+        creation_command_id="create",
+        plan=ExperimentContext.model_validate(definition),
+    )
+    data = next(plan_executions(project, [local_completion()])).model_copy(
+        update={
+            "execution_outputs": {"samples": "/workspace/prepared.jsonl"},
+            "delivery_outputs": {"report": "/workspace/report.json"},
+            "report_state": delivery,
+            "artifacts": ({"artifact_id": "v1"},) if delivery == "ready" else (),
+        }
+    )
+    snapshot = ConversationSnapshot(
+        conversation_id="session",
+        capabilities=HarnessCapabilities(),
+        experiment_executions=(data,),
+    )
+
+    def eligible(rows):
+        return [t.id for t, _, _ in independent_plan_steps(project, snapshot, rows)]
+
+    assert eligible([]) == ["diagnosis", "baseline"]
+    completed = {
+        "id": "diagnosis",
+        "stage_id": analysis["stage_id"],
+        "business_status": "completed",
+    }
+    row = {**completed, "attempt": 2, "report_version_id": "v1"}
+    steps = list(independent_plan_steps(project, snapshot, [row]))
+    diagnosis = steps[0][2]
+    assert (
+        diagnosis and diagnosis.task_id == "diagnosis" and diagnosis.plan_attempt == 2
+    )
+    assert diagnosis.state == "queued" and not diagnosis.registered_report_ids
+    assert eligible([row, {"id": "baseline", "business_status": "completed"}]) == [
+        "diagnosis"
+    ]
+    assert eligible([{**row, "attempt": 0}]) == ["baseline"]
+    issued = diagnosis.model_copy(
+        update={
+            "state": "succeeded",
+            "report_state": "ready",
+            "artifacts": ({"artifact_id": "v2"},),
+        }
+    )
+    settled = snapshot.model_copy(update={"experiment_executions": (data, issued)})
+    for attempt in (1, 2):
+        assert [
+            t.id
+            for t, _, _ in independent_plan_steps(
+                project, settled, [{**row, "attempt": attempt}]
+            )
+        ] == ["baseline"]
+    blocked = {
+        "id": "baseline",
+        "business_status": "ready_blocked",
+        "blocked_by": ["data"],
+    }
+    assert eligible([blocked]) == (
+        ["diagnosis", "baseline"] if delivery == "ready" else ["diagnosis"]
+    )
+    assert eligible([{**blocked, "blocked_by": ["missing"]}]) == ["diagnosis"]
+    assert eligible([{**blocked, "platform_task_id": "existing"}]) == ["diagnosis"]
+    assert eligible([{"id": "baseline", "business_status": "blocked"}]) == ["diagnosis"]
+    next_task["inputs"][0]["output_name"] = "report"
+    project = ProjectView.model_validate({**project.model_dump(), "plan": definition})
+    assert eligible([]) == (
+        ["diagnosis", "baseline"] if delivery == "ready" else ["diagnosis"]
+    )
+    snapshot = snapshot.model_copy(
+        update={
+            "experiment_executions": (
+                data,
+                data.model_copy(
+                    update={
+                        "plan_attempt": 2,
+                        "state": "failed",
+                        "report_state": "not_started",
+                    }
+                ),
+            )
+        }
+    )
+    assert eligible([]) == []
 
 
 def test_approved_continuation_requires_proven_local_outputs():
@@ -857,6 +966,25 @@ async def test_manager_execution_never_writes_chat_or_replays_old_notices(
                 },
             )
         )
+        for message_id, notice in (
+            ("report-delivery:v1", {"action": "report", "public_copy": True}),
+            ("chat-reply", None),
+        ):
+            chat_store.append(
+                ProductEvent(
+                    conversation_id=chat.conversation_id,
+                    event_id=f"execution-notice:{message_id}"
+                    if notice
+                    else "chat-reply",
+                    type="message.completed",
+                    payload={
+                        "message_id": message_id,
+                        "role": "assistant",
+                        "content": blocks,
+                        **({"execution_notice": notice} if notice else {}),
+                    },
+                )
+            )
         chat_events = chat_store.replay()
         for snapshot in (
             await runtime.echomind_chat.snapshot(cid, context),
@@ -865,17 +993,14 @@ async def test_manager_execution_never_writes_chat_or_replays_old_notices(
             assert snapshot
             assert [
                 m.item_id for m in snapshot.timeline if isinstance(m, TimelineMessage)
-            ] == ["legacy"]
+            ] == ["chat-reply"]
         assert chat_store.replay() == chat_events
-        assert [
-            event.payload.get("message_id")
-            for event in chat_events
-            if event.type.startswith("message.")
-        ] == ["legacy"]
-        legacy = chat_events[-1]
-        replay = visible_chat_event(legacy)
-        assert replay.seq == legacy.seq and replay.type == "chat.notification.skipped"
-        assert not replay.payload
+        for event in chat_events:
+            if event.payload.get("execution_notice"):
+                replay = visible_chat_event(event)
+                assert replay.seq == event.seq
+                assert replay.type == "chat.notification.skipped" and not replay.payload
+        assert visible_chat_event(chat_events[-1]) == chat_events[-1]
     finally:
         await runtime.close()
 

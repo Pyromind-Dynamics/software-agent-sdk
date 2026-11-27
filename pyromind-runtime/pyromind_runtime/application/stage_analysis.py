@@ -105,7 +105,12 @@ def ready_stage_analyses(
     }
     versions_by_path: dict[str, list[ArtifactVersion]] = {}
     for item in versions.values():
-        path = _storage_path(item.manifest.source.storage_ref)
+        source = item.manifest.source.storage_ref
+        # A registered /workspace/public_data output is stored without /workspace.
+        # Only restore the prefix for trusted manifests, not for plan input.
+        if source and source.startswith("/public_data/"):
+            source = "/workspace" + source
+        path = _storage_path(source)
         if path is not None:
             versions_by_path.setdefault(path, []).append(item)
     producers = {run.id: run.source.task_id for run in producer_runs}

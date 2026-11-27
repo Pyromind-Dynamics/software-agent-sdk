@@ -138,6 +138,7 @@ class ObservationNode(ContractModel):
     title: str
     type: str
     business_status: str
+    execution_complete: bool = Field(default=False, exclude_if=lambda value: not value)
     delivery_status: Literal["pending", "registering", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

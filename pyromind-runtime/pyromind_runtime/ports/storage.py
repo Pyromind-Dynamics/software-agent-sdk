@@ -80,3 +80,10 @@ class DeletableEvaluationStorage(Protocol):
     """Optional garbage-collection capability of a storage implementation."""
 
     def delete(self, path: str) -> None: ...
+
+
+@runtime_checkable
+class EvidenceRangeReader(Protocol):
+    def read_evidence_range(self, path: str, offset: int, size: int) -> bytes:
+        """Read at most size bytes from an execution artifact, starting at offset."""
+        ...

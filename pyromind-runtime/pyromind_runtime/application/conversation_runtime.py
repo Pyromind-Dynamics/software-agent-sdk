@@ -8,7 +8,7 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,7 +17,10 @@ from uuid import uuid4
 
 from pyromind_runtime.application.echomind_chat import EchoMindChat
 from pyromind_runtime.application.echomind_notices import (
+    REPORT_HANDOFF_PREFIX,
     latest_origin,
+    ready_report_messages,
+    report_handoff_instruction,
     visible_chat_event,
     visible_chat_snapshot,
 )
@@ -66,6 +69,7 @@ from pyromind_runtime.application.plan_execution import (
     completed_callback_task,
     completed_plan_write,
     delivery_rows,
+    independent_plan_steps,
     model_evaluation_retry,
     next_approved_task,
     plan_delivery_source,
@@ -83,11 +87,14 @@ from pyromind_runtime.application.preparation import (
     Preparations,
 )
 from pyromind_runtime.application.project_observations import (
+    attribution_task_source,
     baseline_evaluation_metrics,
     observation_analysis_report,
     observation_report_details,
     project_observations,
+    summary_only_attribution,
 )
+from pyromind_runtime.application.report_agent import prepare_report_outputs
 from pyromind_runtime.application.reusable_workflows import (
     ReusableWorkflows,
     started_run,
@@ -114,6 +121,7 @@ from pyromind_runtime.application.sdk_workflow_archive import (
 )
 from pyromind_runtime.application.snapshot_projector import project_stage_activity
 from pyromind_runtime.application.stage_analysis import (
+    ROLES,
     existing_stage_analysis,
     ready_stage_analyses,
     save_stage_analysis,
@@ -211,6 +219,7 @@ from pyromind_runtime.domain.snapshot import (
     ConversationSnapshot,
     ConversationSummary,
     ExternalTaskState,
+    SubagentActivity,
     TimelineMessage,
     TimelineNotice,
     TimelineOperation,
@@ -269,6 +278,7 @@ from pyromind_runtime.ports.harness import (
     OperationActivityReader,
     PersistedWorkspaceReader,
     ProductCheckpoint,
+    ProjectReportAgent,
     ProjectStageAnalyzer,
     RestoreWorkflowSpec,
     SessionHandle,
@@ -484,6 +494,7 @@ class ConversationRuntime:
         self._read_recoveries: dict[str, asyncio.Task[None]] = {}
         self._version_recovery_completed: set[str] = set()
         self._plan_recovery_checks: dict[str, tuple[int, float]] = {}
+        self._active_subagents: dict[str, dict[str, SubagentActivity]] = {}
         self._stage_analysis_workers: dict[str, asyncio.Task[None]] = {}
         self._stage_analysis_rechecks: dict[str, asyncio.Task[None]] = {}
         self._stage_analysis_recovered: set[str] = set()
@@ -1280,8 +1291,8 @@ class ConversationRuntime:
                     "public_data/workflowPLAN.json. "
                     f"{action} within the approved scope. "
                     "Record runtime status per plan task ID in workflowPLAN.json. "
-                    "Store verified_outputs as a mapping from each exact declared "
-                    "output name to its verified absolute workspace path. "
+                    "Hand off verified non-report outputs and raw evidence_paths "
+                    "for the report agent. "
                     "Reuse existing submissions on recovery.\n"
                     + json.dumps(data, ensure_ascii=False),
                     origin_turn_id=latest_origin(snapshot),
@@ -1437,25 +1448,38 @@ class ConversationRuntime:
             default=None,
         )
 
-    def _undelivered_baseline_reports(
-        self, snapshot: ConversationSnapshot, project: ProjectView
+    def _submission_prerequisites(
+        self,
+        snapshot: ConversationSnapshot,
+        project: ProjectView,
+        consumer: ExperimentTask,
     ) -> list[str]:
         baseline_stages = {
             stage.id
             for stage in project.plan.stages
             if stage.kind == "init" and stage.enabled and not stage.placeholder
         }
-        return [
-            task.id
-            for task in project.plan.tasks
-            if task.stage_id in baseline_stages
-            and task.report_output is not None
-            and (
-                (run := self._plan_attempt(snapshot, project, task.id)) is None
-                or run.state != "succeeded"
-                or not run.registered_report_ids
-            )
-        ]
+        stages = {stage.id: stage.kind for stage in project.plan.stages}
+        report_inputs = {
+            (i.task_id, i.output_name) for i in consumer.inputs if i.task_id
+        }
+        blockers = []
+        for task in project.plan.tasks:
+            run = self._plan_attempt(snapshot, project, task.id)
+            if (
+                task.report_output
+                and (task.id, task.report_output.name) in report_inputs
+                and (not run or not run.registered_report_ids)
+            ):
+                blockers.append(task.id)
+            elif (
+                stages.get(consumer.stage_id) == "train"
+                and task.stage_id in baseline_stages
+                and task.kind != "analysis"
+                and (not run or run.state != "succeeded")
+            ):
+                blockers.append(task.id)
+        return blockers
 
     def _ensure_plan_attempt(
         self,
@@ -1507,6 +1531,7 @@ class ConversationRuntime:
             if kind not in {
                 "project_start",
                 "project_continue",
+                "report_handoff",
                 "requirement",
                 "preparation_review",
             }:
@@ -1514,7 +1539,17 @@ class ConversationRuntime:
             task_id = str(item["task_id"])
             command_id = task_id.removeprefix("requirement:")
             instruction = str(item["instruction"])
-            if kind == "preparation_review":
+            if kind == "report_handoff":
+                instruction = await self._report_handoff_instruction(
+                    snapshot.conversation_id,
+                    task_id.removeprefix(REPORT_HANDOFF_PREFIX),
+                    instruction,
+                    active.context,
+                )
+                if instruction is None:
+                    self._mark_task_dispatched(store, snapshot.conversation_id, task_id)
+                    continue
+            elif kind == "preparation_review":
                 view = await self.get_preparation(
                     snapshot.conversation_id, active.context
                 )
@@ -1568,6 +1603,15 @@ class ConversationRuntime:
                     )
                 if attempt is None:
                     return
+                # A running Main turn may have picked this step up after it was
+                # queued. Consume the stale notification without submitting twice.
+                if (
+                    attempt.platform_task_id
+                    or attempt.platform_task_ids
+                    or attempt.state != "queued"
+                ):
+                    self._mark_task_dispatched(store, snapshot.conversation_id, task_id)
+                    continue
                 correlation = TaskCorrelation(
                     conversation_id=snapshot.conversation_id,
                     task_kind="project_continue",
@@ -1726,7 +1770,6 @@ class ConversationRuntime:
         snapshot = store.load_snapshot()
         if project is not None:
             stages = {stage.id: stage for stage in project.plan.stages}
-            baseline_blockers = self._undelivered_baseline_reports(snapshot, project)
             pending = [
                 task
                 for task in snapshot.external_tasks
@@ -1762,7 +1805,7 @@ class ConversationRuntime:
                         and external.correlation.execution == execution
                     )
                 ]
-                blocked_by = baseline_blockers if stage.kind == "train" else []
+                blocked_by = self._submission_prerequisites(snapshot, project, task)
                 contexts: JsonObject = {}
                 if not blocked_by and not waiting_for:
                     contexts.update(out_ids(execution))
@@ -1940,13 +1983,12 @@ class ConversationRuntime:
                             )
                         validate_evaluation_inputs(project, task, rows, *saved_paths)
                     return previous.platform_task_id
-            if (run.stage_snapshot or {}).get("kind") == "train":
-                blockers = self._undelivered_baseline_reports(snapshot, project)
-                if blockers:
-                    raise ValueError(
-                        "Training requires registered Baseline reports: "
-                        + ", ".join(blockers)
-                    )
+            blockers = self._submission_prerequisites(snapshot, project, task)
+            if blockers:
+                raise ValueError(
+                    "Unfinished execution or required report input: "
+                    + ", ".join(blockers)
+                )
         self._record_execution(
             store, run.model_copy(update={"platform_task_id": platform_task_id})
         )
@@ -1971,6 +2013,18 @@ class ConversationRuntime:
         if previous and previous.platform_task_ids and not run.platform_task_ids:
             run = run.model_copy(
                 update={"platform_task_ids": previous.platform_task_ids}
+            )
+        if previous and previous.execution_outputs and not run.execution_outputs:
+            run = run.model_copy(
+                update={"execution_outputs": previous.execution_outputs}
+            )
+        if previous and previous.report_evidence_key and not run.report_evidence_key:
+            run = run.model_copy(
+                update={"report_evidence_key": previous.report_evidence_key}
+            )
+        if previous and previous.report_input_paths and not run.report_input_paths:
+            run = run.model_copy(
+                update={"report_input_paths": previous.report_input_paths}
             )
         if previous and previous.delivery_requests:
             run = run.model_copy(
@@ -2041,12 +2095,63 @@ class ConversationRuntime:
                     )
                 except (ProductRuntimeError, OSError):
                     text = None
-                rows = (
-                    read_plan_tasks(text, project)
-                    if text
-                    else recover_plan_delivery_rows(snapshot, project)
-                )
+                try:
+                    rows = read_plan_tasks(text, project) if text else []
+                except (ValueError, TypeError):
+                    rows = []
+                    text = None
+                if not text and self._observation_storage_factory:
+                    # Older Main Agents mirrored the ledger into shared Storage.
+                    # Accept it only when it explicitly identifies this project.
+                    try:
+                        storage = self._observation_storage_factory(active.context)
+                        mirror = await asyncio.to_thread(
+                            storage.read, "/public_data/workflowPLAN.json"
+                        )
+                        document = json.loads(mirror)
+                        metadata = document.get("runtime") or document
+                        if (
+                            metadata.get("project_id") == project.project_id
+                            and metadata.get("plan_sequence", project.plan_sequence)
+                            == project.plan_sequence
+                            and type(project.plan).model_validate(document["plan"])
+                            == project.plan
+                        ):
+                            rows = read_plan_tasks(mirror.decode(), project)
+                            text = mirror.decode()
+                    except (
+                        ValueError,
+                        TypeError,
+                        AttributeError,
+                        KeyError,
+                        OSError,
+                        EvaluationStorageUnavailableError,
+                        EvaluationStorageMissingError,
+                    ):
+                        pass
+                if not text:
+                    rows = recover_plan_delivery_rows(snapshot, project)
                 registered = snapshot.experiment_executions or ()
+                # A terminal callback can beat the Main Agent's first ledger write.
+                if isinstance(active.adapter, ProjectReportAgent):
+                    recorded = {row.get("id") for row in rows if isinstance(row, dict)}
+                    for task in project.plan.tasks:
+                        bound = self._plan_attempt(snapshot, project, task.id)
+                        if (
+                            task.id not in recorded
+                            and bound
+                            and bound.platform_task_id
+                            and bound.state
+                            not in {"failed", "cancelled", "needs_input"}
+                        ):
+                            rows.append(
+                                {
+                                    "id": task.id,
+                                    "stage_id": task.stage_id,
+                                    "attempt": bound.plan_attempt or 1,
+                                    "business_status": "in_progress",
+                                }
+                            )
                 rows = delivery_rows(project, rows, registered)
                 if not text and not rows:
                     if self.versions and self._observation_storage_factory:
@@ -2117,6 +2222,22 @@ class ConversationRuntime:
                     is not None,
                 ):
                     previous = previous_runs.get(run.run_id)
+                    task = plan_tasks[run.task_id]
+                    if (
+                        task.kind == "analysis"
+                        and task.report_output
+                        and isinstance(active.adapter, ProjectReportAgent)
+                        and not (
+                            previous
+                            and (
+                                previous.report_input_paths
+                                or previous.report_evidence_key
+                                or previous.registered_report_ids
+                                or previous.delivery_command_id
+                            )
+                        )
+                    ):
+                        continue
                     if previous and previous.platform_task_id:
                         run = run.model_copy(
                             update={
@@ -2137,6 +2258,10 @@ class ConversationRuntime:
                                 else run.artifacts,
                             }
                         )
+                    if previous and previous.execution_outputs:
+                        run = run.model_copy(
+                            update={"execution_outputs": previous.execution_outputs}
+                        )
                     if run.task_id in required:
                         row = rows_by_task[run.task_id]
                         selected = row.get("platform_task_id") or row.get(
@@ -2150,7 +2275,13 @@ class ConversationRuntime:
                                 continue
                             run = run.model_copy(update={"platform_task_id": selected})
                         run = check_inference_receipt(
-                            run, receipts, sdk_receipts=sdk_receipts
+                            run,
+                            receipts,
+                            sdk_receipts=sdk_receipts,
+                            require_receipt=bool(
+                                run.platform_task_id
+                                and external.get(run.platform_task_id) == "succeeded"
+                            ),
                         )
                         paths = (
                             sdk_receipts.get(run.platform_task_id)
@@ -2182,6 +2313,25 @@ class ConversationRuntime:
                         run = run.model_copy(
                             update={"platform_task_id": source.platform_task_id}
                         )
+                    if (
+                        isinstance(active.adapter, ProjectReportAgent)
+                        and run.state == "succeeded"
+                        and not platform_results_ready(source, external)
+                    ):
+                        statuses = {
+                            external.get(key)
+                            for key in (
+                                source.platform_task_ids or (source.platform_task_id,)
+                            )
+                            if key is not None
+                        }
+                        if "failed" in statuses:
+                            state = "failed"
+                        elif "cancelled" in statuses:
+                            state = "cancelled"
+                        else:
+                            state = "waiting_platform"
+                        run = run.model_copy(update={"state": state})
                     attempt = run.run_id.rsplit(":", 1)[-1]
                     if (
                         self.versions
@@ -2195,6 +2345,56 @@ class ConversationRuntime:
                     ):
                         row = rows_by_task[run.task_id]
                         task = plan_tasks[run.task_id]
+                        if isinstance(active.adapter, ProjectReportAgent):
+                            verified = row.get("verified_outputs")
+                            if isinstance(verified, dict):
+                                names = {
+                                    o.name
+                                    for o in task.outputs
+                                    if o != task.report_output
+                                }
+                                if "model_output" in names:
+                                    names.add("selected_checkpoint")
+                                confirmed = {
+                                    k: v
+                                    for k, v in verified.items()
+                                    if k in names
+                                    and isinstance(v, str)
+                                    and v.startswith("/workspace/")
+                                }
+                                if confirmed:
+                                    run = run.model_copy(
+                                        update={
+                                            "execution_outputs": {
+                                                **run.execution_outputs,
+                                                **confirmed,
+                                            }
+                                        }
+                                    )
+                        if task.kind == "analysis" and not row.get("evidence_paths"):
+                            bound_inputs = []
+                            for item in task.inputs:
+                                upstream = (
+                                    self._plan_attempt(snapshot, project, item.task_id)
+                                    if item.task_id
+                                    else None
+                                )
+                                if upstream and upstream.report_state == "ready":
+                                    value = upstream.delivery_outputs.get(
+                                        item.output_name or ""
+                                    )
+                                else:
+                                    value = next(
+                                        (
+                                            r.storage_path
+                                            for r in project.plan.resources
+                                            if r.id == item.resource_id
+                                        ),
+                                        None,
+                                    )
+                                if value:
+                                    bound_inputs.append(value)
+                            row["evidence_paths"] = bound_inputs
                         report = delivery_report(
                             source,
                             row,
@@ -2224,7 +2424,20 @@ class ConversationRuntime:
                                 ),
                                 report,
                             )
-                        elif run.state == "succeeded":
+                        elif run.state == "succeeded" or (
+                            source.platform_task_id
+                            and (
+                                (run.stage_snapshot or {}).get("kind") != "train"
+                                or not any(o.kind == "model" for o in task.outputs)
+                                or all(
+                                    o.name in (row.get("verified_outputs") or {})
+                                    for o in task.outputs
+                                    if o.kind == "model"
+                                )
+                            )
+                            and task.report_output
+                            and isinstance(active.adapter, ProjectReportAgent)
+                        ):
                             if (
                                 not task.outputs
                                 and run.stage_id not in stages_with_outputs
@@ -2244,11 +2457,18 @@ class ConversationRuntime:
                                 )
                     if run.state != "queued":
                         self._record_execution(store, run)
+                if (
+                    self._uses_report_agents(active)
+                    and not active.stopping
+                    and not self._closing
+                ):
+                    self._advance_independent_steps(active, store, project, rows)
                 await self._queue_stage_analyses(
                     active, store, project, rows, artifacts
                 )
-                # Restored tool receipts can register existing outputs only.
-                return rows if text else []
+            await self._queue_report_handoffs(store, artifacts)
+            # Restored tool receipts can register existing outputs only.
+            return rows if text else []
         except Exception as exc:
             logger.warning(
                 "Plan projection pending: conversation=%s error=%s",
@@ -2297,6 +2517,46 @@ class ConversationRuntime:
     ) -> ExperimentExecutionView:
         context = active.context
         has_storage_credentials = bool(context.cookie or context.authorization)
+        delegate = bool(
+            task.report_output
+            and not run.delivery_command_id
+            and isinstance(active.adapter, ProjectReportAgent)
+        )
+        if delegate:
+            snapshot = store.load_snapshot()
+            if snapshot.automatic_turns_suspended or active.stopping:
+                return previous or run
+            directories = platform_output_directories(run, snapshot.external_tasks)
+            if not (
+                directories or row.get("verified_outputs") or row.get("evidence_paths")
+            ):
+                return (
+                    run.model_copy(update={"state": "succeeded"})
+                    if task.kind != "analysis"
+                    else run
+                )
+            key = fingerprint(
+                [
+                    platform_task_ids,
+                    run.platform_task_id,
+                    directories,
+                    row.get("verified_outputs"),
+                    row.get("evidence_paths"),
+                ]
+            )
+            run = run.model_copy(
+                update={
+                    "report_evidence_key": key,
+                    "state": "waiting_analysis"
+                    if task.kind == "analysis"
+                    else "succeeded",
+                }
+            )
+            retry = retry or bool(previous and previous.report_evidence_key != key)
+        if delegate and previous and previous.run_id == run.run_id:
+            previous = previous.model_copy(
+                update={"execution_outputs": run.execution_outputs, "state": run.state}
+            )
         if previous and previous.report_state == "registration_failed" and not retry:
             format_changed = (
                 (run.stage_snapshot or {}).get("kind") == "dataset"
@@ -2315,6 +2575,8 @@ class ConversationRuntime:
         worker = self._stage_analysis_workers.get(job_id)
         worker_running = worker is not None and not worker.done()
         if worker_running and previous and previous.report_state == "registering":
+            if delegate and previous.report_evidence_key != run.report_evidence_key:
+                return run.model_copy(update={"report_state": "registering"})
             return previous
         if not has_storage_credentials:
             return self._delivery_failed(run, "credentials_required")
@@ -2343,6 +2605,12 @@ class ConversationRuntime:
             worker.add_done_callback(
                 lambda finished: self._stage_analysis_finished(active, job_id, finished)
             )
+            if delegate:
+                worker.add_done_callback(
+                    lambda _: self._schedule_stage_analysis_recheck(
+                        active.handle.session_id, active, store
+                    )
+                )
         return pending
 
     async def _register_plan_delivery(
@@ -2365,14 +2633,48 @@ class ConversationRuntime:
                     return
                 error_code = "storage_unavailable"
                 error_field = None
+                prepared_outputs: dict[str, str] | None = None
                 for delay in (0, 1, 4):
                     if delay:
                         await asyncio.sleep(delay)
                     try:
+                        storage = factory(context)
+                        directories = platform_output_directories(
+                            run, store.load_snapshot().external_tasks
+                        )
+                        if (
+                            prepared_outputs is None
+                            and task.report_output
+                            and not run.delivery_command_id
+                            and isinstance(active.adapter, ProjectReportAgent)
+                        ):
+                            activity = SubagentActivity(
+                                job_id=job_id,
+                                role=ROLES[str((run.stage_snapshot or {}).get("kind"))],
+                                task_name=task.name,
+                                phase="delivery",
+                            )
+                            with self._subagent_activity(store, activity) as on_tool:
+                                prepared_outputs = await prepare_report_outputs(
+                                    active.adapter,
+                                    active.handle,
+                                    context,
+                                    storage,
+                                    task,
+                                    run,
+                                    row,
+                                    directories,
+                                    on_tool,
+                                )
+                            row = {**row, "verified_outputs": prepared_outputs}
+                        if prepared_outputs is not None:
+                            current = store.load_snapshot()
+                            if not self._current_report_agent_attempt(current, run):
+                                return
                         report = await asyncio.to_thread(
                             register_plan_delivery,
                             versions,
-                            factory(context),
+                            storage,
                             task,
                             run,
                             row,
@@ -2430,6 +2732,10 @@ class ConversationRuntime:
                             )
                             if (
                                 latest
+                                and (
+                                    not run.report_evidence_key
+                                    or self._current_report_agent_attempt(snapshot, run)
+                                )
                                 and latest.plan_sequence == run.plan_sequence
                                 and latest.delivery_command_id
                                 == run.delivery_command_id
@@ -2478,6 +2784,12 @@ class ConversationRuntime:
                     )
                     if (
                         latest
+                        and (
+                            not run.report_evidence_key
+                            or self._current_report_agent_attempt(
+                                store.load_snapshot(), run
+                            )
+                        )
                         and latest.plan_sequence == run.plan_sequence
                         and latest.delivery_command_id == run.delivery_command_id
                     ):
@@ -2485,6 +2797,28 @@ class ConversationRuntime:
                             store,
                             self._delivery_failed(latest, error_code, error_field),
                         )
+
+    @staticmethod
+    def _current_report_agent_attempt(
+        snapshot: ConversationSnapshot, run: ExperimentExecutionView
+    ) -> bool:
+        latest = max(
+            (
+                r
+                for r in snapshot.experiment_executions or ()
+                if r.project_id == run.project_id and r.task_id == run.task_id
+            ),
+            key=lambda r: (r.plan_sequence or 0, r.plan_attempt or 1),
+            default=None,
+        )
+        return bool(
+            latest
+            and latest.run_id == run.run_id
+            and latest.plan_sequence == run.plan_sequence
+            and latest.report_evidence_key == run.report_evidence_key
+            and latest.report_state == "registering"
+            and latest.state not in {"failed", "cancelled", "needs_input"}
+        )
 
     @staticmethod
     def _delivery_failed(
@@ -2571,6 +2905,42 @@ class ConversationRuntime:
                 type(error).__name__,
             )
 
+    @contextlib.contextmanager
+    def _subagent_activity(
+        self, store: FileProductStore, activity: SubagentActivity
+    ) -> Iterator[Callable[[str | None], None]]:
+        scope = store.conversation_dir.name
+        jobs = self._active_subagents.setdefault(scope, {})
+
+        def publish(current: SubagentActivity | None) -> None:
+            event, _ = store.append(
+                ProductEvent(
+                    conversation_id=scope,
+                    type="subagent.activity",
+                    payload={
+                        "job_id": activity.job_id,
+                        "activity": current.model_dump(mode="json")
+                        if current
+                        else None,
+                    },
+                )
+            )
+            self._publish(event)
+
+        def update(tool: str | None) -> None:
+            current = activity.model_copy(update={"tool": tool})
+            jobs[activity.job_id] = current
+            publish(current)
+
+        try:
+            update(None)
+            yield update
+        finally:
+            jobs.pop(activity.job_id, None)
+            if not jobs:
+                self._active_subagents.pop(scope, None)
+            publish(None)
+
     def _record_stage_analysis(
         self, store: FileProductStore, job: StageAnalysisJob
     ) -> None:
@@ -2610,18 +2980,23 @@ class ConversationRuntime:
         versions: Versions,
         version_project: VersionProject,
     ) -> None:
+        step = "lookup"
         for delay in (0, 1, 4):
             if delay:
                 await asyncio.sleep(delay)
             context = active.context
+            step = "lookup"
             try:
                 report = await asyncio.to_thread(
                     existing_stage_analysis, job, versions, version_project
                 )
                 if report:
+                    step = "validation"
                     result = StageAnalysisResult.model_validate(report.manifest.summary)
+                    step = "registration"
                     report = await asyncio.to_thread(versions.finish, report, context)
                 else:
+                    step = "evidence"
                     evidence = await asyncio.to_thread(
                         stage_analysis_evidence,
                         job,
@@ -2629,12 +3004,22 @@ class ConversationRuntime:
                         version_project,
                         context,
                     )
+                    step = "model"
                     adapter = active.adapter
                     assert isinstance(adapter, ProjectStageAnalyzer)
-                    response = await adapter.analyze_project_stage(
-                        active.handle, job.role, evidence, context
+                    activity = SubagentActivity(
+                        job_id=job.job_id,
+                        role=job.role,
+                        task_name="阶段汇总",
+                        phase="analysis",
                     )
+                    with self._subagent_activity(store, activity):
+                        response = await adapter.analyze_project_stage(
+                            active.handle, job.role, evidence, context
+                        )
+                    step = "validation"
                     result = validate_stage_analysis(response, evidence)
+                    step = "registration"
                     report = await asyncio.to_thread(
                         save_stage_analysis,
                         job,
@@ -2645,8 +3030,9 @@ class ConversationRuntime:
                     )
             except Exception as exc:
                 logger.warning(
-                    "Stage analysis attempt failed: job=%s error=%s",
+                    "Stage analysis attempt failed: job=%s step=%s error=%s",
                     job.job_id,
+                    step,
                     type(exc).__name__,
                 )
                 continue
@@ -2655,6 +3041,7 @@ class ConversationRuntime:
                 job.model_copy(
                     update={
                         "status": "ready",
+                        "failure_step": None,
                         "report_version_id": report.id,
                         "result": result,
                     }
@@ -2662,7 +3049,9 @@ class ConversationRuntime:
             )
             await self._publish_artifacts(active.handle.session_id, context)
             return
-        self._record_stage_analysis(store, job.model_copy(update={"status": "failed"}))
+        self._record_stage_analysis(
+            store, job.model_copy(update={"status": "failed", "failure_step": step})
+        )
 
     def _schedule_stage_analysis_recheck(
         self,
@@ -2696,6 +3085,68 @@ class ConversationRuntime:
         finally:
             self._stage_analysis_rechecks.pop(scope, None)
 
+    def _uses_report_agents(self, active: _ActiveConversation) -> bool:
+        return (
+            self.versions is not None
+            and self._observation_storage_factory is not None
+            and isinstance(active.adapter, ProjectReportAgent)
+        )
+
+    def _advance_independent_steps(
+        self,
+        active: _ActiveConversation,
+        store: FileProductStore,
+        project: ProjectView,
+        rows: list,
+    ) -> None:
+        snapshot = store.load_snapshot()
+        if (
+            snapshot.automatic_turns_suspended
+            or snapshot.pending_inputs
+            or snapshot.pending_permissions
+            or snapshot.status in {"closed", "deleting", "paused", "stuck", "error"}
+        ):
+            return
+        scope = active.handle.session_id
+        for task, inputs, analysis in independent_plan_steps(project, snapshot, rows):
+            if analysis is not None:
+                self._record_execution(
+                    store,
+                    analysis.model_copy(
+                        update={
+                            "state": "waiting_analysis",
+                            "report_input_paths": tuple(dict.fromkeys(inputs.values())),
+                        }
+                    ),
+                )
+                self._schedule_stage_analysis_recheck(scope, active, store)
+                continue
+            command = f"project-continue:{project.project_id}:{task.id}"
+            if any(
+                t.task_id == command for t in (snapshot.task_runs or {}).values()
+            ) or any(
+                q.get("task_id") == command for q in snapshot.experiment_queue or ()
+            ):
+                continue
+            self._queue_task(
+                store,
+                scope,
+                command,
+                "project_continue",
+                "Execute the approved task with its verified inputs. "
+                "Check existing receipts before submitting. "
+                "Record outputs and evidence for the report agent. "
+                "Continue independently of report delivery.\n"
+                + json.dumps(
+                    {"task": task.model_dump(mode="json"), "inputs": inputs},
+                    ensure_ascii=False,
+                ),
+                origin_turn_id=snapshot.task_origins.get(
+                    f"project-start:{project.project_id}"
+                ),
+            )
+            self._schedule_notification_retry(scope)
+
     async def _continue_approved_project(
         self,
         active: _ActiveConversation,
@@ -2706,6 +3157,9 @@ class ConversationRuntime:
         *,
         delivery: ExperimentExecutionView | None = None,
     ) -> None:
+        # The report-agent path advances both lanes during plan projection.
+        if self._uses_report_agents(active):
+            return
         conversation_id = active.handle.session_id
         snapshot = store.load_snapshot()
         if (
@@ -2779,6 +3233,23 @@ class ConversationRuntime:
         existing = self._plan_attempt(snapshot, project, task.id)
         if existing and (existing.platform_task_id or existing.state != "queued"):
             return
+        if (
+            task.kind == "analysis"
+            and task.report_output
+            and isinstance(active.adapter, ProjectReportAgent)
+        ):
+            analysis = self._ensure_plan_attempt(store, project, task.id)
+            if analysis and not analysis.report_input_paths:
+                self._record_execution(
+                    store,
+                    analysis.model_copy(
+                        update={
+                            "report_input_paths": tuple(dict.fromkeys(inputs.values()))
+                        }
+                    ),
+                )
+                self._schedule_stage_analysis_recheck(conversation_id, active, store)
+            return
         next_id = prefix + task.id
         payload = {"task": task.model_dump(mode="json"), "inputs": inputs}
         self._queue_task(
@@ -2788,8 +3259,8 @@ class ConversationRuntime:
             "project_continue",
             "Continue the already confirmed Project with this task only. "
             "Use its inputs and accepted scope. Check existing platform receipts "
-            "before submitting. Record verified_outputs by declared output name "
-            "and absolute workspace path in workflowPLAN.json after verification. "
+            "before submitting. Record verified non-report outputs and evidence_paths "
+            "in workflowPLAN.json for the report agent. "
             "Pause if additional authorization is required.\n"
             + json.dumps(payload, ensure_ascii=False),
             origin_turn_id=snapshot.task_origins.get(start_id),
@@ -2839,6 +3310,49 @@ class ConversationRuntime:
         project = self.versions.project(scope, context, create=False)
         return tuple(self.versions.store.list_versions(project.id)) if project else ()
 
+    async def _queue_report_handoffs(
+        self, store: FileProductStore, artifacts: tuple[ArtifactVersion, ...]
+    ) -> None:
+        if not artifacts:
+            return
+        snapshot = await asyncio.to_thread(store.load_snapshot)
+        for report, title in ready_report_messages(snapshot, artifacts):
+            self._queue_task(
+                store,
+                snapshot.conversation_id,
+                REPORT_HANDOFF_PREFIX + report.id,
+                "report_handoff",
+                title,
+            )
+            self._schedule_notification_retry(snapshot.conversation_id)
+
+    async def _report_handoff_instruction(
+        self, scope: str, report_id: str, title: str, context: RequestContext
+    ) -> str | None:
+        from pyromind_runtime.application.versions import snapshot_result
+
+        versions = self.versions
+        if versions is None:
+            return None
+        artifacts = await asyncio.to_thread(self._artifact_versions, scope, context)
+        report = next(
+            (
+                v
+                for v in artifacts
+                if v.id == report_id and v.kind == "report" and v.state == "ready"
+            ),
+            None,
+        )
+        if report is None:
+            return None
+        try:
+            raw = await asyncio.to_thread(
+                versions.snapshots.read_text, snapshot_result(report), context
+            )
+        except (OSError, LookupError, ValueError, RuntimeError):
+            raw = ""
+        return report_handoff_instruction(title, report, raw, artifacts)
+
     async def _publish_artifacts(
         self,
         scope: str,
@@ -2881,6 +3395,7 @@ class ConversationRuntime:
             self._publish(event)
 
             changed = True
+        await self._queue_report_handoffs(store, artifacts)
         active = self._active.get(scope)
         if changed and active is not None and not active.stopping:
             self._schedule_stage_analysis_recheck(scope, active, store)
@@ -3210,6 +3725,14 @@ class ConversationRuntime:
                 raise ValueError(
                     "plan delivery requires the current approved task attempt"
                 )
+            if isinstance(active.adapter, ProjectReportAgent) and not (
+                run.delivery_command_id == command_id
+                or fingerprint(command_id) in run.delivery_requests
+            ):
+                raise PermissionError(
+                    "The stage report agent owns this delivery. "
+                    "Record execution evidence in workflowPLAN.json."
+                )
             required = model_evaluation_tasks(project, policy)
             sdk_receipts = (
                 await asyncio.to_thread(
@@ -3503,11 +4026,13 @@ class ConversationRuntime:
         node_id: str,
         report_version_id: str,
         context: RequestContext,
+        *,
+        include_task_source: bool = False,
     ) -> dict[str, str]:
         snapshot = await self.get_snapshot(conversation_id, context)
         if self.versions is None:
             raise FileNotFoundError("Baseline analysis report is unavailable")
-        return await asyncio.to_thread(
+        archived = await asyncio.to_thread(
             observation_analysis_report,
             snapshot,
             project_id,
@@ -3516,6 +4041,41 @@ class ConversationRuntime:
             self.versions,
             context,
         )
+        if (
+            not include_task_source
+            or not self._observation_storage_factory
+            or not summary_only_attribution(archived["text"])
+        ):
+            return archived
+        try:
+            plan = await self.read_persisted_workspace_text(
+                conversation_id, PLAN_PATH, context, max_bytes=1024 * 1024
+            )
+            if plan and snapshot.project:
+                source = await asyncio.to_thread(
+                    attribution_task_source,
+                    snapshot,
+                    node_id,
+                    report_version_id,
+                    read_plan_tasks(plan, snapshot.project),
+                    self._observation_storage_factory(context),
+                )
+                if source:
+                    return {**archived, **source}
+        except (
+            ProductRuntimeError,
+            OSError,
+            ValueError,
+            LookupError,
+            EvaluationStorageMissingError,
+            EvaluationStorageUnavailableError,
+        ):
+            logger.info(
+                "Baseline task source unavailable: project=%s version=%s",
+                project_id,
+                report_version_id,
+            )
+        return archived
 
     async def get_project_observation_report(
         self,
@@ -3570,6 +4130,7 @@ class ConversationRuntime:
             ):
                 return []
 
+        factory = self._observation_storage_factory
         return await asyncio.to_thread(
             observation_report_details,
             snapshot,
@@ -3580,6 +4141,9 @@ class ConversationRuntime:
             context,
             load_baseline_metrics,
             report_version_id=report_version_id,
+            load_dataset_source=(lambda path: factory(context).read(path))
+            if factory
+            else None,
         )
 
     async def get_project_training_series(
@@ -5106,6 +5670,15 @@ class ConversationRuntime:
             if not snapshot.capabilities.read_only:
                 await asyncio.to_thread(store.save_x_cluster, context.x_cluster)
             self._schedule_read_recovery(conversation_id, store, context)
+            # Live workers belong to this Runtime. An interrupted process must
+            # never replay an old start as a currently running child.
+            snapshot = snapshot.model_copy(
+                update={
+                    "active_subagents": tuple(
+                        self._active_subagents.get(conversation_id, {}).values()
+                    )
+                }
+            )
             result = "ok"
             return (
                 visible_chat_snapshot(snapshot)
@@ -7759,6 +8332,34 @@ class ConversationRuntime:
                 )
                 if product_event is None:
                     continue
+                if (
+                    product_event.type == "message.completed"
+                    and product_event.run_id
+                    and product_event.task_id
+                    and product_event.task_id.startswith(REPORT_HANDOFF_PREFIX)
+                    and product_event.payload.get("role") == "assistant"
+                    and product_event.payload.get("project_reply")
+                ):
+                    product_event = product_event.model_copy(
+                        update={
+                            "payload": {
+                                **product_event.payload,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": product_event.payload["project_reply"],
+                                    }
+                                ],
+                                "execution_notice": {
+                                    "action": "report",
+                                    "target_id": product_event.task_id.removeprefix(
+                                        REPORT_HANDOFF_PREFIX
+                                    ),
+                                    "delivery_format": "markdown",
+                                },
+                            }
+                        }
+                    )
                 if product_event.type == "external_task.submitted":
                     context = self._task_contexts.get(handle.session_id)
                     if context is not None:

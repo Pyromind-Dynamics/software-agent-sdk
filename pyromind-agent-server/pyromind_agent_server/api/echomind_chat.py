@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated
 
 from fastapi import (
@@ -25,6 +26,7 @@ from pyromind_agent_server.api.router import (
 from pyromind_agent_server.api.schemas import AgentLLMConfig
 from pyromind_agent_server.auth_context import request_context
 from pyromind_agent_server.dependencies import check_session_api_key
+from pyromind_agent_server.evaluation_storage import build_evaluation_storage
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.domain.commands import (
     CancelCommand,
@@ -119,6 +121,32 @@ async def read_report(
         raise _not_found(manager_id) from exc
     response.headers["Cache-Control"] = "no-store"
     return {"artifact_id": artifact_id, "text": text}
+
+
+@router.get("/reports/{artifact_id}/files/{file_id}/preview")
+async def report_file_preview(
+    manager_id: str,
+    artifact_id: str,
+    file_id: str,
+    request: Request,
+    response: Response,
+) -> dict[str, str]:
+    try:
+        path, context = await get_product_runtime(
+            request
+        ).echomind_chat.report_attachment(
+            manager_id, artifact_id, file_id, request_context(request)
+        )
+    except (FileNotFoundError, PermissionError, ProductStoreError, ValueError) as exc:
+        raise _not_found(manager_id) from exc
+    try:
+        url = await asyncio.to_thread(
+            build_evaluation_storage(context).preview_url, path
+        )
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(502, "报告预览暂不可用") from exc
+    response.headers["Cache-Control"] = "no-store"
+    return {"url": url}
 
 
 @router.get("/events")

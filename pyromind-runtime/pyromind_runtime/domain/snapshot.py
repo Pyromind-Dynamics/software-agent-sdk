@@ -45,6 +45,9 @@ class TimelineEntry(ContractModel):
 
 
 class ExecutionNoticeLink(ContractModel):
+    delivery_format: Literal["markdown"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     source_seq: int | None = Field(
         default=None, ge=1, exclude_if=lambda value: value is None
     )
@@ -251,6 +254,14 @@ class TaskRunProgress(ContractModel):
     seq: int = Field(ge=1)
 
 
+class SubagentActivity(ContractModel):
+    job_id: str
+    role: str
+    task_name: str
+    phase: Literal["delivery", "analysis"]
+    tool: str | None = None
+
+
 class ConversationSnapshot(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     conversation_id: str = Field(min_length=1)
@@ -274,6 +285,9 @@ class ConversationSnapshot(ContractModel):
     experiment_plan: ExperimentPlanView | None = None
     experiment_context: ExperimentContextView | None = None
     experiment_executions: tuple[ExperimentExecutionView, ...] | None = None
+    active_subagents: tuple[SubagentActivity, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     stage_analyses: tuple[StageAnalysisJob, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )

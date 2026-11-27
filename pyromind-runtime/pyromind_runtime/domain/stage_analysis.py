@@ -61,5 +61,8 @@ class StageAnalysisJob(ContractModel):
     artifact_ids: tuple[str, ...]
     report_ids: tuple[str, ...]
     status: Literal["queued", "ready", "failed"] = "queued"
+    failure_step: (
+        Literal["lookup", "evidence", "model", "validation", "registration"] | None
+    ) = None
     report_version_id: str | None = None
     result: StageAnalysisResult | None = None

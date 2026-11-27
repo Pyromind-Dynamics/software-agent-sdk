@@ -110,6 +110,7 @@ async def analysis_report(
     request: Request,
     project_node_id: Annotated[str, Query(min_length=1, max_length=128)],
     report_version_id: Annotated[str, Query(min_length=1, max_length=128)],
+    include_task_source: bool = False,
 ) -> dict[str, str]:
     context, info, _ = _load_project(request, project_id, require_cluster=True)
     try:
@@ -121,6 +122,7 @@ async def analysis_report(
             project_node_id,
             report_version_id,
             context,
+            **({"include_task_source": True} if include_task_source else {}),
         )
     except PermissionError as exc:
         raise HTTPException(403, "Observation report authorization required") from exc

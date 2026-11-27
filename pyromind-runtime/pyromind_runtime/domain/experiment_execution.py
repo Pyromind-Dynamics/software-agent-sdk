@@ -54,10 +54,19 @@ class ExperimentExecutionView(ContractModel):
     state: str
     report_state: str
     report_required: bool = Field(default=False, exclude_if=lambda value: not value)
+    report_input_paths: tuple[str, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    report_evidence_key: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     delivery_command_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     delivery_requests: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    execution_outputs: dict[str, str] = Field(
         default_factory=dict, exclude_if=lambda value: not value
     )
     delivery_outputs: dict[str, str] = Field(

@@ -225,6 +225,7 @@ def validate_plan_report(
     platform_output_dirs: tuple[str, ...] = (),
     require_schema_version: bool = False,
     freeze_attribution: bool = False,
+    draft_report: dict | None = None,
 ) -> JsonObject:
     stage = (run.stage_snapshot or {}).get("kind")
     report_output = task.report_output
@@ -253,6 +254,7 @@ def validate_plan_report(
         stage,
         paths,
         report_name=report_output.name if report_output else None,
+        draft_report=draft_report,
         typed_outputs=kinds,
         platform_task_id=run.platform_task_id,
         platform_task_ids=run.platform_task_ids,
@@ -264,7 +266,12 @@ def validate_plan_report(
     )
     directories: dict[str, set[str]] = {}
     check_paths = {
-        path for name, path in paths.items() if name not in referenced_outputs
+        path
+        for name, path in paths.items()
+        if name not in referenced_outputs
+        and not (
+            draft_report is not None and report_output and name == report_output.name
+        )
     }
     if stage == "dataset":
         check_paths.update(
@@ -370,6 +377,7 @@ def _read_report(
     outputs: dict[str, str],
     *,
     report_name: str | None = None,
+    draft_report: dict | None = None,
     typed_outputs: Mapping[str, ArtifactKind] | None = None,
     platform_task_id: str | None = None,
     platform_task_ids: tuple[str, ...] = (),
@@ -379,7 +387,11 @@ def _read_report(
     require_schema_version: bool = False,
 ) -> JsonObject:
     if report_name is not None:
-        body = _read_report_body(storage, outputs[report_name])
+        body = (
+            draft_report
+            if draft_report is not None
+            else _read_report_body(storage, outputs[report_name])
+        )
         if "schema_version" in body or require_schema_version:
             if (
                 type(body.get("schema_version")) is not int

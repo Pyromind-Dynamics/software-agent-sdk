@@ -533,6 +533,34 @@ class PiAdapter:
         evidence: JsonObject,
         context: RequestContext,
     ) -> JsonObject:
+        async def deny(_method: str, _params: dict[str, Any]) -> Any:
+            raise PermissionError("Stage analysis has no tool access")
+
+        return await self._stage_runner(
+            handle, role, evidence, context, deny, "stage_analysis"
+        )
+
+    async def prepare_project_report(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+        tool: Callable[[str, JsonObject], Awaitable[JsonObject]],
+    ) -> None:
+        await self._stage_runner(
+            handle, role, evidence, context, tool, "stage_delivery"
+        )
+
+    async def _stage_runner(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+        tool: Callable,
+        mode: str,
+    ) -> JsonObject:
         session = self._session(handle.session_id)
         if (session.context.user_id, session.context.profile_id) != (
             context.user_id,
@@ -542,20 +570,17 @@ class PiAdapter:
                 "Stage evidence belongs to another conversation owner"
             )
 
-        async def deny(_method: str, _params: dict[str, Any]) -> Any:
-            raise PermissionError("Stage analysis has no tool access")
-
         async def ignore(_value: Any) -> None:
             pass
 
         runner = PiRunnerProcess(
-            request_handler=deny, event_handler=ignore, exit_handler=ignore
+            request_handler=tool, event_handler=ignore, exit_handler=ignore
         )
         try:
-            async with asyncio.timeout(55):
+            async with asyncio.timeout(600 if mode == "stage_delivery" else 55):
                 result = await runner.start(
                     {
-                        "mode": "stage_analysis",
+                        "mode": mode,
                         "role": role,
                         "model": {
                             **session.config["model"],

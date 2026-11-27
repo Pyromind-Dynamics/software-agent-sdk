@@ -15,6 +15,7 @@ from pyromind_common.tools.pyromind_dataset.definition import (
     _default_storage_base_url,
     _extract_api_data,
     download_file_from_pyromind,
+    request_storage_url,
     upload_local_file_to_pyromind,
 )
 from pyromind_common.tools.utils.platform_env import (
@@ -70,6 +71,15 @@ class PyromindEvaluationStorage(EvaluationStorage):
         self._read_attempts = read_attempts
         self._max_manifest_bytes = max_manifest_bytes
 
+    def preview_url(self, path: str) -> str:
+        return request_storage_url(
+            storage_path=path,
+            storage_base_url=self._base_url,
+            headers=self._headers,
+            timeout=self._timeout,
+            force_download=False,
+        )
+
     def read(self, path: str) -> bytes:
         max_bytes = self._max_read_bytes
         if self._max_manifest_bytes is not None and path.endswith(
@@ -98,6 +108,47 @@ class PyromindEvaluationStorage(EvaluationStorage):
             raise EvaluationStorageUnavailableError(
                 f"storage read failed for {path}"
             ) from exc
+
+    def read_evidence_range(self, path: str, offset: int, size: int) -> bytes:
+        if offset < 0 or not 0 < size <= 64 * 1024:
+            raise ValueError("Invalid evidence range")
+        url = request_storage_url(
+            storage_path=path,
+            storage_base_url=self._base_url,
+            headers=self._headers,
+            timeout=self._timeout,
+        )
+        with httpx.stream(
+            "GET",
+            url,
+            headers={
+                "range": f"bytes={offset}-{offset + size - 1}",
+                "accept-encoding": "identity",
+            },
+            timeout=self._timeout,
+            follow_redirects=True,
+        ) as response:
+            if response.status_code == 416:
+                return b""
+            if response.status_code == 404:
+                raise EvaluationStorageMissingError(path)
+            if response.status_code == 206:
+                if not response.headers.get("content-range", "").startswith(
+                    f"bytes {offset}-"
+                ):
+                    raise EvaluationStorageUnavailableError(
+                        "Invalid evidence range response"
+                    )
+            elif response.status_code != 200 or offset:
+                raise EvaluationStorageUnavailableError(
+                    "Storage did not serve the requested evidence range"
+                )
+            data = bytearray()
+            for chunk in response.iter_bytes(chunk_size=8192):
+                data.extend(chunk[: size - len(data)])
+                if len(data) == size:
+                    break
+            return bytes(data)
 
     def write(self, path: str, payload: bytes) -> None:
         target_dir = str(PurePosixPath(path).parent)
@@ -176,7 +227,7 @@ def build_evaluation_storage(
     max_read_bytes: int = REPORT_MAX_BYTES,
     read_attempts: int = 3,
     max_manifest_bytes: int | None = None,
-) -> EvaluationStorage:
+) -> PyromindEvaluationStorage:
     headers = {"accept": "*/*"}
     if context.cookie:
         headers["cookie"] = context.cookie

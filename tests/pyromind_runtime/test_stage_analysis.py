@@ -213,6 +213,26 @@ def test_dataset_analysis_uses_this_attempt_and_requires_every_artifact():
     assert not ready_stage_analyses(
         project, paths, runs, (), (old_train, val, report), []
     )
+    stored = "/public_data/output/train-v2.jsonl"
+    public_train = train.model_copy(
+        update={
+            "manifest": train.manifest.model_copy(
+                update={
+                    "source": train.manifest.source.model_copy(
+                        update={"storage_ref": stored}
+                    )
+                }
+            )
+        }
+    )
+    paths[0]["verified_outputs"]["train"] = "/workspace" + stored
+    assert ready_stage_analyses(
+        project, paths, runs, (), (public_train, val, report), []
+    ) == [job]
+    paths[0]["verified_outputs"]["train"] = stored
+    assert not ready_stage_analyses(
+        project, paths, runs, (), (public_train, val, report), []
+    )
     rows[0]["business_status"] = "in_progress"
     assert not ready_stage_analyses(project, rows, runs, (), (train, val, report), [])
 

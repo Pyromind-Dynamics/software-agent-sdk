@@ -5,6 +5,7 @@ import json
 from dataclasses import replace
 from datetime import datetime
 from hashlib import sha256
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from pyromind_runtime.domain.commands import EnqueueTaskCommand
@@ -30,6 +31,7 @@ from pyromind_runtime.domain.snapshot import (
     TimelineMessage,
     TimelineOperation,
 )
+from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.domain.versions import VersionToolRequest
 from pyromind_runtime.infrastructure.file_product_store import ProductStoreError
 from pyromind_runtime.ports.harness import SessionSpec
@@ -152,7 +154,7 @@ class EchoMindChat:
             manager.authorize(context.user_id, MANAGER_PROFILE)
             if self._runtime._store(chat_id).metadata_path.is_file():
                 return await self._runtime.get_snapshot(chat_id, context)
-            snapshot = await self._runtime.create_conversation(
+            await self._runtime.create_conversation(
                 SessionSpec(
                     conversation_id=chat_id,
                     user_id=context.user_id,
@@ -166,7 +168,7 @@ class EchoMindChat:
                 ),
                 context,
             )
-            return snapshot
+            return await self._runtime.get_snapshot(chat_id, context)
 
     async def model_history(
         self, chat_id: str, current: str, context: RequestContext
@@ -279,6 +281,37 @@ class EchoMindChat:
             "text": text[:16000],
             "truncated": len(text) > 16000,
         }
+
+    async def report_attachment(
+        self, manager_id: str, report_id: str, file_id: str, context: RequestContext
+    ) -> tuple[str, RequestContext]:
+        _, context = await self._manager(manager_id, context)
+        versions = {
+            v.id: v
+            for v in await asyncio.to_thread(
+                self._runtime._artifact_versions, manager_id, context
+            )
+        }
+        report = versions.get(report_id)
+        item = versions.get(file_id)
+        if (
+            report is None
+            or report.kind != "report"
+            or report.state != "ready"
+            or item is None
+            or item.state not in {"ready", "reference_only"}
+            or not any(p.version_id == item.id for p in report.manifest.parents)
+        ):
+            raise ValueError("No registered report attachment")
+        path = item.manifest.source.storage_ref
+        if not path or PurePosixPath(path).suffix.lower() not in {
+            ".json",
+            ".md",
+            ".html",
+            ".htm",
+        }:
+            raise ValueError("Report attachment has no preview")
+        return to_storage_api_path(path), context
 
     async def read_report(
         self, manager_id: str, artifact_id: str, context: RequestContext

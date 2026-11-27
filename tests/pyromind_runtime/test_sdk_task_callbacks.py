@@ -65,7 +65,7 @@ def correlation(environment, kind="workflow_run"):
     )
 
 
-async def test_training_submission_waits_for_both_current_baseline_reports(
+async def test_training_waits_for_baseline_execution_and_only_consumed_reports(
     sdk_project_runtime, monkeypatch
 ):
     runtime, context, active_project = sdk_project_runtime
@@ -115,39 +115,21 @@ async def test_training_submission_waits_for_both_current_baseline_reports(
             for task in ("bench", "analysis")
         ],
     )
-    runtime._record_execution(store, bench)
     initial = await contexts()
     assert initial["bench"]["out_ids"]
-    assert initial["analysis"]["out_ids"]
-    assert initial["sft"]["out_ids"] == {}
-    assert initial["sft"]["blocked_by"] == ["bench", "analysis"]
+    assert initial["sft"]["blocked_by"] == ["bench"]
     with pytest.raises(
-        ValueError, match="registered Baseline reports: bench, analysis"
+        ValueError, match="Unfinished execution or required report input: bench"
     ):
         await runtime.bind_plan_submission(scope, "sft", 1, context)
-
     runtime._record_execution(
-        store,
-        bench.model_copy(
-            update={
-                "report_state": "ready",
-                "artifacts": ({"artifact_id": "bench-v1"},),
-            }
-        ),
+        store, bench.model_copy(update={"report_state": "registering"})
     )
     runtime._record_execution(
         store, analysis.model_copy(update={"report_state": "registration_failed"})
     )
-    assert (await contexts())["sft"]["blocked_by"] == ["analysis"]
-    with pytest.raises(ValueError, match="registered Baseline reports: analysis"):
-        await runtime.bind_plan_submission(scope, "sft", 1, context)
+    assert (await contexts())["sft"]["out_ids"]
 
-    runtime._record_execution(
-        store,
-        analysis.model_copy(
-            update={"report_state": "ready", "artifacts": ({"artifact_id": "diag-v1"},)}
-        ),
-    )
     allowed = (await contexts())["sft"]
     assert "blocked_by" not in allowed
     address = TaskCorrelation.model_validate_json(allowed["out_ids"]["workflow_run"])

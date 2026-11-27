@@ -34,6 +34,10 @@ from pyromind_runtime.domain.storage_paths import (
     to_storage_api_path,
 )
 from pyromind_runtime.domain.versions import ArtifactVersion, canonical, fingerprint
+from pyromind_runtime.ports.storage import (
+    EvaluationStorage,
+    EvaluationStorageUnavailableError,
+)
 
 
 _TRAINING_METRICS = tuple(
@@ -219,6 +223,13 @@ def project_observations(
                 title=stage.name,
                 type=stage.kind or "",
                 business_status=status,
+                execution_complete=execution_states == {"succeeded"}
+                and all(
+                    run and run.state == "succeeded" and run.registered_report_ids
+                    for task, run in stage_runs
+                    if task.kind == "analysis" and task.report_output
+                )
+                and any(run and run.report_evidence_key for _, run in stage_runs),
                 delivery_status=delivery_status,
                 delivery_error=failed_delivery.delivery_error
                 if failed_delivery
@@ -328,6 +339,123 @@ def _legacy_entry_report(
     return False
 
 
+def summary_only_attribution(text: str) -> bool:
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return False
+    return (
+        isinstance(body, dict)
+        and isinstance(body.get("summary"), str)
+        and not body.get("findings")
+        and not body.get("metrics")
+        and not (
+            body.keys()
+            - {
+                "schema_version",
+                "kind",
+                "name",
+                "summary",
+                "source",
+                "findings",
+                "metrics",
+            }
+        )
+    )
+
+
+def attribution_task_source(
+    snapshot: ConversationSnapshot,
+    node_id: str,
+    report_id: str,
+    rows: list[dict],
+    storage: EvaluationStorage,
+) -> dict[str, str] | None:
+    """Read a richer task output only when its producer and parent receipt match."""
+    project = snapshot.project
+    if project is None:
+        return None
+    runs = [
+        r
+        for r in snapshot.experiment_executions or ()
+        if r.project_id == project.project_id
+        and r.plan_sequence == project.plan_sequence
+        and r.stage_id == node_id
+        and r.role_id == "main"
+    ]
+    run = next((r for r in runs if report_id in r.registered_report_ids), None)
+    if run is None:
+        return None
+    task = next(
+        (t for t in project.plan.tasks if t.id == run.task_id and t.kind == "analysis"),
+        None,
+    )
+    if not task or not task.report_output:
+        return None
+    matching = [
+        row
+        for row in rows
+        if row.get("id") == task.id and row.get("stage_id") == node_id
+    ]
+    if len(matching) != 1:
+        return None
+    row = matching[0]
+    attempt = run.plan_attempt or 1
+    attempts = [row[k] for k in ("attempt", "plan_attempt") if k in row] or [1]
+    if any(type(n) is not int or n != attempt for n in attempts):
+        return None
+    outputs = row.get("verified_outputs")
+    path = outputs.get(task.report_output.name) if isinstance(outputs, dict) else None
+    if not isinstance(path, str) or not path.endswith(".json"):
+        return None
+    source = to_storage_api_path(normalize_workspace_path(path))
+    limit = 48 * 1024
+    payload = storage.read(source)
+    if len(payload) > limit:
+        return None
+    body = json.loads(payload)
+    if (
+        not isinstance(body, dict)
+        or body.get("plan_task_id") != task.id
+        or type(body.get("plan_attempt")) is not int
+        or body["plan_attempt"] != attempt
+        or not isinstance(body.get("summary"), str)
+        or not body["summary"].strip()
+        or not (body.get("findings") or report_metrics(body))
+    ):
+        return None
+    parents = {i.task_id for i in task.inputs if i.task_id}
+    parent = max(
+        (
+            r
+            for r in runs
+            if r.task_id == body.get("parent_task_id") and r.task_id in parents
+        ),
+        key=lambda r: r.plan_attempt or 1,
+        default=None,
+    )
+    if (
+        parent is None
+        or not body.get("platform_task_id")
+        or str(body["platform_task_id"])
+        not in (parent.platform_task_id, *parent.platform_task_ids)
+    ):
+        return None
+    result = {"task_source_text": canonical(body)}
+    markdown = str(PurePosixPath(path).with_suffix(".md"))
+    evidence = row.get("evidence_paths")
+    if isinstance(evidence, list) and markdown in evidence:
+        try:
+            content = storage.read(to_storage_api_path(markdown))
+            if len(content) <= limit:
+                text = content.decode("utf-8")
+                if body["summary"].strip() in text:
+                    result["task_source_markdown"] = text
+        except (ValueError, LookupError, OSError, EvaluationStorageUnavailableError):
+            pass
+    return result
+
+
 def observation_analysis_report(
     snapshot: ConversationSnapshot,
     project_id: str,
@@ -401,6 +529,7 @@ def observation_report_details(
     load_baseline_metrics: Callable[[str], list[StageAnalysisMetric]] | None = None,
     *,
     report_version_id: str | None = None,
+    load_dataset_source: Callable[[str], bytes] | None = None,
 ) -> ObservationReportDetails:
     overview = project_observations(snapshot, project_id)
     node = next((item for item in overview.nodes if item.id == node_id), None)
@@ -414,7 +543,8 @@ def observation_report_details(
     job = None
     historical_runs = (
         stage_report_runs(snapshot, project_id, node.id, node.type)
-        if report_version_id is not None or (node.type == "init" and analysis_job_id)
+        if report_version_id is not None
+        or (node.type in {"init", "dataset"} and analysis_job_id)
         else {}
     )
     if analysis_job_id is not None:
@@ -475,6 +605,7 @@ def observation_report_details(
     read_errors: list[Exception] = []
     baseline_task_ids: set[str] = set()
     readable = []
+    source_runs = {}
     for identity in report_ids:
         artifact = versions.store.get_version(project.id, identity)
         if artifact.state != "ready" or artifact.kind not in {"report", "evaluation"}:
@@ -508,6 +639,8 @@ def observation_report_details(
         if (analysis_job_id is None or node.type == "init") and run is None:
             continue
         readable.append(artifact)
+        if run is not None:
+            source_runs[artifact.id] = run
         if node.type == "init" and run is not None and run.platform_task_id:
             baseline_task_ids.add(run.platform_task_id)
 
@@ -554,10 +687,43 @@ def observation_report_details(
                 if metric not in metrics:
                     metrics.append(metric)
             if node.type == "dataset":
-                files.update(
-                    (file.path, file)
-                    for file in dataset_report_files(body, issues=collected)
-                )
+                listed = dataset_report_files(body, issues=collected)
+                source_run = source_runs.get(artifact.id)
+                if (
+                    load_dataset_source
+                    and source_run
+                    and source_run.delivery_outputs
+                    and any(not f.distributions.get("label") for f in listed)
+                ):
+                    attempt = fingerprint([source_run.plan_sequence, source_run.run_id])
+                    root = (
+                        PurePosixPath("/workspace/.pyromind-agent")
+                        / snapshot.conversation_id
+                        / "reports"
+                        / attempt
+                    )
+                    for value in source_run.delivery_outputs.values():
+                        path = PurePosixPath(value)
+                        if (
+                            path.parent != root
+                            or path.suffix != ".json"
+                            or len(path.stem) != 64
+                        ):
+                            continue
+                        try:
+                            source = json.loads(
+                                load_dataset_source(to_storage_api_path(value))
+                            )
+                            if (
+                                isinstance(source, dict)
+                                and fingerprint(source) == path.stem
+                            ):
+                                listed = restore_dataset_file_statistics(
+                                    listed, source, source_run.delivery_outputs
+                                )
+                        except (OSError, ValueError, LookupError, RuntimeError):
+                            pass
+                files.update((file.path, file) for file in listed)
                 if report_checks:
                     checks.update(report_checks)
             elif isinstance(summary := body.get("summary"), str):
@@ -653,6 +819,70 @@ def baseline_evaluation_metrics(body: object) -> list[StageAnalysisMetric]:
     return report_metrics({"metrics": results})
 
 
+def restore_dataset_file_statistics(
+    files: list[ObservationDatasetFile], raw: dict, outputs: dict[str, str]
+) -> list[ObservationDatasetFile]:
+    """Recover file-level counts from the older split-indexed report shape."""
+    by_split = raw.get("distribution")
+    if not isinstance(by_split, dict):
+        return files
+    raw_files = {
+        item["path"]: item
+        for item in raw.get("files", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    for index, file in enumerate(files):
+        if file.distributions.get("label"):
+            continue
+        item = raw_files.get(file.path)
+        if (
+            not item
+            or item.get("sample_count") != file.sample_count
+            or file.sample_count is None
+        ):
+            continue
+        splits = {
+            key.removesuffix("_by_label")
+            for key in by_split
+            if key.endswith("_by_label")
+        }
+        candidates = [
+            split
+            for split in splits
+            if {
+                path
+                for name, path in outputs.items()
+                if name == split or name.startswith(split + "_")
+            }
+            == {file.path}
+        ]
+        if len(candidates) != 1:
+            continue
+        labels = by_split[candidates[0] + "_by_label"]
+        if (
+            not isinstance(labels, dict)
+            or not labels
+            or not all(
+                isinstance(k, str) and k and type(v) is int and v >= 0
+                for k, v in labels.items()
+            )
+            or sum(labels.values()) != file.sample_count
+        ):
+            continue
+        size = item.get("size_bytes", item.get("bytes"))
+        files[index] = file.model_copy(
+            update={
+                "distributions": {**file.distributions, "label": labels},
+                "size_bytes": file.size_bytes
+                if file.size_bytes is not None
+                else size
+                if type(size) is int and size >= 0
+                else None,
+            }
+        )
+    return files
+
+
 def dataset_report_checks(body: dict) -> dict[str, bool]:
     raw = body.get("checks")
     if not isinstance(raw, dict):
@@ -705,7 +935,7 @@ def dataset_report_files(
                 if isinstance(labels, dict):
                     counts = {
                         label: hits
-                        for label, value in list(labels.items())[:100]
+                        for label, value in labels.items()
                         if (
                             hits := count(
                                 value, f"{field}.distributions.{group}.{label}"

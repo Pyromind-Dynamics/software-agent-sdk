@@ -41,6 +41,7 @@ _BUSINESS_STATES = {
 }
 _RUNTIME_TASK_FIELDS = (
     "business_status",
+    "blocked_by",
     "plan_attempt",
     "attempt",
     "platform_task_id",
@@ -48,6 +49,7 @@ _RUNTIME_TASK_FIELDS = (
     "report_version_id",
     "next_action",
     "verified_outputs",
+    "evidence_paths",
 )
 
 
@@ -206,6 +208,31 @@ def delivery_rows(
             != run.run_id
         ):
             continue
+        if (
+            run.report_input_paths
+            and run.report_state != "ready"
+            and row.get("business_status") not in {"blocked", "failed"}
+        ):
+            existing_paths = row.get("evidence_paths")
+            extra = (
+                [path for path in existing_paths if isinstance(path, str)]
+                if isinstance(existing_paths, list)
+                else []
+            )
+            row = {
+                **row,
+                "id": task_id,
+                "stage_id": run.stage_id,
+                "attempt": run.plan_attempt or 1,
+                "business_status": "completed",
+                "evidence_paths": list(
+                    dict.fromkeys([*run.report_input_paths, *extra])
+                ),
+            }
+            if positions:
+                result[positions[0]] = row
+            else:
+                result.append(row)
         if (
             run.delivery_outputs
             and (run.delivery_command_id or run.report_state == "ready")
@@ -426,7 +453,9 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
                     "stage_id": task.stage_id,
                     "attempt": record.get("plan_attempt", 1),
                     "business_status": record.get("business_status"),
+                    "blocked_by": record.get("blocked_by"),
                     "verified_outputs": record.get("verified_outputs", {}),
+                    "evidence_paths": record.get("evidence_paths", []),
                     "report_version_id": record.get("report_version_id"),
                     "next_action": record.get("next_action"),
                 }
@@ -598,6 +627,147 @@ def completed_callback_task(
         and run.report_state != "failed"
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def independent_plan_steps(
+    project: ProjectView, snapshot: ConversationSnapshot, rows: list
+) -> Iterator[tuple[ExperimentTask, dict[str, str], ExperimentExecutionView | None]]:
+    """Run ordered execution work and ready analysis work on separate tracks."""
+    current: dict[str, ExperimentExecutionView] = {}
+    for run in snapshot.experiment_executions or ():
+        if (
+            run.project_id != project.project_id
+            or run.plan_sequence != project.plan_sequence
+            or run.role_id != "main"
+        ):
+            continue
+        previous = current.get(run.task_id)
+        if previous is None or (run.plan_attempt or 1) > (previous.plan_attempt or 1):
+            current[run.task_id] = run
+    resources = {item.id: item.storage_path for item in project.plan.resources}
+    enabled = {s.id for s in project.plan.stages if s.enabled and not s.placeholder}
+    tasks = {task.id: task for task in project.plan.tasks if task.stage_id in enabled}
+    external = {t.task_id: t for t in snapshot.external_tasks}
+    ledger = {
+        row["id"]: row
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+    }
+    main_open = True
+    completed_main = set()
+    for task in tasks.values():
+        child = task.kind == "analysis" and task.report_output is not None
+        run = current.get(task.id)
+        if not child and run and run.state == "succeeded":
+            receipt = external.get(run.platform_task_id or "")
+            if not run.platform_task_id or (
+                receipt and receipt.status == "succeeded" and receipt.resume_auto_run
+            ):
+                completed_main.add(task.stage_id)
+                continue
+        if child:
+            if task.stage_id not in completed_main and not any(
+                i.task_id for i in task.inputs
+            ):
+                continue
+        else:
+            eligible = main_open and bool(completed_main)
+            main_open = False
+            if not eligible:
+                continue
+        row = ledger.get(task.id, {})
+        analysis = None
+        if child:
+            # A ledger completion can hand off files but cannot certify a report.
+            candidate = next(
+                plan_executions(
+                    project,
+                    [
+                        {
+                            "id": task.id,
+                            "stage_id": task.stage_id,
+                            **row,
+                            "business_status": "pending",
+                        }
+                    ],
+                    registered=snapshot.experiment_executions or (),
+                ),
+                None,
+            )
+            if candidate is None or (
+                run and (candidate.plan_attempt or 1) < (run.plan_attempt or 1)
+            ):
+                continue
+            if run is None or run.run_id != candidate.run_id:
+                run = candidate
+            analysis = run
+        if run and (
+            run.platform_task_id
+            or run.report_input_paths
+            or run.registered_report_ids
+            or (
+                run.state != "queued"
+                and not (
+                    child
+                    and run.state in {"succeeded", "waiting_analysis"}
+                    and run.report_state == "not_started"
+                )
+            )
+        ):
+            continue
+        status = row.get("business_status")
+        if row.get("platform_task_id") or row.get("actual_platform_task_id"):
+            continue
+        if status == "ready_blocked":
+            # Older ledgers left this marker after the listed gates cleared.
+            blockers = row.get("blocked_by")
+            if (
+                not isinstance(blockers, list)
+                or not blockers
+                or not all(
+                    isinstance(key, str)
+                    and key in current
+                    and current[key].state == "succeeded"
+                    and (
+                        key in tasks
+                        and (
+                            not tasks[key].report_output
+                            or current[key].registered_report_ids
+                        )
+                    )
+                    for key in blockers
+                )
+            ):
+                continue
+        elif status not in (None, "pending") and not (child and status == "completed"):
+            continue
+        inputs = {}
+        for item in task.inputs:
+            path = resources.get(item.resource_id or "")
+            if item.task_id:
+                producer = current.get(item.task_id)
+                declaration = tasks.get(item.task_id)
+                if not producer or producer.state != "succeeded" or not declaration:
+                    break
+                report = declaration.report_output
+                if (
+                    report
+                    and report.name == item.output_name
+                    and not producer.registered_report_ids
+                ):
+                    break
+                path = verified_input_path(
+                    item, {**producer.execution_outputs, **producer.delivery_outputs}
+                )
+            if not path:
+                break
+            try:
+                inputs[item.name] = normalize_workspace_path(path)
+            except StoragePathError:
+                break
+        else:
+            if inputs or not child:
+                yield task, inputs, analysis
 
 
 def next_approved_task(

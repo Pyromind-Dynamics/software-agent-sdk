@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Protocol, runtime_checkable
 
 from pydantic import Field
@@ -303,3 +303,17 @@ class ProjectStageAnalyzer(Protocol):
         evidence: JsonObject,
         context: RequestContext,
     ) -> JsonObject: ...
+
+
+@runtime_checkable
+class ProjectReportAgent(Protocol):
+    async def prepare_project_report(
+        self,
+        handle: SessionHandle,
+        role: str,
+        evidence: JsonObject,
+        context: RequestContext,
+        tool: Callable[[str, JsonObject], Awaitable[JsonObject]],
+    ) -> None:
+        """Run the isolated report agent with attempt-scoped tools."""
+        ...

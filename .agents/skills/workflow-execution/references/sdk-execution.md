@@ -244,8 +244,7 @@ Project 任务读取 `PYROMIND_PROJECT_EXECUTIONS`：它是包含
 `project_id`、`task_id`、`attempt`、`out_ids` 的 JSON 列表。选择已获授权的 Project
 任务和当前 attempt，再从该项的 `out_ids` 选择任务类型。不要用普通会话关联替代
 Project 关联；新业务尝试需要新的 attempt 上下文，旧 attempt 的迟到回调不代表新尝试完成。
-训练任务如果有 `blocked_by`，先完成其中列出的 Baseline 任务的报告登记。
-登记后从新的终端调用读取 `out_ids`，取得该训练任务的提交关联再提交。
+如果任务有 `blocked_by`，检查所列执行前置条件和任务声明的具体输入。执行结果和所需输入到位后，从新终端调用读取 `out_ids`。只有显式使用报告的输入需要等待报告交付。
 有 `waiting_for` 的任务等待所列平台任务的回调，同次尝试暂时不会取得新的提交关联。
 其他节点可以继续已获授权的工作和报告登记。没有可推进的工作时结束本轮。
 分片提交保留每片真实 `task_id`，不只保存最后一片。
@@ -253,8 +252,9 @@ Project 关联；新业务尝试需要新的 attempt 上下文，旧 attempt 的
 
 核验产物后更新 `public_data/workflowPLAN.json`。保留获批的 `plan.tasks`，在
 `runtime.tasks[计划任务ID]` 记录当前 `attempt`、实际 `platform_task_id` 和
-`verified_outputs`（按声明的产物名映射到绝对路径）。产物齐备后将该记录的
-`business_status` 设为 `completed`。工作台按任务 ID 和执行轮次登记交付。
+`verified_outputs`（按声明的产物名映射到绝对路径）。执行类任务的产物齐备后可将该记录的
+`business_status` 设为 `completed`。纯分析任务已有文件时写入 `evidence_paths`，保留待处理状态。
+子 Agent 校验并登记本次任务的报告后，运行时才确认该分析任务完成。
 
 `out_id` 仅用于关联，不是平台提交幂等键，也不是平台权限凭据。可信平台回调会核验
 服务端签名关联，然后补齐任务事实并通知原 Main；普通 HTTP 手工回调不能据此认领未知任务。

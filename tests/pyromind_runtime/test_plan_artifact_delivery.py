@@ -31,16 +31,22 @@ from pyromind_runtime.application.plan_execution import (
     with_platform_states,
 )
 from pyromind_runtime.application.project_observations import (
+    attribution_task_source,
     observation_analysis_report,
     observation_report_details,
     project_observations,
+    restore_dataset_file_statistics,
+    summary_only_attribution,
 )
 from pyromind_runtime.application.stage_analysis import ready_stage_analyses
 from pyromind_runtime.application.versions import Versions, snapshot_result
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
 from pyromind_runtime.domain.content import JsonObject
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.experiment_plans import ExperimentTask, PlanOutput
+from pyromind_runtime.domain.observations import ObservationDatasetFile
 from pyromind_runtime.domain.preparation import PreparationPolicy, ProjectView
 from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
 from pyromind_runtime.domain.versions import (
@@ -53,7 +59,11 @@ from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
 from pyromind_runtime.infrastructure.sqlite_version_store import SQLiteVersionStore
-from pyromind_runtime.ports.harness import SessionSpec
+from pyromind_runtime.ports.harness import (
+    ProjectReportAgent,
+    SessionHandle,
+    SessionSpec,
+)
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageTooLargeError,
@@ -718,6 +728,29 @@ def test_failed_snapshot_is_never_reused_for_a_corrected_submission(
     )
 
 
+def test_legacy_dataset_label_counts_require_unambiguous_split_and_total():
+    train = ObservationDatasetFile(
+        name="train", path="/workspace/train.jsonl", sample_count=5
+    )
+    val = ObservationDatasetFile(
+        name="val", path="/workspace/val.jsonl", sample_count=3
+    )
+    raw = {
+        "files": [file.model_dump() for file in (train, val)],
+        "distribution": {
+            "train_by_label": {"good": 3, "bad": 2},
+            "val_by_label": {"good": 2},
+        },
+    }
+    outputs = {"train_data": train.path, "val_data": val.path}
+    recovered = restore_dataset_file_statistics([train, val], raw, outputs)
+    assert recovered[0].distributions == {"label": {"good": 3, "bad": 2}}
+    assert recovered[1].distributions == {}
+    assert restore_dataset_file_statistics(
+        [train], raw, {**outputs, "train_extra": val.path}
+    ) == [train]
+
+
 def test_primary_dataset_report_registers_files_despite_bad_auxiliary_values():
     outputs = {"prepare_report": "/run/report.json", "train": "/run/train.jsonl"}
     body = {
@@ -789,6 +822,67 @@ def test_legacy_detection_preserves_summary_reports_and_skips_oversized_non_repo
         _read_report(storage, "init", outputs, report_name="model_config")
 
 
+async def test_attribution_submission_requires_findings_and_read_evidence():
+    from pyromind_runtime.application.report_agent import prepare_report_outputs
+
+    source = "/workspace/public_data/run/errors.json"
+    body = {"schema_version": 1, "summary": "probe"}
+    storage = Mock(spec=EvaluationStorage)
+    storage.list.return_value = {"errors.json", "other.json"}
+    storage.read.return_value = b'{"missed_label":"glare"}'
+    task = ExperimentTask.model_validate(
+        {
+            "id": "diagnose",
+            "kind": "analysis",
+            "stage_id": "init",
+            "name": "Diagnosis",
+            "outputs": [{"kind": "report", "name": "diagnosis"}],
+        }
+    )
+    run = ExperimentExecutionView(
+        project_id="p",
+        plan_sequence=1,
+        stage_id="init",
+        stage_snapshot={"kind": "init"},
+        run_id="run",
+        task_id=task.id,
+        task_name=task.name,
+        role_id="main",
+        state="waiting_analysis",
+        report_state="registering",
+    )
+
+    async def prepare(handle, role, evidence, context, tool):
+        await tool("list_evidence", {"path": "/workspace/public_data/run"})
+        assert "text" in await tool("read_evidence", {"path": source})
+        args = {"outputs": {}, "report": body}
+        assert (await tool("submit_report", args))["field"] == "findings"
+        body["findings"] = ["Glare appears among missed labels."]
+        body["evidence_paths"] = ["/workspace/public_data/run/other.json"]
+        assert (await tool("submit_report", args))["field"] == "evidence_paths"
+        storage.write.assert_not_called()
+        body["evidence_paths"] = [source]
+        assert await tool("submit_report", args) == {"accepted": True}
+
+    outputs = await prepare_report_outputs(
+        Mock(spec=ProjectReportAgent, prepare_project_report=prepare),
+        SessionHandle(
+            session_id="session",
+            adapter_session_ref="session",
+            capabilities=HarnessCapabilities(),
+        ),
+        RequestContext(user_id="42"),
+        storage,
+        task,
+        run,
+        {},
+        ("/workspace/public_data/run",),
+        lambda _: None,
+    )
+    assert "diagnosis" in outputs
+    assert json.loads(storage.write.call_args.args[1])["evidence_paths"] == [source]
+
+
 def test_baseline_and_attribution_complete_together_but_have_separate_reports(tmp_path):
     context = RequestContext(user_id="42")
     snapshots = FileArtifactSnapshots(tmp_path / "storage")
@@ -814,6 +908,13 @@ def test_baseline_and_attribution_complete_together_but_have_separate_reports(tm
                         "kind": "analysis",
                         "stage_id": "init",
                         "name": "Explain",
+                        "inputs": [
+                            {
+                                "name": "predictions",
+                                "task_id": "bench",
+                                "output_name": "result",
+                            }
+                        ],
                         "outputs": [{"name": "analysis", "kind": "report"}],
                     },
                 ],
@@ -874,6 +975,9 @@ def test_baseline_and_attribution_complete_together_but_have_separate_reports(tm
         reports[task.id] = report.id
         runs[task.id] = with_plan_report(ready, report)
 
+    runs["bench"] = runs["bench"].model_copy(
+        update={"report_evidence_key": "baseline-evidence"}
+    )
     snapshot = ConversationSnapshot.model_validate(
         {
             "conversation_id": "session",
@@ -886,6 +990,15 @@ def test_baseline_and_attribution_complete_together_but_have_separate_reports(tm
     assert waiting.business_status == "waiting_analysis"
     assert waiting.report_version_ids == (reports["bench"],)
     assert waiting.analysis_report_version_ids == ()
+    assert not waiting.execution_complete
+    unregistered = runs["explain"].model_copy(update={"artifacts": ()})
+    partial = snapshot.model_copy(
+        update={"experiment_executions": (runs["bench"], unregistered)}
+    )
+    pending = project_observations(partial, "p").nodes[0]
+    assert (
+        pending.business_status == "waiting_analysis" and not pending.execution_complete
+    )
 
     complete = snapshot.model_copy(
         update={"experiment_executions": tuple(runs.values())}
@@ -894,6 +1007,50 @@ def test_baseline_and_attribution_complete_together_but_have_separate_reports(tm
     assert node.business_status == "succeeded"
     assert node.report_version_ids == (reports["bench"],)
     assert node.analysis_report_version_ids == (reports["explain"],)
+    assert node.execution_complete
+    source_snapshot = complete.model_copy(
+        update={
+            "experiment_executions": (
+                runs["bench"].model_copy(update={"platform_task_id": "1420"}),
+                runs["explain"],
+            )
+        }
+    )
+    row = {
+        "id": "explain",
+        "attempt": 1,
+        "stage_id": "init",
+        "verified_outputs": {"analysis": "/workspace/run/diagnosis.json"},
+        "evidence_paths": ["/workspace/run/diagnosis.md"],
+    }
+    source = {
+        "plan_task_id": "explain",
+        "plan_attempt": 1,
+        "parent_task_id": "bench",
+        "platform_task_id": "1420",
+        "summary": "Glare affected accuracy.",
+        "findings": ["Glare."],
+    }
+    (directory / "diagnosis.md").write_text("# Diagnosis\nGlare affected accuracy.")
+
+    def resolve_source(document, rows):
+        (directory / "diagnosis.json").write_text(json.dumps(document))
+        return attribution_task_source(
+            source_snapshot, "init", reports["explain"], rows, storage
+        )
+
+    assert summary_only_attribution('{"summary":"probe","schema_version":1}')
+    assert not summary_only_attribution(json.dumps(source))
+    verified = resolve_source(source, [row])
+    assert verified and verified["task_source_markdown"].startswith("# Diagnosis")
+    assert resolve_source(source, [dict(row, attempt=2)]) is None
+    assert resolve_source(dict(source, platform_task_id="unrelated"), [row]) is None
+    assert resolve_source(dict(source, plan_attempt=2), [row]) is None
+    assert resolve_source(source, [row, row]) is None
+    (directory / "diagnosis.md").write_text("Another attempt")
+    verified = resolve_source(source, [row])
+    assert verified and "task_source_markdown" not in verified
+
     metrics = observation_report_details(complete, "p", "init", None, versions, context)
     assert [metric.value for metric in metrics.metrics] == [0.72]
     with pytest.raises(FileNotFoundError):
@@ -1407,3 +1564,226 @@ def test_completed_plan_outputs_register_once_and_recover(
         assert details.metrics[0].label == "accuracy"
     if stage == "init":
         assert details.summaries == ("Baseline accuracy was 0.5.",)
+
+
+@pytest.mark.parametrize(
+    ("stage", "role"),
+    [
+        ("init", "baseline_analysis"),
+        ("dataset", "dataset_analysis"),
+        ("train", "train_analysis"),
+        ("eval", "evaluation_analysis"),
+    ],
+)
+@pytest.mark.parametrize("platform", [False, True])
+async def test_stage_agent_delivers_from_raw_evidence(
+    stage, role, platform, preparation_setup, tmp_path, monkeypatch
+):
+    preparation, owner, _ = preparation_setup
+    scope = owner.conversation_id
+    context = RequestContext(
+        user_id=owner.user_id,
+        profile_id=owner.profile_id,
+        authorization="Bearer test-only",
+    )
+    project = ProjectView.model_validate(
+        {
+            "project_id": "project",
+            "conversation_id": scope,
+            "plan_sequence": 1,
+            "creation_command_id": "start",
+            "plan": {
+                "stages": [{"id": "s", "kind": stage, "name": stage}],
+                "tasks": [
+                    {
+                        "id": "work",
+                        "stage_id": "s",
+                        "name": "approved task",
+                        "outputs": [{"kind": "report", "name": "primary"}],
+                    }
+                ],
+            },
+        }
+    )
+    snapshots = FileArtifactSnapshots(tmp_path / "artifacts")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+
+    def write(path, data):
+        target = snapshots.path(path, context)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+    storage = Mock(
+        spec=EvaluationStorage,
+        write=write,
+        read=lambda p: snapshots.path(p, context).read_bytes(),
+        list=lambda p: {q.name for q in snapshots.path(p, context).iterdir()},
+    )
+    write("/raw/result.json", b'{"score":0.5}')
+
+    class Adapter(FakeAdapter):
+        calls = 0
+
+        async def prepare_project_report(
+            self, handle, assigned_role, evidence, context, tool
+        ):
+            self.calls += 1
+            assert assigned_role == role
+            live = (await runtime.get_snapshot(scope, context)).active_subagents
+            assert [(item.role, item.task_name) for item in live] == [
+                (role, "approved task")
+            ]
+            assert "error" in await tool(
+                "read_evidence", {"path": "/workspace/another/result.json"}
+            )
+            inspected = await tool(
+                "read_evidence", {"path": "/workspace/raw/result.json"}
+            )
+            assert json.loads(inspected["text"])["score"] == 0.5
+            invalid = await tool("submit_report", {"outputs": {}, "report": {}})
+            assert invalid["field"] == "schema_version"
+            body = {"schema_version": 1, "metrics": [{"label": "score", "value": 0.5}]}
+            if stage == "dataset":
+                body["files"] = [
+                    {
+                        "path": "/workspace/raw/result.json",
+                        "name": "validation",
+                        "sample_count": 1,
+                    }
+                ]
+                rejected = await tool("submit_report", {"outputs": {}, "report": body})
+                assert rejected["field"] == "files[0].distributions.label"
+                body["files"][0]["distributions"] = {"label": {"pass": 2}}
+                rejected = await tool("submit_report", {"outputs": {}, "report": body})
+                assert rejected["field"] == "files[0].distributions.label"
+                body["files"][0]["distributions"] = {"label": {"pass": 1}}
+            assert await tool("submit_report", {"outputs": {}, "report": body}) == {
+                "accepted": True
+            }
+
+    # A temporary registration failure must reuse the already validated report.
+    if platform and stage == "train":
+
+        def register_on_retry(*args, **kwargs):
+            if register.call_count == 1:
+                raise OSError("temporary storage failure")
+            return register_plan_delivery(*args, **kwargs)
+
+        register = Mock(side_effect=register_on_retry)
+        monkeypatch.setattr(conversation_runtime, "register_plan_delivery", register)
+
+    adapter = Adapter()
+    root = tmp_path / "sessions"
+    runtime = ConversationRuntime(
+        root,
+        adapter,
+        preparation_store=preparation,
+        versions=versions,
+        observation_storage_factory=lambda _: storage,
+    )
+    monkeypatch.setattr(runtime, "get_project", AsyncMock(return_value=project))
+    policy = PreparationPolicy.model_validate(
+        {"workflow_nodes": [{"id": stage, "name": stage}]}
+    )
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=scope,
+                user_id=context.user_id,
+                profile_id=context.profile_id,
+                workspace_root=str(root / scope),
+                preparation_policy=policy,
+                tool_allowlist=("product_versions",),
+            ),
+            context,
+        )
+        path = root / scope / PLAN_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "id": "work",
+                            "stage_id": "s",
+                            "business_status": "completed",
+                            "evidence_paths": ["/workspace/raw/result.json"],
+                        }
+                    ]
+                }
+            )
+        )
+        active, store = runtime._active[scope], runtime._store(scope)
+        if platform:
+            # The callback may arrive before the Main Agent writes its first task row.
+            path.write_text('{"tasks":[]}')
+            bound = runtime._ensure_plan_attempt(store, project, "work")
+            assert bound is not None
+            runtime._record_execution(
+                store, bound.model_copy(update={"platform_task_id": "own"})
+            )
+            store.append(
+                ProductEvent(
+                    conversation_id=scope,
+                    type="external_task.submitted",
+                    payload={
+                        "task_id": "own",
+                        "kind": "workflow_run",
+                        "status": "running",
+                        "output_dir": "/raw",
+                        "submitted_at": "2026-11-27T00:00:00Z",
+                        "updated_at": "2026-11-27T00:00:00Z",
+                    },
+                )
+            )
+            await runtime._capture_plan_progress(active, store)
+            assert adapter.calls == 0 and not runtime._stage_analysis_workers
+            store.append(
+                ProductEvent(
+                    conversation_id=scope,
+                    type="external_task.completed",
+                    payload={
+                        "task_id": "own",
+                        "status": "succeeded",
+                        "output_dir": "/raw",
+                    },
+                )
+            )
+        await asyncio.gather(
+            runtime._capture_plan_progress(active, store),
+            runtime._capture_plan_progress(active, store),
+        )
+        await asyncio.gather(*runtime._stage_analysis_workers.values())
+        await runtime._capture_plan_progress(active, store)
+        run = runtime._plan_attempt(store.load_snapshot(), project, "work")
+        assert run and run.report_state == "ready", run
+        assert run.registered_report_ids and run.delivery_outputs["primary"]
+        assert adapter.calls == 1
+        await runtime._capture_plan_progress(active, store)
+        handoffs = [
+            e
+            for e in store.replay()
+            if e.type == "task.queued" and e.payload.get("kind") == "report_handoff"
+        ]
+        assert len(handoffs) == 1
+        assert (
+            handoffs[0].payload["task_id"]
+            == f"report-handoff:{run.registered_report_ids[0]}"
+        )
+        assert not any(
+            e.type == "message.completed" and e.payload.get("execution_notice")
+            for e in store.replay()
+        )
+        assert not (await runtime.get_snapshot(scope, context)).active_subagents
+        updates = [
+            e.payload["activity"]
+            for e in store.replay()
+            if e.type == "subagent.activity"
+        ]
+        assert isinstance(updates[0], dict) and updates[0]["tool"] is None
+        assert updates[-1] is None
+        assert [a["tool"] for a in updates if isinstance(a, dict) and a["tool"]] == (
+            ["read_evidence"] * 2 + ["submit_report"] * (4 if stage == "dataset" else 2)
+        )
+    finally:
+        await runtime.close()

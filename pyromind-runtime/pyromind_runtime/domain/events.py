@@ -45,6 +45,7 @@ type ProductEventType = Literal[
     "task.dispatched",
     "artifact.registered",
     "project_stage_analysis.changed",
+    "subagent.activity",
     "external_task.observed",
     "experiment_context.changed",
     "experiment_plan.changed",

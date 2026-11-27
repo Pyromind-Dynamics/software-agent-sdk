@@ -34,7 +34,12 @@ from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
 from pyromind_runtime.domain.experiment_execution import ExperimentExecutionView
 from pyromind_runtime.domain.snapshot import TimelineMessage
-from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.domain.versions import (
+    SaveVersion,
+    SnapshotSource,
+    VersionParent,
+    VersionToolRequest,
+)
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
@@ -98,6 +103,187 @@ async def test_manager_summaries_rank_newer_saved_chat_activity(tmp_path):
         )
     finally:
         await runtime.close()
+
+
+@pytest.mark.parametrize("open_first", [True, False])
+async def test_bound_report_delivery_stays_in_main_agent(
+    tmp_path, open_first, preparation_setup, monkeypatch
+):
+    preparation, owner, policy = preparation_setup
+    snapshots = FileArtifactSnapshots(tmp_path / "storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    requests = []
+    reply = (
+        "**训练结果**\n\n本轮训练已完成。\n\n**交付物**\n\n"
+        "- [训练报告 JSON](#echomind-report=v2)"
+    )
+
+    async def main_model(request):
+        requests.append(await request.json())
+        chunks = [
+            dict(
+                choices=[
+                    dict(
+                        index=0,
+                        delta={"content": "[[echomind:reply]]" + reply},
+                        finish_reason=None,
+                    )
+                ]
+            ),
+            dict(choices=[dict(index=0, delta={}, finish_reason="stop")]),
+        ]
+        return web.Response(
+            text="".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+            + "data: [DONE]\n\n",
+            content_type="text/event-stream",
+        )
+
+    gateway = web.Application()
+    gateway.router.add_post("/main/chat/completions", main_model)
+    server = TestServer(gateway)
+    await server.start_server()
+    monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
+    runtime = ConversationRuntime(
+        tmp_path / "sessions",
+        PiAdapter(tmp_path / "sessions", terminal_backend="os-sandbox"),
+        versions=versions,
+        preparation_store=preparation,
+    )
+    ctx = RequestContext(user_id=owner.user_id, profile_id=MANAGER_PROFILE)
+    cid = owner.conversation_id
+    try:
+        await runtime.create_conversation(
+            SessionSpec(
+                conversation_id=cid,
+                user_id=ctx.user_id,
+                profile_id=MANAGER_PROFILE,
+                command_allowlist=("enqueue_task", "user_message"),
+                tool_allowlist=(),
+                model_configuration={
+                    "model": "test",
+                    "base_url": str(server.make_url("/main")),
+                },
+                preparation_policy=policy,
+                delegated_roles=(DelegatedRole(name="eval"),),
+                workspace_root=str(tmp_path / "sessions" / cid),
+            ),
+            ctx,
+        )
+        manager = runtime._store(cid)
+        if open_first:
+            await runtime.echomind_chat.open(cid, {}, ctx)
+        project = versions.project(cid, ctx)
+        assert project is not None
+        run = ExperimentExecutionView(
+            run_id="p:train:1",
+            project_id="p",
+            plan_sequence=1,
+            task_id="train",
+            task_name="模型训练",
+            role_id="main",
+            state="succeeded",
+            report_state="registering",
+            report_required=True,
+        )
+        path = snapshots.path("/runs/eval.html", ctx)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("<h1>Evaluation</h1>")
+        html = versions.save(
+            project,
+            "html",
+            SaveVersion(
+                kind="dataset",
+                logical_key="preview",
+                source=SnapshotSource(
+                    storage_ref="/runs/eval.html", reference_only=True
+                ),
+            ),
+            ctx,
+        )
+        artifact = versions.save(
+            project,
+            "delivery",
+            SaveVersion(
+                kind="report",
+                logical_key="train/report",
+                parents=[VersionParent(version_id=html.id, relation="eval_html")],
+                summary={"plan_execution": [1, run.run_id]},
+                source=SnapshotSource(text='{"summary":"训练已完成。"}'),
+            ),
+            ctx,
+        )
+        runtime._record_execution(manager, run)
+        await runtime._queue_report_handoffs(manager, (artifact, html))
+        assert not any(
+            isinstance(i, TimelineMessage) for i in manager.load_snapshot().timeline
+        )
+        runtime._record_execution(
+            manager,
+            run.model_copy(
+                update={
+                    "report_state": "ready",
+                    "artifacts": ({"artifact_id": artifact.id},),
+                }
+            ),
+        )
+        for _ in range(2):
+            await runtime._queue_report_handoffs(manager, (artifact, html))
+        assert not requests
+        assert [q["kind"] for q in manager.load_snapshot().experiment_queue or ()] == [
+            "report_handoff"
+        ]
+        async with asyncio.timeout(15):
+            while not any(
+                isinstance(m, TimelineMessage) and m.execution_notice
+                for m in manager.load_snapshot().timeline
+            ):
+                await asyncio.sleep(0.05)
+        main_reply = next(
+            m
+            for m in manager.load_snapshot().timeline
+            if isinstance(m, TimelineMessage) and m.execution_notice
+        )
+        assert (
+            main_reply.task_id == f"report-handoff:{artifact.id}" and main_reply.run_id
+        )
+        assert main_reply.project_reply == reply
+        assert len(requests) == 1
+        prompt = json.dumps(requests[0]["messages"], ensure_ascii=False)
+        assert (
+            "训练已完成。" in prompt
+            and f"#echomind-report={artifact.id}&file={html.id}" in prompt
+        )
+        await runtime._queue_report_handoffs(manager, (artifact, html))
+        assert not manager.load_snapshot().experiment_queue
+        if not open_first:
+            assert await runtime.echomind_chat.snapshot(cid, ctx) is None
+            await runtime.echomind_chat.open(cid, {}, ctx)
+        for snap in (
+            await runtime.echomind_chat.snapshot(cid, ctx),
+            await runtime.echomind_chat.open(cid, {}, ctx),
+        ):
+            assert snap is not None
+            assert not any(isinstance(item, TimelineMessage) for item in snap.timeline)
+            assert not snap.experiment_queue and not snap.active_run_id
+        filepath, _ = await runtime.echomind_chat.report_attachment(
+            cid, artifact.id, html.id, ctx
+        )
+        assert filepath == "/runs/eval.html"
+        with pytest.raises(ValueError):
+            await runtime.echomind_chat.report_attachment(
+                cid, artifact.id, artifact.id, ctx
+            )
+        with pytest.raises(PermissionError):
+            await runtime.echomind_chat.report_attachment(
+                cid, artifact.id, html.id, replace(ctx, user_id="foreign")
+            )
+        assert not any(
+            event.type.startswith("message.")
+            for event in runtime._store(CHAT_PREFIX + cid).replay()
+        )
+    finally:
+        await runtime.close()
+        await server.close()
 
 
 async def test_saved_report_remains_readable_without_chat_delivery(

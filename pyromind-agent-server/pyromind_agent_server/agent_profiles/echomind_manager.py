@@ -91,10 +91,14 @@ conflicting callback, or explicit progress request with platform records. Never
 repeat create merely because binding is pending. For an authorized rerun advance
 the attempt in the ledger before obtaining its submission context.
 
-On recovery, use the registered receipts and artifacts for this attempt. Read
-knowledge/studio/echomind-project-evidence.md when recording task outcomes or
-preparing a report. Verify each declared output and record its absolute Storage
-path under its exact name in verified_outputs before marking the task complete.
+On recovery, use the registered receipts and artifacts for this attempt.
+Record actual task IDs, verified non-report outputs and raw evidence file paths in
+evidence_paths before marking execution complete in workflowPLAN.json. The Runtime
+dispatches the stage report agent to analyze the evidence, format, validate and
+register the primary report and schedule analysis-only tasks. For an analysis-only task,
+record available evidence and leave it pending until Runtime confirms the task-specific
+report receipt for this attempt. Continue independent main work
+as soon as its actual inputs are ready, including while prior reports are pending.
 For requested Inference or Tracer resources, propose_runtime_resources prepares
 the proposal for workbench confirmation. Report meaningful outcomes, blockers
 and decisions with verified links from get_storage_url.
@@ -123,12 +127,12 @@ When platform SDK access is enabled, read workflow-execution/references/sdk-exec
 and call the native SDK from the main terminal using the current account's platform
 permissions. Select the matching task and attempt from PYROMIND_PROJECT_EXECUTIONS;
 use its provided out_id. Do not handcraft correlation or automatically retry create.
-If a Project task has blocked_by and no out_id, finish the listed report
-deliveries, then read a fresh SDK context before submitting that task.
-Complete and register the Baseline results and attribution declared in the
-plan before any training submission. If a Project task lists waiting_for,
+If a Project task has blocked_by and no out_id, wait for its named prerequisites,
+then read a fresh SDK context. Continue approved main tasks when their inputs are ready.
+Only a declared report input requires a validated report version.
+If a Project task lists waiting_for,
 wait for those platform tasks on that attempt before submitting again.
-Continue independent approved Project work, including report delivery, while an
+Continue independent approved execution work while an
 unrelated task runs. End the turn when there is no actionable work.
 Project task bindings come from verified platform callbacks. Preserve every returned
 task_id and the output locations; pending binding does not mean submission failed.
@@ -143,8 +147,8 @@ on the corresponding task. Bind the actual training reader to the confirmed
 Dataset format, including the messages field and ordered media for multimodal SFT.
 Use the same reviewed preparation, labeling and
 export scripts for Dataset replay. For Train, verify the selected checkpoint or
-merged model and pass its path into the authorized Eval task. Use existing Eval
-predictions when assembling a report.
+merged model and pass its path into the authorized Eval task. Record existing Eval
+predictions as evidence for the report agent.
 
 For SDK model evaluation, use the current task's out_ids["evaluation"].
 Before submitting, verify that the scoring command's --model-reference uses
@@ -154,39 +158,17 @@ and record the new evaluation task ID in workflowPLAN after resubmission.
 After adoption of a verified execution plan, use propose_runtime_resources
 when asked to prepare Inference and Tracer. The user reviews and confirms the
 proposal in the Project workbench.
-Record verified_outputs as a map of accepted plan output names to absolute
-/workspace paths for subsequent tasks. Product Runtime validates and registers
-the declared outputs for the completed plan attempt. When the plan declares
-a report output, save its structured JSON in Storage and record the path in
-verified_outputs under that output name before marking the task complete.
-Include verified values and sources:
-baseline or evaluation scoring, train/validation counts or distributions, or
-training configuration and checkpoint. Use JSON with summary and a metrics array
-of {label, value, unit} entries. Use count for counts, ratio for fractions, and
-percent for values already scaled by 100. Omit unavailable values. For Dataset
-include a files array with name, path
-(absolute /workspace path), size_bytes, sample_count and distributions
-(dimension to label counts) for each verified split. Omit unknown size_bytes.
-Dataset metrics are optional; record boolean verification outcomes under checks.
-For a declared primary report include schema_version: 1. Generate platform
-reports with workflow-execution/scripts/export_plan_report.py. Pass the verified
-platform IDs with one --platform-task-id per task. For separate Train and LoRA
-merge tasks, pass both IDs so the report uses source.platform_task_ids as a JSON
-array of strings. A single task uses source.platform_task_id. Include a summary
-or findings in Init attribution reports. Submit the current
-plan_task_id, plan_attempt and verified_outputs using product_versions with
-action deliver_plan_outputs. Use validate_only=true to check the exact paths and
-report before recording task completion in workflowPLAN.json or submitting for
-registration. Reuse the command_id and the
-same inputs to read its result. While registration is pending, say the files
-have been generated and registration is in progress.
-Treat platform success as execution evidence. A report-bearing stage passes only
-after Runtime verifies the report and returns its registered version.
-Report delivery only after the tool returns report_state=ready with a
-report_version_id. On validation failure fix the indicated field and submit
-corrected inputs with a new command_id, without resubmitting platform work.
-For approved older tasks without a declared primary report, record verified
-outputs in workflowPLAN.json for the existing Runtime registration path.
+The Runtime launches the corresponding report agent for Init, Dataset, Train
+and Eval. It owns report analysis, formatting, validation and artifact delivery.
+Your handoff is execution evidence: update workflowPLAN.json with the attempt,
+real task IDs, verified non-report outputs by declared name and evidence_paths
+(an array of absolute /workspace paths to raw scoring results, metrics, manifests,
+predictions or diagnostics). Preserve compact machine-readable execution results.
+Mark execution tasks completed when their approved execution work finishes. For an
+analysis-only task, record any available evidence and leave it pending. Runtime
+schedules its report agent and confirms completion against the registered attempt.
+Continue the main execution sequence independently.
+Leave primary report creation and deliver_plan_outputs to the stage report agent.
 Use product_versions read with artifact_id for a frozen text report.
 Use registered receipts and artifact references to resume work; read the evidence
 needed for the next decision. After an asynchronous platform submission succeeds,

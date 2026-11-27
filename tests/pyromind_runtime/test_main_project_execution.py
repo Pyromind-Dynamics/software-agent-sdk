@@ -270,11 +270,18 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
     async def respond(http_request):
         body = await http_request.json()
         system = body["messages"][0]["content"]
-        if "Summarize the candidate evaluation" in system:
+        # Report handoffs are separate Main Agent turns in this same session.
+        handoff = "A stage report was validated" in str(body["messages"][-1]["content"])
+        analyzing = "Summarize the candidate evaluation" in system
+        content = None
+        if handoff:
+            content = "[[echomind:reply]]阶段报告已完成。"
+        elif analyzing:
             assert reviewed.is_set()
             assert not body.get("tools")
             analysis_requests.append(body)
             content = json.dumps({"summary": "评估已完成", "findings": []})
+        if content is not None:
             chunks = [
                 {
                     "choices": [
