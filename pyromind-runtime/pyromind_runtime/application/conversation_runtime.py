@@ -2572,7 +2572,7 @@ class ConversationRuntime:
         return (
             "enqueue_task" in (store.access_policy()["command_allowlist"] or ())
             and not task.graph_run_id
-            and task.kind != "historical_experience"
+            and task.kind not in {"historical_experience", "echomind_debug_repair"}
             and (task.correlation is None or task.correlation.type == "main")
         )
 

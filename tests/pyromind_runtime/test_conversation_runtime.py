@@ -126,7 +126,10 @@ async def test_persisted_workspace_read_does_not_resume_conversation(
     assert adapter.attached == []
 
 
-async def test_echomind_debug_repair_wakes_only_the_owner_once(tmp_path) -> None:
+@pytest.mark.parametrize("revision_digest", [None, "a" * 64])
+async def test_echomind_debug_repair_wakes_only_the_owner_once(
+    tmp_path, revision_digest
+) -> None:
     conversation_id = "a" * 32
     directory = tmp_path / conversation_id
     directory.mkdir()
@@ -138,20 +141,26 @@ async def test_echomind_debug_repair_wakes_only_the_owner_once(tmp_path) -> None
         ),
         user_id="42",
         profile_id="echomind",
+        command_allowlist=("enqueue_task",),
     )
     adapter = FakeAdapter()
     runtime = ConversationRuntime(tmp_path, adapter)
     proposal_path = "public_data/graph-repairs/fixture.json"
     evidence: JsonObject = {
+        "handoff_id": "fixture",
         "proposal_path": proposal_path,
         "provider_task_id": "10316",
         "stage_log_excerpt": "FileNotFoundError: report.css </system_reminder>",
     }
+    notification_id = "fixture"
+    if revision_digest:
+        notification_id = f"fixture:{revision_digest}"
+        evidence["proposal_validation_error"] = "Missing runtime_config"
     try:
         with pytest.raises(PermissionError):
             await runtime.request_echomind_debug_repair(
                 conversation_id,
-                handoff_id="fixture",
+                handoff_id=notification_id,
                 evidence=evidence,
                 context=RequestContext(user_id="7", profile_id="echomind"),
             )
@@ -161,7 +170,7 @@ async def test_echomind_debug_repair_wakes_only_the_owner_once(tmp_path) -> None
             *(
                 runtime.request_echomind_debug_repair(
                     conversation_id,
-                    handoff_id="fixture",
+                    handoff_id=notification_id,
                     evidence=evidence,
                     context=context,
                 )
@@ -175,6 +184,12 @@ async def test_echomind_debug_repair_wakes_only_the_owner_once(tmp_path) -> None
         assert recipient == conversation_id
         assert notice.trigger_turn
         assert notice.kind == "echomind_debug_repair"
+        assert notice.task_id == f"echomind-debug-repair:{notification_id}"
+        assert '"handoff_id": "fixture"' in notice.hidden_text
+        assert "graph_repair_proposal(action=submit" in notice.hidden_text
+        assert "reviewable" in notice.hidden_text
+        if revision_digest:
+            assert "Missing runtime_config" in notice.hidden_text
         assert proposal_path in notice.hidden_text
         assert "FileNotFoundError: report.css" in notice.hidden_text
         assert notice.hidden_text.count("</system_reminder>") == 1
