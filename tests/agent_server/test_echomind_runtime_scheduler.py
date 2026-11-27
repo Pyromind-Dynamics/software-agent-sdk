@@ -34,6 +34,7 @@ from pyromind_agent_server.echomind_runtime_contracts import (
     ExternalTaskIntent,
     RuntimeCredentialUnavailableError,
     StageCancellationResult,
+    StagePollResult,
     StagePreparationResult,
     StageSubmissionResult,
 )
@@ -673,15 +674,16 @@ def test_retry_rejects_replacement_of_succeeded_stage_input(tmp_path, monkeypatc
     assert backend.submit_count == 1
 
 
-def test_train_poll_without_request_credentials_stays_waiting(tmp_path):
+def test_train_poll_without_request_credentials_stays_waiting(tmp_path, monkeypatch):
     projects_root = tmp_path / "projects"
     project, published = _published_project(
         projects_root,
         train_runtime=True,
     )
+    executor = _CredentialWaitingTrainExecutor()
     scheduler = RuntimeGraphScheduler(
         projects_root=projects_root,
-        executors={"train_runtime": _CredentialWaitingTrainExecutor()},
+        executors={"train_runtime": executor},
     )
 
     waiting = scheduler.start(
@@ -692,6 +694,10 @@ def test_train_poll_without_request_credentials_stays_waiting(tmp_path):
     )
 
     assert waiting.status == "waiting_external"
+    submitted = _stage_for_node(scheduler, project, waiting.run_id, "train").task_runs[
+        0
+    ]
+    assert not submitted.requires_request_credentials
     advanced = scheduler.advance(
         project=project,
         published=published,
@@ -746,12 +752,31 @@ def test_train_poll_without_request_credentials_stays_waiting(tmp_path):
         assert task.status == "submitted"
         assert task.finished_at is None
         assert task.provider_reported_status == expected
+        assert task.requires_request_credentials
         standalone = scheduler.graph_run_store.load_task_run(
             project_id=waiting.project_id,
             graph_run_id=waiting.run_id,
             task_run_id=task.task_run_id,
         )
         assert standalone == task
+
+    monkeypatch.setattr(
+        executor,
+        "poll",
+        lambda *_: StagePollResult(status="running", message="Training."),
+    )
+    scheduler.advance(project=project, published=published, run_id=waiting.run_id)
+    resumed = _stage_for_node(scheduler, project, waiting.run_id, "train").task_runs[0]
+    assert resumed.task_run_id == submitted.task_run_id
+    assert not resumed.requires_request_credentials
+    assert (
+        scheduler.graph_run_store.load_task_run(
+            project_id=waiting.project_id,
+            graph_run_id=waiting.run_id,
+            task_run_id=resumed.task_run_id,
+        )
+        == resumed
+    )
 
 
 def test_retry_reuses_provider_task_after_legacy_credential_poll_failure(

@@ -125,6 +125,9 @@ class TaskRun(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=512)
     status: TaskRunStatus = "submitting"
     provider_reported_status: ProviderReportedTaskStatus | None = None
+    requires_request_credentials: bool = Field(
+        default=False, exclude_if=lambda v: not v
+    )
     request_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     created_at: datetime = Field(default_factory=_utc_now)
     submitted_at: datetime | None = None

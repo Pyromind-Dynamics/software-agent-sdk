@@ -735,6 +735,7 @@ class RuntimeGraphScheduler:
                         "status": "submitted",
                         "created_at": now,
                         "submitted_at": resumable_task.submitted_at or now,
+                        "requires_request_credentials": False,
                         "last_polled_at": None,
                         "finished_at": None,
                         "error": None,
@@ -822,6 +823,7 @@ class RuntimeGraphScheduler:
                     canceled = task.model_copy(
                         update={
                             "status": "canceled",
+                            "requires_request_credentials": False,
                             "finished_at": utc_now(),
                             "error": None,
                         }
@@ -1196,13 +1198,15 @@ class RuntimeGraphScheduler:
             return self._submit_task(run=run, stage=stage, task=task)
         context = self._resolved_stage_context(published, run, stage)
         executor = self.executor_registry.get(stage.executor)
+        if task.requires_request_credentials:
+            task = task.model_copy(update={"requires_request_credentials": False})
         try:
             polled = executor.poll(context, task)
         except RuntimeCredentialUnavailableError as exc:
             return self._wait_for_task(
                 run=run,
                 stage=stage,
-                task=task,
+                task=task.model_copy(update={"requires_request_credentials": True}),
                 message=(
                     f"{stage.node_id} is waiting for request credentials "
                     f"to poll the platform task: {exc}"
