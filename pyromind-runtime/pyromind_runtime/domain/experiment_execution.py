@@ -53,6 +53,16 @@ class ExperimentExecutionView(ContractModel):
     role_id: str
     state: str
     report_state: str
+    report_required: bool = Field(default=False, exclude_if=lambda value: not value)
+    delivery_command_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    delivery_requests: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    delivery_outputs: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     delivery_error: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -78,3 +88,13 @@ class ExperimentExecutionView(ContractModel):
     checkpoint: CheckpointView | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+
+    @property
+    def registered_report_ids(self) -> tuple[str, ...]:
+        if self.report_state != "ready":
+            return ()
+        return tuple(
+            identity
+            for artifact in self.artifacts
+            if isinstance(identity := artifact.get("artifact_id"), str) and identity
+        )

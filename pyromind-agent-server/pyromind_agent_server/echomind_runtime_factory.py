@@ -41,6 +41,10 @@ def build_echomind_runtime_scheduler(
 ) -> RuntimeGraphScheduler:
     return RuntimeGraphScheduler(
         projects_root=projects_root,
+        project_store=ProjectStore(
+            projects_root,
+            conversations_dir=Path(conversations_dir) if conversations_dir else None,
+        ),
         executors={
             "dataset_runtime": DatasetRuntimeExecutor(
                 workflow_executor=PlatformDatasetRuntimeExecutor(

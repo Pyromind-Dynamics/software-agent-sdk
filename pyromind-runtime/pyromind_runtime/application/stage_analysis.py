@@ -159,6 +159,10 @@ def ready_stage_analyses(
                 break
             report_id = row.get("report_version_id")
             report = versions.get(report_id) if isinstance(report_id, str) else None
+            if task.report_output is not None and (
+                report is None or report.id not in run.registered_report_ids
+            ):
+                break
             if report and (
                 not artifact_belongs_to_execution(report, run, producers)
                 or report.state != "ready"

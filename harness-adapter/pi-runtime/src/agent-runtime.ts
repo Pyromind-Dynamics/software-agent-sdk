@@ -254,7 +254,8 @@ export class PiAgentRuntime {
   private async waitingForExternalTask(signal?: AbortSignal): Promise<boolean> {
     const runId = this.activeRunId;
     if (!runId || this.externalTaskWaitBypassed) return false;
-    if (this.pendingNotifications.some(item => item.message.details.run_id === runId)) return true;
+    if (this.pendingNotifications.some(({ message }) =>
+      message.details.run_id === runId && message.details.blocks_origin_turn !== false)) return true;
     const result = await this.peer.request("external_task.waiting", { run_id: runId }, signal);
     if (!isObject(result) || !Array.isArray(result.task_ids) ||
         !result.task_ids.every(id => typeof id === "string" && id.length > 0)) {

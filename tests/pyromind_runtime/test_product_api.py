@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from pydantic import JsonValue, SecretStr
 
@@ -53,8 +54,10 @@ from pyromind_agent_server.echomind_runtime_slots import (
 )
 from pyromind_agent_server.echomind_script_consolidation import ConsolidationCompilation
 from pyromind_agent_server.echomind_stage_runs import ProjectRunStore
+from pyromind_agent_server.echomind_storage import ProjectLease
 from pyromind_agent_server.echomind_tracer_admin import load_tracer_admin_key
 from pyromind_agent_server.profiles import (
+    ECHOMIND_PRODUCT_PROFILE,
     ConversationProfile,
 )
 from pyromind_agent_server.service_context import ProductServiceContext
@@ -63,11 +66,15 @@ from pyromind_runtime.application.consolidation_evidence import (
     ConsolidationStageEvidence,
 )
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
-from pyromind_runtime.domain.content import JsonObject
+from pyromind_runtime.domain.capabilities import HarnessCapabilities
+from pyromind_runtime.domain.commands import UserMessageCommand
+from pyromind_runtime.domain.content import JsonObject, TextContent
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.domain.echomind_chat import CHAT_PREFIX, CHAT_PROFILE
 from pyromind_runtime.domain.echomind_resources import RuntimeResourceProposalArguments
 from pyromind_runtime.domain.errors import ProductRuntimeError
 from pyromind_runtime.domain.events import ProductEvent
+from pyromind_runtime.domain.snapshot import ConversationSnapshot
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
 from pyromind_runtime.ports.harness import SessionSpec
 from pyromind_runtime.ports.storage import EvaluationStorageMissingError
@@ -112,6 +119,140 @@ async def test_composed_app_mounts_product_router(tmp_path) -> None:
     # Lifespan is intentionally not entered, so the runtime is unavailable;
     # 503 proves the composed app matched the Product route instead of 404.
     assert response.status_code == 503
+
+
+async def test_delete_echomind_conversation_archives_its_projects(tmp_path) -> None:
+    root = tmp_path / "sessions"
+    runtime = ConversationRuntime(root, {"pi": FakeAdapter()})
+    app = _app(tmp_path, runtime)
+    app.state.conversation_service = ProductServiceContext(conversations_dir=root)
+    app.include_router(create_product_router(ECHOMIND_PRODUCT_PROFILE))
+    app.include_router(echomind_router)
+    projects = ProjectStore.for_conversations_dir(root)
+    conversation_id, unrelated_id = uuid4().hex, uuid4().hex
+    for identity in (conversation_id, unrelated_id):
+        directory = root / identity
+        directory.mkdir(parents=True)
+        (directory / ".agent-profile").write_text(
+            ECHOMIND_PRODUCT_PROFILE.conversation_marker or ""
+        )
+        FileProductStore(directory).create(
+            ConversationSnapshot(
+                conversation_id=identity, capabilities=HarnessCapabilities()
+            ),
+            user_id="42",
+            profile_id="echomind",
+        )
+
+    def create_project(identity: str) -> str:
+        project_id = str(uuid4())
+        projects.save(
+            ProjectInfo(
+                project=ProjectRecord(
+                    project_id=project_id,
+                    name="Project",
+                    description="",
+                    skill="experiment-planning",
+                    owner_user_id="42",
+                    conversation_id=identity,
+                    cluster="us-west-1#pre",
+                ),
+                graph=ProjectGraph(graph_id=str(uuid4()), project_id=project_id),
+            )
+        )
+        return project_id
+
+    first, duplicate = create_project(conversation_id), create_project(conversation_id)
+    unrelated = create_project(unrelated_id)
+    chat_id = CHAT_PREFIX + conversation_id
+    chat_directory = root / chat_id
+    chat_directory.mkdir()
+    chat = FileProductStore(chat_directory)
+    chat.create(
+        ConversationSnapshot(
+            conversation_id=chat_id, capabilities=HarnessCapabilities()
+        ),
+        user_id="42",
+        profile_id=CHAT_PROFILE,
+    )
+    store = FileProductStore(root / conversation_id)
+    base = "/api/v2/echomind/conversations"
+    project_base = "/api/echomind/projects"
+    transport = httpx.ASGITransport(app=app)
+    headers = {"x-pyromind-debug-user-id": "42"}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=headers
+    ) as client:
+        path = f"{base}/{conversation_id}"
+        assert (
+            await client.delete(path, headers={"x-pyromind-debug-user-id": "7"})
+        ).status_code == 404
+        store.append(
+            ProductEvent(
+                conversation_id=conversation_id,
+                event_id="running",
+                type="status.changed",
+                run_id="test-run",
+                payload={"status": "running"},
+            )
+        )
+        busy = await client.delete(path)
+        assert (
+            busy.status_code == 409
+            and busy.json()["detail"]["code"] == "conversation_busy"
+        )
+        assert not store.is_workspace_archived()
+        store.append(
+            ProductEvent(
+                conversation_id=conversation_id,
+                event_id="idle",
+                type="status.changed",
+                run_id="test-run",
+                payload={"status": "idle"},
+            )
+        )
+        assert not store.archive_workspace(
+            "42", "echomind", expected_sequence=0, expected_command_bytes=0
+        )
+        assert not store.archive_workspace(
+            "42", "echomind", expected_sequence=2, expected_command_bytes=1
+        )
+        published = projects.load(first, owner_user_id="42")
+        projects.save(
+            ProjectInfo(
+                project=published.project.model_copy(update={"lifecycle": "frozen"}),
+                graph=published.graph.model_copy(update={"lifecycle": "frozen"}),
+            )
+        )
+        blocked = await client.delete(path)
+        assert blocked.status_code == 409
+        assert "已发布" in blocked.json()["detail"]
+        projects.save(published)
+        with ProjectLease(projects.root, first).acquire():
+            assert (await client.delete(path)).status_code == 409
+        assert not store.is_workspace_archived()
+        assert (await client.delete(path)).json() == {"deleted": True}
+        assert (await client.delete(path)).json() == {"deleted": True}
+        assert (await client.get(f"{path}/snapshot")).status_code == 404
+        assert (await client.get(f"{project_base}/{first}")).status_code == 404
+        assert (await client.get(f"{project_base}/{duplicate}")).status_code == 404
+        assert [
+            item["conversation_id"]
+            for item in (await client.get(f"{base}/summaries")).json()
+        ] == [unrelated_id]
+        assert [
+            item["project_id"] for item in (await client.get(project_base)).json()
+        ] == [unrelated]
+    with pytest.raises(PermissionError):
+        await runtime.submit_command(
+            chat_id,
+            UserMessageCommand(command_id="late", content=(TextContent(text="Late"),)),
+            RequestContext(user_id="42", profile_id=CHAT_PROFILE),
+        )
+    assert chat.load_snapshot().through_seq == 0
+    assert store.events_path.is_file()
+    assert (projects.root / first / "graph.json").is_file()
+    await runtime.close()
 
 
 def test_composed_app_mounts_echomind_project_routes(tmp_path) -> None:

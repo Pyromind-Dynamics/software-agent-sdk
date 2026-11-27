@@ -113,6 +113,8 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     assert ECHOMIND_PRODUCT_PROFILE.profile_id == "echomind"
     assert set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ()) == {
         "read",
+        "find",
+        "grep",
         "write",
         "edit",
         "terminal",
@@ -126,6 +128,7 @@ def test_echomind_manager_planning_and_development_capabilities_are_explicit():
     )
     assert ECHOMIND_MANAGER_PROFILE.usage_id == "echomind-manager"
     assert "propose_runtime_resources" in ECHOMIND_MANAGER_DEVELOPMENT_TOOLS
+    assert {"find", "grep"} <= set(ECHOMIND_MANAGER_DEVELOPMENT_TOOLS)
     assert (
         ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist
         == ECHOMIND_MANAGER_DEVELOPMENT_TOOLS

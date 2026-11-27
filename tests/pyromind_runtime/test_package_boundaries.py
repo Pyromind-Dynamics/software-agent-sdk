@@ -553,6 +553,20 @@ def test_preparation_policy_is_trusted_profile_configuration():
     tools = set(ECHOMIND_PRODUCT_PROFILE.tool_allowlist or ())
     review_tool = "request_reward_bundle_review"
     assert review_tool in tools
+    model_id = "openrouter/deepseek/deepseek-v4-flash-0731"
+    assert DEFAULT_PRODUCT_PROFILE.for_model(model_id) is DEFAULT_PRODUCT_PROFILE
+    assert ECHOMIND_PRODUCT_PROFILE.for_model("gpt-5") is ECHOMIND_PRODUCT_PROFILE
+    assert (
+        ECHOMIND_PRODUCT_PROFILE.for_model("vendor-deepseek-v4-flash")
+        is ECHOMIND_PRODUCT_PROFILE
+    )
+    selected = ECHOMIND_PRODUCT_PROFILE.for_model(model_id)
+    assert selected is not ECHOMIND_PRODUCT_PROFILE
+    assert "set_preparation_plan" in selected.instructions
+    assert "frozen-reward-evaluation" not in selected.instructions
+    assert selected.development_product_instructions
+    assert "set_preparation_plan" not in selected.development_product_instructions
+    assert "frozen-reward-evaluation" in selected.development_product_instructions
     assert DEFAULT_PRODUCT_PROFILE.development_product_instructions is None
     assert "set_preparation_plan" in ECHOMIND_PRODUCT_PROFILE.instructions
     assert "frozen-reward-evaluation" not in ECHOMIND_PRODUCT_PROFILE.instructions
@@ -570,10 +584,8 @@ def test_preparation_policy_is_trusted_profile_configuration():
     )
     assert "set_preparation_plan" in tools
     assert not {"get_preparation", "update_preparation", "inspect_resource"} & tools
-    assert {"read", "write", "edit", "terminal"} <= tools
+    assert {"read", "find", "grep", "write", "edit", "terminal"} <= tools
     assert not {
-        "grep",
-        "find",
         "ls",
         "subagent",
         "sandbox_create",
@@ -584,6 +596,8 @@ def test_preparation_policy_is_trusted_profile_configuration():
     }.intersection(tools)
     assert set(ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()) == {
         "read",
+        "find",
+        "grep",
         "write",
         "edit",
         "terminal",

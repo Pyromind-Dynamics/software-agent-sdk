@@ -349,9 +349,11 @@ class PublicationStore:
 
 
 class ProjectPublicationService:
-    def __init__(self, projects_root: Path | str) -> None:
+    def __init__(
+        self, projects_root: Path | str, *, project_store: ProjectStore | None = None
+    ) -> None:
         self.projects_root = Path(projects_root)
-        self.project_store = ProjectStore(self.projects_root)
+        self.project_store = project_store or ProjectStore(self.projects_root)
         self.publication_store = PublicationStore(self.projects_root)
         self.graph_run_store = GraphRunStore(self.projects_root)
         self.stage_run_store = ProjectRunStore(self.projects_root)

@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 from pathlib import PurePosixPath
 
+from pydantic import JsonValue
+
 from pyromind_runtime.application.project_observations import (
     baseline_evaluation_metrics,
     dataset_report_checks,
@@ -33,6 +35,7 @@ from pyromind_runtime.domain.versions import (
     SnapshotSource,
     VersionParent,
     canonical,
+    check_persistable,
     fingerprint,
 )
 from pyromind_runtime.ports.storage import (
@@ -58,6 +61,12 @@ def delivery_key(run: ExperimentExecutionView, name: str) -> str:
     return "plan-delivery:" + fingerprint([run.plan_sequence, run.run_id, name])
 
 
+def delivery_version_key(run: ExperimentExecutionView, name: str) -> str:
+    if run.delivery_command_id is None:
+        return delivery_key(run, name)
+    return delivery_key(run, fingerprint([run.delivery_command_id, name]))
+
+
 def delivery_report(
     run: ExperimentExecutionView,
     row: Mapping,
@@ -75,7 +84,13 @@ def delivery_report(
         and artifact_belongs_to_execution(item, run, producers)
     ]
     by_key = {item.registration_key: item for item in eligible}
-    registered = by_key.get(delivery_key(run, "report"))
+    registered = by_key.get(delivery_version_key(run, "report"))
+    legacy = by_key.get(delivery_key(run, "report"))
+    if registered is None and legacy is not None:
+        if not run.delivery_requests or any(
+            item.get("artifact_id") == legacy.id for item in run.artifacts
+        ):
+            registered = legacy
     if declared_report:
         return registered
     rebuilt = by_key.get(delivery_key(run, REBUILT_REPORT))
@@ -92,7 +107,9 @@ def register_plan_delivery(
     row: Mapping,
     scope: str,
     context: RequestContext,
-) -> None:
+    *,
+    platform_output_dirs: tuple[str, ...] = (),
+) -> ArtifactVersion:
     project = versions.project(scope, context)
     assert project is not None
     artifacts = tuple(versions.store.list_versions(project.id))
@@ -100,16 +117,15 @@ def register_plan_delivery(
         item.id: item.source.task_id for item in versions.store.list_runs(project.id)
     }
     report_output = task.report_output
-    if delivery_report(
+    if report := delivery_report(
         run, row, artifacts, producers, declared_report=report_output is not None
     ):
-        return
+        return report
 
     saved = {item.registration_key: item for item in artifacts}
-    previous = saved.get(delivery_key(run, "report"))
+    previous = saved.get(delivery_version_key(run, "report"))
     if previous is not None:
-        versions.finish(previous, context)
-        return
+        return versions.finish(previous, context)
 
     outputs = row.get("verified_outputs")
     if not task.outputs or not isinstance(outputs, dict):
@@ -149,25 +165,16 @@ def register_plan_delivery(
     kinds: dict[str, ArtifactKind] = {
         output.name: output.kind for output in task.outputs if output.kind is not None
     }
-    document = _read_report(
+    document = validate_plan_report(
         storage,
-        stage,
+        task,
+        run,
         paths,
-        report_name=report_output.name if report_output else None,
-        typed_outputs=kinds,
+        referenced_outputs=frozenset(replacements),
+        platform_output_dirs=platform_output_dirs,
+        require_schema_version=report_output is not None,
+        freeze_attribution=True,
     )
-    directories: dict[str, set[str]] = {}
-    check_paths = {path for name, path in paths.items() if name not in replacements}
-    if stage == "dataset":
-        check_paths.update(
-            to_storage_api_path(file.path) for file in dataset_report_files(document)
-        )
-    for path in sorted(check_paths):
-        parent = str(PurePosixPath(path).parent)
-        if parent not in directories:
-            directories[parent] = storage.list(parent)
-        if PurePosixPath(path).name not in directories[parent]:
-            raise InvalidPlanDelivery("missing_output")
 
     binding: JsonObject = {"plan_execution": [run.plan_sequence, run.run_id]}
     parents = []
@@ -183,7 +190,7 @@ def register_plan_delivery(
         if prior is None:
             prior = versions.save(
                 project,
-                delivery_key(run, f"output:{name}"),
+                delivery_version_key(run, f"output:{name}"),
                 SaveVersion(
                     kind=kinds.get(name) or _output_kind(stage, name),
                     logical_key=f"{task.id}/{name}",
@@ -194,9 +201,9 @@ def register_plan_delivery(
                 context,
             )
         parents.append(VersionParent(version_id=prior.id, relation=name))
-    versions.save(
+    return versions.save(
         project,
-        delivery_key(run, "report"),
+        delivery_version_key(run, "report"),
         SaveVersion(
             kind="report",
             logical_key=f"{task.id}/delivery-report",
@@ -206,6 +213,70 @@ def register_plan_delivery(
         ),
         context,
     )
+
+
+def validate_plan_report(
+    storage: EvaluationStorage,
+    task: ExperimentTask,
+    run: ExperimentExecutionView,
+    paths: dict[str, str],
+    *,
+    referenced_outputs: frozenset[str] = frozenset(),
+    platform_output_dirs: tuple[str, ...] = (),
+    require_schema_version: bool = False,
+    freeze_attribution: bool = False,
+) -> JsonObject:
+    stage = (run.stage_snapshot or {}).get("kind")
+    report_output = task.report_output
+    kinds: dict[str, ArtifactKind] = {
+        output.name: output.kind for output in task.outputs if output.kind is not None
+    }
+    report_path = paths[report_output.name] if report_output else None
+    host_bound_report = bool(report_output and report_output.name in referenced_outputs)
+    if report_path and not host_bound_report:
+        for directory in platform_output_dirs:
+            try:
+                bound = to_storage_api_path(directory)
+            except ValueError:
+                continue
+            if bound != "/" and PurePosixPath(report_path).is_relative_to(bound):
+                host_bound_report = True
+                break
+    bound_tasks = set(run.platform_task_ids)
+    if run.platform_task_id:
+        bound_tasks.add(run.platform_task_id)
+    strict_source = (
+        require_schema_version or run.delivery_command_id is not None
+    ) and (not host_bound_report or len(bound_tasks) > 1)
+    document = _read_report(
+        storage,
+        stage,
+        paths,
+        report_name=report_output.name if report_output else None,
+        typed_outputs=kinds,
+        platform_task_id=run.platform_task_id,
+        platform_task_ids=run.platform_task_ids,
+        require_platform_source=strict_source,
+        allow_narrative=stage == "init" and task.kind == "analysis",
+        freeze_attribution=freeze_attribution,
+        require_schema_version=require_schema_version
+        or run.delivery_command_id is not None,
+    )
+    directories: dict[str, set[str]] = {}
+    check_paths = {
+        path for name, path in paths.items() if name not in referenced_outputs
+    }
+    if stage == "dataset":
+        check_paths.update(
+            to_storage_api_path(file.path) for file in dataset_report_files(document)
+        )
+    for path in sorted(check_paths):
+        parent = str(PurePosixPath(path).parent)
+        if parent not in directories:
+            directories[parent] = storage.list(parent)
+        if PurePosixPath(path).name not in directories[parent]:
+            raise InvalidPlanDelivery("missing_output", path[:240])
+    return document
 
 
 def rebuild_legacy_report(
@@ -300,10 +371,73 @@ def _read_report(
     *,
     report_name: str | None = None,
     typed_outputs: Mapping[str, ArtifactKind] | None = None,
+    platform_task_id: str | None = None,
+    platform_task_ids: tuple[str, ...] = (),
+    require_platform_source: bool = False,
+    allow_narrative: bool = False,
+    freeze_attribution: bool = False,
+    require_schema_version: bool = False,
 ) -> JsonObject:
     if report_name is not None:
         body = _read_report_body(storage, outputs[report_name])
-        document = _report_document(body, stage, outputs)
+        if "schema_version" in body or require_schema_version:
+            if (
+                type(body.get("schema_version")) is not int
+                or body["schema_version"] != 1
+            ):
+                raise InvalidPlanDelivery("invalid_report", "schema_version")
+            task_ids = set(platform_task_ids)
+            if platform_task_id:
+                task_ids.add(platform_task_id)
+            if (
+                require_schema_version
+                and "source" in body
+                and not isinstance(body["source"], dict)
+            ):
+                raise InvalidPlanDelivery("invalid_report", "source")
+            if task_ids or require_schema_version:
+                _validate_platform_source(
+                    body, task_ids, required=require_platform_source
+                )
+        elif stage == "init":
+            body = _normalize_legacy_init(body, platform_task_id)
+        document = _report_document(body, stage, outputs, strict=require_schema_version)
+        if body.get("schema_version") == 1:
+            document["schema_version"] = 1
+        if allow_narrative:
+            findings = body.get("findings")
+            valid_findings: list[JsonValue] = []
+            if isinstance(findings, list):
+                valid_findings = [
+                    value.strip()
+                    for value in findings[:24]
+                    if isinstance(value, str) and 0 < len(value.strip()) <= 900
+                ]
+                document["findings"] = valid_findings
+            if (
+                require_schema_version
+                and "findings" in body
+                and (
+                    not isinstance(findings, list)
+                    or len(findings) != len(valid_findings)
+                )
+            ):
+                raise InvalidPlanDelivery("invalid_report", "findings")
+            if not document.get("summary") and not document.get("findings"):
+                raise InvalidPlanDelivery("invalid_report", "summary")
+            if freeze_attribution:
+                try:
+                    check_persistable(body)
+                    json.dumps(body, allow_nan=False)
+                except ValueError as exc:
+                    raise InvalidPlanDelivery(
+                        "invalid_report", "attribution_report"
+                    ) from exc
+                document["attribution_report"] = body
+                document["attribution_report_filename"] = PurePosixPath(
+                    outputs[report_name]
+                ).name
+            return document
         if stage == "dataset":
             if not document.get("files"):
                 raise InvalidPlanDelivery("invalid_report", "files")
@@ -370,6 +504,32 @@ def _read_report(
     return document
 
 
+def _validate_platform_source(
+    body: Mapping, expected: set[str], *, required: bool
+) -> None:
+    declared: set[str] = set()
+    source = body.get("source")
+    for container in (body, source):
+        if not isinstance(container, Mapping):
+            continue
+        single = container.get("platform_task_id")
+        multiple = container.get("platform_task_ids")
+        if single is not None and type(single) not in (str, int):
+            raise InvalidPlanDelivery("invalid_report", "source.platform_task_id")
+        if multiple is not None and (
+            not isinstance(multiple, list)
+            or any(type(item) not in (str, int) for item in multiple)
+        ):
+            raise InvalidPlanDelivery("invalid_report", "source.platform_task_ids")
+        if single is not None:
+            declared.add(str(single))
+        if multiple is not None:
+            declared.update(str(item) for item in multiple)
+    if (declared - expected) or (required and declared != expected):
+        field = "platform_task_ids" if len(expected) > 1 else "platform_task_id"
+        raise InvalidPlanDelivery("invalid_report", f"source.{field}")
+
+
 def _read_report_body(storage: EvaluationStorage, path: str) -> dict:
     try:
         data = storage.read(path)
@@ -397,8 +557,11 @@ def _report_document(
     outputs: dict[str, str],
     *,
     legacy: bool = False,
+    strict: bool = False,
 ) -> JsonObject:
     issues: list[ReportIssue] = []
+    if strict and "metrics" in body and not isinstance(body["metrics"], list):
+        raise InvalidPlanDelivery("invalid_report_metrics", "metrics")
     checks = dataset_report_checks(body) if stage == "dataset" else None
     metrics = report_metrics(
         body, issues=issues, checks=checks, allow_comparisons=stage == "eval"
@@ -412,12 +575,18 @@ def _report_document(
         summary = summary.strip()
         if 0 < len(summary) <= 900:
             document["summary"] = summary
+    if strict and "summary" in body and "summary" not in document:
+        raise InvalidPlanDelivery("invalid_report", "summary")
     if stage == "dataset":
-        files = dataset_report_files(body, issues=issues)
+        if strict and (
+            not isinstance(body.get("files"), list) or len(body["files"]) > 32
+        ):
+            raise InvalidPlanDelivery("invalid_report", "files")
+        files = dataset_report_files(body, issues=issues, explicit_only=strict)
         dataset_outputs = _dataset_paths(outputs)
-        if not files:
+        if not files and not strict:
             files = _merged_dataset_report_files(body, dataset_outputs)
-        if not files and len(dataset_outputs) == 1:
+        if not strict and not files and len(dataset_outputs) == 1:
             ((name, path),) = dataset_outputs.items()
             records = body.get("n_train_records")
             if (
@@ -442,11 +611,70 @@ def _report_document(
                     }
                 )
         document["files"] = [item.model_dump(mode="json") for item in files]
+        if (
+            strict
+            and "checks" in body
+            and (
+                not isinstance(body["checks"], dict)
+                or checks is None
+                or len(checks) != len(body["checks"])
+            )
+        ):
+            raise InvalidPlanDelivery("invalid_report", "checks")
     if checks:
         document["checks"] = {name: passed for name, passed in checks.items()}
     if issues:
+        if strict:
+            field = issues[0].field
+            raise InvalidPlanDelivery(
+                "invalid_report_metrics"
+                if field.startswith("metrics")
+                else "invalid_report",
+                field,
+            )
         document["issues"] = [item.model_dump(mode="json") for item in issues[:32]]
     return document
+
+
+def _normalize_legacy_init(body: dict, platform_task_id: str | None) -> dict:
+    """Convert the saved Init baseline format, with proof of platform ownership."""
+    source = body.get("source")
+    metrics = body.get("metrics")
+    if (
+        body.get("report_kind") != "init_baseline"
+        or not platform_task_id
+        or not isinstance(source, dict)
+        or str(source.get("platform_task_id")) != platform_task_id
+        or not isinstance(metrics, dict)
+        or type(metrics.get("result_accuracy")) not in (int, float)
+    ):
+        return body
+    converted: list[JsonObject] = []
+
+    def add(values: dict, key: str, unit: str, label: str = "") -> None:
+        if type(value := values.get(key)) in (int, float):
+            converted.append({"label": label or key, "value": value, "unit": unit})
+
+    add(metrics, "result_accuracy", "ratio")
+    add(metrics, "macro_f1", "ratio")
+    add(metrics, "result_total", "count", "evaluated_samples")
+    classes = metrics.get("per_class")
+    if isinstance(classes, dict):
+        for label in ("pass", "defect", "fail"):
+            if isinstance(stats := classes.get(label), dict):
+                for key in ("precision", "recall", "f1"):
+                    add(stats, key, "ratio", f"{label}_{key}")
+    for section, keys, unit in (
+        ("boxes", ("box_precision", "box_recall", "box_f1", "box_hit_rate"), "ratio"),
+        ("format", ("json_parse_failure_rate", "format_compliance_rate"), "ratio"),
+        ("category", ("accuracy_vs_gt_reason", "accuracy_vs_sample_category"), "ratio"),
+        ("latency", ("mean_latency_seconds", "p95_latency_seconds"), "seconds"),
+        ("confidence", ("mean_when_correct", "mean_when_wrong"), "ratio"),
+    ):
+        if isinstance(stats := metrics.get(section), dict):
+            for key in keys:
+                add(stats, key, unit)
+    return {**body, "schema_version": 1, "metrics": converted}
 
 
 def _merged_dataset_report_files(

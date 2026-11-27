@@ -139,8 +139,10 @@ class RuntimeGraphScheduler:
         executors: Mapping[str, RuntimeNodeExecutor] | None = None,
         finalizer: RuntimeFinalizer | None = None,
         lease_timeout_seconds: float = 30,
+        project_store: ProjectStore | None = None,
     ) -> None:
         self.projects_root = Path(projects_root)
+        self.project_store = project_store or ProjectStore(self.projects_root)
         self.graph_run_store = GraphRunStore(self.projects_root)
         self.stage_run_store = ProjectRunStore(self.projects_root)
         self.publication_store = PublicationStore(self.projects_root)
@@ -163,7 +165,7 @@ class RuntimeGraphScheduler:
     ) -> GraphRun:
         project_id = project.project.project_id
         with self._lease(project_id):
-            project = ProjectStore(self.projects_root).load(
+            project = self.project_store.load(
                 project_id,
                 owner_user_id=project.project.owner_user_id,
             )
@@ -253,7 +255,7 @@ class RuntimeGraphScheduler:
     ) -> GraphRun:
         project_id = project.project.project_id
         with self._lease(project_id):
-            project = ProjectStore(self.projects_root).load(
+            project = self.project_store.load(
                 project_id, owner_user_id=project.project.owner_user_id
             )
             self._validate_start(
@@ -529,7 +531,7 @@ class RuntimeGraphScheduler:
         conversation_id: str | None = None,
         task_kind: str | None = None,
     ) -> GraphRun | None:
-        project_store = ProjectStore(self.projects_root)
+        project_store = self.project_store
         match: tuple[ProjectInfo, PublishedGraph, GraphRun] | None = None
         for summary in project_store.list(owner_user_id=None):
             if conversation_id is not None and _conversation_id(
@@ -881,7 +883,7 @@ class RuntimeGraphScheduler:
     def recover_all(self) -> list[GraphRun]:
         if not self.projects_root.is_dir():
             return []
-        project_store = ProjectStore(self.projects_root)
+        project_store = self.project_store
         recovered: list[GraphRun] = []
         for project_dir in sorted(self.projects_root.iterdir()):
             if not project_dir.is_dir():

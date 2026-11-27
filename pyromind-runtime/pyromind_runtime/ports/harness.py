@@ -116,6 +116,7 @@ class ExternalTaskNotification(ContractModel):
     visible_text: str | None = None
     hidden_text: str
     trigger_turn: bool = True
+    blocks_origin_turn: bool = Field(default=True, exclude_if=lambda value: value)
     reset_attempt_budget: bool = False
     resume_interrupted: bool = False
 
@@ -219,6 +220,13 @@ class BackgroundExecutionContext(Protocol):
     def refresh_execution_context(
         self, handle: SessionHandle, context: RequestContext
     ) -> None: ...
+
+
+@runtime_checkable
+class SessionModelReader(Protocol):
+    async def session_model_id(self, conversation_id: str) -> str | None:
+        """Return the saved model identity without starting a session."""
+        ...
 
 
 @runtime_checkable

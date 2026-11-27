@@ -1,5 +1,5 @@
 import { lstat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export type WorkspacePathOperation = "read" | "write";
 
@@ -83,6 +83,8 @@ export class WorkspaceAccessPolicy {
     if (!input) throw pathScopeError(operation);
     const candidate = this.resolveInput(input);
     const target = await canonicalCandidate(candidate);
+    if (operation === "read" && dirname(target) === this.terminalTempRoot &&
+        /^pi-bash-[0-9a-f]+\.log$/.test(basename(target))) return target;
     const allowedRoots = operation === "write"
       ? [this.publicDataRoot]
       : [this.publicDataRoot, ...this.readOnlyRoots];
@@ -173,6 +175,6 @@ function isMissing(error: unknown): boolean {
 function pathScopeError(operation: WorkspacePathOperation): Error {
   const scope = operation === "write"
     ? "write and edit paths must stay within public_data/"
-    : "read paths must stay within public_data/, configured skill directories, or knowledge/";
+    : "read paths must stay within public_data/, configured skill directories, knowledge/, or this session's terminal output logs";
   return new Error(`PATH_SCOPE_ERROR: ${scope}`);
 }

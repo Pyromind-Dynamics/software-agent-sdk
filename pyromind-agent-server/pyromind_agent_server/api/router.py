@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
@@ -21,11 +24,16 @@ from pyromind_agent_server.api.schemas import (
 from pyromind_agent_server.auth_context import request_context
 from pyromind_agent_server.bootstrap import ensure_product_runtime
 from pyromind_agent_server.dependencies import check_session_api_key
+from pyromind_agent_server.echomind_graph_runs import GraphRunStore
+from pyromind_agent_server.echomind_projects import ProjectStore
+from pyromind_agent_server.echomind_stage_runs import ProjectRunStore
+from pyromind_agent_server.echomind_storage import ProjectLease, ProjectLeaseTimeout
 from pyromind_agent_server.profiles import DEFAULT_PRODUCT_PROFILE, ConversationProfile
 from pyromind_agent_server.service_context import ProductServiceContext
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
 from pyromind_runtime.domain.commands import CommandReceipt, ProductCommand
 from pyromind_runtime.domain.content import TextContent
+from pyromind_runtime.domain.echomind_chat import MANAGER_PROFILE
 from pyromind_runtime.domain.errors import ProductRuntimeError, UserInputValidationError
 from pyromind_runtime.domain.experiments import (
     ExperimentCatalog,
@@ -87,9 +95,17 @@ async def configure_session(
             get_conversation_service(request).conversations_dir / conversation_id
         )
         store.authorize(request_context(request).user_id, profile.profile_id)
-        if store.harness_id() not in runtime.adapters:
+        if (
+            store.harness_id() not in runtime.adapters
+            or store.configuration_version() >= profile.configuration_version
+        ):
             return
-        await get_product_runtime(request).apply_session_configuration(
+        context = context_for_profile(request, profile)
+        if profile.model_prompts is not None:
+            profile = profile.for_model(
+                await runtime.session_model_id(conversation_id, context)
+            )
+        await runtime.apply_session_configuration(
             conversation_id,
             SessionPolicy(
                 configuration_version=profile.configuration_version,
@@ -106,7 +122,7 @@ async def configure_session(
                 command_allowlist=profile.command_allowlist,
                 preparation_policy=profile.preparation_policy,
             ),
-            context_for_profile(request, profile),
+            context,
         )
 
 
@@ -217,6 +233,7 @@ def create_product_router(
                 raise HTTPException(422, detail="Workflow execution is not enabled")
         conversation_id = uuid4().hex
         conversations_dir = get_conversation_service(request).conversations_dir
+        selected = profile.for_model(body.llm.model or os.getenv("LLM_MODEL"))
         spec = SessionSpec(
             conversation_id=conversation_id,
             user_id=context.user_id,
@@ -229,12 +246,12 @@ def create_product_router(
             extra=body.extra,
             profile_id=profile.profile_id,
             harness_id=profile.harness_id,
-            product_instructions=profile.instructions,
+            product_instructions=selected.instructions,
             tool_allowlist=profile.tool_allowlist,
             skill_allowlist=profile.skill_allowlist,
             development_tool_allowlist=profile.development_tool_allowlist,
             development_skill_allowlist=profile.development_skill_allowlist,
-            development_product_instructions=profile.development_product_instructions,
+            development_product_instructions=selected.development_product_instructions,
             command_allowlist=profile.command_allowlist,
             delegated_roles=profile.delegated_roles,
             preparation_policy=profile.preparation_policy,
@@ -277,6 +294,41 @@ def create_product_router(
         return await get_product_runtime(request).list_summaries(
             context_for(request), conversation_ids=ids
         )
+
+    if profile.profile_id == MANAGER_PROFILE:
+
+        @router.delete("/{conversation_id}")
+        async def delete_conversation(
+            conversation_id: str, request: Request
+        ) -> dict[str, bool]:
+            await asyncio.to_thread(_require_profile, request, conversation_id, profile)
+            context = context_for(request)
+            try:
+                await get_product_runtime(request).delete_echomind_conversation(
+                    conversation_id,
+                    context,
+                    project_guard=partial(
+                        _guard_project_deletion,
+                        get_conversation_service(request).conversations_dir,
+                        conversation_id,
+                        context.user_id,
+                    ),
+                )
+            except ProductRuntimeError as exc:
+                raise _product_error(exc) from exc
+            except ProjectLeaseTimeout as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail="关联 Project 正在更新，请稍后重试删除。",
+                ) from exc
+            except (
+                FileNotFoundError,
+                PermissionError,
+                ProductStoreError,
+                ValueError,
+            ) as exc:
+                raise _not_found(conversation_id) from exc
+            return {"deleted": True}
 
     @router.get("/{conversation_id}/snapshot", response_model=ConversationSnapshot)
     async def get_snapshot(
@@ -435,7 +487,9 @@ def create_product_router(
             html = await get_product_runtime(request).read_input_html(
                 conversation_id, request_id, context_for(request)
             )
-            return JSONResponse({"html": html}, headers={"Cache-Control": "private, no-store"})
+            return JSONResponse(
+                {"html": html}, headers={"Cache-Control": "private, no-store"}
+            )
         except (FileNotFoundError, PermissionError, ProductStoreError) as exc:
             raise _not_found(conversation_id) from exc
         except ValueError as exc:
@@ -574,6 +628,49 @@ def _not_found(conversation_id: str) -> HTTPException:
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Conversation not found: {conversation_id}",
     )
+
+
+@contextmanager
+def _guard_project_deletion(
+    conversations_dir: Path, conversation_id: str, user_id: str
+) -> Iterator[None]:
+    store = ProjectStore.for_conversations_dir(conversations_dir)
+    graph_runs = GraphRunStore(store.root)
+    stage_runs = ProjectRunStore(store.root)
+
+    def linked_project_ids() -> list[str]:
+        return sorted(
+            item.project_id
+            for item in store.list(owner_user_id=user_id)
+            if item.conversation_id == conversation_id
+        )
+
+    project_ids = linked_project_ids()
+    with ExitStack() as leases:
+        for project_id in project_ids:
+            leases.enter_context(
+                ProjectLease(store.root, project_id, timeout_seconds=1).acquire()
+            )
+        if linked_project_ids() != project_ids:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, detail="关联 Project 已变化，请重试删除。"
+            )
+        for project_id in project_ids:
+            project = store.load(project_id, owner_user_id=user_id)
+            if project.project.lifecycle == "frozen":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail="请先将已发布的关联 Project 退回开发状态。",
+                )
+            if graph_runs.active(project_id) or any(
+                run.status in {"pending", "running", "waiting_external"}
+                for run in stage_runs.list(project_id)
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail="关联 Project 仍有任务在执行，请结束任务后再删除。",
+                )
+        yield
 
 
 def _product_error(error: ProductRuntimeError) -> HTTPException:

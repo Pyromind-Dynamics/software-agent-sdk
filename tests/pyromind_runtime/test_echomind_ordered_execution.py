@@ -355,6 +355,52 @@ async def test_authenticated_read_recovers_a_missed_wrapped_plan_continuation(
     assert "/workspace/samples.jsonl" in continuations[0].hidden_text
 
 
+async def test_delivered_report_advances_after_turn_ends_without_a_next_attempt(
+    started_echomind_project, tmp_path
+):
+    runtime, adapter, store, context, first_id, project_id = started_echomind_project
+    snapshot = store.load_snapshot()
+    cid = snapshot.conversation_id
+    assert not any(
+        run.task_id == "baseline" for run in snapshot.experiment_executions or ()
+    )
+    (tmp_path / cid / PLAN_PATH).write_text(json.dumps({"tasks": [local_completion()]}))
+    store.append(
+        ProductEvent(
+            conversation_id=cid,
+            type="status.changed",
+            run_id="first-run",
+            task_id=first_id,
+            payload={"status": "idle"},
+        )
+    )
+    saved = store.load_snapshot().experiment_executions
+    assert saved
+    runtime._record_execution(
+        store,
+        saved[0].model_copy(
+            update={
+                "state": "succeeded",
+                "report_state": "ready",
+                "delivery_outputs": local_completion()["verified_outputs"],
+                "artifacts": ({"artifact_id": "report-version"},),
+            }
+        ),
+    )
+    for _ in range(2):
+        await runtime._recover_saved_project_step(store, store.load_snapshot(), context)
+    continuations = [
+        note
+        for _, note, _ in adapter.external_task_notifications
+        if note.kind == "project_continue"
+    ]
+    assert [note.task_id for note in continuations] == [
+        f"project-continue:{project_id}:baseline"
+    ]
+    assert continuations[0].correlation and continuations[0].correlation.execution
+    assert continuations[0].correlation.execution.task_id == "baseline"
+
+
 async def test_saved_successful_callback_projects_its_output_before_dispatch(
     started_echomind_project, tmp_path
 ):

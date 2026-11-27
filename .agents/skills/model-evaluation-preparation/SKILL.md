@@ -42,6 +42,10 @@ Dataset 报告必须提供有效的 files 文件清单，样本数用整数，�
 entry_task_id 选择首先执行的任务，它必须通过 resource_id 引用有实际位置的资源。
 重要信息放入 constraints 或任务 description，不再复制另一份 facts。
 
+搭建 Dataset → Train → Eval 时，原始数据用 `source_batch`，基模用 `base_model`，
+约定的独立训练验证文件用 `training_validation`，独立评测集用 `eval_data`。
+中间清单单列资源。Dataset 任务记录已确认的标签来源和划分策略。
+
 最小示例（数据准备）：
 
 ```json

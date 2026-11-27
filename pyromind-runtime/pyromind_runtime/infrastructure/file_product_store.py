@@ -76,6 +76,7 @@ class _Metadata(ContractModel):
     command_allowlist: tuple[str, ...] | None = None
     capabilities: HarnessCapabilities
     last_sequence: int = Field(default=0, ge=0)
+    workspace_archived: bool = Field(default=False, exclude_if=lambda value: not value)
 
     def development_policy(self) -> SessionPolicy:
         return SessionPolicy(
@@ -227,10 +228,48 @@ class FileProductStore:
             self.directory.rmdir()
             raise
 
-    def authorize(self, user_id: str, profile_id: str | None = None) -> None:
+    def authorize(
+        self,
+        user_id: str,
+        profile_id: str | None = None,
+        *,
+        include_archived: bool = False,
+    ) -> None:
         metadata = self._load_metadata()
-        if metadata.user_id != user_id or metadata.profile_id != profile_id:
+        if (
+            metadata.user_id != user_id
+            or metadata.profile_id != profile_id
+            or (metadata.workspace_archived and not include_archived)
+        ):
             raise PermissionError("conversation does not belong to current user")
+
+    def is_workspace_archived(self, *, owner_user_id: str | None = None) -> bool:
+        metadata = self._load_metadata()
+        return metadata.workspace_archived and (
+            owner_user_id is None or metadata.user_id == owner_user_id
+        )
+
+    def archive_workspace(
+        self,
+        user_id: str,
+        profile_id: str,
+        *,
+        expected_sequence: int,
+        expected_command_bytes: int,
+    ) -> bool:
+        with self._lock():
+            self.authorize(user_id, profile_id, include_archived=True)
+            metadata = self._load_metadata()
+            if metadata.workspace_archived:
+                return True
+            if (
+                metadata.last_sequence != expected_sequence
+                or self.commands_path.stat().st_size != expected_command_bytes
+            ):
+                return False
+            archived = metadata.model_copy(update={"workspace_archived": True})
+            self._atomic_write(self.metadata_path, archived.model_dump_json())
+            return True
 
     def plan_owner(self) -> PlanOwner:
         metadata = self._load_metadata()
@@ -757,6 +796,10 @@ class FileProductStore:
         if isinstance(command, InputResponseCommand):
             intent = CommandIntent(type="input_response", request_id=command.request_id)
         with self._lock():
+            if self.is_workspace_archived():
+                raise PermissionError(
+                    "conversation has been deleted from the workspace"
+                )
             commands = self._load_commands(repair_tail=True)
             existing = commands.get(command.command_id)
             if existing is not None:

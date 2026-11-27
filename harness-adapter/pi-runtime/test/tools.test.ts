@@ -406,6 +406,23 @@ test("safePath resolves relative, absolute, normalized, and missing public paths
   );
 });
 
+test("terminal output logs are read-only and scoped to their conversation", async (t) => {
+  const { root, workspace } = await workspaceLayout();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const policy = await WorkspaceAccessPolicy.create({ workspaceRoot: workspace, readOnlyRoots: [] });
+  const log = join(policy.terminalTempRoot, "pi-bash-0123456789abcdef.log");
+  await writeFile(log, "output");
+  assert.equal(await policy.resolvePath(log, "read"), log);
+  await assert.rejects(policy.resolvePath(log, "write"), /PATH_SCOPE_ERROR/);
+  const foreign = join(root, "other", "pi", "terminal-output", "pi-bash-fedcba9876543210.log");
+  await mkdir(join(foreign, ".."), { recursive: true });
+  await writeFile(foreign, "other output");
+  const link = join(policy.terminalTempRoot, "pi-bash-aaaaaaaaaaaaaaaa.log");
+  await symlink(foreign, link);
+  await assert.rejects(policy.resolvePath(link, "read"), /PATH_SCOPE_ERROR/);
+  await assert.rejects(policy.resolvePath(foreign, "read"), /PATH_SCOPE_ERROR/);
+});
+
 test("safePath denies private, read-only, and out-of-scope paths", async () => {
   const { root, workspace, skill, knowledge } = await workspaceLayout();
   await assert.rejects(

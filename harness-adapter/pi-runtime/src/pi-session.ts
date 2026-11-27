@@ -26,7 +26,7 @@ import {
   type ExtensionAPI,
   type ExtensionHandler,
 } from "@earendil-works/pi-coding-agent";
-import { createPiModelRuntime, type PiModelConfig } from "./pi-model.js";
+import { createPiModelRuntime, deepSeekModelFamily, type PiModelConfig } from "./pi-model.js";
 import { createNoProgressGuardExtension } from "./no-progress-guard.js";
 import { createNoSpinExtension } from "./no-spin-extension.js";
 import { createToolResultExtension } from "./tool-results.js";
@@ -629,7 +629,9 @@ function parseConfig(value: JsonObject): PiSessionConfig {
     throw new Error("invalid platform_sdk_enabled");
   }
   const model = record(value, "model");
-  const thinking = typeof model.thinking_level === "string" ? model.thinking_level : "off";
+  const modelId = requiredString(model, "id");
+  const defaultThinking = model.api !== "openai-responses" && deepSeekModelFamily(modelId) ? "high" : "off";
+  const thinking = typeof model.thinking_level === "string" ? model.thinking_level : defaultThinking;
   if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) {
     throw new Error("invalid thinking level");
   }
@@ -640,7 +642,7 @@ function parseConfig(value: JsonObject): PiSessionConfig {
   return {
     sessionId: requiredString(value, "session_id"),
     provider: requiredString(model, "provider"),
-    modelId: requiredString(model, "id"),
+    modelId,
     apiKey: requiredString(model, "api_key"),
     baseUrl: typeof model.base_url === "string" ? model.base_url : undefined,
     api,

@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestServer
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.plan_execution import with_plan_report
 from pyromind_runtime.application.train_observer import ObservationCursor, TrainObserver
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.commands import (
@@ -26,7 +27,7 @@ from pyromind_runtime.domain.observations import MetricPoint, SourcePage
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy, SetPreparationPlan
 from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.domain.versions import SaveVersion, VersionToolRequest
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
@@ -42,10 +43,28 @@ from .test_preparation import (
 from .test_workflow_execution import FakeSubmission
 
 
-@pytest.mark.parametrize("queued_preparation", [False, True], ids=["user", "queue"])
+_GATEWAY_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+
+
+@pytest.mark.parametrize(
+    ("queued_preparation", "model_id", "legacy_control"),
+    [
+        (False, "test", False),
+        (True, "test", False),
+        (False, _GATEWAY_MODEL, True),
+        (False, _GATEWAY_MODEL, False),
+    ],
+    ids=["user", "queue", "deepseek-control", "deepseek"],
+)
 @pytest.mark.parametrize("state_format", ["task_records", "tasks"])
 async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
-    preparation_setup, tmp_path, monkeypatch, queued_preparation, state_format
+    preparation_setup,
+    tmp_path,
+    monkeypatch,
+    queued_preparation,
+    state_format,
+    model_id,
+    legacy_control,
 ):
     preparation, owner, _ = preparation_setup
     scope = owner.conversation_id
@@ -53,6 +72,8 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
         user_id=owner.user_id, profile_id=owner.profile_id, x_cluster="test"
     )
     profile = ECHOMIND_PRODUCT_PROFILE
+    if not legacy_control:
+        profile = profile.for_model(model_id)
     assert profile.skill_allowlist and profile.development_skill_allowlist
     assert profile.development_product_instructions
     root = tmp_path / "conversations"
@@ -282,11 +303,43 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             review_started.set()
             await asyncio.wait_for(finish_review.wait(), timeout=10)
         action = actions.pop(0) if actions else None
-        if action and action[0] == "write":
+        if action and action[0] == "submit_workflow":
+            store = runtime._store(scope)
+            saved = store.load_snapshot()
+            assert any(
+                task.task_id == "evaluation-1" and task.status == "succeeded"
+                for task in saved.external_tasks
+            )
+            baseline = next(
+                run
+                for run in saved.experiment_executions or ()
+                if run.task_id == "baseline"
+            )
+            version_project = versions.project(scope, context)
+            assert version_project
+            baseline_report = versions.save(
+                version_project,
+                "test:baseline-report",
+                SaveVersion.model_validate(
+                    {
+                        "kind": "report",
+                        "logical_key": "baseline/evidence",
+                        "source": {"text": evidence, "filename": "baseline.json"},
+                    }
+                ),
+                context,
+            )
+            runtime._record_execution(
+                store,
+                with_plan_report(
+                    baseline.model_copy(update={"state": "succeeded"}), baseline_report
+                ),
+            )
+        elif action and action[0] == "write":
             (artifact,) = [
                 item
                 for item in runtime._artifact_versions(scope, context)
-                if item.kind == "report"
+                if item.kind == "report" and item.logical_key == "candidate/evidence"
             ]
             rows: list[dict] = [
                 {"id": key, "stage_id": key, "business_status": "completed"}
@@ -373,7 +426,7 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
                     command_allowlist=profile.command_allowlist,
                     product_instructions=profile.instructions,
                     model_configuration={
-                        "model": "test",
+                        "model": model_id,
                         "base_url": str(server.make_url("/v1")),
                         "api_key": "local-test-key",
                     },
@@ -413,6 +466,11 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             preparation_prompt = requests[0]["messages"][0]["content"]
             assert profile.instructions in preparation_prompt
             assert profile.development_product_instructions not in preparation_prompt
+            if model_id == _GATEWAY_MODEL and not legacy_control:
+                assert profile is not ECHOMIND_PRODUCT_PROFILE
+                assert ECHOMIND_PRODUCT_PROFILE.instructions not in preparation_prompt
+                assert preparation_prompt.count("[[echomind:reply]]") == 1
+                assert "update_plan" not in preparation_prompt
             assert set(re.findall(r"<name>([^<]+)</name>", preparation_prompt)) == set(
                 profile.skill_allowlist
             )
@@ -562,6 +620,13 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             execution_prompt = requests[2]["messages"][0]["content"]
             assert profile.development_product_instructions in execution_prompt
             assert profile.instructions not in execution_prompt
+            if model_id == _GATEWAY_MODEL and not legacy_control:
+                assert execution_prompt.count("[[echomind:reply]]") == 1
+                assert "update_plan" not in execution_prompt
+                assert (
+                    profile.development_product_instructions
+                    in requests[-1]["messages"][0]["content"]
+                )
             assert set(re.findall(r"<name>([^<]+)</name>", execution_prompt)) == set(
                 profile.development_skill_allowlist
             )
@@ -571,13 +636,17 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             assert training.run_id.endswith(":training:3")
             assert training.platform_task_id == "task-123"
             events = runtime._store(scope).replay()
-            (artifact_id,) = [
-                e.payload["artifact_id"]
-                for e in events
-                if e.type == "artifact.registered"
-                and e.payload["kind"] == "report"
-                and e.payload["artifact_id"] != job.report_version_id
+            (candidate_evidence,) = [
+                item
+                for item in runtime._artifact_versions(scope, context)
+                if item.logical_key == "candidate/evidence"
             ]
+            artifact_id = candidate_evidence.id
+            assert any(
+                event.type == "artifact.registered"
+                and event.payload["artifact_id"] == artifact_id
+                for event in events
+            )
             read = VersionToolRequest(
                 action="read", arguments={"artifact_id": artifact_id}
             )
@@ -596,12 +665,10 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             assert replay["id"] == legacy["id"]
             assert len(studio.submissions) == 1 and len(jobs) == 2
             assert not (root / scope / "pi" / "subagents").exists()
-            assert all(
-                {"subagent", "ls", "find", "grep"}.isdisjoint(
-                    t["function"]["name"] for t in r["tools"]
-                )
-                for r in requests
-            )
+            for model_request in requests:
+                names = {tool["function"]["name"] for tool in model_request["tools"]}
+                assert {"find", "grep", "terminal"} <= names
+                assert {"subagent", "ls", "bash"}.isdisjoint(names)
             assert all(e.payload.get("category") != "subagent" for e in events)
             queued = EnqueueTaskCommand(
                 command_id="additional", instruction="Review the reports"

@@ -16,6 +16,7 @@ BASELINE_METRIC_GROUPS = (
     ObservationMetricGroup(
         title="整体表现",
         labels={
+            "result_accuracy": "Accuracy",
             "label_accuracy": "标签准确率",
             "macro_f1": "Macro-F1",
             "evaluated_samples": "评估样本",
@@ -37,10 +38,13 @@ BASELINE_METRIC_GROUPS = (
         labels={
             "pass_precision": "Pass 精确率",
             "pass_recall": "Pass 召回率",
+            "pass_f1": "Pass F1",
             "defect_precision": "Defect 精确率",
             "defect_recall": "Defect 召回率",
+            "defect_f1": "Defect F1",
             "fail_precision": "Fail 精确率",
             "fail_recall": "Fail 召回率",
+            "fail_f1": "Fail F1",
         },
     ),
 )
@@ -53,7 +57,7 @@ def observation_detail_form(
     if kind == "init":
         section = ObservationDetailSection(
             id="report",
-            label="Orchestrator report",
+            label="Baseline report",
             selection="report_version",
             blocks=(
                 ObservationSelectBlock(label="Report version"),

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pyromind_agent_server.agent_profiles.echomind_manager import (
+    DEEPSEEK_PROMPTS,
     ECHOMIND_MANAGER_PROFILE,
 )
+from pyromind_agent_server.agent_profiles.spec import ModelPrompts
 from pyromind_runtime.application.product_instructions import DATA_FLYWHEEL_INSTRUCTIONS
 from pyromind_runtime.domain.preparation import PreparationPolicy
 from pyromind_runtime.domain.reward_bundle import (
@@ -32,6 +34,17 @@ class ConversationProfile:
     conversation_marker: str | None = None
     preparation_policy: PreparationPolicy | None = None
     execution_only: bool = False
+    model_prompts: ModelPrompts | None = None
+
+    def for_model(self, model_id: str | None) -> ConversationProfile:
+        prompts = self.model_prompts
+        if prompts is None or not model_id or not prompts.model_ids.fullmatch(model_id):
+            return self
+        return replace(
+            self,
+            instructions=prompts.preparation,
+            development_product_instructions=prompts.execution,
+        )
 
 
 _PRODUCT_ROUTING_INSTRUCTIONS = """For Pyromind workflow requests, read the matching
@@ -61,6 +74,8 @@ DEFAULT_PRODUCT_PROFILE = ConversationProfile(
 _PREPARATION_SKILLS = ("model-evaluation-preparation", "rubric-elicitation")
 _PREPARATION_TOOLS = (
     "read",
+    "find",
+    "grep",
     "write",
     "edit",
     "terminal",
@@ -93,7 +108,8 @@ _PREPARATION_POLICY = _load_preparation_policy()
 
 
 ECHOMIND_PRODUCT_PROFILE = ConversationProfile(
-    configuration_version=43,
+    configuration_version=49,
+    model_prompts=DEEPSEEK_PROMPTS,
     route_prefix="/api/v2/echomind/conversations",
     execution_only=True,
     profile_id=ECHOMIND_MANAGER_PROFILE.name,

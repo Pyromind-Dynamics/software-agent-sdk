@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import PurePosixPath
 
 from pyromind_runtime.application.model_evaluation_plan import (
     check_inference_receipt,
+    inference_paths,
     verified_input_path,
 )
 from pyromind_runtime.application.stage_analysis import artifact_belongs_to_execution
@@ -17,7 +18,11 @@ from pyromind_runtime.domain.experiment_plans import ExperimentTask
 from pyromind_runtime.domain.persisted_payload import validate_persisted_payload
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import ProjectView
-from pyromind_runtime.domain.snapshot import ConversationSnapshot, TimelineOperation
+from pyromind_runtime.domain.snapshot import (
+    ConversationSnapshot,
+    ExternalTaskState,
+    TimelineOperation,
+)
 from pyromind_runtime.domain.storage_paths import (
     StoragePathError,
     from_storage_api_path,
@@ -83,6 +88,7 @@ def plan_executions(
     versions: Iterable[ArtifactVersion] = (),
     *,
     registered: Iterable[ExperimentExecutionView] = (),
+    require_canonical_delivery: bool = False,
 ) -> Iterator[ExperimentExecutionView]:
     tasks = {task.id: task for task in project.plan.tasks}
     stages = {stage.id: stage for stage in project.plan.stages}
@@ -129,11 +135,12 @@ def plan_executions(
             intent="execute",
             state=_BUSINESS_STATES[status],
             report_state="not_started",
+            report_required=task.report_output is not None,
             waiting_reason=row.get("next_action")
             if status == "blocked" and isinstance(row.get("next_action"), str)
             else None,
         )
-        if report:
+        if report and (task.report_output is None or not require_canonical_delivery):
             run = with_plan_report(run, report)
         validate_persisted_payload(run.model_dump(mode="json"))
         yield run
@@ -157,6 +164,133 @@ def with_plan_report(
                 },
             ),
         }
+    )
+
+
+def delivery_rows(
+    project: ProjectView, rows: list, runs: tuple[ExperimentExecutionView, ...]
+) -> list:
+    """Apply accepted delivery inputs for the current attempts to workspace rows."""
+    current = {}
+    for run in (*runs, *plan_executions(project, rows, registered=runs)):
+        if (
+            run.project_id != project.project_id
+            or run.plan_sequence != project.plan_sequence
+            or run.role_id != "main"
+        ):
+            continue
+        previous = current.get(run.task_id)
+        if previous is None or (run.plan_attempt or 1) > (previous.plan_attempt or 1):
+            current[run.task_id] = run
+    indexes: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        if isinstance(row, dict) and isinstance(row.get("id"), str):
+            indexes.setdefault(row["id"], []).append(index)
+    result = list(rows)
+    for task_id, run in current.items():
+        positions = indexes.get(task_id, [])
+        if len(positions) > 1:
+            continue
+        row = rows[positions[0]] if positions else {}
+        history = [
+            item
+            for item in runs
+            if item.task_id == task_id
+            and item.project_id == project.project_id
+            and item.plan_sequence == project.plan_sequence
+            and item.role_id == "main"
+        ]
+        if (
+            row
+            and _plan_run_id(f"{project.project_id}:{task_id}", row, history)
+            != run.run_id
+        ):
+            continue
+        if (
+            run.delivery_outputs
+            and (run.delivery_command_id or run.report_state == "ready")
+            and run.state not in {"failed", "cancelled", "needs_input"}
+            and row.get("business_status") not in {"blocked", "failed"}
+        ):
+            updated = {
+                **row,
+                "id": task_id,
+                "stage_id": run.stage_id,
+                "attempt": run.plan_attempt or 1,
+                "business_status": "completed",
+                "verified_outputs": run.delivery_outputs,
+            }
+            if positions:
+                result[positions[0]] = updated
+            else:
+                result.append(updated)
+    return result
+
+
+def _platform_task_ids(run: ExperimentExecutionView) -> set[str]:
+    ids = set(run.platform_task_ids)
+    if run.platform_task_id:
+        ids.add(run.platform_task_id)
+    return ids
+
+
+def plan_delivery_source(
+    run: ExperimentExecutionView,
+    sdk_receipts: dict[str, tuple[str, str]] | None,
+    *,
+    task: ExperimentTask | None = None,
+    statuses: Mapping[str, str] | None = None,
+) -> ExperimentExecutionView:
+    """Scope a report to receipts relevant to the current result."""
+    identities = run.platform_task_ids
+    if len(identities) < 2:
+        return run
+    latest = identities[-1]
+    if (
+        task is not None
+        and task.kind == "bench"
+        and (run.stage_snapshot or {}).get("kind") == "init"
+        and statuses is not None
+        and latest in statuses
+        and all(
+            statuses.get(task_id) in {"failed", "cancelled"}
+            for task_id in identities[:-1]
+        )
+    ):
+        return run.model_copy(
+            update={"platform_task_id": latest, "platform_task_ids": (latest,)}
+        )
+    selected = run.platform_task_id
+    if (
+        selected
+        and selected in identities
+        and sdk_receipts
+        and selected in sdk_receipts
+        and not any(
+            identity in sdk_receipts
+            for identity in identities[identities.index(selected) + 1 :]
+        )
+    ):
+        return run.model_copy(update={"platform_task_ids": (selected,)})
+    return run
+
+
+def platform_results_ready(
+    run: ExperimentExecutionView, statuses: dict[str, str]
+) -> bool:
+    return all(
+        statuses.get(task_id) == "succeeded" for task_id in _platform_task_ids(run)
+    )
+
+
+def platform_output_directories(
+    run: ExperimentExecutionView, tasks: tuple[ExternalTaskState, ...]
+) -> tuple[str, ...]:
+    ids = _platform_task_ids(run)
+    return tuple(
+        task.output_dir
+        for task in tasks
+        if task.task_id in ids and task.status == "succeeded" and task.output_dir
     )
 
 
@@ -301,6 +435,8 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
             ]
     runtime = plan.get("runtime")
     records = runtime.get("tasks") if isinstance(runtime, dict) else None
+    if definition is None and project and plan.get("project_id") == project.project_id:
+        definition = {}
     if not isinstance(definition, dict):
         raise ValueError("workflow plan requires a tasks array")
     if isinstance(definition.get("tasks"), list):
@@ -308,6 +444,8 @@ def read_plan_tasks(text: str, project: ProjectView | None = None) -> list:
     elif (
         project is not None and "tasks" not in definition and isinstance(records, dict)
     ):
+        if plan.get("project_id", project.project_id) != project.project_id:
+            raise ValueError("workflow plan does not match the approved project ID")
         if definition.get("goal", project.plan.goal) != project.plan.goal:
             raise ValueError("workflow plan does not match the approved project goal")
         tasks = [
@@ -468,6 +606,7 @@ def next_approved_task(
     completed_task_id: str,
     *,
     completed_platform_id: str | None = None,
+    ready_deliveries: set[str] | None = None,
 ) -> tuple[ExperimentTask, dict[str, str]] | None:
     records = {
         row["id"]: row
@@ -475,8 +614,16 @@ def next_approved_task(
         if isinstance(row, dict) and isinstance(row.get("id"), str)
     }
     completed = records.get(completed_task_id, {})
+    primary_reports = {
+        task.id for task in project.plan.tasks if task.report_output is not None
+    }
     if (
         completed.get("business_status") != "completed"
+        or (
+            ready_deliveries is not None
+            and completed_task_id in primary_reports
+            and completed_task_id not in ready_deliveries
+        )
         or not isinstance(completed.get("verified_outputs"), dict)
         or not completed["verified_outputs"]
         or any(
@@ -500,6 +647,12 @@ def next_approved_task(
         row = records.get(task.id, {})
         status = row.get("business_status", "pending")
         if status == "completed":
+            if (
+                ready_deliveries is not None
+                and task.id in primary_reports
+                and task.id not in ready_deliveries
+            ):
+                return None
             continue
         if (
             status != "pending"
@@ -515,6 +668,12 @@ def next_approved_task(
                 outputs = upstream.get("verified_outputs")
                 if upstream.get("business_status") != "completed" or not isinstance(
                     outputs, dict
+                ):
+                    return None
+                if (
+                    ready_deliveries is not None
+                    and item.task_id in primary_reports
+                    and item.task_id not in ready_deliveries
                 ):
                     return None
                 path = verified_input_path(item, outputs)
@@ -593,6 +752,46 @@ def restore_saved_data_status(snapshot: ConversationSnapshot) -> ConversationSna
     )
 
 
+def model_evaluation_retry(
+    run: ExperimentExecutionView,
+    tasks: Mapping[str, ExternalTaskState],
+    pipelines: Mapping[str, PipelineRun],
+    sdk_receipts: dict[str, tuple[str, str]] | None,
+) -> ExternalTaskState | None:
+    identities = run.platform_task_ids
+    selected = run.platform_task_id
+    if (
+        run.state not in {"needs_input", "failed", "cancelled", "waiting_platform"}
+        or not selected
+        or selected not in identities
+        or run.registered_report_ids
+    ):
+        return None
+    for identity in reversed(identities[identities.index(selected) + 1 :]):
+        task = tasks.get(identity)
+        if task is None:
+            continue
+        if (sdk_receipts and identity in sdk_receipts) or inference_paths(
+            pipelines.get(identity)
+        ):
+            return task
+        correlation = task.correlation
+        reference = correlation.execution if correlation else None
+        if (
+            correlation
+            and correlation.signature
+            and correlation.type == "main"
+            and correlation.task_kind == "evaluation"
+            and reference
+            and reference.project_id == run.project_id
+            and reference.plan_sequence == run.plan_sequence
+            and reference.task_id == run.task_id
+            and reference.attempt == run.plan_attempt
+        ):
+            return task
+    return None
+
+
 def with_platform_states(
     snapshot: ConversationSnapshot,
     model_evals: set[str] | None = None,
@@ -604,25 +803,42 @@ def with_platform_states(
         pipeline.task_id: pipeline for pipeline in pipelines if pipeline.task_id
     }
     tasks = {item.task_id: item for item in snapshot.external_tasks}
+    statuses = {identity: task.status for identity, task in tasks.items()}
+    plan_tasks = (
+        {task.id: task for task in snapshot.project.plan.tasks}
+        if snapshot.project
+        else {}
+    )
     runs = []
     for run in snapshot.experiment_executions or ():
-        identities = run.platform_task_ids or (
-            (run.platform_task_id,) if run.platform_task_id else ()
-        )
         model_eval = (
             run.role_id == "main" and model_evals and run.task_id in model_evals
         )
-        if (
-            model_eval
-            and run.state == "succeeded"
-            and run.report_state == "ready"
-            and run.platform_task_id
-            and identities
-            and identities[-1] == run.platform_task_id
-            and sdk_receipts
-            and run.platform_task_id in sdk_receipts
-        ):
-            identities = (run.platform_task_id,)
+        source = plan_delivery_source(
+            run,
+            sdk_receipts if model_eval else None,
+            task=plan_tasks.get(run.task_id) if run.role_id == "main" else None,
+            statuses=statuses,
+        )
+        identities = source.platform_task_ids or (
+            (source.platform_task_id,) if source.platform_task_id else ()
+        )
+        if source.platform_task_id != run.platform_task_id:
+            run = run.model_copy(update={"platform_task_id": source.platform_task_id})
+        retry = (
+            model_evaluation_retry(run, tasks, receipts, sdk_receipts)
+            if model_eval
+            else None
+        )
+        if retry is not None:
+            identities = (retry.task_id,)
+            run = run.model_copy(
+                update={
+                    "platform_task_id": retry.task_id,
+                    "state": "waiting_analysis",
+                    "waiting_reason": None,
+                }
+            )
         platform = [tasks[identity] for identity in identities if identity in tasks]
         if platform and run.role_id == "main":
             if any(
@@ -642,8 +858,13 @@ def with_platform_states(
                 "queued",
             }:
                 run = run.model_copy(update={"state": "waiting_analysis"})
-        if model_eval:
-            run = check_inference_receipt(run, receipts, sdk_receipts=sdk_receipts)
+        if model_eval and (retry is None or retry.status == "succeeded"):
+            run = check_inference_receipt(
+                run,
+                receipts,
+                sdk_receipts=sdk_receipts,
+                require_receipt=retry is not None,
+            )
         runs.append(run)
     return (
         snapshot.model_copy(update={"experiment_executions": tuple(runs)})

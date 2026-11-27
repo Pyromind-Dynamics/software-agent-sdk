@@ -384,8 +384,9 @@ for (const workflowsEnabled of [false, true]) {
 }
 
 test("a persistent length stop finishes as output_truncated, never completed", async (context) => {
+  const requests: JsonObject[] = [];
   const server = createServer(async (request, response) => {
-    await readJson(request);
+    requests.push(await readJson(request));
     sendText(response, "I", "length");
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -429,7 +430,6 @@ test("a persistent length stop finishes as output_truncated, never completed", a
       id: "deepseek-v4-flash-0731",
       api_key: "test-key",
       base_url: `http://127.0.0.1:${address.port}/v1`,
-      context_window: 200_000,
     },
     tools: [],
   });
@@ -452,6 +452,9 @@ test("a persistent length stop finishes as output_truncated, never completed", a
   assert.equal(outcome.status, "failed");
   assert.equal(outcome.stop_reason, "length");
   assert.equal(outcome.error_code, "output_truncated");
+  assert.equal(requests[0]?.max_tokens, 256_000);
+  assert.equal(requests[0]?.reasoning_effort, "high");
+  assert.deepEqual(requests[0]?.thinking, { type: "enabled" });
 });
 
 test("business failures retain details through real hooks, events, persistence and legacy resume", async (context) => {

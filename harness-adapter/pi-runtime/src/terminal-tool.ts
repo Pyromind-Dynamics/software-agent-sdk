@@ -41,11 +41,22 @@ export function createTerminalTool(
   },
 ): AgentTool<ReturnType<typeof createBashTool>["parameters"], TerminalToolDetails> {
   const native = createBashTool(cwd, options);
+  const timeout = {
+    ...native.parameters.properties.timeout,
+    description: "Execution timeout in seconds. The backend default applies when omitted.",
+  };
   const knownSecrets = new Set<string>();
   return {
     ...native,
     name: "terminal",
     label: "terminal",
+    description: "Run a Bash command or script. Each call starts at the workspace root. " +
+      "The result contains stdout and stderr, with the tail shown for long output. " +
+      "Redirect large results to a workspace file when you need to inspect them later.",
+    parameters: {
+      ...native.parameters,
+      properties: { ...native.parameters.properties, timeout },
+    },
     async execute(callId, params, signal, onUpdate) {
       let commandCwd = cwd;
       let completed: TerminalExecutionResult | undefined;

@@ -15,12 +15,14 @@ from pyromind_agent_server.echomind_projects import (
     ProjectInfo,
     ProjectNode,
     ProjectNodeType,
+    ProjectStore,
 )
 from pyromind_agent_server.echomind_stage_executors import (
     StageArtifactPayload,
     StageExecutionResult,
     get_project_node_executor,
 )
+from pyromind_agent_server.echomind_storage import ProjectLease
 
 
 StageRunStatus = Literal[
@@ -326,9 +328,14 @@ def run_project_node(
     project: ProjectInfo,
     node: ProjectNode,
     run_store: ProjectRunStore,
+    project_store: ProjectStore | None = None,
 ) -> StageRun:
     executor = get_project_node_executor(node.executor)
-    run = run_store.start(project=project, node=node)
+    project_id = project.project.project_id
+    with ProjectLease(run_store.projects_root, project_id).acquire():
+        if project_store is not None:
+            project_store.load(project_id, owner_user_id=project.project.owner_user_id)
+        run = run_store.start(project=project, node=node)
     try:
         result = executor.run(project=project, node=node)
         return run_store.succeed(run, result)

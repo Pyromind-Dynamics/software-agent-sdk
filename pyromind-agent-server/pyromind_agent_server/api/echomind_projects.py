@@ -1326,7 +1326,7 @@ async def publish_echomind_project(
     )
     try:
         return await asyncio.to_thread(
-            ProjectPublicationService(store.root).publish,
+            ProjectPublicationService(store.root, project_store=store).publish,
             project=project,
             published_by=context.user_id,
             publication_mode=(body.publication_mode if body is not None else "debug"),
@@ -1335,6 +1335,8 @@ async def publish_echomind_project(
             validation_project_id=body.validation_project_id if body else None,
             require_ready_resources=True,
         )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(404, detail=f"Project not found: {project_id}") from exc
     except PublicationValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1368,8 +1370,11 @@ async def reopen_echomind_project(
     _, project, store = _load_project(request, project_id, require_cluster=True)
     try:
         return await asyncio.to_thread(
-            ProjectPublicationService(store.root).reopen, project=project
+            ProjectPublicationService(store.root, project_store=store).reopen,
+            project=project,
         )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(404, detail=f"Project not found: {project_id}") from exc
     except (
         ActiveGraphRunExistsError,
         ProjectLeaseTimeout,
@@ -1982,7 +1987,7 @@ async def start_echomind_debug_graph_run(
                 "Debug GraphRuns require a development Project."
             )
         snapshot = await asyncio.to_thread(
-            ProjectPublicationService(store.root).prepare_debug,
+            ProjectPublicationService(store.root, project_store=store).prepare_debug,
             project=project,
             reviewed_by=context.user_id,
             expected_contract_sha256=body.expected_contract_sha256,
@@ -2075,7 +2080,9 @@ async def start_graph_repair_debug(
         )
     try:
         snapshot = await asyncio.to_thread(
-            ProjectPublicationService(store.root).prepare_repair_debug,
+            ProjectPublicationService(
+                store.root, project_store=store
+            ).prepare_repair_debug,
             project=project,
             release_id=run.release_id,
             proposal=proposal,
@@ -2663,11 +2670,18 @@ async def run_echomind_project_node(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
-    return run_project_node(
-        project=project,
-        node=node,
-        run_store=ProjectRunStore(store.root),
-    )
+    try:
+        return await asyncio.to_thread(
+            run_project_node,
+            project=project,
+            node=node,
+            run_store=ProjectRunStore(store.root),
+            project_store=store,
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(404, detail=f"Project not found: {project_id}") from exc
+    except ProjectLeaseTimeout as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
 
 
 @router.get(

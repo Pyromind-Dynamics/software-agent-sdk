@@ -57,12 +57,10 @@ async def test_main_host_creates_through_api_and_executes_tools_directly(
             assert ECHOMIND_PRODUCT_PROFILE.delegated_roles == ()
             session = adapter._sessions[created.json()["conversation_id"]]
             assert created.json()["preparation"]["phase"] == "collecting"
-            assert {"read", "write", "edit", "terminal"} <= set(
+            assert {"read", "find", "grep", "write", "edit", "terminal"} <= set(
                 session.config["tool_allowlist"]
             )
             assert not {
-                "grep",
-                "find",
                 "ls",
                 "subagent",
                 "propose_runtime_resources",
@@ -85,7 +83,7 @@ async def test_main_host_creates_through_api_and_executes_tools_directly(
                     user_id="42", profile_id=ECHOMIND_PRODUCT_PROFILE.profile_id
                 ),
             )
-            native = {"read", "write", "edit", "terminal", "ask_user"}
+            native = {"read", "find", "grep", "write", "edit", "terminal", "ask_user"}
             assert set(session.config["tool_allowlist"]) == set(
                 ECHOMIND_PRODUCT_PROFILE.development_tool_allowlist or ()
             )

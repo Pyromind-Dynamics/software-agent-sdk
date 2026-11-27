@@ -21,6 +21,10 @@ from pyromind_runtime.domain.experiment_plans import (
     WorkflowPlan,
 )
 from pyromind_runtime.domain.preparation import ProjectView
+from pyromind_runtime.infrastructure.file_product_store import (
+    FileProductStore,
+    ProductStoreError,
+)
 
 
 ProjectNodeType = Literal["dataset", "inference", "evaluator", "train"]
@@ -250,12 +254,16 @@ class ProjectClusterMismatchError(PermissionError):
 class ProjectStore:
     """File-backed Project store whose identity comes from an ExperimentPlan."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(
+        self, root: Path | str, *, conversations_dir: Path | None = None
+    ) -> None:
         self.root = Path(root)
+        self.conversations_dir = conversations_dir or self.root.parent / "conversations"
 
     @classmethod
     def for_conversations_dir(cls, conversations_dir: Path | str) -> ProjectStore:
-        return cls(Path(conversations_dir).parent / "projects")
+        directory = Path(conversations_dir)
+        return cls(directory.parent / "projects", conversations_dir=directory)
 
     def bind_plan(
         self,
@@ -385,6 +393,8 @@ class ProjectStore:
             raise ProjectNotFoundError(project_id)
         if owner_user_id is not None and project.project.owner_user_id != owner_user_id:
             raise ProjectNotFoundError(project_id)
+        if self._conversation_archived(project):
+            raise ProjectNotFoundError(project_id)
         return project
 
     def list(self, *, owner_user_id: str | None) -> list[ProjectSummary]:
@@ -396,7 +406,9 @@ class ProjectStore:
                 continue
             try:
                 project = self._load_optional(project_dir.name)
-            except (OSError, ValidationError, ValueError):
+                if project is not None and self._conversation_archived(project):
+                    continue
+            except (OSError, ValidationError, ValueError, ProductStoreError):
                 continue
             if project is None:
                 continue
@@ -443,6 +455,19 @@ class ProjectStore:
             raise ProjectClusterMismatchError(
                 f"Project belongs to cluster {project.project.cluster}"
             )
+
+    def _conversation_archived(self, project: ProjectInfo) -> bool:
+        if project.project.owner_user_id is None:
+            return False
+        conversation = FileProductStore(
+            self.conversations_dir / project.project.conversation_id
+        )
+        return (
+            conversation.metadata_path.is_file()
+            and conversation.is_workspace_archived(
+                owner_user_id=project.project.owner_user_id
+            )
+        )
 
     def _load_optional(self, canonical_project_id: str) -> ProjectInfo | None:
         project_dir = self.root / canonical_project_id

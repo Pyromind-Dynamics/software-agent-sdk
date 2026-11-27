@@ -377,7 +377,6 @@ function bindPathTool(
   }
   return {
     ...tool,
-    description: `${tool.description}\n\n${pathScope}`,
     parameters,
     async execute(callId, params: any, signal, onUpdate) {
       if (!isRecord(params) || typeof params.path !== "string") throw new Error("path must be a string");

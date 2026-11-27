@@ -230,5 +230,13 @@ class VersionToolRequest(ContractModel):
         "new_iteration",
         "recover",
         "bind_execution_metadata",
+        "deliver_plan_outputs",
     ]
     arguments: JsonObject = Field(default_factory=dict)
+
+
+class PlanDeliveryRequest(ContractModel):
+    plan_task_id: str = Field(min_length=1, max_length=128)
+    plan_attempt: int = Field(strict=True, ge=1)
+    verified_outputs: dict[str, str] = Field(min_length=1)
+    validate_only: bool = False
