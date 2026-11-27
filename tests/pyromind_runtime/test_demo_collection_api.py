@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -27,7 +28,9 @@ from pyromind_agent_server.echomind_projects import (
 from pyromind_agent_server.echomind_publication import PublicationStore
 from pyromind_agent_server.echomind_runtime_slots import RuntimeSlotStore
 from pyromind_agent_server.echomind_sandbox_storage import SandboxEvaluationStorage
+from pyromind_agent_server.echomind_storage import project_directory
 from pyromind_agent_server.service_context import ProductServiceContext
+from pyromind_runtime.ports.storage import EvaluationStorageMissingError
 
 
 @pytest.fixture
@@ -215,3 +218,98 @@ async def test_selected_page_starts_one_real_tracer_runner(
     assert len(simulations.list(pid)) == 2
     prepared.assert_called_once()
     status.assert_called_once_with(endpoint="https://tracer.test", access_key="test")
+
+
+async def test_registered_directory_uses_fixed_eval_and_all_five_training_groups(
+    project_client, monkeypatch
+):
+    client, project, simulations = project_client
+    pid = project.project.project_id
+    root = simulations.projects_root
+    directory = "/workspace/datasets/pcb/images"
+    config = demo.PcbCollectionConfig(
+        release_digest="sha256:" + "a" * 64,
+        image_directory=directory,
+        system_prompt="reviewed system",
+        user_prompt="reviewed user",
+    )
+    (project_directory(root, pid) / "pcb_image_collection.json").write_text(
+        config.model_dump_json()
+    )
+    evaluator = Mock(type="evaluator", inputs={"validation_dataset": Mock()})
+    evaluator.inputs["validation_dataset"].binding.kind = "literal"
+    evaluator.inputs[
+        "validation_dataset"
+    ].binding.value = "/workspace/datasets/eval.jsonl"
+    release = Mock(
+        content_sha256="sha256:" + "b" * 64,
+        release_id="release",
+        nodes=[
+            Mock(
+                type="dataset",
+                config={
+                    "batch_label_source": "dataset",
+                    "batch_validation_source": "none",
+                },
+            ),
+            evaluator,
+        ],
+    )
+    monkeypatch.setattr(PublicationStore, "load_active", lambda *args: release)
+    url = f"/api/echomind/projects/{pid}/demo-collection"
+    assert (await client.get(url + "/config")).json() is None
+    slot = Mock(
+        active_release_id="release", status="ready", batch_execution_available=True
+    )
+    slot.tracer.custom_runtime_script_path = (
+        f"/app/trigger/echomind-project-{pid}-" + "f" * 64 + ".sh"
+    )
+    slot.tracer.buffer_config.batch_size = 5
+    monkeypatch.setattr(RuntimeSlotStore, "load", lambda *args: slot)
+    release.content_sha256 = config.release_digest
+    assert (await client.get(url + "/config")).json() == {"image_directory": directory}
+    runtime = Mock()
+    rows = [
+        {
+            "id": f"report_{i}",
+            "images": [
+                f"{directory}/report_{i}/{f}"
+                for f in ("defect.jpg", "diff.jpg", "gt.jpg")
+            ],
+            "image_sha256": ["0" * 64] * 3,
+        }
+        for i in range(5)
+    ]
+    reader = Mock(spec=demo.PcbCollectionReader)
+    runtime.recorded_workflow_storage.return_value = reader
+    reader.select_pcb_groups.return_value = rows
+    monkeypatch.setattr(demo, "get_product_runtime", lambda request: runtime)
+    monkeypatch.setattr(demo, "build_bound_evaluation_storage", lambda **kwargs: None)
+    storage = Mock()
+    storage.read.side_effect = EvaluationStorageMissingError
+    monkeypatch.setattr(demo, "build_evaluation_storage", lambda ctx: storage)
+    launch = AsyncMock()
+    monkeypatch.setattr(demo, "_launch_collection_simulation", launch)
+    body = {**selection(), "image_directory": directory}
+    wrong = await client.post(
+        url, json={**body, "image_directory": "/workspace/datasets/other"}
+    )
+    assert wrong.status_code == 422
+    response = await client.post(url, json=body)
+    assert response.status_code == 202
+    sim = simulations.load(
+        project_id=pid, simulation_id=response.json()["simulation_id"]
+    )
+    assert sim.error is None
+    assert sim.source.image_layout == "pcb_report_directory"
+    assert sim.splits == ["train"]
+    reader.select_pcb_groups.assert_called_once_with(
+        directory, evaluator.inputs["validation_dataset"].binding.value, 17
+    )
+    train, val = storage.write.call_args_list
+    assert [json.loads(line)["user_prompt"] for line in train.args[1].splitlines()] == [
+        "reviewed user"
+    ] * 5
+    assert all("gt" not in json.loads(line) for line in train.args[1].splitlines())
+    assert val.args[1] == b"\n"
+    launch.assert_awaited_once()

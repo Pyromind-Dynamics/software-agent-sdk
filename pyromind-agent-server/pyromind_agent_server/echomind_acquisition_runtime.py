@@ -41,6 +41,7 @@ from pyromind_agent_server.echomind_train_runtime import (
     TrainRuntimeError,
     _json_path_tokens,
 )
+from pyromind_common.platform.pcb_collection import PCB_REPORT_IMAGES
 from pyromind_runtime.domain.storage_paths import (
     from_storage_api_path,
     to_storage_api_path,
@@ -619,6 +620,56 @@ class TracerBatchMaterializer:
                     raise AcquisitionPaused(
                         f"Batch input differs from its receipt: {path}"
                     )
+
+    def write_pcb_report_batch(
+        self,
+        *,
+        directory: str,
+        image_root: str,
+        rows: Mapping[AcquisitionSplit, Sequence[Mapping[str, Any]]],
+    ) -> None:
+        if rows["val"] or not rows["train"]:
+            raise AcquisitionPaused("The PCB image batch requires training rows only")
+        root = PurePosixPath(image_root)
+        target = PurePosixPath(directory)
+        records = []
+        for row in rows["train"]:
+            name = row["id"]
+            if not name.startswith("report_") or PurePosixPath(name).name != name:
+                raise AcquisitionPaused("Invalid PCB report directory name")
+            sources = [str(root / name / role) for role in PCB_REPORT_IMAGES]
+            digests = row.get("image_sha256", [])
+            if row["images"] != sources or len(digests) != len(sources):
+                raise AcquisitionPaused("PCB source triplet differs from the selection")
+            images = []
+            for role, source, digest in zip(
+                PCB_REPORT_IMAGES, sources, digests, strict=True
+            ):
+                destination = str(target / name / role)
+                self._copy_verified_image(source, destination, digest)
+                images.append(destination)
+            records.append({**row, "images": images})
+        groups = {
+            entry
+            for entry in self.storage.list(to_storage_api_path(directory))
+            if entry.startswith("report_")
+        }
+        if groups != {row["id"] for row in records}:
+            raise AcquisitionPaused("PCB batch directory differs from sealed samples")
+        self.write(directory=directory, rows={"train": records, "val": []})
+
+    def _copy_verified_image(self, source: str, destination: str, digest: str) -> None:
+        path = to_storage_api_path(destination)
+        try:
+            existing = self.storage.read(path)
+        except EvaluationStorageMissingError:
+            image = self.storage.read(to_storage_api_path(source))
+            if hashlib.sha256(image).hexdigest() != digest:
+                raise AcquisitionPaused(f"PCB source image changed: {source}")
+            self.storage.write(path, image)
+        else:
+            if hashlib.sha256(existing).hexdigest() != digest:
+                raise AcquisitionPaused(f"PCB batch image differs from receipt: {path}")
 
 
 class AcquisitionSimulationRunner:
@@ -1254,7 +1305,12 @@ class AcquisitionSimulationRunner:
             f"/workspace/.pyromind-agent/{conversation_id}"
             f"/tracer-batches/{simulation_id}/{batch.index}"
         )
-        materializer.write(directory=directory, rows=rows)
+        if simulation.source.image_layout == "pcb_report_directory":
+            materializer.write_pcb_report_batch(
+                directory=directory, image_root=simulation.source.image_root, rows=rows
+            )
+        else:
+            materializer.write(directory=directory, rows=rows)
         return self._save_batch(
             simulation,
             batch_id,

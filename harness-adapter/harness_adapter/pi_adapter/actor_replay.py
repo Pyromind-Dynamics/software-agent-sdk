@@ -7,11 +7,13 @@ import json
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import Any
 
 import httpx
 
 from harness_adapter.pi_adapter.actor_workspace import ActorWorkspace
 from pyromind_common.platform.dataset_replay import DatasetReplayPaths
+from pyromind_common.platform.pcb_collection import pcb_selection_command
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.ports.storage import (
     EvaluationStorageMissingError,
@@ -156,6 +158,32 @@ class RecordedActorReplayReader:
                 "Replay evidence changed while reading"
             )
         return content
+
+    def select_pcb_groups(
+        self, image_directory: str, validation_uri: str, offset: int
+    ) -> list[dict[str, Any]]:
+        raw, heldout = (
+            to_storage_api_path(p) for p in (image_directory, validation_uri)
+        )
+        if offset < 0 or not all(p.startswith("/datasets/") for p in (raw, heldout)):
+            raise ValueError(
+                "PCB selection requires a datasets directory and fixed Eval file"
+            )
+        command = pcb_selection_command(
+            self.workspace.storage_path, raw, heldout, offset
+        )
+        try:
+            result = self.workspace.execute_command(shlex.join(command), timeout=180)
+        except (httpx.HTTPError, TimeoutError) as exc:
+            raise EvaluationStorageUnavailableError("PCB 选图工作区不可用") from exc
+        if result.timeout_occurred:
+            raise EvaluationStorageUnavailableError("PCB 图片分组或评测集校验超时")
+        if result.exit_code or "[Actor output truncated]" in result.stdout:
+            raise ValueError("所选范围缺少 5 组可用三图，或固定评测集图片无法校验")
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list) or len(rows) != 5:
+            raise ValueError("PCB selection returned an incomplete page")
+        return rows
 
     def verify_splits(self, paths: DatasetReplayPaths) -> tuple[int, str, str]:
         for path in (paths.source_batch, paths.approved_source, paths.fixed_validation):

@@ -38,6 +38,9 @@ class AcquisitionSource(BaseModel):
     train_uri: str = Field(min_length=1, max_length=4000)
     val_uri: str = Field(min_length=1, max_length=4000)
     image_root: str = Field(min_length=1, max_length=4000)
+    image_layout: Literal["pcb_report_directory"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AcquisitionBatch(BaseModel):

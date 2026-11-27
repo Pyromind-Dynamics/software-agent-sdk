@@ -20,6 +20,7 @@ from pyromind_agent_server.echomind_acquisition import (
     AcquisitionSimulation,
     AcquisitionSimulationStore,
     AcquisitionSource,
+    AcquisitionSplit,
 )
 from pyromind_agent_server.echomind_acquisition_runtime import (
     AcquisitionPaused,
@@ -821,6 +822,38 @@ def test_http_transport_uses_tracer_task_and_batch_endpoints():
         ground_truth=None,
     )
     assert json.loads(requests[-1].content) == {"task_id": "raw-task"}
+
+
+def test_pcb_batch_preserves_sealed_triplet_and_source_receipt():
+    root = "/workspace/datasets/images"
+    batch = "/workspace/batches/test"
+    images = [f"{root}/report_1/{name}.jpg" for name in ("defect", "diff", "gt")]
+    payloads = [b"defect", b"difference", b"reference"]
+    row = {
+        "id": "report_1",
+        "images": images,
+        "image_sha256": [hashlib.sha256(image).hexdigest() for image in payloads],
+        "user_prompt": "inspect all three images",
+    }
+    rows: dict[AcquisitionSplit, list[dict[str, Any]]] = {"train": [row], "val": []}
+    storage = _BatchStorage(
+        dict(zip((p.removeprefix("/workspace") for p in images), payloads, strict=True))
+    )
+    materializer = TracerBatchMaterializer(storage)
+    storage.files["/datasets/images/report_1/diff.jpg"] = b"modified"
+    with pytest.raises(AcquisitionPaused, match="source image changed"):
+        materializer.write_pcb_report_batch(directory=batch, image_root=root, rows=rows)
+    assert "/batches/test/train.jsonl" not in storage.files
+    storage.files["/datasets/images/report_1/diff.jpg"] = payloads[1]
+    materializer.write_pcb_report_batch(directory=batch, image_root=root, rows=rows)
+    written = storage.written.copy()
+    materializer.write_pcb_report_batch(directory=batch, image_root=root, rows=rows)
+    assert storage.written == written
+    roster = json.loads(storage.files["/batches/test/train.jsonl"])
+    copied = [p.replace(root, batch) for p in images]
+    assert roster == {**row, "images": copied}
+    assert [storage.files[p.removeprefix("/workspace")] for p in copied] == payloads
+    assert storage.files["/batches/test/val.jsonl"].strip() == b""
 
 
 class _MemoryReader:

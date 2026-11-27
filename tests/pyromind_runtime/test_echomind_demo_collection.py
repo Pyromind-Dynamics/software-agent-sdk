@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from pyromind_agent_server import echomind_demo_collection as demo
+from pyromind_common.platform.pcb_collection import pcb_selection_command
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.ports.storage import EvaluationStorageMissingError
 
@@ -162,3 +163,33 @@ def test_labeler_uses_serving_openai_route_without_tracing(monkeypatch):
     assert label([]) == "label"
     assert post.call_args.args == ("https://serving.invalid/job/v1/chat/completions",)
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer test"}
+
+
+def test_report_directory_uses_only_eligible_groups_across_pages(tmp_path):
+    images = tmp_path / "datasets/pcb/images"
+    validation = tmp_path / "datasets/eval"
+    validation.mkdir(parents=True)
+    groups = ["irrelevant", *(f"report_{i:02}" for i in range(13))]
+    for group in groups:
+        directory = images / group
+        directory.mkdir(parents=True)
+        for filename in demo._FILES:
+            (directory / filename).write_bytes(f"{group}/{filename}".encode())
+    (images / "report_02/diff.jpg").unlink()
+    (validation / "renamed.png").write_bytes((images / "report_01/gt.jpg").read_bytes())
+    (validation / "val.jsonl").write_text(
+        json.dumps({"id": "report_00", "images": ["renamed.png"]})
+    )
+    for offset in (0, 5):
+        command = pcb_selection_command(
+            str(tmp_path), "/datasets/pcb/images", "/datasets/eval/val.jsonl", offset
+        )
+        output = subprocess.check_output([sys.executable, *command[1:]], text=True)
+        rows = json.loads(output)
+        expected = [f"report_{i:02}" for i in range(3 + offset, 8 + offset)]
+        assert [r["id"] for r in rows] == expected
+        for row in rows:
+            assert row["image_sha256"] == [
+                hashlib.sha256((images / row["id"] / file).read_bytes()).hexdigest()
+                for file in demo._FILES
+            ]
