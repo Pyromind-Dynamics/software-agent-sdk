@@ -166,12 +166,13 @@ def check_inference_receipt(
     receipts: dict[str, PipelineRun],
     *,
     sdk_receipts: dict[str, tuple[str, str]] | None = None,
+    require_receipt: bool = False,
 ) -> ExperimentExecutionView:
     if run.platform_task_id and sdk_receipts and run.platform_task_id in sdk_receipts:
         return run
     receipt = receipts.get(run.platform_task_id) if run.platform_task_id else None
     if not inference_paths(receipt) and (
-        receipt is not None or run.state == "succeeded"
+        require_receipt or receipt is not None or run.state == "succeeded"
     ):
         return run.model_copy(
             update={

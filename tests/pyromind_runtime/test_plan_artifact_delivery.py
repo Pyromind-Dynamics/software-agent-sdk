@@ -1,5 +1,7 @@
 import asyncio
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,9 +23,12 @@ from pyromind_runtime.application.plan_artifact_delivery import (
 )
 from pyromind_runtime.application.plan_execution import (
     PLAN_PATH,
+    plan_delivery_source,
     plan_executions,
+    platform_results_ready,
     recover_plan_delivery_rows,
     with_plan_report,
+    with_platform_states,
 )
 from pyromind_runtime.application.project_observations import (
     observation_analysis_report,
@@ -281,6 +286,55 @@ async def test_delivery_receipt_survives_replay_and_stale_workspace_status(
         await runtime.close()
 
 
+def test_train_report_export_normalizes_training_and_merge_task_ids(tmp_path):
+    exporter = (
+        Path(__file__).resolve().parents[2]
+        / ".agents/skills/workflow-execution/scripts/export_plan_report.py"
+    )
+    result = tmp_path / "training_result.json"
+    result.write_text(
+        json.dumps(
+            {
+                "platform_task_ids": {"sft_training": "1398", "lora_merge": "1400"},
+                "steps": 180,
+            }
+        )
+    )
+    mapping = tmp_path / "report_mapping.json"
+    mapping.write_text(
+        json.dumps(
+            {"metrics": [{"label": "steps", "unit": "count", "path": ["steps"]}]}
+        )
+    )
+    command = [sys.executable, str(exporter), str(result), str(mapping)]
+    exported = subprocess.run(
+        [*command, "--platform-task-id", "1398", "--platform-task-id", "1400"],
+        check=True,
+        capture_output=True,
+    )
+    report = json.loads(exported.stdout)
+    assert report["source"] == {"platform_task_ids": ["1398", "1400"]}
+    assert "platform_task_ids" not in report
+    storage = cast(EvaluationStorage, SimpleNamespace(read=lambda _: exported.stdout))
+    assert _read_report(
+        storage,
+        "train",
+        {"report": "/train/report.json"},
+        report_name="report",
+        platform_task_id="1398",
+        platform_task_ids=("1398", "1400"),
+        require_platform_source=True,
+        require_schema_version=True,
+    )["metrics"] == [{"label": "steps", "value": 180, "unit": "count"}]
+
+    mismatched = subprocess.run(
+        [*command, "--platform-task-id", "1398"], check=False, capture_output=True
+    )
+    assert mismatched.returncode == 2
+    assert not mismatched.stdout
+    assert b"outside --platform-task-id" in mismatched.stderr
+
+
 def test_v1_platform_report_must_match_its_trusted_task():
     body = {
         "schema_version": 1,
@@ -329,10 +383,249 @@ def test_v1_platform_report_must_match_its_trusted_task():
             "init",
             outputs,
             report_name="report",
+            platform_task_id="bound",
             allow_narrative=True,
             require_schema_version=True,
         )
     assert narrative.value.field == "summary"
+
+
+@pytest.mark.parametrize(
+    ("stage", "invalid_fields", "field"),
+    [
+        (
+            "init",
+            {
+                "metrics": [
+                    {"label": "accuracy", "value": 0.72},
+                    {"label": "bad", "value": "bad"},
+                ]
+            },
+            "metrics[1].value",
+        ),
+        (
+            "dataset",
+            {"files": {}, "splits": {"train": {"file": "/workspace/run/train.jsonl"}}},
+            "files",
+        ),
+        ("train", {"schema_version": None}, "schema_version"),
+        (
+            "eval",
+            {"source": {"platform_task_ids": {"scoring": "1398"}}},
+            "source.platform_task_ids",
+        ),
+    ],
+)
+def test_primary_report_controls_node_completion_even_without_explicit_delivery(
+    tmp_path, stage, invalid_fields, field
+):
+    context = RequestContext(user_id="42")
+    snapshots = FileArtifactSnapshots(tmp_path / "Storage")
+    versions = Versions(SQLiteVersionStore(tmp_path / "versions.db"), snapshots)
+    neighbors = tuple(
+        kind for kind in ("init", "dataset", "train", "eval") if kind != stage
+    )
+    project = ProjectView.model_validate(
+        {
+            "project_id": "p",
+            "conversation_id": "session",
+            "plan_sequence": 1,
+            "creation_command_id": "create",
+            "plan": {
+                "stages": [
+                    {"id": "s", "kind": stage, "name": stage},
+                    *({"id": kind, "kind": kind, "name": kind} for kind in neighbors),
+                ],
+                "tasks": [
+                    {
+                        "id": "task",
+                        "stage_id": "s",
+                        "name": "Report",
+                        "outputs": [{"name": "result", "kind": "report"}],
+                    },
+                    *(
+                        {"id": kind, "stage_id": kind, "name": kind}
+                        for kind in neighbors
+                    ),
+                ],
+            },
+        }
+    )
+    row = {
+        "id": "task",
+        "stage_id": "s",
+        "business_status": "completed",
+        "verified_outputs": {"result": "/workspace/run/report.json"},
+    }
+    run, *other_runs = plan_executions(
+        project,
+        [
+            row,
+            *(
+                {"id": kind, "stage_id": kind, "business_status": "in_progress"}
+                for kind in neighbors
+            ),
+        ],
+    )
+    run = run.model_copy(update={"platform_task_id": "own-result"})
+    other_runs = [
+        item.model_copy(update={"platform_task_id": f"{item.task_id}-running"})
+        for item in other_runs
+    ]
+    task = project.plan.tasks[0]
+    scope = "session"
+    valid = {
+        "schema_version": 1,
+        "metrics": [{"label": "result", "value": 0.72}],
+        "source": {"platform_task_id": "own-result"},
+        **(
+            {"files": [{"name": "train", "path": "/workspace/run/train.jsonl"}]}
+            if stage == "dataset"
+            else {}
+        ),
+    }
+    read = Mock(return_value=json.dumps({**valid, **invalid_fields}).encode())
+    storage = cast(
+        EvaluationStorage,
+        SimpleNamespace(read=read, list=lambda _: {"report.json", "train.jsonl"}),
+    )
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": scope,
+            "capabilities": {},
+            "project": project,
+            "external_tasks": [
+                {
+                    "task_id": identity,
+                    "kind": "workflow_run",
+                    "status": status,
+                    "run_id": "same-main-turn",
+                    "submitted_at": "2026-11-25T06:00:00Z",
+                    "updated_at": "2026-11-25T06:00:00Z",
+                }
+                for identity, status in [
+                    ("own-result", "succeeded"),
+                    *((f"{kind}-running", "running") for kind in neighbors),
+                ]
+            ],
+        }
+    )
+
+    def node(execution):
+        current = snapshot.model_copy(
+            update={"experiment_executions": (execution, *other_runs)}
+        )
+        target, *other_nodes = project_observations(
+            with_platform_states(current), "p"
+        ).nodes
+        assert all(item.business_status == "running" for item in other_nodes)
+        return target
+
+    assert node(run).business_status == "waiting_analysis"
+    assert node(run).delivery_status == "pending"
+    assert (
+        node(run.model_copy(update={"report_state": "ready"})).business_status
+        == "waiting_analysis"
+    )
+    with pytest.raises(InvalidPlanDelivery) as failure:
+        register_plan_delivery(versions, storage, task, run, row, scope, context)
+    assert failure.value.field == field
+    version_project = versions.project(scope, context, create=False)
+    assert version_project and not versions.store.list_versions(version_project.id)
+    failed = run.model_copy(
+        update={
+            "report_state": "registration_failed",
+            "delivery_error": failure.value.code,
+        }
+    )
+    assert node(failed).business_status == "waiting_analysis"
+    assert node(failed).delivery_status == "failed"
+
+    read.return_value = json.dumps(valid).encode()
+    directory = snapshots.path("/run", context)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "report.json").write_bytes(read.return_value)
+    ready = register_plan_delivery(versions, storage, task, run, row, scope, context)
+    completed = node(with_plan_report(run, ready))
+    assert completed.business_status == "succeeded"
+    assert completed.report_version_ids == (ready.id,)
+
+
+def test_baseline_retry_uses_the_latest_bound_receipt_after_failed_runs():
+    project = ProjectView.model_validate(
+        {
+            "project_id": "p",
+            "conversation_id": "session",
+            "plan_sequence": 3,
+            "creation_command_id": "create",
+            "plan": {
+                "stages": [{"id": "init", "kind": "init", "name": "Init"}],
+                "tasks": [
+                    {
+                        "id": "baseline_bench",
+                        "stage_id": "init",
+                        "kind": "bench",
+                        "name": "Baseline",
+                        "outputs": [{"name": "baseline_report", "kind": "report"}],
+                    }
+                ],
+            },
+        }
+    )
+    (run,) = plan_executions(
+        project,
+        [{"id": "baseline_bench", "stage_id": "init", "business_status": "completed"}],
+    )
+    run = run.model_copy(
+        update={"platform_task_id": "1395", "platform_task_ids": ("1395", "1397")}
+    )
+    statuses = {"1395": "failed", "1397": "succeeded"}
+    task = project.plan.tasks[0]
+    source = plan_delivery_source(run, None, task=task, statuses=statuses)
+    assert source.platform_task_id == "1397"
+    assert source.platform_task_ids == ("1397",)
+    assert platform_results_ready(source, statuses)
+    assert (
+        plan_delivery_source(
+            run, None, task=task, statuses={**statuses, "1395": "succeeded"}
+        )
+        == run
+    )
+    assert plan_delivery_source(
+        run.model_copy(update={"stage_snapshot": {"kind": "train"}}),
+        None,
+        task=task,
+        statuses=statuses,
+    ).platform_task_ids == ("1395", "1397")
+
+    snapshot = ConversationSnapshot.model_validate(
+        {
+            "conversation_id": "session",
+            "capabilities": {},
+            "project": project,
+            "experiment_executions": (run,),
+            "external_tasks": [
+                {
+                    "task_id": identity,
+                    "kind": "workflow_run",
+                    "status": status,
+                    "submitted_at": "2026-11-27T02:07:00Z",
+                    "updated_at": "2026-11-27T02:37:00Z",
+                }
+                for identity, status in statuses.items()
+            ],
+        }
+    )
+    projected = with_platform_states(snapshot)
+    assert projected.experiment_executions
+    (current,) = projected.experiment_executions
+    assert current.platform_task_id == "1397"
+    assert current.platform_task_ids == ("1395", "1397")
+    assert current.state == "succeeded"
+    node = project_observations(projected, "p").nodes[0]
+    assert (
+        node.business_status == "waiting_analysis" and node.delivery_status == "pending"
+    )
 
 
 def test_failed_snapshot_is_never_reused_for_a_corrected_submission(

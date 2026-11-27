@@ -233,6 +233,10 @@ Project 任务读取 `PYROMIND_PROJECT_EXECUTIONS`：它是包含
 `project_id`、`task_id`、`attempt`、`out_ids` 的 JSON 列表。选择已获授权的 Project
 任务和当前 attempt，再从该项的 `out_ids` 选择任务类型。不要用普通会话关联替代
 Project 关联；新业务尝试需要新的 attempt 上下文，旧 attempt 的迟到回调不代表新尝试完成。
+训练任务如果有 `blocked_by`，先完成其中列出的 Baseline 任务的报告登记。
+登记后从新的终端调用读取 `out_ids`，取得该训练任务的提交关联再提交。
+有 `waiting_for` 的任务等待所列平台任务的回调，同次尝试暂时不会取得新的提交关联。
+其他节点可以继续已获授权的工作和报告登记。没有可推进的工作时结束本轮。
 分片提交保留每片真实 `task_id`，不只保存最后一片。
 执行计划内的模型评测时，使用该评测任务当前尝试的 `out_ids["evaluation"]`，让工作台能将推理回执关联到对应的模型和验证集。
 

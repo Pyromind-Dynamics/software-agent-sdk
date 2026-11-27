@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 from pathlib import PurePosixPath
 
+from pydantic import JsonValue
+
 from pyromind_runtime.application.project_observations import (
     baseline_evaluation_metrics,
     dataset_report_checks,
@@ -170,6 +172,7 @@ def register_plan_delivery(
         paths,
         referenced_outputs=frozenset(replacements),
         platform_output_dirs=platform_output_dirs,
+        require_schema_version=report_output is not None,
         freeze_attribution=True,
     )
 
@@ -386,23 +389,40 @@ def _read_report(
             task_ids = set(platform_task_ids)
             if platform_task_id:
                 task_ids.add(platform_task_id)
-            if task_ids:
+            if (
+                require_schema_version
+                and "source" in body
+                and not isinstance(body["source"], dict)
+            ):
+                raise InvalidPlanDelivery("invalid_report", "source")
+            if task_ids or require_schema_version:
                 _validate_platform_source(
                     body, task_ids, required=require_platform_source
                 )
         elif stage == "init":
             body = _normalize_legacy_init(body, platform_task_id)
-        document = _report_document(body, stage, outputs)
+        document = _report_document(body, stage, outputs, strict=require_schema_version)
         if body.get("schema_version") == 1:
             document["schema_version"] = 1
         if allow_narrative:
             findings = body.get("findings")
+            valid_findings: list[JsonValue] = []
             if isinstance(findings, list):
-                document["findings"] = [
+                valid_findings = [
                     value.strip()
                     for value in findings[:24]
                     if isinstance(value, str) and 0 < len(value.strip()) <= 900
                 ]
+                document["findings"] = valid_findings
+            if (
+                require_schema_version
+                and "findings" in body
+                and (
+                    not isinstance(findings, list)
+                    or len(findings) != len(valid_findings)
+                )
+            ):
+                raise InvalidPlanDelivery("invalid_report", "findings")
             if not document.get("summary") and not document.get("findings"):
                 raise InvalidPlanDelivery("invalid_report", "summary")
             if freeze_attribution:
@@ -494,20 +514,20 @@ def _validate_platform_source(
             continue
         single = container.get("platform_task_id")
         multiple = container.get("platform_task_ids")
-        if (single is not None and type(single) not in (str, int)) or (
-            multiple is not None
-            and (
-                not isinstance(multiple, list)
-                or any(type(item) not in (str, int) for item in multiple)
-            )
-        ):
+        if single is not None and type(single) not in (str, int):
             raise InvalidPlanDelivery("invalid_report", "source.platform_task_id")
+        if multiple is not None and (
+            not isinstance(multiple, list)
+            or any(type(item) not in (str, int) for item in multiple)
+        ):
+            raise InvalidPlanDelivery("invalid_report", "source.platform_task_ids")
         if single is not None:
             declared.add(str(single))
         if multiple is not None:
             declared.update(str(item) for item in multiple)
     if (declared - expected) or (required and declared != expected):
-        raise InvalidPlanDelivery("invalid_report", "source.platform_task_id")
+        field = "platform_task_ids" if len(expected) > 1 else "platform_task_id"
+        raise InvalidPlanDelivery("invalid_report", f"source.{field}")
 
 
 def _read_report_body(storage: EvaluationStorage, path: str) -> dict:
@@ -537,8 +557,11 @@ def _report_document(
     outputs: dict[str, str],
     *,
     legacy: bool = False,
+    strict: bool = False,
 ) -> JsonObject:
     issues: list[ReportIssue] = []
+    if strict and "metrics" in body and not isinstance(body["metrics"], list):
+        raise InvalidPlanDelivery("invalid_report_metrics", "metrics")
     checks = dataset_report_checks(body) if stage == "dataset" else None
     metrics = report_metrics(
         body, issues=issues, checks=checks, allow_comparisons=stage == "eval"
@@ -552,12 +575,18 @@ def _report_document(
         summary = summary.strip()
         if 0 < len(summary) <= 900:
             document["summary"] = summary
+    if strict and "summary" in body and "summary" not in document:
+        raise InvalidPlanDelivery("invalid_report", "summary")
     if stage == "dataset":
-        files = dataset_report_files(body, issues=issues)
+        if strict and (
+            not isinstance(body.get("files"), list) or len(body["files"]) > 32
+        ):
+            raise InvalidPlanDelivery("invalid_report", "files")
+        files = dataset_report_files(body, issues=issues, explicit_only=strict)
         dataset_outputs = _dataset_paths(outputs)
-        if not files:
+        if not files and not strict:
             files = _merged_dataset_report_files(body, dataset_outputs)
-        if not files and len(dataset_outputs) == 1:
+        if not strict and not files and len(dataset_outputs) == 1:
             ((name, path),) = dataset_outputs.items()
             records = body.get("n_train_records")
             if (
@@ -582,9 +611,27 @@ def _report_document(
                     }
                 )
         document["files"] = [item.model_dump(mode="json") for item in files]
+        if (
+            strict
+            and "checks" in body
+            and (
+                not isinstance(body["checks"], dict)
+                or checks is None
+                or len(checks) != len(body["checks"])
+            )
+        ):
+            raise InvalidPlanDelivery("invalid_report", "checks")
     if checks:
         document["checks"] = {name: passed for name, passed in checks.items()}
     if issues:
+        if strict:
+            field = issues[0].field
+            raise InvalidPlanDelivery(
+                "invalid_report_metrics"
+                if field.startswith("metrics")
+                else "invalid_report",
+                field,
+            )
         document["issues"] = [item.model_dump(mode="json") for item in issues[:32]]
     return document
 

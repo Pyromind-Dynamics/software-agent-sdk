@@ -47,16 +47,19 @@ from .fake_adapter import FakeAdapter
 from .test_product_api import _app
 
 
-def test_report_required_tasks_validate_typed_primary_outputs():
+@pytest.mark.parametrize(
+    ("stage", "kind"), [("init", "bench"), ("dataset", "clean_label")]
+)
+def test_report_required_tasks_validate_typed_primary_outputs(stage, kind):
     policy = ECHOMIND_PRODUCT_PROFILE.preparation_policy
     assert policy is not None
     body = {
-        "stages": [{"id": "baseline", "kind": "init", "name": "Baseline"}],
+        "stages": [{"id": "stage", "kind": stage, "name": "Report stage"}],
         "tasks": [
             {
                 "id": "score",
-                "kind": "bench",
-                "stage_id": "baseline",
+                "kind": kind,
+                "stage_id": "stage",
                 "name": "Score predictions",
                 "outputs": [{"name": "baseline_results"}],
             }

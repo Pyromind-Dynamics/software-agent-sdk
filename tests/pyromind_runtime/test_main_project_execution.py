@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestServer
 from harness_adapter.pi_adapter import PiAdapter
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.plan_execution import with_plan_report
 from pyromind_runtime.application.train_observer import ObservationCursor, TrainObserver
 from pyromind_runtime.application.versions import Versions
 from pyromind_runtime.domain.commands import (
@@ -26,7 +27,7 @@ from pyromind_runtime.domain.observations import MetricPoint, SourcePage
 from pyromind_runtime.domain.pipeline import PipelineRun
 from pyromind_runtime.domain.preparation import PreparationPolicy, SetPreparationPlan
 from pyromind_runtime.domain.session_policy import SessionPolicy
-from pyromind_runtime.domain.versions import VersionToolRequest
+from pyromind_runtime.domain.versions import SaveVersion, VersionToolRequest
 from pyromind_runtime.infrastructure.file_artifact_snapshots import (
     FileArtifactSnapshots,
 )
@@ -302,11 +303,43 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             review_started.set()
             await asyncio.wait_for(finish_review.wait(), timeout=10)
         action = actions.pop(0) if actions else None
-        if action and action[0] == "write":
+        if action and action[0] == "submit_workflow":
+            store = runtime._store(scope)
+            saved = store.load_snapshot()
+            assert any(
+                task.task_id == "evaluation-1" and task.status == "succeeded"
+                for task in saved.external_tasks
+            )
+            baseline = next(
+                run
+                for run in saved.experiment_executions or ()
+                if run.task_id == "baseline"
+            )
+            version_project = versions.project(scope, context)
+            assert version_project
+            baseline_report = versions.save(
+                version_project,
+                "test:baseline-report",
+                SaveVersion.model_validate(
+                    {
+                        "kind": "report",
+                        "logical_key": "baseline/evidence",
+                        "source": {"text": evidence, "filename": "baseline.json"},
+                    }
+                ),
+                context,
+            )
+            runtime._record_execution(
+                store,
+                with_plan_report(
+                    baseline.model_copy(update={"state": "succeeded"}), baseline_report
+                ),
+            )
+        elif action and action[0] == "write":
             (artifact,) = [
                 item
                 for item in runtime._artifact_versions(scope, context)
-                if item.kind == "report"
+                if item.kind == "report" and item.logical_key == "candidate/evidence"
             ]
             rows: list[dict] = [
                 {"id": key, "stage_id": key, "business_status": "completed"}
@@ -603,13 +636,17 @@ async def test_main_runs_plans_and_evaluation_starts_only_its_report_runner(
             assert training.run_id.endswith(":training:3")
             assert training.platform_task_id == "task-123"
             events = runtime._store(scope).replay()
-            (artifact_id,) = [
-                e.payload["artifact_id"]
-                for e in events
-                if e.type == "artifact.registered"
-                and e.payload["kind"] == "report"
-                and e.payload["artifact_id"] != job.report_version_id
+            (candidate_evidence,) = [
+                item
+                for item in runtime._artifact_versions(scope, context)
+                if item.logical_key == "candidate/evidence"
             ]
+            artifact_id = candidate_evidence.id
+            assert any(
+                event.type == "artifact.registered"
+                and event.payload["artifact_id"] == artifact_id
+                for event in events
+            )
             read = VersionToolRequest(
                 action="read", arguments={"artifact_id": artifact_id}
             )

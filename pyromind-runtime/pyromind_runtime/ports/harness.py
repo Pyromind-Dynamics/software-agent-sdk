@@ -115,6 +115,7 @@ class ExternalTaskNotification(ContractModel):
     visible_text: str | None = None
     hidden_text: str
     trigger_turn: bool = True
+    blocks_origin_turn: bool = Field(default=True, exclude_if=lambda value: value)
     reset_attempt_budget: bool = False
     resume_interrupted: bool = False
 

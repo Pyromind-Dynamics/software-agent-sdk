@@ -27,7 +27,8 @@
       "tasks": [
         {
           "id": "clean_label",
-          "description": "生成可核验的数据版本与统计。"
+          "description": "生成可核验的数据版本与统计。",
+          "requires_report": true
         }
       ],
       "roles": []

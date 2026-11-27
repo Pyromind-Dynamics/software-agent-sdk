@@ -135,23 +135,30 @@ def project_observations(
     nodes = []
     for stage in stages.values():
         stage_runs = [
-            (task.kind, current_runs.get(task.id))
+            (task, current_runs.get(task.id))
             for task in project.plan.tasks
             if task.stage_id == stage.id
         ]
         states = {run.state if run else "queued" for _, run in stage_runs}
         execution_states = {
             run.state if run else "queued"
-            for kind, run in stage_runs
-            if kind != "analysis"
+            for task, run in stage_runs
+            if task.kind != "analysis"
         } or states
+        pending_report = any(
+            run
+            and (task.report_output is not None or run.report_required)
+            and run.state in {"succeeded", "waiting_analysis"}
+            and not run.registered_report_ids
+            for task, run in stage_runs
+        )
         if states & {"failed", "cancelled", "needs_input"}:
             status = next(
                 state
                 for state in ("failed", "cancelled", "needs_input")
                 if state in states
             )
-        elif states == {"succeeded"}:
+        elif states == {"succeeded"} and not pending_report:
             status = "succeeded"
         elif execution_states and execution_states <= {"succeeded", "waiting_analysis"}:
             status = "waiting_analysis"
@@ -166,24 +173,17 @@ def project_observations(
             dict.fromkeys(
                 artifact_id
                 for _, run in stage_runs
-                if run
-                and run.report_state == "ready"
-                and (baseline_tasks is None or run.task_id in baseline_tasks)
-                for artifact in run.artifacts
-                if isinstance(artifact_id := artifact.get("artifact_id"), str)
+                if run and (baseline_tasks is None or run.task_id in baseline_tasks)
+                for artifact_id in run.registered_report_ids
             )
         )
         analysis_report_ids: tuple[str, ...] = (
             tuple(
                 dict.fromkeys(
                     analysis_id
-                    for kind, run in stage_runs
-                    if kind == "analysis"
-                    and run
-                    and run.state == "succeeded"
-                    and run.report_state == "ready"
-                    for artifact in run.artifacts
-                    if isinstance(analysis_id := artifact.get("artifact_id"), str)
+                    for task, run in stage_runs
+                    if task.kind == "analysis" and run and run.state == "succeeded"
+                    for analysis_id in run.registered_report_ids
                 )
             )
             if stage.kind == "init"
@@ -210,14 +210,7 @@ def project_observations(
             else "registering"
             if any(run and run.report_state == "registering" for _, run in stage_runs)
             else "pending"
-            if any(
-                task.stage_id == stage.id
-                and task.report_output is not None
-                and (run := current_runs.get(task.id))
-                and run.state in {"succeeded", "waiting_analysis"}
-                and run.report_state != "ready"
-                for task in project.plan.tasks
-            )
+            if pending_report
             else None
         )
         nodes.append(
@@ -672,7 +665,7 @@ def dataset_report_checks(body: dict) -> dict[str, bool]:
 
 
 def dataset_report_files(
-    body: dict, *, issues: list[ReportIssue] | None = None
+    body: dict, *, issues: list[ReportIssue] | None = None, explicit_only: bool = False
 ) -> list[ObservationDatasetFile]:
     def count(value: object, field: str) -> int | None:
         if type(value) is int and value >= 0:
@@ -739,8 +732,10 @@ def dataset_report_files(
             for index, item in enumerate(entries[:32])
             if (file := make_file(item, f"files[{index}]"))
         ]
-        if explicit_files:
+        if explicit_files or explicit_only:
             return explicit_files
+    if explicit_only:
+        return []
     splits = body.get("splits")
     if isinstance(splits, dict):
         split_files = [

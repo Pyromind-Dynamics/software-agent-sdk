@@ -112,6 +112,13 @@ When platform SDK access is enabled, read workflow-execution/references/sdk-exec
 and call the native SDK from the main terminal using the current account's platform
 permissions. Select the matching task and attempt from PYROMIND_PROJECT_EXECUTIONS;
 use its provided out_id. Do not handcraft correlation or automatically retry create.
+If a Project task has blocked_by and no out_id, finish the listed report
+deliveries, then read a fresh SDK context before submitting that task.
+Complete and register the Baseline results and attribution declared in the
+plan before any training submission. If a Project task lists waiting_for,
+wait for those platform tasks on that attempt before submitting again.
+Continue independent approved Project work, including report delivery, while an
+unrelated task runs. End the turn when there is no actionable work.
 Project task bindings come from verified platform callbacks. Preserve every returned
 task_id and the output locations; pending binding does not mean submission failed.
 Use legacy submission tools only when they are still listed and the matching SDK
@@ -127,6 +134,11 @@ Use the same reviewed preparation, labeling and
 export scripts for Dataset replay. For Train, verify the selected checkpoint or
 merged model and pass its path into the authorized Eval task. Use existing Eval
 predictions when assembling a report.
+For SDK model evaluation, use the current task's out_ids["evaluation"].
+Before submitting, verify that the scoring command's --model-reference uses
+the same Storage model path as the inference node and that --dataset-path
+matches the approved evaluation dataset. Preserve the actual workflow receipt
+and record the new evaluation task ID in workflowPLAN after resubmission.
 After adoption of a verified execution plan, use propose_runtime_resources
 when asked to prepare Inference and Tracer. The user reviews and confirms the
 proposal in the Project workbench.
@@ -144,15 +156,20 @@ include a files array with name, path
 (absolute /workspace path), size_bytes, sample_count and distributions
 (dimension to label counts) for each verified split. Omit unknown size_bytes.
 Dataset metrics are optional; record boolean verification outcomes under checks.
-For a declared primary report include schema_version: 1. For reports derived
-from a platform attempt, include the verified task ID in source.platform_task_id
-or the full ID list in source.platform_task_ids. Include a summary or findings
-in Init attribution reports. Submit the current
+For a declared primary report include schema_version: 1. Generate platform
+reports with workflow-execution/scripts/export_plan_report.py. Pass the verified
+platform IDs with one --platform-task-id per task. For separate Train and LoRA
+merge tasks, pass both IDs so the report uses source.platform_task_ids as a JSON
+array of strings. A single task uses source.platform_task_id. Include a summary
+or findings in Init attribution reports. Submit the current
 plan_task_id, plan_attempt and verified_outputs using product_versions with
 action deliver_plan_outputs. Use validate_only=true to check the exact paths and
-report with the same validator before submitting. Reuse the command_id and the
+report before recording task completion in workflowPLAN.json or submitting for
+registration. Reuse the command_id and the
 same inputs to read its result. While registration is pending, say the files
 have been generated and registration is in progress.
+Treat platform success as execution evidence. A report-bearing stage passes only
+after Runtime verifies the report and returns its registered version.
 Report delivery only after the tool returns report_state=ready with a
 report_version_id. On validation failure fix the indicated field and submit
 corrected inputs with a new command_id, without resubmitting platform work.

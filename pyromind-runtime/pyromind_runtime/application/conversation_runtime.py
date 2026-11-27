@@ -65,6 +65,7 @@ from pyromind_runtime.application.plan_execution import (
     completed_callback_task,
     completed_plan_write,
     delivery_rows,
+    model_evaluation_retry,
     next_approved_task,
     plan_delivery_source,
     plan_executions,
@@ -1424,6 +1425,26 @@ class ConversationRuntime:
             default=None,
         )
 
+    def _undelivered_baseline_reports(
+        self, snapshot: ConversationSnapshot, project: ProjectView
+    ) -> list[str]:
+        baseline_stages = {
+            stage.id
+            for stage in project.plan.stages
+            if stage.kind == "init" and stage.enabled and not stage.placeholder
+        }
+        return [
+            task.id
+            for task in project.plan.tasks
+            if task.stage_id in baseline_stages
+            and task.report_output is not None
+            and (
+                (run := self._plan_attempt(snapshot, project, task.id)) is None
+                or run.state != "succeeded"
+                or not run.registered_report_ids
+            )
+        ]
+
     def _ensure_plan_attempt(
         self,
         store: FileProductStore,
@@ -1693,37 +1714,22 @@ class ConversationRuntime:
         snapshot = store.load_snapshot()
         if project is not None:
             stages = {stage.id: stage for stage in project.plan.stages}
+            baseline_blockers = self._undelivered_baseline_reports(snapshot, project)
+            pending = [
+                task
+                for task in snapshot.external_tasks
+                if task.status in {"pending", "running", "waiting"}
+            ]
             for task in project.plan.tasks:
                 stage = stages[task.stage_id]
                 if not stage.enabled or stage.placeholder:
                     continue
-                attempts = [
-                    run.plan_attempt or 1
-                    for run in snapshot.experiment_executions or ()
-                    if run.project_id == project.project_id
-                    and run.task_id == task.id
-                    and run.role_id == "main"
-                    and run.plan_sequence == project.plan_sequence
-                ]
+                current = self._plan_attempt(snapshot, project, task.id)
                 execution = ProjectTaskReference(
                     project_id=project.project_id,
                     task_id=task.id,
-                    attempt=max(attempts, default=1),
+                    attempt=(current.plan_attempt or 1) if current else 1,
                     plan_sequence=project.plan_sequence,
-                )
-                contexts: JsonObject = {
-                    kind: value for kind, value in out_ids(execution).items()
-                }
-                current = next(
-                    (
-                        run
-                        for run in snapshot.experiment_executions or ()
-                        if run.project_id == project.project_id
-                        and run.task_id == task.id
-                        and run.plan_attempt == execution.attempt
-                        and run.plan_sequence == project.plan_sequence
-                    ),
-                    None,
                 )
                 identities: list[JsonValue] = []
                 if current is not None:
@@ -1734,15 +1740,32 @@ class ConversationRuntime:
                     and current.platform_task_id not in identities
                 ):
                     identities.insert(0, current.platform_task_id)
-                executions.append(
-                    {
-                        "project_id": execution.project_id,
-                        "task_id": execution.task_id,
-                        "attempt": execution.attempt,
-                        "platform_task_ids": identities,
-                        "out_ids": contexts,
-                    }
-                )
+                waiting_for = [
+                    external.task_id
+                    for external in pending
+                    if external.task_id in identities
+                    or (
+                        external.correlation
+                        and external.correlation.type == "main"
+                        and external.correlation.execution == execution
+                    )
+                ]
+                blocked_by = baseline_blockers if stage.kind == "train" else []
+                contexts: JsonObject = {}
+                if not blocked_by and not waiting_for:
+                    contexts.update(out_ids(execution))
+                entry: JsonObject = {
+                    "project_id": execution.project_id,
+                    "task_id": execution.task_id,
+                    "attempt": execution.attempt,
+                    "platform_task_ids": identities,
+                    "out_ids": contexts,
+                }
+                if blocked_by:
+                    entry["blocked_by"] = list(blocked_by)
+                if waiting_for:
+                    entry["waiting_for"] = list(waiting_for)
+                executions.append(entry)
         associations = [
             {
                 "task_id": task.task_id,
@@ -1885,7 +1908,8 @@ class ConversationRuntime:
                         project, store, rows, context
                     )
                 validate_evaluation_inputs(project, task, rows, *paths)
-            for previous in store.load_snapshot().experiment_executions or ():
+            snapshot = store.load_snapshot()
+            for previous in snapshot.experiment_executions or ():
                 if previous.run_id == run.run_id and previous.platform_task_id:
                     if model_eval:
                         prior = next(
@@ -1904,6 +1928,13 @@ class ConversationRuntime:
                             )
                         validate_evaluation_inputs(project, task, rows, *saved_paths)
                     return previous.platform_task_id
+            if (run.stage_snapshot or {}).get("kind") == "train":
+                blockers = self._undelivered_baseline_reports(snapshot, project)
+                if blockers:
+                    raise ValueError(
+                        "Training requires registered Baseline reports: "
+                        + ", ".join(blockers)
+                    )
         self._record_execution(
             store, run.model_copy(update={"platform_task_id": platform_task_id})
         )
@@ -2129,11 +2160,16 @@ class ConversationRuntime:
                                         "waiting_reason": str(exc),
                                     }
                                 )
-                    source = (
-                        plan_delivery_source(run, sdk_receipts)
-                        if run.task_id in required
-                        else run
+                    source = plan_delivery_source(
+                        run,
+                        sdk_receipts if run.task_id in required else None,
+                        task=plan_tasks[run.task_id],
+                        statuses=external,
                     )
+                    if source.platform_task_id != run.platform_task_id:
+                        run = run.model_copy(
+                            update={"platform_task_id": source.platform_task_id}
+                        )
                     attempt = run.run_id.rsplit(":", 1)[-1]
                     if (
                         self.versions
@@ -2712,8 +2748,7 @@ class ConversationRuntime:
             for task in project.plan.tasks
             if (item := self._plan_attempt(snapshot, project, task.id))
             and item.state == "succeeded"
-            and item.report_state == "ready"
-            and item.artifacts
+            and item.registered_report_ids
         }
         next_step = next_approved_task(
             project,
@@ -2857,6 +2892,9 @@ class ConversationRuntime:
         error_summary: str | None,
         auto_run: bool,
     ) -> ExternalTaskNotification:
+        blocks_origin_turn = (
+            task.correlation is not None and task.correlation.type != "main"
+        ) or task.task_id not in _project_platform_task_ids(store.load_snapshot())
         if not self._registry_only_update(store, task):
             return _build_external_task_notification(
                 task,
@@ -2864,7 +2902,7 @@ class ConversationRuntime:
                 error_summary=error_summary,
                 auto_run=auto_run,
                 has_training_node=_workflow_has_training_node(store, task),
-            )
+            ).model_copy(update={"blocks_origin_turn": blocks_origin_turn})
 
         def references() -> list[str]:
             versions = self.versions
@@ -2902,6 +2940,7 @@ class ConversationRuntime:
             error_summary=error_summary,
             output_dir=task.output_dir,
             trigger_turn=auto_run,
+            blocks_origin_turn=blocks_origin_turn,
             resume_interrupted=auto_run,
             hidden_text=json.dumps(facts, ensure_ascii=False),
         )
@@ -3017,6 +3056,59 @@ class ConversationRuntime:
             )
         return result
 
+    async def _resolve_evaluation_delivery_retry(
+        self,
+        active: _ActiveConversation,
+        project: ProjectView,
+        task: ExperimentTask,
+        run: ExperimentExecutionView,
+        snapshot: ConversationSnapshot,
+        receipts: dict[str, tuple[str, str]] | None,
+    ) -> ExperimentExecutionView:
+        if not receipts or run.state != "needs_input":
+            return run
+        retry = model_evaluation_retry(
+            run, {item.task_id: item for item in snapshot.external_tasks}, {}, receipts
+        )
+        if (
+            retry is None
+            or retry.status != "succeeded"
+            or retry.task_id not in receipts
+        ):
+            return run
+        selected = retry.task_id
+        try:
+            text = await active.adapter.read_workspace_text(
+                active.handle, PLAN_PATH, active.context, max_bytes=1024 * 1024
+            )
+            rows = read_plan_tasks(text, project) if text else []
+        except (ProductRuntimeError, OSError, ValueError):
+            return run
+        task_rows = [row for row in rows if row.get("id") == task.id]
+        if len(task_rows) != 1:
+            return run
+        [row] = task_rows
+        if (
+            (row.get("platform_task_id") or row.get("actual_platform_task_id"))
+            != selected
+            or row.get("business_status") not in {"in_progress", "completed"}
+            or not any(
+                candidate.run_id == run.run_id
+                for candidate in plan_executions(project, [row], registered=[run])
+            )
+        ):
+            return run
+        validate_evaluation_inputs(
+            project, task, rows, *receipts[selected], require_bindings=True
+        )
+        return run.model_copy(
+            update={
+                "platform_task_id": selected,
+                "state": "waiting_analysis",
+                "waiting_reason": None,
+            }
+        )
+
     async def _submit_plan_delivery(
         self,
         store: FileProductStore,
@@ -3098,7 +3190,17 @@ class ConversationRuntime:
                 else None
             )
             if request.validate_only:
-                source = plan_delivery_source(run, sdk_receipts)
+                run = await self._resolve_evaluation_delivery_retry(
+                    active, project, task, run, snapshot, sdk_receipts
+                )
+                source = plan_delivery_source(
+                    run,
+                    sdk_receipts,
+                    task=task,
+                    statuses={
+                        item.task_id: item.status for item in snapshot.external_tasks
+                    },
+                )
                 try:
                     document = await asyncio.to_thread(
                         validate_plan_report,
@@ -3175,13 +3277,19 @@ class ConversationRuntime:
                     raise ValueError("the attempt already has an accepted delivery")
                 if run.report_state == "ready":
                     return self._plan_delivery_result(run)
+                run = await self._resolve_evaluation_delivery_retry(
+                    active, project, task, run, snapshot, sdk_receipts
+                )
                 statuses = {
                     item.task_id: item.status for item in snapshot.external_tasks
                 }
                 if (
                     run.state in {"failed", "cancelled", "needs_input"}
                     or not platform_results_ready(
-                        plan_delivery_source(run, sdk_receipts), statuses
+                        plan_delivery_source(
+                            run, sdk_receipts, task=task, statuses=statuses
+                        ),
+                        statuses,
                     )
                     or (task.id in required and not run.platform_task_id)
                 ):
@@ -3224,11 +3332,7 @@ class ConversationRuntime:
         return {
             "run_id": run.run_id,
             "report_state": run.report_state,
-            "report_version_id": next(
-                (artifact.get("artifact_id") for artifact in run.artifacts), None
-            )
-            if run.report_state == "ready"
-            else None,
+            "report_version_id": next(iter(run.registered_report_ids), None),
             "delivery_error": run.delivery_error,
             "delivery_error_field": run.delivery_error_field,
             "retryable": run.delivery_error
@@ -6716,9 +6820,10 @@ class ConversationRuntime:
     async def pending_external_tasks(
         self, conversation_id: str, run_id: str, context: RequestContext
     ) -> tuple[str, ...]:
-        """Return registered platform work owned by this foreground run."""
+        """Return platform work that parks the entire foreground run."""
         store = await self._authorized_store(conversation_id, context)
         snapshot = await asyncio.to_thread(store.load_snapshot)
+        project_tasks = _project_platform_task_ids(snapshot)
         return tuple(
             task.task_id
             for task in snapshot.external_tasks
@@ -6727,6 +6832,7 @@ class ConversationRuntime:
             and task.kind != "historical_experience"
             and task.graph_run_id is None
             and (task.correlation is None or task.correlation.type == "main")
+            and task.task_id not in project_tasks
         )
 
     async def authorize_event_stream(
@@ -8149,6 +8255,22 @@ def _history_external_waiting(result: JsonObject) -> JsonObject | None:
         if isinstance(waiting, dict) and waiting.get("kind") == "external":
             return waiting
     return None
+
+
+def _project_platform_task_ids(snapshot: ConversationSnapshot) -> set[str]:
+    return {
+        task_id
+        for run in snapshot.experiment_executions or ()
+        if run.role_id == "main" and run.plan_sequence is not None
+        for task_id in (*run.platform_task_ids, run.platform_task_id)
+        if task_id
+    } | {
+        task.task_id
+        for task in snapshot.external_tasks
+        if task.correlation
+        and task.correlation.type == "main"
+        and task.correlation.execution is not None
+    }
 
 
 def _build_external_task_notification(

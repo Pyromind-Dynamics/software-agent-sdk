@@ -494,3 +494,133 @@ async def test_selected_eval_submission_requires_its_own_inference_receipt(
         ordinary.experiment_executions
         and ordinary.experiment_executions[0].state == "failed"
     )
+
+
+async def test_blocked_model_eval_projects_a_new_signed_retry(
+    sdk_project_runtime, version_runtime, inference_graph, monkeypatch
+):
+    runtime, context, project = sdk_project_runtime
+    runtime.versions = version_runtime[0].versions
+    scope = project.conversation_id
+    (entry,) = json.loads(
+        (await runtime.platform_sdk_context(scope, context))[
+            "PYROMIND_PROJECT_EXECUTIONS"
+        ]
+    )
+    evaluation = TaskCorrelation.model_validate_json(entry["out_ids"]["evaluation"])
+    preparation = TaskCorrelation.model_validate_json(
+        entry["out_ids"]["data_preparation"]
+    )
+    store = runtime._store(scope)
+
+    async def current_run():
+        snapshot = await runtime.get_snapshot(scope, context)
+        assert snapshot.experiment_executions
+        (run,) = snapshot.experiment_executions
+        return run
+
+    await runtime.deliver_external_task_status(
+        scope,
+        task_id="old-evaluation",
+        status="Failed",
+        correlation=evaluation,
+        trusted_platform=True,
+        auto_run=False,
+    )
+    saved = store.load_snapshot()
+    assert saved.experiment_executions
+    (old,) = saved.experiment_executions
+    runtime._record_execution(
+        store, old.model_copy(update={"state": "needs_input", "waiting_reason": "old"})
+    )
+    for task_id, correlation in (
+        ("new-evaluation", evaluation),
+        ("auxiliary-preparation", preparation),
+    ):
+        await runtime.deliver_external_task_status(
+            scope,
+            task_id=task_id,
+            status="Running",
+            correlation=correlation,
+            trusted_platform=True,
+            auto_run=False,
+        )
+
+    running = await current_run()
+    assert running.state == "waiting_platform"
+    assert running.platform_task_id == "new-evaluation"
+    assert running.waiting_reason is None
+    assert running.platform_task_ids == (
+        "old-evaluation",
+        "new-evaluation",
+        "auxiliary-preparation",
+    )
+
+    await runtime.deliver_external_task_status(
+        scope,
+        task_id="new-evaluation",
+        status="Succeeded",
+        correlation=evaluation,
+        trusted_platform=True,
+        auto_run=False,
+    )
+    blocked = await current_run()
+    assert blocked.state == "needs_input"
+    assert blocked.platform_task_id == "new-evaluation"
+    assert blocked.waiting_reason
+
+    inference_graph["nodes"][1]["data"]["config"]["command"] = (
+        "python3 evaluate_inference.py --endpoint '$param' "
+        "--model-reference /models/merged --dataset-path /workspace/eval.jsonl"
+    )
+    await runtime.version_call(
+        scope,
+        VersionToolRequest(
+            action="bind_execution_metadata",
+            arguments={"task_id": "new-evaluation", "workflow": inference_graph},
+        ),
+        "retry-metadata",
+        context,
+    )
+    ready = await current_run()
+    assert ready.state == "waiting_analysis"
+    assert ready.platform_task_id == "new-evaluation"
+    assert not ready.registered_report_ids
+
+    task = project.plan.tasks[0]
+    active = runtime._active[scope]
+    snapshot = store.load_snapshot()
+    assert snapshot.experiment_executions
+    (persisted,) = snapshot.experiment_executions
+    assert persisted.platform_task_id == "old-evaluation"
+    record = {
+        "plan_attempt": 1,
+        "platform_task_id": "new-evaluation",
+        "business_status": "in_progress",
+    }
+    monkeypatch.setattr(
+        active.adapter,
+        "read_workspace_text",
+        AsyncMock(
+            return_value=json.dumps(
+                {"tasks": [{"id": task.id, "stage_id": task.stage_id, **record}]}
+            )
+        ),
+    )
+    receipts = verified_sdk_inference_paths(store, project, {task.id})
+    accepted = await runtime._resolve_evaluation_delivery_retry(
+        active, project, task, persisted, snapshot, receipts
+    )
+    assert accepted.platform_task_id == "new-evaluation"
+    assert accepted.state == "waiting_analysis"
+    source = plan_delivery_source(accepted, receipts)
+    assert source.platform_task_ids == ("new-evaluation",)
+    with pytest.raises(ValueError, match="requires model"):
+        await runtime._resolve_evaluation_delivery_retry(
+            active,
+            project,
+            task,
+            persisted,
+            snapshot,
+            {"new-evaluation": ("/workspace/wrong-model", "/workspace/eval.jsonl")},
+        )

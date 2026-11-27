@@ -3,14 +3,16 @@
 import asyncio
 import json
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from pyromind_agent_server.external_task_registry import WorkflowExternalTaskRegistry
 from pyromind_runtime.application.conversation_runtime import ConversationRuntime
+from pyromind_runtime.application.plan_execution import plan_executions
 from pyromind_runtime.application.preparation import Preparations
 from pyromind_runtime.domain.context import RequestContext
-from pyromind_runtime.domain.preparation import PreparationPolicy
+from pyromind_runtime.domain.preparation import PreparationPolicy, ProjectView
 from pyromind_runtime.domain.session_policy import SessionPolicy
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
 from pyromind_runtime.infrastructure.file_product_store import FileProductStore
@@ -61,6 +63,143 @@ def correlation(environment, kind="workflow_run"):
     return TaskCorrelation.model_validate_json(
         json.loads(environment["PYROMIND_TASK_CONTEXTS"])[kind]
     )
+
+
+async def test_training_submission_waits_for_both_current_baseline_reports(
+    sdk_project_runtime, monkeypatch
+):
+    runtime, context, active_project = sdk_project_runtime
+    project = ProjectView.model_validate(
+        {
+            **active_project.model_dump(),
+            "plan": {
+                "stages": [
+                    {"id": "init", "kind": "init", "name": "Baseline"},
+                    {"id": "train", "kind": "train", "name": "Train"},
+                ],
+                "tasks": [
+                    {
+                        "id": "bench",
+                        "stage_id": "init",
+                        "kind": "bench",
+                        "name": "Baseline evaluation",
+                        "outputs": [{"name": "baseline_report", "kind": "report"}],
+                    },
+                    {
+                        "id": "analysis",
+                        "stage_id": "init",
+                        "kind": "analysis",
+                        "name": "Baseline attribution",
+                        "outputs": [{"name": "diagnosis", "kind": "report"}],
+                    },
+                    {"id": "sft", "stage_id": "train", "name": "Train"},
+                ],
+            },
+        }
+    )
+    monkeypatch.setattr(runtime, "get_project", AsyncMock(return_value=project))
+    scope = project.conversation_id
+    store = runtime._store(scope)
+
+    async def contexts():
+        environment = await runtime.platform_sdk_context(scope, context)
+        return {
+            task["task_id"]: task
+            for task in json.loads(environment["PYROMIND_PROJECT_EXECUTIONS"])
+        }
+
+    (bench, analysis) = plan_executions(
+        project,
+        [
+            {"id": task, "stage_id": "init", "business_status": "completed"}
+            for task in ("bench", "analysis")
+        ],
+    )
+    runtime._record_execution(store, bench)
+    initial = await contexts()
+    assert initial["bench"]["out_ids"]
+    assert initial["analysis"]["out_ids"]
+    assert initial["sft"]["out_ids"] == {}
+    assert initial["sft"]["blocked_by"] == ["bench", "analysis"]
+    with pytest.raises(
+        ValueError, match="registered Baseline reports: bench, analysis"
+    ):
+        await runtime.bind_plan_submission(scope, "sft", 1, context)
+
+    runtime._record_execution(
+        store,
+        bench.model_copy(
+            update={
+                "report_state": "ready",
+                "artifacts": ({"artifact_id": "bench-v1"},),
+            }
+        ),
+    )
+    runtime._record_execution(
+        store, analysis.model_copy(update={"report_state": "registration_failed"})
+    )
+    assert (await contexts())["sft"]["blocked_by"] == ["analysis"]
+    with pytest.raises(ValueError, match="registered Baseline reports: analysis"):
+        await runtime.bind_plan_submission(scope, "sft", 1, context)
+
+    runtime._record_execution(
+        store,
+        analysis.model_copy(
+            update={"report_state": "ready", "artifacts": ({"artifact_id": "diag-v1"},)}
+        ),
+    )
+    allowed = (await contexts())["sft"]
+    assert "blocked_by" not in allowed
+    address = TaskCorrelation.model_validate_json(allowed["out_ids"]["workflow_run"])
+    assert address.execution and address.execution.task_id == "sft"
+    assert store.verify_task_correlation(address)
+    assert await runtime.bind_plan_submission(scope, "sft", 1, context) is None
+    address = store.issue_task_correlation(
+        address.model_copy(update={"origin_run_id": "foreground"})
+    )
+    await runtime.deliver_external_task_status(
+        scope,
+        task_id="training-1",
+        status="Running",
+        correlation=address,
+        trusted_platform=True,
+        auto_run=False,
+    )
+    during_training = await contexts()
+    assert during_training["sft"]["out_ids"] == {}
+    assert during_training["sft"]["waiting_for"] == ["training-1"]
+    assert during_training["bench"]["out_ids"]
+    assert during_training["analysis"]["out_ids"]
+    assert await runtime.pending_external_tasks(scope, "foreground", context) == ()
+
+    (retry,) = plan_executions(
+        project,
+        [
+            {
+                "id": "bench",
+                "stage_id": "init",
+                "attempt": 2,
+                "business_status": "pending",
+            }
+        ],
+    )
+    runtime._record_execution(store, retry)
+    assert (await contexts())["sft"]["blocked_by"] == ["bench"]
+
+    await runtime.deliver_external_task_status(
+        scope,
+        task_id="training-1",
+        status="Succeeded",
+        correlation=address,
+        trusted_platform=True,
+    )
+    subsequent = await contexts()
+    assert "waiting_for" not in subsequent["sft"]
+    adapter = runtime._active[scope].adapter
+    assert isinstance(adapter, FakeAdapter)
+    notification = adapter.external_task_notifications[-1][1]
+    assert notification.task_id == "training-1"
+    assert notification.blocks_origin_turn is False
 
 
 async def test_sdk_context_is_stable_without_a_submission_ledger_and_survives_restart(

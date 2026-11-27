@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import PurePosixPath
 
 from pyromind_runtime.application.model_evaluation_plan import (
     check_inference_receipt,
+    inference_paths,
     verified_input_path,
 )
 from pyromind_runtime.application.stage_analysis import artifact_belongs_to_execution
@@ -236,15 +237,39 @@ def _platform_task_ids(run: ExperimentExecutionView) -> set[str]:
 def plan_delivery_source(
     run: ExperimentExecutionView,
     sdk_receipts: dict[str, tuple[str, str]] | None,
+    *,
+    task: ExperimentTask | None = None,
+    statuses: Mapping[str, str] | None = None,
 ) -> ExperimentExecutionView:
-    """Scope an SDK evaluation report to the latest selected inference receipt."""
+    """Scope a report to receipts relevant to the current result."""
+    identities = run.platform_task_ids
+    if len(identities) < 2:
+        return run
+    latest = identities[-1]
+    if (
+        task is not None
+        and task.kind == "bench"
+        and (run.stage_snapshot or {}).get("kind") == "init"
+        and statuses is not None
+        and latest in statuses
+        and all(
+            statuses.get(task_id) in {"failed", "cancelled"}
+            for task_id in identities[:-1]
+        )
+    ):
+        return run.model_copy(
+            update={"platform_task_id": latest, "platform_task_ids": (latest,)}
+        )
     selected = run.platform_task_id
     if (
         selected
+        and selected in identities
         and sdk_receipts
         and selected in sdk_receipts
-        and len(run.platform_task_ids) > 1
-        and run.platform_task_ids[-1] == selected
+        and not any(
+            identity in sdk_receipts
+            for identity in identities[identities.index(selected) + 1 :]
+        )
     ):
         return run.model_copy(update={"platform_task_ids": (selected,)})
     return run
@@ -727,6 +752,46 @@ def restore_saved_data_status(snapshot: ConversationSnapshot) -> ConversationSna
     )
 
 
+def model_evaluation_retry(
+    run: ExperimentExecutionView,
+    tasks: Mapping[str, ExternalTaskState],
+    pipelines: Mapping[str, PipelineRun],
+    sdk_receipts: dict[str, tuple[str, str]] | None,
+) -> ExternalTaskState | None:
+    identities = run.platform_task_ids
+    selected = run.platform_task_id
+    if (
+        run.state not in {"needs_input", "failed", "cancelled", "waiting_platform"}
+        or not selected
+        or selected not in identities
+        or run.registered_report_ids
+    ):
+        return None
+    for identity in reversed(identities[identities.index(selected) + 1 :]):
+        task = tasks.get(identity)
+        if task is None:
+            continue
+        if (sdk_receipts and identity in sdk_receipts) or inference_paths(
+            pipelines.get(identity)
+        ):
+            return task
+        correlation = task.correlation
+        reference = correlation.execution if correlation else None
+        if (
+            correlation
+            and correlation.signature
+            and correlation.type == "main"
+            and correlation.task_kind == "evaluation"
+            and reference
+            and reference.project_id == run.project_id
+            and reference.plan_sequence == run.plan_sequence
+            and reference.task_id == run.task_id
+            and reference.attempt == run.plan_attempt
+        ):
+            return task
+    return None
+
+
 def with_platform_states(
     snapshot: ConversationSnapshot,
     model_evals: set[str] | None = None,
@@ -738,17 +803,41 @@ def with_platform_states(
         pipeline.task_id: pipeline for pipeline in pipelines if pipeline.task_id
     }
     tasks = {item.task_id: item for item in snapshot.external_tasks}
+    statuses = {identity: task.status for identity, task in tasks.items()}
+    plan_tasks = (
+        {task.id: task for task in snapshot.project.plan.tasks}
+        if snapshot.project
+        else {}
+    )
     runs = []
     for run in snapshot.experiment_executions or ():
-        identities = run.platform_task_ids or (
-            (run.platform_task_id,) if run.platform_task_id else ()
-        )
         model_eval = (
             run.role_id == "main" and model_evals and run.task_id in model_evals
         )
-        if model_eval and run.state == "succeeded" and run.report_state == "ready":
-            identities = (
-                plan_delivery_source(run, sdk_receipts).platform_task_ids or identities
+        source = plan_delivery_source(
+            run,
+            sdk_receipts if model_eval else None,
+            task=plan_tasks.get(run.task_id) if run.role_id == "main" else None,
+            statuses=statuses,
+        )
+        identities = source.platform_task_ids or (
+            (source.platform_task_id,) if source.platform_task_id else ()
+        )
+        if source.platform_task_id != run.platform_task_id:
+            run = run.model_copy(update={"platform_task_id": source.platform_task_id})
+        retry = (
+            model_evaluation_retry(run, tasks, receipts, sdk_receipts)
+            if model_eval
+            else None
+        )
+        if retry is not None:
+            identities = (retry.task_id,)
+            run = run.model_copy(
+                update={
+                    "platform_task_id": retry.task_id,
+                    "state": "waiting_analysis",
+                    "waiting_reason": None,
+                }
             )
         platform = [tasks[identity] for identity in identities if identity in tasks]
         if platform and run.role_id == "main":
@@ -769,8 +858,13 @@ def with_platform_states(
                 "queued",
             }:
                 run = run.model_copy(update={"state": "waiting_analysis"})
-        if model_eval:
-            run = check_inference_receipt(run, receipts, sdk_receipts=sdk_receipts)
+        if model_eval and (retry is None or retry.status == "succeeded"):
+            run = check_inference_receipt(
+                run,
+                receipts,
+                sdk_receipts=sdk_receipts,
+                require_receipt=retry is not None,
+            )
         runs.append(run)
     return (
         snapshot.model_copy(update={"experiment_executions": tuple(runs)})

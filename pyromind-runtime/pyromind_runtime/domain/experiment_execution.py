@@ -88,3 +88,13 @@ class ExperimentExecutionView(ContractModel):
     checkpoint: CheckpointView | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+
+    @property
+    def registered_report_ids(self) -> tuple[str, ...]:
+        if self.report_state != "ready":
+            return ()
+        return tuple(
+            identity
+            for artifact in self.artifacts
+            if isinstance(identity := artifact.get("artifact_id"), str) and identity
+        )

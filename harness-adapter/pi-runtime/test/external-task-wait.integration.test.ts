@@ -96,6 +96,29 @@ test("a terminal callback queued before the submit tool returns owns the continu
     .every(e => (e.payload.outcome as JsonObject).status === "completed"));
 });
 
+test("a project task callback leaves the origin free to deliver another node", { timeout: 15_000 }, async t => {
+  const f = await setup(t, (count, response) => {
+    if (count === 1) commands(response, "submit-train");
+    else if (count === 2) commands(response, "deliver-init");
+    else text(response, count === 3 ? "Init report delivered." : "Training callback handled.");
+  });
+  const terminal = f.session.agent.state.tools.find(tool => tool.name === "terminal")!;
+  t.mock.method(terminal, "execute", async (_id: string, args: { command: string }) => {
+    f.state.executed.push(args.command);
+    if (args.command === "submit-train") {
+      await f.runtime.handle("notify", {
+        run_id: "train-terminal", content: "Training succeeded.",
+        details: { task_id: "training-1", run_id: "main", blocks_origin_turn: false },
+      });
+    }
+    return { content: [{ type: "text" as const, text: "Operation complete" }], details: {} };
+  });
+  await f.run("main");
+  await eventually(() => f.events.filter(e => e.kind === "run.finished").length === 2);
+  assert.deepEqual(f.state.executed, ["submit-train", "deliver-init"]);
+  assert.match(JSON.stringify(f.requests[3]), /Training succeeded/);
+});
+
 test("queued user progress requests bypass the wait without losing the user turn", { timeout: 15_000 }, async t => {
   const f = await setup(t, (count, response) => {
     if (count === 1) commands(response, "submit-sdk");
