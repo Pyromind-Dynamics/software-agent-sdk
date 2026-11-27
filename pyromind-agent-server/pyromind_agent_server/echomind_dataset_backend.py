@@ -38,12 +38,14 @@ from pyromind_common.platform.recipe import dataset_public_profile
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.ports.observation_source import ObservationForbiddenError
+from pyromind_runtime.ports.storage import WorkflowStorageResolver
 
 
 class PlatformDatasetWorkflowBackend(PlatformTrainWorkflowBackend):
     def __init__(
         self,
         *,
+        recorded_storage: WorkflowStorageResolver | None = None,
         credential_store: RuntimeCredentialStore | None = None,
         projects_root: Path | str | None = None,
         conversations_dir: Path | str | None = None,
@@ -51,6 +53,7 @@ class PlatformDatasetWorkflowBackend(PlatformTrainWorkflowBackend):
         super().__init__(
             task_kind="echomind_dataset",
             credential_store=credential_store,
+            recorded_storage=recorded_storage,
             projects_root=projects_root,
             conversations_dir=conversations_dir,
         )
@@ -171,6 +174,7 @@ class PlatformDatasetWorkflowBackend(PlatformTrainWorkflowBackend):
             access_key=access_key,
             projects_root=self.projects_root,
             credential_store=self.credential_store,
+            recorded_storage=self.recorded_storage,
         )
         missing = set(spec.output_filenames).difference(storage.list(prefix))
         if missing:

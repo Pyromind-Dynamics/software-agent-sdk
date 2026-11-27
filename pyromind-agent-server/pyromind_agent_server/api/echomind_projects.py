@@ -444,6 +444,9 @@ def _runtime_scheduler(
         projects_root=projects_root,
         conversations_dir=get_conversation_service(request).conversations_dir,
         request_context=context,
+        recorded_storage=lambda cid, ctx: get_product_runtime(
+            request
+        ).recorded_workflow_storage(cid, ctx),
         credential_store=build_runtime_credential_store(
             projects_root, request.app.state.config
         ),

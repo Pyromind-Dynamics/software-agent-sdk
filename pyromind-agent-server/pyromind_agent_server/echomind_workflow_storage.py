@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
-from typing import Protocol
+from pathlib import Path, PurePosixPath
 
 import httpx
 from minio.error import S3Error
@@ -10,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pyromind_sdk.client import StorageClient
 from pyromind_sdk.client.base import DEFAULT_API_BASE_URL
 
+from pyromind_agent_server.echomind_projects import ProjectStore
 from pyromind_agent_server.echomind_runtime_contracts import (
     RuntimeCredentialUnavailableError,
 )
@@ -23,6 +23,7 @@ from pyromind_agent_server.evaluation_storage import (
     STORAGE_TIMEOUT_SECONDS,
     build_evaluation_storage,
 )
+from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
 from pyromind_common.tools.utils.platform_env import (
     platform_cluster_route,
     platform_headers,
@@ -33,13 +34,9 @@ from pyromind_runtime.domain.storage_paths import to_storage_api_path
 from pyromind_runtime.ports.storage import (
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
+    WorkflowStorageReader,
+    WorkflowStorageResolver,
 )
-
-
-class WorkflowStorageReader(Protocol):
-    def read(self, path: str) -> bytes: ...
-
-    def list(self, prefix: str) -> set[str]: ...
 
 
 class _StorageInfo(BaseModel):
@@ -142,6 +139,37 @@ def _build_api_key_storage(*, cluster: str, access_key: str) -> _SDKStorageReade
         ) from None
 
 
+def _recorded_run_storage(
+    resolve: WorkflowStorageResolver,
+    projects_root: Path | str,
+    project_id: str,
+    spec: TrainWorkflowSpec,
+    context: RequestContext,
+) -> WorkflowStorageReader | None:
+    root = PurePosixPath("/.pyromind-agent", spec.conversation_id, "echomind-runs")
+    if (
+        not spec.output_uri
+        or root not in PurePosixPath(to_storage_api_path(spec.output_uri)).parents
+    ):
+        return None
+    project = ProjectStore(Path(projects_root)).load(
+        project_id, owner_user_id=context.user_id
+    )
+    if (
+        project.project.conversation_id != spec.conversation_id
+        or project.project.cluster != spec.cluster
+    ):
+        raise PermissionError("Workflow artifacts belong to another Project context.")
+    return resolve(
+        spec.conversation_id,
+        RequestContext(
+            user_id=context.user_id,
+            x_cluster=spec.cluster,
+            profile_id=context.profile_id or ECHOMIND_PRODUCT_PROFILE.profile_id,
+        ),
+    )
+
+
 def build_runtime_storage(
     *,
     spec: TrainWorkflowSpec,
@@ -149,8 +177,12 @@ def build_runtime_storage(
     access_key: str | None = None,
     projects_root: Path | str | None = None,
     credential_store: RuntimeCredentialStore | None = None,
+    recorded_storage: WorkflowStorageResolver | None = None,
 ) -> WorkflowStorageReader:
     project_id = spec.template_values.get("project_id")
+    browser = request_context is not None and bool(
+        request_context.cookie or request_context.authorization
+    )
     if projects_root is not None and project_id:
         if spec.owner_user_id is None:
             raise RuntimeCredentialUnavailableError(
@@ -181,9 +213,13 @@ def build_runtime_storage(
         )
         if storage is not None:
             return storage
-    if request_context is not None and (
-        request_context.cookie or request_context.authorization
-    ):
+        if recorded_storage is not None and not browser:
+            reader = _recorded_run_storage(
+                recorded_storage, projects_root, project_id, spec, context
+            )
+            if reader is not None:
+                return reader
+    if request_context is not None and browser:
         return build_evaluation_storage(
             replace(
                 request_context, x_cluster=request_context.x_cluster or spec.cluster

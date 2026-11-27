@@ -24,6 +24,7 @@ from pyromind_common.tools.utils.platform_env import (
 from pyromind_runtime.application.evaluation_annotations import RUN_MANIFEST_NAME
 from pyromind_runtime.domain.context import RequestContext
 from pyromind_runtime.ports.storage import (
+    WORKFLOW_ARTIFACT_MAX_BYTES,
     EvaluationStorage,
     EvaluationStorageMissingError,
     EvaluationStorageTooLargeError,
@@ -33,7 +34,7 @@ from pyromind_runtime.ports.storage import (
 
 logger = logging.getLogger(__name__)
 
-REPORT_MAX_BYTES = 512 * 1024 * 1024
+REPORT_MAX_BYTES = WORKFLOW_ARTIFACT_MAX_BYTES
 STORAGE_TIMEOUT_SECONDS = 60.0
 
 

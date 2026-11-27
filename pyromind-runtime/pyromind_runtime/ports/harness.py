@@ -19,7 +19,7 @@ from pyromind_runtime.domain.snapshot import (
     WorkflowState,
 )
 from pyromind_runtime.domain.task_correlation import TaskCorrelation
-from pyromind_runtime.ports.storage import DatasetReplayReader
+from pyromind_runtime.ports.storage import DatasetReplayReader, WorkflowStorageReader
 
 
 class DelegatedRole(ContractModel):
@@ -245,6 +245,13 @@ class DevelopmentStorageReader(Protocol):
     ) -> StorageProxyConfig | None:
         """Read registered Storage mount metadata without acquiring a workspace."""
         ...
+
+
+@runtime_checkable
+class WorkflowStorageProvider(Protocol):
+    def recorded_workflow_storage(
+        self, conversation_id: str
+    ) -> WorkflowStorageReader | None: ...
 
 
 @runtime_checkable

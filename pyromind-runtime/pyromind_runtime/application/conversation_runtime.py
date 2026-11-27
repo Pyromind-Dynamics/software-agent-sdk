@@ -258,6 +258,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionLivenessAdapter,
     SessionSpec,
+    WorkflowStorageProvider,
 )
 from pyromind_runtime.ports.observability import ExecutionObserver
 from pyromind_runtime.ports.preparation import PreparationStore, ResourceMediaReader
@@ -267,6 +268,7 @@ from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageMissingError,
     EvaluationStorageUnavailableError,
+    WorkflowStorageReader,
 )
 from pyromind_runtime.ports.workflow_submission import (
     ExternalTaskQueryPort,
@@ -4809,6 +4811,27 @@ class ConversationRuntime:
             context,
             max_bytes=max_bytes,
         )
+
+    def recorded_workflow_storage(
+        self, conversation_id: str, context: RequestContext
+    ) -> WorkflowStorageReader | None:
+        store = self._store(conversation_id)
+        if not store.metadata_path.is_file():
+            return None
+        owner = store.plan_owner()
+        if owner.user_id != context.user_id:
+            raise PermissionError("Conversation belongs to another workflow owner")
+        if (
+            owner.conversation_id != conversation_id
+            or owner.profile_id != context.profile_id
+            or not context.x_cluster
+            or store.load_x_cluster() != context.x_cluster
+        ):
+            return None
+        adapter = self.adapters.get(store.harness_id())
+        if isinstance(adapter, WorkflowStorageProvider):
+            return adapter.recorded_workflow_storage(conversation_id)
+        return None
 
     async def dataset_replay_reader(
         self, conversation_id: str, context: RequestContext

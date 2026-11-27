@@ -160,6 +160,10 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     )
     pi_adapter.set_version_handler(version_call, execution_call)
 
+    def recorded_storage(scope: str, context: RequestContext):
+        assert isinstance(runtime, ConversationRuntime)
+        return runtime.recorded_workflow_storage(scope, context)
+
     async def record_training_artifacts(scope, task_id, nodes, context):
         assert isinstance(runtime, ConversationRuntime)
         return await runtime.record_training_artifacts(scope, task_id, nodes, context)
@@ -226,6 +230,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
             PlatformTrainingMetricSource(), ObservationCursor(secrets.token_bytes(32))
         ),
         project_flywheel=ProjectFlywheelServices(
+            recorded_storage=recorded_storage,
             projects_root=projects_root,
             conversations_dir=service.conversations_dir,
             credential_store=build_runtime_credential_store(projects_root, config),
@@ -315,6 +320,7 @@ def ensure_product_runtime(app: FastAPI) -> ConversationRuntime | None:
     projects_root = Path(service.conversations_dir).parent / "projects"
     graph_callbacks = GraphRuntimeCallbackService(
         projects_root,
+        recorded_storage=runtime.recorded_workflow_storage,
         conversations_dir=service.conversations_dir,
         credential_store=build_runtime_credential_store(
             projects_root, getattr(app.state, "config", None)
@@ -481,6 +487,7 @@ async def start_product_runtime(app: FastAPI) -> None:
             graph_poller = RuntimeGraphPoller(
                 build_echomind_runtime_scheduler(
                     projects_root=projects_root,
+                    recorded_storage=runtime.recorded_workflow_storage,
                     conversations_dir=conversation_service.conversations_dir,
                     credential_store=build_runtime_credential_store(
                         projects_root,

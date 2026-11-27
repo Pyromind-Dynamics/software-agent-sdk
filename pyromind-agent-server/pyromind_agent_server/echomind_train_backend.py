@@ -34,7 +34,6 @@ from pyromind_agent_server.echomind_train_runtime import (
     prepare_workflow_for_submission,
 )
 from pyromind_agent_server.echomind_workflow_storage import (
-    WorkflowStorageReader,
     build_runtime_storage,
 )
 from pyromind_agent_server.profiles import ECHOMIND_PRODUCT_PROFILE
@@ -59,7 +58,11 @@ from pyromind_runtime.infrastructure.file_product_store import (
     FileProductStore,
     ProductStoreError,
 )
-from pyromind_runtime.ports.storage import EvaluationStorageMissingError
+from pyromind_runtime.ports.storage import (
+    EvaluationStorageMissingError,
+    WorkflowStorageReader,
+    WorkflowStorageResolver,
+)
 
 
 _ACTIVE_TASK_STATUSES = frozenset({"new", "pending", "running"})
@@ -113,11 +116,13 @@ class PlatformTrainWorkflowBackend:
         self,
         *,
         task_kind: str = "echomind_train",
+        recorded_storage: WorkflowStorageResolver | None = None,
         credential_store: RuntimeCredentialStore | None = None,
         conversations_dir: Path | str | None = None,
         projects_root: Path | str | None = None,
     ) -> None:
         self.task_kind = task_kind
+        self.recorded_storage = recorded_storage
         self.credential_store = credential_store
         self.projects_root = Path(projects_root) if projects_root is not None else None
         self.conversations_dir = (
@@ -365,6 +370,7 @@ class PlatformTrainWorkflowBackend:
                 access_key=access_key,
                 projects_root=self.projects_root,
                 credential_store=self.credential_store,
+                recorded_storage=self.recorded_storage,
             )
             if output_uri is None:
                 return TrainTaskState(
@@ -416,6 +422,7 @@ def _verified_artifact_uri(
     access_key: str | None,
     projects_root: Path | str | None = None,
     credential_store: RuntimeCredentialStore | None = None,
+    recorded_storage: WorkflowStorageResolver | None = None,
 ) -> str | None:
     assert spec.output_uri is not None
     storage = build_runtime_storage(
@@ -424,6 +431,7 @@ def _verified_artifact_uri(
         access_key=access_key,
         projects_root=projects_root,
         credential_store=credential_store,
+        recorded_storage=recorded_storage,
     )
     path = to_storage_api_path(spec.output_uri)
     if spec.artifact_selection == "evaluation_report":

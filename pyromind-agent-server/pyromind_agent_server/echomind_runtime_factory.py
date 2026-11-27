@@ -25,6 +25,7 @@ from pyromind_agent_server.echomind_train_backend import (
 )
 from pyromind_agent_server.echomind_train_runtime import TrainRuntimeExecutor
 from pyromind_runtime.domain.context import RequestContext
+from pyromind_runtime.ports.storage import WorkflowStorageResolver
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ def build_echomind_runtime_scheduler(
     projects_root: Path | str,
     conversations_dir: Path | str | None = None,
     request_context: RequestContext | None = None,
+    recorded_storage: WorkflowStorageResolver | None = None,
     credential_store: RuntimeCredentialStore | None = None,
 ) -> RuntimeGraphScheduler:
     return RuntimeGraphScheduler(
@@ -46,6 +48,7 @@ def build_echomind_runtime_scheduler(
                     backend=PlatformDatasetWorkflowBackend(
                         conversations_dir=conversations_dir,
                         credential_store=credential_store,
+                        recorded_storage=recorded_storage,
                         projects_root=projects_root,
                     ),
                     request_context=request_context,
@@ -55,6 +58,7 @@ def build_echomind_runtime_scheduler(
                 projects_root=str(projects_root),
                 backend=PlatformEvaluatorWorkflowBackend(
                     credential_store=credential_store,
+                    recorded_storage=recorded_storage,
                     projects_root=projects_root,
                 ),
                 request_context=request_context,
@@ -63,6 +67,7 @@ def build_echomind_runtime_scheduler(
                 projects_root=str(projects_root),
                 backend=PlatformTrainWorkflowBackend(
                     credential_store=credential_store,
+                    recorded_storage=recorded_storage,
                     conversations_dir=conversations_dir,
                     projects_root=projects_root,
                 ),
@@ -78,11 +83,13 @@ class GraphRuntimeCallbackService:
         projects_root: Path | str,
         *,
         conversations_dir: Path | str | None = None,
+        recorded_storage: WorkflowStorageResolver | None = None,
         credential_store: RuntimeCredentialStore | None = None,
     ) -> None:
         self.projects_root = Path(projects_root)
         self.conversations_dir = conversations_dir
         self.credential_store = credential_store
+        self.recorded_storage = recorded_storage
 
     async def handle(
         self,
@@ -110,6 +117,7 @@ class GraphRuntimeCallbackService:
             projects_root=self.projects_root,
             conversations_dir=self.conversations_dir,
             credential_store=self.credential_store,
+            recorded_storage=self.recorded_storage,
         )
         run = scheduler.callback_by_provider_task(
             provider_run_id=task_id,

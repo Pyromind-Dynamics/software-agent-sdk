@@ -23,6 +23,7 @@ import httpx
 from pydantic import SecretStr
 
 from harness_adapter.pi_adapter.actor_replay import RecordedActorReplayReader
+from harness_adapter.pi_adapter.actor_workspace import ActorWorkspace
 from harness_adapter.pi_adapter.business_tool_host import (
     PLATFORM_SDK_TOOL_NAMES,
     PyromindBusinessToolHost,
@@ -130,6 +131,7 @@ from pyromind_runtime.ports.harness import (
     SessionHandle,
     SessionSpec,
 )
+from pyromind_runtime.ports.storage import WORKFLOW_ARTIFACT_MAX_BYTES
 from pyromind_runtime.ports.workflows import WorkflowCall, WorkflowEventSink
 
 
@@ -924,16 +926,29 @@ class PiAdapter:
             max_bytes=max_bytes,
         )
 
-    async def dataset_replay_reader(
-        self, conversation_id: str
-    ) -> RecordedActorReplayReader | None:
+    def _recorded_actor_workspace(self, conversation_id: str) -> ActorWorkspace | None:
         if self._terminal_backend != "sandbox" or not isinstance(
             self._sandbox, FixedActorExecutionManager
         ):
             return None
         root = self._safe_conversation_dir(conversation_id)
+        return self._sandbox.recorded_workspace(conversation_id, PiSessionFiles(root))
+
+    def recorded_workflow_storage(
+        self, conversation_id: str
+    ) -> RecordedActorReplayReader | None:
+        workspace = self._recorded_actor_workspace(conversation_id)
+        if workspace is None:
+            return None
+        return RecordedActorReplayReader(
+            workspace, max_read_bytes=WORKFLOW_ARTIFACT_MAX_BYTES
+        )
+
+    async def dataset_replay_reader(
+        self, conversation_id: str
+    ) -> RecordedActorReplayReader | None:
         workspace = await asyncio.to_thread(
-            self._sandbox.recorded_workspace, conversation_id, PiSessionFiles(root)
+            self._recorded_actor_workspace, conversation_id
         )
         return RecordedActorReplayReader(workspace) if workspace else None
 

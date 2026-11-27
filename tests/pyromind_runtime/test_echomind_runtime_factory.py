@@ -34,8 +34,9 @@ from pyromind_agent_server.echomind_train_runtime import (
 
 
 @pytest.mark.parametrize("kind", ["dataset", "train", "evaluator"])
-def test_background_runtime_verifies_all_stage_artifacts_via_project_binding(
-    tmp_path, monkeypatch, kind
+@pytest.mark.parametrize("use_binding", [True, False])
+def test_background_runtime_verifies_each_stage_via_bound_or_recorded_storage(
+    tmp_path, monkeypatch, kind, use_binding
 ):
     credentials = Mock(spec=RuntimeCredentialStore)
     credentials.load.return_value = "owner-key"
@@ -53,12 +54,20 @@ def test_background_runtime_verifies_all_stage_artifacts_via_project_binding(
         "adapter_model.safetensors",
     }
     storage.read.return_value = b'{"status":"succeeded","metrics":{"pass_rate":1}}'
-    bound = Mock(return_value=storage)
+    project_id = str(uuid4())
+    recorded = Mock(return_value=storage)
+    load_project = Mock(
+        return_value=SimpleNamespace(
+            project=SimpleNamespace(conversation_id="conversation", cluster="cn-east-1")
+        )
+    )
+    monkeypatch.setattr(ProjectStore, "load", load_project)
+    bound = Mock(return_value=storage if use_binding else None)
     monkeypatch.setattr(
         echomind_workflow_storage, "build_bound_evaluation_storage", bound
     )
     scheduler = runtime_factory.build_echomind_runtime_scheduler(
-        projects_root=tmp_path, credential_store=credentials
+        projects_root=tmp_path, credential_store=credentials, recorded_storage=recorded
     )
     executor = scheduler.executor_registry.get(f"{kind}_runtime")
     base = TrainWorkflowSpec(
@@ -67,8 +76,8 @@ def test_background_runtime_verifies_all_stage_artifacts_via_project_binding(
         owner_user_id="owner",
         cluster="cn-east-1",
         workflow={},
-        output_uri="/workspace/round/output",
-        template_values={"project_id": str(uuid4())},
+        output_uri="/workspace/.pyromind-agent/conversation/echomind-runs/round/output",
+        template_values={"project_id": project_id},
     )
     if isinstance(executor, DatasetRuntimeExecutor):
         assert executor.workflow_executor is not None
@@ -99,7 +108,53 @@ def test_background_runtime_verifies_all_stage_artifacts_via_project_binding(
     assert context.user_id == "owner"
     assert context.x_cluster == "cn-east-1"
     assert context.cookie is None and context.authorization is None
+    if use_binding:
+        recorded.assert_not_called()
+    else:
+        recorded.assert_called_once()
+        cid, actor_context = recorded.call_args.args
+        assert cid == "conversation" and actor_context.profile_id == "echomind"
+        assert (
+            actor_context.user_id == "owner" and actor_context.x_cluster == "cn-east-1"
+        )
+        load_project.assert_called_once_with(project_id, owner_user_id="owner")
     client.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("cid", "cluster"),
+    [("another-conversation", "cn-east-1"), ("conversation", "us-west-1")],
+)
+def test_recorded_storage_rejects_an_unrelated_project(
+    tmp_path, monkeypatch, cid, cluster
+):
+    project = SimpleNamespace(
+        project=SimpleNamespace(conversation_id=cid, cluster=cluster)
+    )
+    monkeypatch.setattr(ProjectStore, "load", Mock(return_value=project))
+    monkeypatch.setattr(
+        echomind_workflow_storage,
+        "build_bound_evaluation_storage",
+        Mock(return_value=None),
+    )
+    reader = Mock()
+    spec = TrainWorkflowSpec(
+        task_name="task",
+        conversation_id="conversation",
+        cluster="cn-east-1",
+        owner_user_id="owner",
+        workflow={},
+        template_values={"project_id": str(uuid4())},
+        output_uri="/workspace/.pyromind-agent/conversation/echomind-runs/g/s/out",
+    )
+    with pytest.raises(PermissionError, match="Project context"):
+        echomind_workflow_storage.build_runtime_storage(
+            spec=spec,
+            request_context=None,
+            projects_root=tmp_path,
+            recorded_storage=reader,
+        )
+    reader.assert_not_called()
 
 
 async def test_graph_callback_service_returns_owning_conversation(

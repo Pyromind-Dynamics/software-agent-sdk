@@ -6,9 +6,23 @@ them back; it never relies on atomic overwrite semantics.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from pyromind_common.platform.dataset_replay import DatasetReplayPaths
+from pyromind_runtime.domain.context import RequestContext
+
+
+WORKFLOW_ARTIFACT_MAX_BYTES = 512 * 1024 * 1024
+
+
+class WorkflowStorageReader(Protocol):
+    def read(self, path: str) -> bytes: ...
+
+    def list(self, prefix: str) -> set[str]: ...
+
+
+WorkflowStorageResolver = Callable[[str, RequestContext], WorkflowStorageReader | None]
 
 
 @runtime_checkable

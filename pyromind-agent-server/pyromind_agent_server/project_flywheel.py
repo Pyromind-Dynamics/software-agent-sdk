@@ -69,6 +69,7 @@ from pyromind_runtime.infrastructure.file_deployment_store import FileDeployment
 from pyromind_runtime.ports.storage import (
     EvaluationStorage,
     EvaluationStorageUnavailableError,
+    WorkflowStorageResolver,
 )
 
 
@@ -89,11 +90,13 @@ class ProjectFlywheelServices:
         conversations_dir: Path,
         credential_store: RuntimeCredentialStore | None,
         cipher: Cipher | None,
+        recorded_storage: WorkflowStorageResolver | None = None,
     ) -> None:
         self.root = projects_root
         self.conversations_dir = conversations_dir
         self.credential_store = credential_store
         self.cipher = cipher
+        self.recorded_storage = recorded_storage
         self.projects = ProjectStore(projects_root)
         self.report_service = ProjectModelReports(GraphModelReportStore(projects_root))
         self.schedule_store = FileBatchScheduleStore(projects_root)
@@ -337,6 +340,7 @@ class ProjectFlywheelServices:
                 conversations_dir=self.conversations_dir,
                 request_context=context,
                 credential_store=self.credential_store,
+                recorded_storage=self.recorded_storage,
             ),
             storage=storage,
             admin_key=admin_key,

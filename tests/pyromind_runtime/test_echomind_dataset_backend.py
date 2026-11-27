@@ -172,12 +172,24 @@ def test_unbound_workflow_keeps_legacy_storage_and_never_infers_project(
         if explicit_project
         else bound_dataset_spec.model_copy(update={"template_values": {}})
     )
+    spec = spec.model_copy(
+        update={
+            "output_uri": (
+                "/workspace/.pyromind-agent/conversation-1/echomind-runs/run/stage/out"
+            )
+        }
+    )
+    recorded = Mock(
+        side_effect=AssertionError("Browser access must precede the workspace")
+    )
     storage = storage_module.build_runtime_storage(
         spec=spec,
         request_context=RequestContext(user_id="owner", cookie="session-cookie"),
         projects_root=tmp_path,
+        recorded_storage=recorded,
     )
     assert storage is browser.return_value
+    recorded.assert_not_called()
     assert bound.call_count == int(explicit_project)
 
 

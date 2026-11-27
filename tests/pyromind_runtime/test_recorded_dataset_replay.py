@@ -45,6 +45,7 @@ async def test_replay_reader_requires_owner_cluster_and_recorded_workspace(
     runtime = ConversationRuntime(tmp_path, adapter)
     ctx = RequestContext(user_id="a", x_cluster="east")
     assert await runtime.dataset_replay_reader(cid, ctx) is None
+    assert runtime.recorded_workflow_storage(cid, ctx) is None
     sandbox = adapter._sandbox
     assert isinstance(sandbox, FixedActorExecutionManager)
     files = PiSessionFiles(root)
@@ -53,6 +54,14 @@ async def test_replay_reader_requires_owner_cluster_and_recorded_workspace(
     _atomic_json(files.directory / "actor-workspace.json", sandbox._endpoint(workspace))
     reader = await runtime.dataset_replay_reader(cid, ctx)
     assert isinstance(reader, RecordedActorReplayReader)
+    assert isinstance(
+        runtime.recorded_workflow_storage(cid, ctx), RecordedActorReplayReader
+    )
+    with pytest.raises(PermissionError):
+        runtime.recorded_workflow_storage(cid, replace(ctx, user_id="other"))
+    assert (
+        runtime.recorded_workflow_storage(cid, replace(ctx, x_cluster="west")) is None
+    )
     assert sandbox.execution_workspace_path(cid) is None
     with pytest.raises(PermissionError):
         await runtime.dataset_replay_reader(cid, replace(ctx, user_id="b"))
@@ -62,6 +71,7 @@ async def test_replay_reader_requires_owner_cluster_and_recorded_workspace(
     changed = sandbox._endpoint(workspace) | {"base_url": "https://other.test"}
     _atomic_json(files.directory / "actor-workspace.json", changed)
     assert await runtime.dataset_replay_reader(cid, ctx) is None
+    assert runtime.recorded_workflow_storage(cid, ctx) is None
 
 
 def test_recorded_replay_restricts_paths_and_checks_file_identity(monkeypatch):
